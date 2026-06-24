@@ -23,6 +23,14 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn result_image_count(result: &rmcp::model::CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .filter(|item| matches!(item.raw, RawContent::Image(_)))
+        .count()
+}
+
 fn read_optional(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
@@ -162,6 +170,21 @@ async fn spawn_zod_server_with_extra_env_and_extra_args(
     extra_env: Vec<(&str, &str)>,
     extra_args: Vec<String>,
 ) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        control_log,
+        extra_env,
+        Vec::new(),
+        extra_args,
+    )
+    .await
+}
+
+async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    server_env: Vec<(String, String)>,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
     let mut env = Map::new();
@@ -190,7 +213,7 @@ async fn spawn_zod_server_with_extra_env_and_extra_args(
         "files".to_string(),
     ];
     args.extend(extra_args);
-    common::spawn_server_with_args(args).await
+    common::spawn_server_with_args_env(args, server_env).await
 }
 
 async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::McpTestSession> {
@@ -1036,6 +1059,53 @@ async fn zod_worker_session_end_respawn_drops_late_raw_stdout_from_old_worker() 
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_preserves_image_after_large_hidden_input_echo() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "36000".to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let hidden = "h".repeat(12_000);
+    let input = format!("silent {hidden}\noutput-image-bytes 12000");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "hidden echo image bundle returned an error: {text:?}"
+    );
+    assert!(
+        text.contains("later content omitted"),
+        "expected tight bundle quota to report omitted hidden transcript tail, got: {text:?}"
+    );
+    assert_eq!(
+        result_image_count(&result),
+        1,
+        "expected the later reply-visible image to remain visible, got: {text:?}"
+    );
     Ok(())
 }
 

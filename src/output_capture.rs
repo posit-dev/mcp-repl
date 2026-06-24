@@ -39,6 +39,13 @@ impl OutputTimeline {
         }
     }
 
+    pub(crate) fn with_head_retention_capacity(capacity_bytes: usize) -> Self {
+        Self {
+            ring: Arc::new(OutputRing::preserving_head(capacity_bytes)),
+            utf8_tails: Arc::new(Mutex::new(OutputUtf8Tails::default())),
+        }
+    }
+
     pub(crate) fn buffer(&self) -> OutputBuffer {
         OutputBuffer::new(self.ring.clone())
     }
@@ -490,7 +497,14 @@ pub(crate) struct TimelineSettleState {
 
 pub(crate) struct OutputRing {
     capacity_bytes: usize,
+    retention: OutputRetention,
     inner: Mutex<OutputRingInner>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputRetention {
+    Tail,
+    Head,
 }
 
 struct OutputRingInner {
@@ -530,8 +544,17 @@ struct CollectedRange {
 
 impl OutputRing {
     fn new(capacity_bytes: usize) -> Self {
+        Self::with_retention(capacity_bytes, OutputRetention::Tail)
+    }
+
+    fn preserving_head(capacity_bytes: usize) -> Self {
+        Self::with_retention(capacity_bytes, OutputRetention::Head)
+    }
+
+    fn with_retention(capacity_bytes: usize, retention: OutputRetention) -> Self {
         Self {
             capacity_bytes,
+            retention,
             inner: Mutex::new(OutputRingInner {
                 chunks: VecDeque::new(),
                 line_ends: VecDeque::new(),
@@ -575,6 +598,23 @@ impl OutputRing {
             guard.note_progress();
         }
 
+        match self.retention {
+            OutputRetention::Tail => {
+                self.append_bytes_retaining_tail(bytes, is_stderr, origin, source);
+            }
+            OutputRetention::Head => {
+                self.append_bytes_retaining_head(bytes, is_stderr, origin, source);
+            }
+        }
+    }
+
+    fn append_bytes_retaining_tail(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
         let mut dropped_any = false;
         let mut remaining = bytes;
         let max_chunk_len = output_ring_append_chunk_len(self.capacity_bytes);
@@ -583,37 +623,10 @@ impl OutputRing {
             let (head, tail) = remaining.split_at(chunk_len);
             remaining = tail;
 
-            let newline_indices: Vec<usize> = head
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, byte)| (*byte == b'\n').then_some(idx))
-                .collect();
-            let bytes: Arc<[u8]> = head.to_vec().into();
-            let bytes_len = bytes.len();
-
             let mut guard = self.inner.lock().unwrap();
-            let dropped = guard.make_room_for(bytes_len, self.capacity_bytes);
+            let dropped = guard.make_room_for(head.len(), self.capacity_bytes);
             dropped_any |= dropped.dropped_visible();
-
-            let start_offset = guard.end_offset;
-            guard.end_offset = guard
-                .end_offset
-                .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
-            guard.buffered_bytes = guard.buffered_bytes.saturating_add(bytes_len);
-
-            for idx in newline_indices {
-                let offset = start_offset.saturating_add((idx + 1) as u64);
-                guard.line_ends.push_back(offset);
-            }
-
-            guard.chunks.push_back(OutputChunk {
-                start_offset,
-                bytes,
-                range: 0..bytes_len,
-                is_stderr,
-                origin,
-                source,
-            });
+            Self::append_chunk_locked(&mut guard, head, is_stderr, origin, source);
         }
 
         if dropped_any {
@@ -621,6 +634,74 @@ impl OutputRing {
             let notice_offset = guard.end_offset;
             self.append_truncation_notice_locked(&mut guard, notice_offset, 0);
         }
+    }
+
+    fn append_bytes_retaining_head(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
+        let mut remaining = bytes;
+        let max_chunk_len = output_ring_append_chunk_len(self.capacity_bytes);
+        while !remaining.is_empty() {
+            let chunk_len = remaining.len().min(max_chunk_len);
+            let (head, tail) = remaining.split_at(chunk_len);
+            remaining = tail;
+
+            let mut guard = self.inner.lock().unwrap();
+            guard.drop_input_echoes_for_room(chunk_len, self.capacity_bytes);
+            let available = self
+                .capacity_bytes
+                .saturating_sub(guard.total_buffered_bytes());
+            if available == 0 {
+                break;
+            }
+            let retained_len = chunk_len.min(available);
+            Self::append_chunk_locked(&mut guard, &head[..retained_len], is_stderr, origin, source);
+            if retained_len < chunk_len {
+                break;
+            }
+        }
+    }
+
+    fn append_chunk_locked(
+        guard: &mut OutputRingInner,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let newline_indices: Vec<usize> = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, byte)| (*byte == b'\n').then_some(idx))
+            .collect();
+        let bytes: Arc<[u8]> = bytes.to_vec().into();
+        let bytes_len = bytes.len();
+        let start_offset = guard.end_offset;
+        guard.end_offset = guard
+            .end_offset
+            .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
+        guard.buffered_bytes = guard.buffered_bytes.saturating_add(bytes_len);
+
+        for idx in newline_indices {
+            let offset = start_offset.saturating_add((idx + 1) as u64);
+            guard.line_ends.push_back(offset);
+        }
+
+        guard.chunks.push_back(OutputChunk {
+            start_offset,
+            bytes,
+            range: 0..bytes_len,
+            is_stderr,
+            origin,
+            source,
+        });
     }
 
     pub(crate) fn end_offset(&self) -> u64 {
@@ -669,11 +750,21 @@ impl OutputRing {
             return;
         }
 
-        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = guard.end_offset.max(guard.start_offset);
-        if dropped.dropped_visible() {
-            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
-            event_offset = event_offset.max(guard.start_offset);
+        match self.retention {
+            OutputRetention::Tail => {
+                let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
+                if dropped.dropped_visible() {
+                    self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
+                    event_offset = event_offset.max(guard.start_offset);
+                }
+            }
+            OutputRetention::Head => {
+                guard.drop_input_echoes_for_room(event_bytes, self.capacity_bytes);
+                if guard.total_buffered_bytes().saturating_add(event_bytes) > self.capacity_bytes {
+                    return;
+                }
+            }
         }
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
         guard.events.push_back(OutputEvent {

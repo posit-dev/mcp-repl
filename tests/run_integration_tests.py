@@ -1234,17 +1234,20 @@ def r_output_bundle_above_timeline_capacity(client: McpStdioClient) -> None:
         transcript_path,
         "output bundle above timeline capacity transcript",
     )
-    if len(transcript) <= files_output_timeline_capacity_bytes:
-        raise SuiteFailure(
-            "expected transcript to exceed the files output timeline capacity, "
-            f"got {len(transcript)} bytes"
-        )
     if "TIMELINE_FIRST" not in transcript:
         raise SuiteFailure(
-            "expected transcript to retain output before the old files-mode timeline cap"
+            "expected capped transcript to retain output before the old files-mode timeline cap"
         )
-    if "TIMELINE_LAST" not in transcript:
-        raise SuiteFailure("expected transcript to retain final worker output")
+    if "timeline00001" not in transcript:
+        raise SuiteFailure("expected capped transcript to start with the first worker lines")
+    if "timeline16000" in transcript or "TIMELINE_LAST" in transcript:
+        raise SuiteFailure(
+            f"did not expect capped transcript to contain omitted tail, got: {transcript!r}"
+        )
+    if "later content omitted" not in received_text:
+        raise SuiteFailure(
+            f"expected capped output bundle reply to report omitted tail, got: {received_text!r}"
+        )
     if "[repl] output truncated (older output dropped)" in transcript:
         raise SuiteFailure(
             "did not expect ring truncation notice in files-mode output bundle"
@@ -1388,8 +1391,8 @@ CASES: dict[str, SuiteCase] = {
         server_args=("--oversized-output", "files"),
         server_env=(
             ("MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT", "20"),
-            ("MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES", "100663296"),
-            ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "100663296"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES", "1048576"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "2097152"),
         ),
     ),
     "r-output-bundle-size-limit": r_suite_case(

@@ -211,7 +211,12 @@ impl WorkerManager {
                 OversizedOutputMode::Files => files_output_timeline_capacity_bytes()?,
                 OversizedOutputMode::Pager => OUTPUT_RING_CAPACITY_BYTES,
             };
-            let timeline = OutputTimeline::with_capacity(timeline_capacity);
+            let timeline = match oversized_output {
+                OversizedOutputMode::Files => {
+                    OutputTimeline::with_head_retention_capacity(timeline_capacity)
+                }
+                OversizedOutputMode::Pager => OutputTimeline::with_capacity(timeline_capacity),
+            };
             let output = timeline.buffer();
             output.start_capture();
             (timeline, output)

@@ -268,6 +268,14 @@ fn run_command(
         return Ok(false);
     }
 
+    if let Some(len) = command.strip_prefix("output-image-bytes ") {
+        let len: usize = parse_millis(len)?.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "output-image-bytes too large")
+        })?;
+        output_image(writer, control_log_path, &vec![b'i'; len])?;
+        return Ok(false);
+    }
+
     if let Some(len) = command.strip_prefix("repeat-output ") {
         let len: usize = parse_millis(len)?
             .try_into()

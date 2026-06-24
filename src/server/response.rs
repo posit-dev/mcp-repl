@@ -1311,7 +1311,7 @@ impl ActiveOutputBundle {
                         if visibility.is_reply_visible() && !self.omitted_reply_visible_tail =>
                     {
                         let future_reply_visible_reserve =
-                            reply_visible_worker_text_bundle_reserve(&items[index + 1..]);
+                            reply_visible_bundle_reserve(&items[index + 1..]);
                         self.append_worker_text_item(
                             store,
                             &mut retained_items,
@@ -1324,7 +1324,13 @@ impl ActiveOutputBundle {
                         retained_items.push(ReplyItem::server_text(text.clone(), *stream));
                     }
                     ReplyItem::Image(image) if !self.omitted_reply_visible_tail => {
-                        retained_items.push(ReplyItem::Image(image.clone()));
+                        if let Some(retained_item) = self.append_image(store, image)? {
+                            retained_items.push(retained_item);
+                        } else {
+                            retained_items.push(ReplyItem::Image(image.clone()));
+                            omitted_this_reply = true;
+                            self.apply_omission(store, false)?;
+                        }
                     }
                     _ => {}
                 }
@@ -1336,7 +1342,7 @@ impl ActiveOutputBundle {
                     let future_reply_visible_reserve = if visibility.is_reply_visible() {
                         0
                     } else {
-                        reply_visible_worker_text_bundle_reserve(&items[index + 1..])
+                        reply_visible_bundle_reserve(&items[index + 1..])
                     };
                     self.append_worker_text_item(
                         store,
@@ -2084,20 +2090,28 @@ fn reply_visible_worker_text_from_items(items: &[ReplyItem]) -> String {
     out
 }
 
-fn reply_visible_worker_text_bundle_reserve(items: &[ReplyItem]) -> usize {
-    items.iter().fold(0usize, |reserve, item| {
-        if let ReplyItem::WorkerText {
+fn reply_visible_bundle_reserve(items: &[ReplyItem]) -> usize {
+    items.iter().fold(0usize, |reserve, item| match item {
+        ReplyItem::WorkerText {
             text, visibility, ..
-        } = item
-            && visibility.is_reply_visible()
-        {
-            reserve
-                .saturating_add(text.len())
-                .saturating_add(TEXT_ROW_OVERHEAD_BYTES)
-        } else {
-            reserve
+        } if visibility.is_reply_visible() => reserve
+            .saturating_add(text.len())
+            .saturating_add(TEXT_ROW_OVERHEAD_BYTES),
+        ReplyItem::Image(image) => {
+            reserve.saturating_add(reply_visible_image_bundle_reserve(image))
         }
+        ReplyItem::WorkerText { .. } | ReplyItem::ServerText { .. } => reserve,
     })
+}
+
+fn reply_visible_image_bundle_reserve(image: &ReplyImage) -> usize {
+    image
+        .data
+        .len()
+        .saturating_mul(2)
+        .saturating_add(TEXT_ROW_OVERHEAD_BYTES)
+        .saturating_add(OUTPUT_BUNDLE_HEADER.len())
+        .saturating_add(omission_event_line_len())
 }
 
 fn compact_text_bundle_items(
@@ -2150,6 +2164,24 @@ fn compact_text_without_bundle_items(
         }
     }
     out
+}
+
+fn compact_omitted_bundle_items(
+    retained_items: Vec<ReplyItem>,
+    preview_worker_text: &str,
+    bundle: &ActiveOutputBundle,
+) -> Vec<Content> {
+    if bundle.next_image_number > 0 {
+        return compact_output_bundle_items(&retained_items, bundle);
+    }
+    if count_images(&retained_items) >= IMAGE_OUTPUT_BUNDLE_THRESHOLD {
+        let mut out = compact_output_without_bundle_items(&retained_items);
+        if bundle.omitted_tail {
+            out.push(Content::text(build_output_bundle_notice(bundle, 0)));
+        }
+        return out;
+    }
+    compact_text_bundle_items(retained_items, preview_worker_text, bundle)
 }
 
 fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle) -> Vec<Content> {
@@ -2314,15 +2346,11 @@ fn render_active_bundle_contents(
 
     if append.omitted_this_reply {
         active.disclosed = true;
-        if active.next_image_number > 0 {
-            Ok(compact_output_bundle_items(&append.retained_items, active))
-        } else {
-            Ok(compact_text_bundle_items(
-                append.retained_items.clone(),
-                &retained_reply_worker_text,
-                active,
-            ))
-        }
+        Ok(compact_omitted_bundle_items(
+            append.retained_items,
+            &retained_reply_worker_text,
+            active,
+        ))
     } else if retained_images_need_inline_cap {
         Ok(compact_output_without_bundle_items(&append.retained_items))
     } else if retained_image_count > 0 && image_bundle_still_needed {
@@ -2439,7 +2467,13 @@ fn compact_reply_items_with_new_bundle(
                         reply_visible_worker_text_from_items(&append.retained_items);
                     compact_text_bundle_items(append.retained_items, &retained_worker_text, &bundle)
                 } else if append.omitted_this_reply {
-                    compact_output_bundle_items(&append.retained_items, &bundle)
+                    let retained_worker_text =
+                        reply_visible_worker_text_from_items(&append.retained_items);
+                    compact_omitted_bundle_items(
+                        append.retained_items,
+                        &retained_worker_text,
+                        &bundle,
+                    )
                 } else {
                     compact_output_bundle_items(reply_bundle_items, &bundle)
                 }
