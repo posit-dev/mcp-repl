@@ -555,6 +555,137 @@ async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_files_reset_clears_stderr_prefix_state() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stderr",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("stderr: partial"),
+        "expected first reply to drain partial stderr, got: {first_text:?}"
+    );
+
+    let reset = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{4}",
+                "timeout_ms": 1_000
+            }),
+        )
+        .await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("[repl] new session started"),
+        "expected reset to restart the worker, got: {reset_text:?}"
+    );
+
+    let stderr_after_stderr = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let stderr_after_stderr_text = result_text(&stderr_after_stderr);
+    assert!(
+        stderr_after_stderr_text.starts_with("stderr: boom\n"),
+        "reset should restore stderr prefixing after partial stderr, got: {stderr_after_stderr_text:?}"
+    );
+
+    let stdout = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stdout",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let stdout_text = result_text(&stdout);
+    assert!(
+        stdout_text.contains("partial"),
+        "expected reply to drain partial stdout, got: {stdout_text:?}"
+    );
+
+    let reset = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{4}",
+                "timeout_ms": 1_000
+            }),
+        )
+        .await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("[repl] new session started"),
+        "expected second reset to restart the worker, got: {reset_text:?}"
+    );
+
+    let stderr_after_stdout = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let stderr_after_stdout_text = result_text(&stderr_after_stdout);
+    assert!(
+        stderr_after_stdout_text.starts_with("stderr: boom\n"),
+        "reset should not add stale stdout separation before fresh stderr, got: {stderr_after_stdout_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-then-exit",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xC3\n[repl] session ended\n"),
+        "session-end notice should start after the flushed partial UTF-8 tail, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3[repl]"),
+        "session-end notice should not be concatenated to an escaped UTF-8 tail, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");

@@ -62,6 +62,7 @@ impl PendingOutputTape {
         if bytes.is_empty() {
             return;
         }
+        self.timeline.flush_utf8_tails();
         if self.timeline.last_text_ends_with_newline() || bytes.starts_with(b"\n") {
             self.timeline
                 .append_text(bytes, false, ContentOrigin::Server);
@@ -177,6 +178,23 @@ mod tests {
             formatted.contents,
             vec![
                 WorkerContent::worker_stdout("partial"),
+                WorkerContent::server_stdout("\n[repl] session ended\n"),
+            ]
+        );
+    }
+
+    #[test]
+    fn stdout_status_line_flushes_incomplete_utf8_tail_before_separator() {
+        let tape = tape();
+
+        tape.append_stdout_bytes(&[0xC3]);
+        tape.append_stdout_status_line(b"[repl] session ended\n");
+
+        let formatted = tape.drain_final_output();
+        assert_eq!(
+            formatted.contents,
+            vec![
+                WorkerContent::worker_stdout("\\xC3"),
                 WorkerContent::server_stdout("\n[repl] session ended\n"),
             ]
         );

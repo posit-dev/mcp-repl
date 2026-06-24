@@ -238,6 +238,22 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "partial-stdout" {
+        output_text(writer, control_log_path, b"partial")?;
+        return Ok(false);
+    }
+
+    if command == "partial-stderr" {
+        output_stderr_text(writer, control_log_path, b"partial")?;
+        return Ok(false);
+    }
+
+    if command == "partial-utf8-then-exit" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        send_session_end(writer, "runtime_exit")?;
+        return Ok(true);
+    }
+
     if command == "split-utf8-interleaved-stderr" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         output_stderr_text(writer, control_log_path, b"err\n")?;

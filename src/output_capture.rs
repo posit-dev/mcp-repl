@@ -424,6 +424,7 @@ impl OutputBuffer {
     pub(crate) fn clear(&self) {
         let mut guard = self.cursor.lock().unwrap();
         guard.offset = None;
+        guard.last_rendered_text = None;
         drop(guard);
         self.ring().reset();
     }
