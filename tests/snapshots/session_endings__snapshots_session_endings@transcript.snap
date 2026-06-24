@@ -5,6 +5,7 @@ expression: transcript
 == session: restart_timeout_zero ==
 1) r_repl timeout_ms=10000
 >>> x <- 1
+<<< > 
 
 2) r_repl timeout_ms=0
 >>> 
@@ -13,10 +14,12 @@ expression: transcript
 3) r_repl timeout_ms=10000
 >>> print(exists("x"))
 <<< [1] FALSE
+<<< > 
 
 == session: restart_timeout_thirty ==
 1) r_repl timeout_ms=10000
 >>> x <- 1
+<<< > 
 
 2) r_repl timeout_ms=30000
 >>> 
@@ -25,6 +28,7 @@ expression: transcript
 3) r_repl timeout_ms=10000
 >>> print(exists("x"))
 <<< [1] FALSE
+<<< > 
 
 == session: eof_input ==
 1) r_repl timeout_ms=10000
@@ -34,6 +38,7 @@ expression: transcript
 2) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< > 
 
 == session: eof_then_remaining_input_same_call ==
 1) r_repl timeout_ms=10000
@@ -42,10 +47,12 @@ expression: transcript
 <<< [repl] new session started
 <<< 
 <<< [1] 2
+<<< > 
 
 == session: quit_no ==
 1) r_repl timeout_ms=10000
 >>> x <- 1
+<<< > 
 
 2) r_repl timeout_ms=10000
 >>> quit("no")
@@ -55,10 +62,12 @@ expression: transcript
 3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< > 
 
 == session: quit_default ==
 1) r_repl timeout_ms=10000
 >>> x <- 1
+<<< > 
 
 2) r_repl timeout_ms=10000
 >>> quit()
@@ -68,10 +77,12 @@ expression: transcript
 3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< > 
 
 == session: quit_yes ==
 1) r_repl timeout_ms=10000
 >>> setwd(tempdir()); x <- 1
+<<< > 
 
 2) r_repl timeout_ms=10000
 >>> quit("yes")
@@ -81,3 +92,4 @@ expression: transcript
 3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< >
