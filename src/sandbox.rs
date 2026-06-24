@@ -2344,11 +2344,23 @@ fn build_seatbelt_unreadable_glob_policy(
 #[cfg(target_os = "macos")]
 fn build_seatbelt_unreadable_path_policy(
     unreadable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    writable_roots: &[PathBuf],
 ) -> (String, Vec<(String, PathBuf)>) {
     let mut policy_components = Vec::new();
     let mut params = Vec::new();
 
     for (root_index, root) in unreadable_roots.iter().enumerate() {
+        let readable_exceptions = readable_roots
+            .iter()
+            .filter(|path| path.starts_with(root) && path.as_path() != root.as_path())
+            .cloned()
+            .collect::<Vec<_>>();
+        let writable_exceptions = writable_roots
+            .iter()
+            .filter(|path| path.starts_with(root) && path.as_path() != root.as_path())
+            .cloned()
+            .collect::<Vec<_>>();
         for (variant_index, root) in sandbox_path_variants(root).into_iter().enumerate() {
             let root_param = if variant_index == 0 {
                 format!("UNREADABLE_ROOT_{root_index}")
@@ -2358,20 +2370,69 @@ fn build_seatbelt_unreadable_path_policy(
             policy_components.push(format!(
                 "(deny file-read* (literal (param \"{root_param}\")))"
             ));
-            policy_components.push(format!(
-                "(deny file-read* (subpath (param \"{root_param}\")))"
-            ));
+            push_seatbelt_unreadable_subpath_rule(
+                &mut policy_components,
+                &mut params,
+                "file-read*",
+                &root_param,
+                &readable_exceptions,
+                &format!("UNREADABLE_ROOT_{root_index}_{variant_index}_READ_EXCEPTED"),
+            );
             policy_components.push(format!(
                 "(deny file-write-unlink (literal (param \"{root_param}\")))"
             ));
-            policy_components.push(format!(
-                "(deny file-write-unlink (subpath (param \"{root_param}\")))"
-            ));
+            push_seatbelt_unreadable_subpath_rule(
+                &mut policy_components,
+                &mut params,
+                "file-write-unlink",
+                &root_param,
+                &writable_exceptions,
+                &format!("UNREADABLE_ROOT_{root_index}_{variant_index}_WRITE_EXCEPTED"),
+            );
             params.push((root_param, root));
         }
     }
 
     (policy_components.join("\n"), params)
+}
+
+#[cfg(target_os = "macos")]
+fn push_seatbelt_unreadable_subpath_rule(
+    policy_components: &mut Vec<String>,
+    params: &mut Vec<(String, PathBuf)>,
+    action: &str,
+    root_param: &str,
+    exceptions: &[PathBuf],
+    exception_param_prefix: &str,
+) {
+    if exceptions.is_empty() {
+        policy_components.push(format!(
+            "(deny {action} (subpath (param \"{root_param}\")))"
+        ));
+        return;
+    }
+
+    let mut require_parts = vec![format!("(subpath (param \"{root_param}\"))")];
+    for (exception_index, exception) in exceptions.iter().enumerate() {
+        for (variant_index, exception) in sandbox_path_variants(exception).into_iter().enumerate() {
+            let exception_param = if variant_index == 0 {
+                format!("{exception_param_prefix}_{exception_index}")
+            } else {
+                format!("{exception_param_prefix}_{exception_index}_{variant_index}")
+            };
+            require_parts.push(format!(
+                "(require-not (literal (param \"{exception_param}\")))"
+            ));
+            require_parts.push(format!(
+                "(require-not (subpath (param \"{exception_param}\")))"
+            ));
+            params.push((exception_param, exception));
+        }
+    }
+    policy_components.push(format!(
+        "(deny {action} (require-all {} ))",
+        require_parts.join(" ")
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -2653,8 +2714,18 @@ fn create_seatbelt_command_args(
     );
 
     let deny_read_policy = build_seatbelt_unreadable_glob_policy(&file_system, sandbox_policy_cwd);
-    let (deny_path_policy, deny_path_params) =
-        build_seatbelt_unreadable_path_policy(&unreadable_roots);
+    let readable_roots_for_unreadable_path_policy =
+        file_system.get_readable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
+    let writable_roots_for_unreadable_path_policy = file_system
+        .get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
+        .into_iter()
+        .map(|root| root.root)
+        .collect::<Vec<_>>();
+    let (deny_path_policy, deny_path_params) = build_seatbelt_unreadable_path_policy(
+        &unreadable_roots,
+        &readable_roots_for_unreadable_path_policy,
+        &writable_roots_for_unreadable_path_policy,
+    );
     let mut policy_sections = vec![
         MACOS_SEATBELT_BASE_POLICY.to_string(),
         file_read_policy,

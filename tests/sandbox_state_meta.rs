@@ -230,6 +230,37 @@ fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
+fn workspace_write_with_path_deny_and_child_write_meta(
+    sandbox_cwd: &Path,
+    denied_path: &Path,
+    writable_child: &Path,
+) -> Value {
+    let mut entries = vec![
+        root_read_entry(),
+        special_entry("project_roots", "write"),
+        special_entry("tmpdir", "write"),
+        special_entry("slash_tmp", "write"),
+        protected_project_entry(".git"),
+        protected_project_entry(".agents"),
+        protected_project_entry(".codex"),
+    ];
+    entries.push(json!({
+        "path": {
+            "type": "path",
+            "path": denied_path
+        },
+        "access": "deny"
+    }));
+    entries.push(json!({
+        "path": {
+            "type": "path",
+            "path": writable_child
+        },
+        "access": "write"
+    }));
+    codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
+}
+
 fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -3148,6 +3179,96 @@ tryCatch({{
         !canonical_denied_dir.exists(),
         "path-deny write should not create {}",
         canonical_denied_dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_preserves_more_specific_child_write() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-path-deny-child-write")?;
+    let denied_dir = scratch.path().join("private");
+    let allowed_dir = denied_dir.join("allowed");
+    fs::create_dir_all(&allowed_dir)?;
+    let allowed_target = allowed_dir.join("allowed.txt");
+    let blocked_target = denied_dir.join("blocked.txt");
+    let encoded_allowed_target = encode_path(&allowed_target)?;
+    let encoded_blocked_target = encode_path(&blocked_target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+allowed_target <- {encoded_allowed_target}
+blocked_target <- {encoded_blocked_target}
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("CHILD_WRITE_OK\n")
+}}, error = function(e) {{
+  message("CHILD_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(allowed_target)
+  cat("CHILD_READ_OK\n")
+}}, error = function(e) {{
+  message("CHILD_READ_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("blocked", blocked_target)
+  cat("PARENT_WRITE_OK\n")
+}}, error = function(e) {{
+  message("PARENT_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_and_child_write_meta(
+                scratch.path(),
+                &denied_dir,
+                &allowed_dir,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("CHILD_WRITE_OK"),
+        "expected re-allowed child write under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("CHILD_WRITE_ERROR:"),
+        "re-allowed child write unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("CHILD_READ_OK"),
+        "expected re-allowed child read under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("CHILD_READ_ERROR:"),
+        "re-allowed child read unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("PARENT_WRITE_ERROR:"),
+        "expected sibling under denied parent to remain blocked, got: {text}"
+    );
+    assert!(
+        !text.contains("PARENT_WRITE_OK"),
+        "denied parent unexpectedly allowed sibling write: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&allowed_target)?,
+        "allowed\n",
+        "re-allowed child write should persist"
+    );
+    assert!(
+        !blocked_target.exists(),
+        "denied parent write should not create {}",
+        blocked_target.display()
     );
     Ok(())
 }
