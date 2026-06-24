@@ -138,19 +138,15 @@ impl WorkerManager {
     }
 
     pub(super) fn drain_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape.drain_snapshot().format_contents()
+        self.pending_output_tape.drain_output()
     }
 
     pub(super) fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_final_snapshot()
-            .format_contents_for_reply()
+        self.pending_output_tape.drain_final_output()
     }
 
     pub(super) fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_sealed_snapshot()
-            .format_contents()
+        self.pending_output_tape.drain_sealed_output()
     }
 
     pub(super) fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {

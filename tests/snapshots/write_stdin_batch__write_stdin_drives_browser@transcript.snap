@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: browser_queue ==
 1) r_repl timeout_ms=10000
@@ -9,14 +9,17 @@ expression: snapshot.render_transcript()
 2) r_repl timeout_ms=10000
 >>> f()
 <<< Called from: f()
+<<< Browse[1]> 
 
 3) r_repl timeout_ms=10000
 >>> n
 <<< debug at #1: x <- 1
+<<< Browse[1]> 
 
 4) r_repl timeout_ms=10000
 >>> n
 <<< debug at #1: x <- x + 1
+<<< Browse[1]> 
 
 5) r_repl timeout_ms=10000
 >>> c

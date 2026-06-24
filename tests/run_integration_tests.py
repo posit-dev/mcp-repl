@@ -601,10 +601,10 @@ def expected_large_text_preview(label: str, output_number: int) -> str:
 
 
 def expected_capped_text_preview(label: str, output_number: int) -> str:
-    lines = "".join(repeated_text_line(label, index) for index in range(1, 16))
+    lines = "".join(repeated_text_line(label, index) for index in range(1, 15))
     return (
         lines
-        + f"{label}016 {label * 28}\n"
+        + f"{label}015 {label * 91}\n"
         + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt; "
         "later content omitted]..."
     )
@@ -630,10 +630,7 @@ def require_text_file(path: Path, context: str) -> str:
 def r_console_basic(client: McpStdioClient) -> None:
     received = client.repl("1+1\n", timeout_ms=30000)
 
-    expected = tool_result(
-        text("[1] 2\n"),
-        text("> "),
-    )
+    expected = tool_result(text("[1] 2\n> "))
 
     assert_identical(expected, received, "repl")
 
@@ -648,7 +645,7 @@ def r_write_stdin_multiple_calls(client: McpStdioClient) -> None:
 
     add_var = client.repl("x + 1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         add_var,
         "write_stdin follow-up repl",
     )
@@ -659,7 +656,7 @@ def r_write_stdin_timeout_polling_returns_pending_output(
 ) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         warmup,
         "timeout polling warmup repl",
     )
@@ -849,7 +846,7 @@ def python_busy_discards_input(client: McpStdioClient) -> None:
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         warmup,
         "warmup repl",
     )
@@ -882,7 +879,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
 
     recovered = client.repl("1+1\n", timeout_ms=5000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         recovered,
         "recovery repl",
     )
@@ -905,7 +902,7 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 
     after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] FALSE\n"), text("> ")),
+        tool_result(text("[1] FALSE\n> ")),
         after_reset,
         "after reset repl",
     )
@@ -1045,8 +1042,7 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     assert_identical(
         tool_result(
             text("[repl] new session started\n"),
-            text("[1] FALSE\n"),
-            text("> "),
+            text("[1] FALSE\n> "),
         ),
         restarted,
         "restart prefix repl",
@@ -1074,14 +1070,12 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
 
     expected_interrupted = tool_result(
         text("interrupt received\n"),
-        text("AFTER_INTERRUPT\n"),
-        text("> "),
+        text("AFTER_INTERRUPT\n> "),
     )
     expected_interrupted_with_stderr_prefix = tool_result(
         text("interrupt received\n"),
         text("\nstderr: \n"),
-        text("AFTER_INTERRUPT\n"),
-        text("> "),
+        text("AFTER_INTERRUPT\n> "),
     )
     interrupted = client.repl('\u0003cat("AFTER_INTERRUPT\\n")', timeout_ms=5000)
     if is_busy_response(interrupted):

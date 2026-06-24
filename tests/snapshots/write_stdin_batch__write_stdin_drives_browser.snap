@@ -39,11 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Called from: f()"
-    },
-    {
-      "type": "text",
-      "text": "Browse[1]> "
+      "text": "Called from: f()\nBrowse[1]> "
     }
   ]
 }
@@ -63,11 +59,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "debug at #1: x <- 1"
-    },
-    {
-      "type": "text",
-      "text": "Browse[1]> "
+      "text": "debug at #1: x <- 1\nBrowse[1]> "
     }
   ]
 }
@@ -87,11 +79,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "debug at #1: x <- x + 1"
-    },
-    {
-      "type": "text",
-      "text": "Browse[1]> "
+      "text": "debug at #1: x <- x + 1\nBrowse[1]> "
     }
   ]
 }
@@ -111,11 +99,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "[1] 2\n> "
     }
   ]
 }

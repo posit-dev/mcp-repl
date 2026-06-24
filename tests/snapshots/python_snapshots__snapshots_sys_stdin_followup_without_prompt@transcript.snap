@@ -12,3 +12,4 @@ expression: transcript
 2) py_repl timeout_ms=5000
 >>> bravo
 <<< stdin bravo
+<<<

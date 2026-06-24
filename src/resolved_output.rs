@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use crate::reply_presentation::input_echo_text;
-use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
+use crate::worker_protocol::{ContentOrigin, ContentVisibility, TextStream, WorkerContent};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum OutputTextSource {
@@ -19,24 +19,13 @@ pub(crate) struct OutputTextSpan {
     pub source: OutputTextSource,
 }
 
+#[derive(Clone)]
 pub(crate) struct OutputRange {
     pub start_offset: u64,
     pub end_offset: u64,
     pub bytes: Vec<u8>,
     pub events: Vec<OutputEvent>,
     pub text_spans: Vec<OutputTextSpan>,
-}
-
-impl OutputRange {
-    pub(crate) fn empty(start_offset: u64, end_offset: u64) -> Self {
-        Self {
-            start_offset,
-            end_offset,
-            bytes: Vec::new(),
-            events: Vec::new(),
-            text_spans: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,17 +50,45 @@ pub(crate) enum OutputEventKind {
     InputEcho {
         text: String,
     },
+    InputWait,
+    RequestBoundary,
+    SessionEnd,
 }
 
 impl OutputEventKind {
     pub(crate) fn input_echo(prompt: &str, line: &str) -> Option<Self> {
         input_echo_text(prompt, line).map(|text| Self::InputEcho { text })
     }
+
+    pub(crate) fn text_ends_with_newline(&self) -> Option<bool> {
+        match self {
+            Self::Text { text, .. } => Some(text.ends_with('\n')),
+            Self::Image { .. }
+            | Self::InputEcho { .. }
+            | Self::InputWait
+            | Self::RequestBoundary
+            | Self::SessionEnd => None,
+        }
+    }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InputEchoVisibility {
-    TranscriptOnly,
+pub(crate) enum ProjectionMode {
+    Reply,
+    Transcript,
+    Pager,
+    Bundle,
+}
+
+impl ProjectionMode {
+    fn input_echo_visibility(self) -> Option<ContentVisibility> {
+        match self {
+            Self::Reply => None,
+            Self::Transcript => Some(ContentVisibility::ReplyAndTranscript),
+            Self::Pager | Self::Bundle => Some(ContentVisibility::TranscriptOnly),
+        }
+    }
 }
 
 pub(crate) trait EventView {
@@ -129,24 +146,67 @@ fn push_text_with_merge(
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RenderedTextState {
+    stream: TextStream,
+    origin: ContentOrigin,
+    terminated: bool,
+}
+
+fn render_stderr_text(
+    previous_text: Option<RenderedTextState>,
+    origin: ContentOrigin,
+    rendered: String,
+) -> String {
+    if previous_text.is_some_and(|state| {
+        matches!(state.stream, TextStream::Stderr) && state.origin == origin && !state.terminated
+    }) {
+        return rendered;
+    }
+    let needs_separator =
+        previous_text.is_some_and(|state| !state.terminated) && !rendered.starts_with('\n');
+    if needs_separator {
+        format!("\nstderr: {rendered}")
+    } else {
+        format!("stderr: {rendered}")
+    }
+}
+
+fn rendered_state(stream: TextStream, origin: ContentOrigin, text: &str) -> RenderedTextState {
+    RenderedTextState {
+        stream,
+        origin,
+        terminated: text.ends_with('\n'),
+    }
+}
+
 fn push_default_stdout(
     contents: &mut Vec<WorkerContent>,
     bytes: &[u8],
     start: usize,
     end: usize,
     merge_with_previous: bool,
+    last_rendered_text: &mut Option<RenderedTextState>,
 ) -> bool {
     if start >= end || end > bytes.len() {
         return false;
     }
     let text = render_bytes(bytes, start, end);
-    push_text_with_merge(
+    let pushed = push_text_with_merge(
         contents,
-        text,
+        text.clone(),
         TextStream::Stdout,
         ContentOrigin::Worker,
         merge_with_previous,
-    )
+    );
+    if pushed {
+        *last_rendered_text = Some(rendered_state(
+            TextStream::Stdout,
+            ContentOrigin::Worker,
+            &text,
+        ));
+    }
+    pushed
 }
 
 fn push_span_text(
@@ -156,37 +216,50 @@ fn push_span_text(
     end: usize,
     span: &impl TextSpanView,
     merge_with_previous: bool,
+    last_rendered_text: &mut Option<RenderedTextState>,
 ) -> bool {
     if start >= end || end > bytes.len() {
         return false;
     }
-    let text = render_bytes(bytes, start, end);
-    push_text_with_merge(
+    let rendered = render_bytes(bytes, start, end);
+    let stream = if span.is_stderr() {
+        TextStream::Stderr
+    } else {
+        TextStream::Stdout
+    };
+    let text = if span.is_stderr() {
+        render_stderr_text(*last_rendered_text, span.origin(), rendered)
+    } else {
+        rendered
+    };
+    let pushed = push_text_with_merge(
         contents,
-        text,
-        if span.is_stderr() {
-            TextStream::Stderr
-        } else {
-            TextStream::Stdout
-        },
+        text.clone(),
+        stream,
         span.origin(),
         merge_with_previous,
-    )
+    );
+    if pushed {
+        *last_rendered_text = Some(rendered_state(stream, span.origin(), &text));
+    }
+    pushed
 }
 
 fn push_generated_echo(
     contents: &mut Vec<WorkerContent>,
     text: &str,
-    visibility: InputEchoVisibility,
+    projection_mode: ProjectionMode,
     merge_with_previous_echo: bool,
 ) {
     if text.is_empty() {
         return;
     }
+    let Some(visibility) = projection_mode.input_echo_visibility() else {
+        return;
+    };
     let next = match visibility {
-        InputEchoVisibility::TranscriptOnly => {
-            WorkerContent::worker_stdout_transcript_only(text.to_string())
-        }
+        ContentVisibility::ReplyAndTranscript => WorkerContent::worker_stdout(text.to_string()),
+        ContentVisibility::TranscriptOnly => WorkerContent::worker_stdout_transcript_only(text),
     };
     let WorkerContent::ContentText {
         text,
@@ -219,73 +292,78 @@ fn push_generated_echo(
     });
 }
 
-fn emit_text_range<S: TextSpanView>(
-    contents: &mut Vec<WorkerContent>,
-    bytes: &[u8],
+struct TextRangeEmitter<'a, S> {
+    contents: &'a mut Vec<WorkerContent>,
+    bytes: &'a [u8],
     base_offset: u64,
-    start_offset: u64,
-    end_offset: u64,
-    spans: &[S],
-    merge_with_previous: bool,
-) -> bool {
-    let end_offset = end_offset.min(base_offset.saturating_add(bytes.len() as u64));
-    let start_offset = start_offset.min(end_offset);
-    if start_offset >= end_offset {
-        return false;
-    }
+    spans: &'a [S],
+    last_rendered_text: &'a mut Option<RenderedTextState>,
+}
 
-    let mut emitted = false;
-    let mut can_merge = merge_with_previous;
-    let mut cursor = start_offset;
-    for span in spans {
-        if span.end() <= start_offset {
-            continue;
-        }
-        if span.start() >= end_offset {
-            break;
+impl<S: TextSpanView> TextRangeEmitter<'_, S> {
+    fn emit(&mut self, start_offset: u64, end_offset: u64, merge_with_previous: bool) -> bool {
+        let end_offset = end_offset.min(self.base_offset.saturating_add(self.bytes.len() as u64));
+        let start_offset = start_offset.min(end_offset);
+        if start_offset >= end_offset {
+            return false;
         }
 
-        let span_start = span.start().max(start_offset);
-        if cursor < span_start
-            && push_default_stdout(
-                contents,
-                bytes,
-                cursor.saturating_sub(base_offset) as usize,
-                span_start.saturating_sub(base_offset) as usize,
+        let mut emitted = false;
+        let mut can_merge = merge_with_previous;
+        let mut cursor = start_offset;
+        for span in self.spans {
+            if span.end() <= start_offset {
+                continue;
+            }
+            if span.start() >= end_offset {
+                break;
+            }
+
+            let span_start = span.start().max(start_offset);
+            if cursor < span_start
+                && push_default_stdout(
+                    self.contents,
+                    self.bytes,
+                    cursor.saturating_sub(self.base_offset) as usize,
+                    span_start.saturating_sub(self.base_offset) as usize,
+                    can_merge,
+                    self.last_rendered_text,
+                )
+            {
+                emitted = true;
+                can_merge = true;
+            }
+
+            let span_end = span.end().min(end_offset);
+            if push_span_text(
+                self.contents,
+                self.bytes,
+                span_start.saturating_sub(self.base_offset) as usize,
+                span_end.saturating_sub(self.base_offset) as usize,
+                span,
                 can_merge,
+                self.last_rendered_text,
+            ) {
+                emitted = true;
+                can_merge = true;
+            }
+            cursor = span_end;
+        }
+
+        if cursor < end_offset
+            && push_default_stdout(
+                self.contents,
+                self.bytes,
+                cursor.saturating_sub(self.base_offset) as usize,
+                end_offset.saturating_sub(self.base_offset) as usize,
+                can_merge,
+                self.last_rendered_text,
             )
         {
             emitted = true;
-            can_merge = true;
         }
-
-        let span_end = span.end().min(end_offset);
-        if push_span_text(
-            contents,
-            bytes,
-            span_start.saturating_sub(base_offset) as usize,
-            span_end.saturating_sub(base_offset) as usize,
-            span,
-            can_merge,
-        ) {
-            emitted = true;
-            can_merge = true;
-        }
-        cursor = span_end;
+        emitted
     }
-
-    if cursor < end_offset
-        && push_default_stdout(
-            contents,
-            bytes,
-            cursor.saturating_sub(base_offset) as usize,
-            end_offset.saturating_sub(base_offset) as usize,
-            can_merge,
-        )
-    {
-        emitted = true;
-    }
-    emitted
 }
 
 fn render_bytes(bytes: &[u8], start: usize, end: usize) -> String {
@@ -325,68 +403,98 @@ pub(crate) fn render_bytes_with_events_and_spans<E: EventView, S: TextSpanView>(
     end_offset: u64,
     spans: &[S],
     events: &[E],
-    input_echo_visibility: InputEchoVisibility,
+    projection_mode: ProjectionMode,
 ) -> Vec<WorkerContent> {
+    render_bytes_with_events_and_spans_with_state(
+        bytes,
+        base_offset,
+        end_offset,
+        spans,
+        events,
+        projection_mode,
+        None,
+    )
+    .0
+}
+
+pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: TextSpanView>(
+    bytes: &[u8],
+    base_offset: u64,
+    end_offset: u64,
+    spans: &[S],
+    events: &[E],
+    projection_mode: ProjectionMode,
+    previous_rendered_text: Option<RenderedTextState>,
+) -> (Vec<WorkerContent>, Option<RenderedTextState>) {
     let mut contents = Vec::new();
     let mut cursor = base_offset;
     let mut last_content_was_input_echo = false;
-    for event in events
-        .iter()
-        .filter(|event| event.offset() >= base_offset && event.offset() <= end_offset)
+    let mut last_rendered_text = previous_rendered_text;
     {
-        if event.offset() > base_offset.saturating_add(bytes.len() as u64) {
-            break;
-        }
-        if event.offset() > cursor
-            && emit_text_range(
-                &mut contents,
-                bytes,
-                base_offset,
-                cursor,
-                event.offset(),
-                spans,
-                !last_content_was_input_echo,
-            )
-        {
-            last_content_was_input_echo = false;
-        }
-        match event.kind() {
-            OutputEventKind::InputEcho { text } => {
-                push_generated_echo(
-                    &mut contents,
-                    text,
-                    input_echo_visibility,
-                    last_content_was_input_echo,
-                );
-                last_content_was_input_echo = true;
-            }
-            kind => {
-                contents.push(output_event_to_content(kind));
-                last_content_was_input_echo = false;
-            }
-        }
-        cursor = event.offset();
-    }
-    if cursor < end_offset {
-        emit_text_range(
-            &mut contents,
+        let mut text_emitter = TextRangeEmitter {
+            contents: &mut contents,
             bytes,
             base_offset,
-            cursor,
-            end_offset,
             spans,
-            !last_content_was_input_echo,
-        );
+            last_rendered_text: &mut last_rendered_text,
+        };
+
+        for event in events
+            .iter()
+            .filter(|event| event.offset() >= base_offset && event.offset() <= end_offset)
+        {
+            if event.offset() > base_offset.saturating_add(bytes.len() as u64) {
+                break;
+            }
+            if event.offset() > cursor
+                && text_emitter.emit(cursor, event.offset(), !last_content_was_input_echo)
+            {
+                last_content_was_input_echo = false;
+            }
+            match event.kind() {
+                OutputEventKind::InputEcho { text } => {
+                    push_generated_echo(
+                        text_emitter.contents,
+                        text,
+                        projection_mode,
+                        last_content_was_input_echo,
+                    );
+                    last_content_was_input_echo = true;
+                }
+                OutputEventKind::Image { .. } | OutputEventKind::Text { .. } => {
+                    text_emitter
+                        .contents
+                        .push(output_event_to_content(event.kind()));
+                    last_content_was_input_echo = false;
+                    *text_emitter.last_rendered_text = None;
+                }
+                OutputEventKind::InputWait
+                | OutputEventKind::RequestBoundary
+                | OutputEventKind::SessionEnd => {}
+            }
+            cursor = event.offset();
+        }
+        if cursor < end_offset {
+            text_emitter.emit(cursor, end_offset, !last_content_was_input_echo);
+        }
     }
-    contents
+    (contents, last_rendered_text)
 }
 
 pub(crate) fn contents_from_output_range(
     range: OutputRange,
-    input_echo_visibility: InputEchoVisibility,
+    projection_mode: ProjectionMode,
 ) -> Vec<WorkerContent> {
+    contents_from_output_range_with_state(range, projection_mode, None).0
+}
+
+pub(crate) fn contents_from_output_range_with_state(
+    range: OutputRange,
+    projection_mode: ProjectionMode,
+    previous_rendered_text: Option<RenderedTextState>,
+) -> (Vec<WorkerContent>, Option<RenderedTextState>) {
     if range.bytes.is_empty() && range.events.is_empty() {
-        return Vec::new();
+        return (Vec::new(), previous_rendered_text);
     }
     let base_offset = range.start_offset;
     let end_offset = range.end_offset;
@@ -402,13 +510,14 @@ pub(crate) fn contents_from_output_range(
         })
         .collect();
     let end_offset = range.bytes.len() as u64;
-    render_bytes_with_events_and_spans(
+    render_bytes_with_events_and_spans_with_state(
         &range.bytes,
         0,
         end_offset,
         &range.text_spans,
         &events,
-        input_echo_visibility,
+        projection_mode,
+        previous_rendered_text,
     )
 }
 
@@ -445,6 +554,11 @@ fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
             }
         }
         OutputEventKind::InputEcho { .. } => unreachable!("input echo is handled by policy"),
+        OutputEventKind::InputWait
+        | OutputEventKind::RequestBoundary
+        | OutputEventKind::SessionEnd => {
+            unreachable!("timeline markers do not materialize")
+        }
     }
 }
 

@@ -34,7 +34,7 @@ use crate::ipc::{
 use crate::ipc::{IpcHandlers, IpcOutputImage};
 use crate::output_capture::OutputTimeline;
 use crate::oversized_output::OversizedOutputMode;
-use crate::pending_output_tape::{PendingOutputTape, PendingSidebandKind};
+use crate::pending_output_tape::PendingSidebandKind;
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, prepare_worker_command_with_managed_network,
 };
@@ -125,7 +125,6 @@ pub(crate) struct GuardrailShared {
 
 #[derive(Clone)]
 pub(crate) struct LiveOutputCapture {
-    pending_output_tape: Option<PendingOutputTape>,
     output_timeline: OutputTimeline,
     #[cfg(any(test, target_os = "windows"))]
     drop_windows_conpty_startup_noise_before_input: Option<Arc<AtomicBool>>,
@@ -133,13 +132,10 @@ pub(crate) struct LiveOutputCapture {
 
 impl LiveOutputCapture {
     pub(crate) fn new(
-        oversized_output: OversizedOutputMode,
-        pending_output_tape: PendingOutputTape,
+        _oversized_output: OversizedOutputMode,
         output_timeline: OutputTimeline,
     ) -> Self {
         Self {
-            pending_output_tape: matches!(oversized_output, OversizedOutputMode::Files)
-                .then_some(pending_output_tape),
             output_timeline,
             #[cfg(any(test, target_os = "windows"))]
             drop_windows_conpty_startup_noise_before_input: None,
@@ -219,13 +215,6 @@ impl LiveOutputCapture {
                     self.output_timeline
                         .append_text(bytes, false, ContentOrigin::Worker);
                 }
-                if let Some(tape) = &self.pending_output_tape {
-                    if is_output_text {
-                        tape.append_stdout_ipc_bytes(bytes);
-                    } else {
-                        tape.append_stdout_bytes(bytes);
-                    }
-                }
             }
             TextStream::Stderr => {
                 if is_output_text {
@@ -243,13 +232,6 @@ impl LiveOutputCapture {
                         is_continuation,
                     );
                 }
-                if let Some(tape) = &self.pending_output_tape {
-                    if is_output_text {
-                        tape.append_stderr_ipc_bytes(bytes);
-                    } else {
-                        tape.append_stderr_bytes(bytes);
-                    }
-                }
             }
         }
     }
@@ -262,12 +244,6 @@ impl LiveOutputCapture {
                 ContentOrigin::Server,
                 Some(image.readline_results_seen),
             );
-            if let Some(tape) = &self.pending_output_tape {
-                tape.append_stdout_status_event(
-                    PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
-                    image.readline_results_seen,
-                );
-            }
         }
         self.output_timeline.append_image(
             image.id.clone(),
@@ -276,23 +252,16 @@ impl LiveOutputCapture {
             image.is_new,
             image.readline_results_seen,
         );
-        if let Some(tape) = &self.pending_output_tape {
-            tape.append_image(
-                image.id,
-                image.mime_type,
-                image.data,
-                image.is_new,
-                image.readline_results_seen,
-            );
-        }
     }
 
     pub(crate) fn append_sideband(&self, kind: PendingSidebandKind) {
-        if let PendingSidebandKind::ReadlineResult { prompt, line } = &kind {
-            self.output_timeline.append_input_echo(prompt, line);
-        }
-        if let Some(tape) = &self.pending_output_tape {
-            tape.append_sideband(kind);
+        match kind {
+            PendingSidebandKind::InputWait { .. } => self.output_timeline.append_input_wait(),
+            PendingSidebandKind::ReadlineResult { prompt, line } => {
+                self.output_timeline.append_input_echo(&prompt, &line);
+            }
+            PendingSidebandKind::RequestBoundary => self.output_timeline.append_request_boundary(),
+            PendingSidebandKind::SessionEnd => self.output_timeline.append_session_end(),
         }
     }
 }
@@ -672,7 +641,6 @@ impl Drop for WindowsProcess {
 #[derive(Clone)]
 pub(crate) struct WorkerSpawnContext<'a> {
     pub(crate) oversized_output: OversizedOutputMode,
-    pub(crate) pending_output_tape: PendingOutputTape,
     pub(crate) output_timeline: OutputTimeline,
     pub(crate) guardrail: GuardrailShared,
     pub(crate) managed_network_proxy: Option<&'a crate::managed_network::ManagedNetworkProxy>,
@@ -729,7 +697,6 @@ impl WorkerProcess {
     ) -> Result<Self, WorkerError> {
         let WorkerSpawnContext {
             oversized_output,
-            pending_output_tape,
             output_timeline,
             guardrail,
             managed_network_proxy,
@@ -741,11 +708,7 @@ impl WorkerProcess {
         let _ = &guardrail;
 
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
-        let live_output = LiveOutputCapture::new(
-            oversized_output,
-            pending_output_tape.clone(),
-            output_timeline.clone(),
-        );
+        let live_output = LiveOutputCapture::new(oversized_output, output_timeline.clone());
         #[cfg(target_os = "windows")]
         let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
             live_output.with_windows_conpty_startup_noise_filter()
@@ -1534,7 +1497,6 @@ impl WorkerProcess {
             ipc: IpcHandle::new(),
             live_output: LiveOutputCapture::new(
                 OversizedOutputMode::Files,
-                PendingOutputTape::new(),
                 OutputTimeline::new(Arc::new(crate::output_capture::OutputRing::with_capacity(
                     crate::output_capture::OUTPUT_RING_CAPACITY_BYTES,
                 ))),
@@ -2427,7 +2389,7 @@ fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
 mod tests {
     use super::*;
     use crate::output_capture::{OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing};
-    use crate::pending_output_tape::{PendingOutputEvent, PendingOutputTape};
+    use crate::pending_output_tape::PendingOutputTape;
     use crate::worker_protocol::WorkerContent;
     use base64::Engine as _;
     use std::sync::{Mutex, OnceLock};
@@ -2441,12 +2403,9 @@ mod tests {
         oversized_output: OversizedOutputMode,
     ) -> (LiveOutputCapture, Arc<OutputRing>, PendingOutputTape) {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
-        let capture = LiveOutputCapture::new(
-            oversized_output,
-            tape.clone(),
-            OutputTimeline::new(output_ring.clone()),
-        );
+        let timeline = OutputTimeline::new(output_ring.clone());
+        let tape = PendingOutputTape::with_timeline(timeline.clone());
+        let capture = LiveOutputCapture::new(oversized_output, timeline);
         (capture, output_ring, tape)
     }
 
@@ -2712,12 +2671,10 @@ mod tests {
     }
 
     #[test]
-    fn pager_output_capture_skips_pending_output_tape() {
+    fn pager_output_capture_writes_to_shared_timeline() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
         let capture = LiveOutputCapture::new(
             OversizedOutputMode::Pager,
-            tape.clone(),
             OutputTimeline::new(output_ring.clone()),
         );
         capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
@@ -2731,10 +2688,6 @@ mod tests {
         });
         capture.append_sideband(PendingSidebandKind::RequestBoundary);
 
-        assert!(
-            tape.drain_final_snapshot().events.is_empty(),
-            "pager mode should not mirror text, images, or sideband events into the pending tape"
-        );
         let output_end = output_ring.end_offset();
         let output_range = output_ring.read_range(0, output_end);
         assert!(
@@ -2766,10 +2719,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"");
         assert!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents
-                .is_empty(),
+            tape.drain_final_output().contents.is_empty(),
             "raw ConPTY startup toggles should not enter output bundles"
         );
     }
@@ -2783,9 +2733,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
         assert_eq!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents,
+            tape.drain_final_output().contents,
             vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
         );
     }
@@ -2800,9 +2748,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
         assert_eq!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents,
+            tape.drain_final_output().contents,
             vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
         );
     }
@@ -2816,9 +2762,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001hvisible\n");
         assert_eq!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents,
+            tape.drain_final_output().contents,
             vec![WorkerContent::worker_stdout("\u{1b}[?9001hvisible\n")]
         );
     }
@@ -2852,12 +2796,9 @@ mod tests {
     #[test]
     fn files_output_capture_anchors_update_notice_before_late_prompt_shaped_text() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
-        let capture = LiveOutputCapture::new(
-            OversizedOutputMode::Files,
-            tape.clone(),
-            OutputTimeline::new(output_ring),
-        );
+        let timeline = OutputTimeline::new(output_ring);
+        let tape = PendingOutputTape::with_timeline(timeline.clone());
+        let capture = LiveOutputCapture::new(OversizedOutputMode::Files, timeline);
 
         capture.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
@@ -2873,10 +2814,7 @@ mod tests {
         });
         capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
-        let contents = tape
-            .drain_final_snapshot()
-            .format_contents_for_reply()
-            .contents;
+        let contents = tape.drain_final_output().contents;
 
         assert_eq!(
             contents,
@@ -2889,7 +2827,7 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
-                WorkerContent::stdout("> lines(4:8, 4:8)\n"),
+                WorkerContent::worker_stdout("> lines(4:8, 4:8)\n"),
             ]
         );
     }
@@ -2897,12 +2835,9 @@ mod tests {
     #[test]
     fn files_ipc_output_text_appends_to_tape_and_timeline_in_ipc_order() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
-        let capture = LiveOutputCapture::new(
-            OversizedOutputMode::Files,
-            tape.clone(),
-            OutputTimeline::new(output_ring.clone()),
-        );
+        let timeline = OutputTimeline::new(output_ring.clone());
+        let tape = PendingOutputTape::with_timeline(timeline.clone());
+        let capture = LiveOutputCapture::new(OversizedOutputMode::Files, timeline);
         let (done_tx, done_rx) = mpsc::channel();
 
         let output_capture = capture.clone();
@@ -2986,67 +2921,9 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("server IPC consumed session_end");
 
-        let snapshot = tape.drain_final_snapshot();
-        assert_eq!(snapshot.events.len(), 7);
-        assert!(matches!(
-            &snapshot.events[0],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::InputWait { prompt },
-                ..
-            } if prompt == "> "
-        ));
-        assert!(matches!(
-            &snapshot.events[1],
-            PendingOutputEvent::TextFragment {
-                stream: TextStream::Stdout,
-                origin: ContentOrigin::Worker,
-                bytes,
-                ..
-            } if bytes == b"before\n"
-        ));
-        assert!(matches!(
-            &snapshot.events[2],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::ReadlineResult { prompt, line, .. },
-                ..
-            } if prompt == "> " && line == "plot(1)\n"
-        ));
-        assert!(matches!(
-            &snapshot.events[3],
-            PendingOutputEvent::Image {
-                id,
-                mime_type,
-                readline_results_seen: 1,
-                ..
-            } if id.starts_with("image-") && mime_type == "image/png"
-        ));
-        assert!(matches!(
-            &snapshot.events[4],
-            PendingOutputEvent::TextFragment {
-                stream: TextStream::Stderr,
-                origin: ContentOrigin::Worker,
-                bytes,
-                ..
-            } if bytes == b"err\n"
-        ));
-        assert!(matches!(
-            &snapshot.events[5],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::InputWait { prompt },
-                ..
-            } if prompt == "> "
-        ));
-        assert!(matches!(
-            &snapshot.events[6],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::SessionEnd,
-                ..
-            }
-        ));
-
         let end = output_ring.end_offset();
         let range = output_ring.read_range(0, end);
-        assert_eq!(range.bytes, b"before\n\nstderr: err\n");
+        assert_eq!(range.bytes, b"before\nerr\n");
         let image_event = range
             .events
             .iter()
@@ -3058,6 +2935,31 @@ mod tests {
         assert_eq!(image_event.0, b"before\n".len() as u64);
         assert!(image_event.1.starts_with("image-"));
         assert_eq!(image_event.2, "image/png");
+
+        let output = tape.drain_final_output();
+        assert_eq!(output.contents.len(), 4);
+        assert_eq!(output.contents[0], WorkerContent::worker_stdout("before\n"));
+        assert_eq!(
+            output.contents[1],
+            WorkerContent::worker_stdout_transcript_only("> plot(1)\n")
+        );
+        assert!(
+            matches!(
+                &output.contents[2],
+                WorkerContent::ContentImage {
+                    data,
+                    mime_type,
+                    id,
+                    is_new: true,
+                } if data == "AA==" && mime_type == "image/png" && id.starts_with("image-")
+            ),
+            "expected generated image event in output order, got: {:?}",
+            output.contents[2]
+        );
+        assert_eq!(
+            output.contents[3],
+            WorkerContent::worker_stderr("stderr: err\n")
+        );
     }
 
     #[test]
@@ -3065,10 +2967,13 @@ mod tests {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let capture = LiveOutputCapture::new(
             OversizedOutputMode::Pager,
-            PendingOutputTape::new(),
             OutputTimeline::new(output_ring.clone()),
         );
 
+        capture.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "lines(4:8, 4:8)\n".to_string(),
+        });
         capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),

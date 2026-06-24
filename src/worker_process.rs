@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::backend::{Backend, WorkerLaunch};
 use crate::completion_reply::{CompletionInfo, PagerCompletionPrompt};
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline, ensure_output_ring, reset_output_ring,
+    FILES_OUTPUT_TIMELINE_CAPACITY_BYTES, OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline,
 };
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::Pager;
@@ -195,14 +195,15 @@ impl WorkerManager {
             });
             crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         }
-        #[cfg(test)]
-        let _output_ring_guard = crate::output_capture::output_ring_test_mutex()
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        let output_timeline = {
-            let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-            reset_output_ring();
-            OutputTimeline::new(output_ring)
+        let (output_timeline, output) = {
+            let timeline_capacity = match oversized_output {
+                OversizedOutputMode::Files => FILES_OUTPUT_TIMELINE_CAPACITY_BYTES,
+                OversizedOutputMode::Pager => OUTPUT_RING_CAPACITY_BYTES,
+            };
+            let timeline = OutputTimeline::with_capacity(timeline_capacity);
+            let output = timeline.buffer();
+            output.start_capture();
+            (timeline, output)
         };
         Ok(Self {
             exe_path,
@@ -217,8 +218,8 @@ impl WorkerManager {
             #[cfg(target_os = "windows")]
             windows_sandbox_launch: None,
             oversized_output,
-            pending_output_tape: PendingOutputTape::new(),
-            output: OutputBuffer::default(),
+            pending_output_tape: PendingOutputTape::with_timeline(output_timeline.clone()),
+            output,
             pager: Pager::default(),
             output_timeline,
             driver: new_backend_driver(&worker_launch),

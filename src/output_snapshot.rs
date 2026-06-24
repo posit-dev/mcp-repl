@@ -77,10 +77,15 @@ pub(crate) fn snapshot_pending_timeout_page_with_images(
     let range = output.read_range(start_offset, end_offset);
     if range.bytes.is_empty()
         && !range.events.is_empty()
-        && range
-            .events
-            .iter()
-            .all(|event| matches!(event.kind, OutputEventKind::InputEcho { .. }))
+        && range.events.iter().all(|event| {
+            matches!(
+                event.kind,
+                OutputEventKind::InputEcho { .. }
+                    | OutputEventKind::InputWait
+                    | OutputEventKind::RequestBoundary
+                    | OutputEventKind::SessionEnd
+            )
+        })
     {
         return SnapshotWithImages {
             contents: Vec::new(),
@@ -126,13 +131,13 @@ fn page_end_offset(
     start_offset: u64,
     end_offset: u64,
     pages_left: u64,
-    last_range_end_byte: Option<u64>,
+    last_range_end_offset: Option<u64>,
 ) -> u64 {
     if pages_left == 0 {
         return end_offset;
     }
-    if let Some(end_byte) = last_range_end_byte {
-        return start_offset.saturating_add(end_byte);
+    if let Some(end_offset) = last_range_end_offset {
+        return end_offset;
     }
     start_offset
 }

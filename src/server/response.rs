@@ -11,6 +11,7 @@ use rmcp::model::{
 use serde_json::Value;
 use tempfile::Builder;
 
+use crate::output_capture::OUTPUT_TRUNCATION_NOTICE;
 pub(crate) use crate::stdin_payload::{TimeoutBundleReuse, timeout_bundle_reuse_for_input};
 use crate::worker_process::WorkerError;
 use crate::worker_protocol::{
@@ -1966,7 +1967,6 @@ pub(crate) fn strip_text_stream_meta(result: &mut CallToolResult) {
 fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
     let mut out = Vec::new();
     let mut pending_worker_text: Option<(String, TextStream)> = None;
-    let mut skipped_transcript_only_worker_text = false;
 
     for item in items {
         match item {
@@ -1974,34 +1974,25 @@ fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
                 text,
                 stream,
                 visibility,
-            } if visibility.is_reply_visible() => {
-                match &mut pending_worker_text {
-                    Some((pending, pending_stream))
-                        if *pending_stream == stream && skipped_transcript_only_worker_text =>
-                    {
-                        pending.push_str(&text);
-                    }
-                    Some(_) => {
-                        flush_pending_worker_text(&mut out, &mut pending_worker_text);
-                        pending_worker_text = Some((text, stream));
-                    }
-                    None => {
-                        pending_worker_text = Some((text, stream));
-                    }
+            } if visibility.is_reply_visible() => match &mut pending_worker_text {
+                Some((pending, pending_stream)) if *pending_stream == stream => {
+                    pending.push_str(&text);
                 }
-                skipped_transcript_only_worker_text = false;
-            }
-            ReplyItem::WorkerText { .. } => {
-                skipped_transcript_only_worker_text = true;
-            }
+                Some(_) => {
+                    flush_pending_worker_text(&mut out, &mut pending_worker_text);
+                    pending_worker_text = Some((text, stream));
+                }
+                None => {
+                    pending_worker_text = Some((text, stream));
+                }
+            },
+            ReplyItem::WorkerText { .. } => {}
             ReplyItem::ServerText { text, stream } => {
                 flush_pending_worker_text(&mut out, &mut pending_worker_text);
-                skipped_transcript_only_worker_text = false;
                 out.push(content_text(text, stream));
             }
             ReplyItem::Image(image) => {
                 flush_pending_worker_text(&mut out, &mut pending_worker_text);
-                skipped_transcript_only_worker_text = false;
                 out.push(image_to_content(&image));
             }
         }
@@ -2629,6 +2620,7 @@ fn item_text(item: &ReplyItem) -> Option<&str> {
             text, visibility, ..
         } if visibility.is_reply_visible() => Some(text),
         ReplyItem::WorkerText { .. } => None,
+        ReplyItem::ServerText { text, .. } if text == OUTPUT_TRUNCATION_NOTICE => None,
         ReplyItem::ServerText { text, .. } => Some(text),
         ReplyItem::Image(_) => None,
     }
@@ -2927,6 +2919,17 @@ mod tests {
             .collect()
     }
 
+    fn result_text_chunks(result: &rmcp::model::CallToolResult) -> Vec<&str> {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match &item.raw {
+                RawContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn result_images(result: &rmcp::model::CallToolResult) -> Vec<Vec<u8>> {
         result
             .content
@@ -3010,6 +3013,26 @@ mod tests {
         );
 
         assert_eq!(result_text(&result), "\u{1b}[?9001h\u{1b}[?1004h2\n");
+    }
+
+    #[test]
+    fn adjacent_visible_worker_text_materializes_as_one_content_item() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("[1] 42\n"),
+                    WorkerContent::worker_stdout("> "),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        assert_eq!(result_text_chunks(&result), vec!["[1] 42\n> "]);
     }
 
     #[test]

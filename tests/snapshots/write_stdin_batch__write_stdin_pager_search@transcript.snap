@@ -5,20 +5,21 @@ expression: transcript
 == session: pager_search_queue ==
 1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) cat(sprintf("line%04d %s\n", i, line))
-<<< line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< --More-- (140p, 0.5%, @0..210/42000)
+<<< 
+<<< --More-- (140p, 0.2%, @0..103/42103)
 
 2) r_repl timeout_ms=30000
 >>> :/line0050
-<<< [pager] search for `line0050` @10290
+<<< [pager] search for `line0050` @10393
 <<< [match] line0050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
-<<< --More-- (106p, 24.5%, @10290/42000)
+<<< 
+<<< --More-- (106p, 24.6%, @10393/42103)
 
 3) r_repl timeout_ms=30000
 >>> :n
 <<< [pager] already at the last known search hit for `line0050`
-<<< --More-- (106p, 24.5%, @10290/42000)
+<<< --More-- (106p, 24.6%, @10393/42103)
 
 4) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 24.5%, @10290/42000)
+<<< (END, 24.6%, @10393/42103)

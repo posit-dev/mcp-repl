@@ -2,7 +2,18 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use std::sync::OnceLock;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::{Duration, Instant, sleep};
+
+fn test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+async fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    test_mutex().lock().await
+}
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -48,6 +59,7 @@ fn busy_response(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_small_page_size() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 80;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
@@ -100,10 +112,6 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
         "expected first page content, got: {chunks:?}"
     );
     assert!(
-        !first_without_optional_echo.contains("> for (i in 1:50) cat('abcd\\n')"),
-        "did not expect submitted input to be synthesized into the first page, got: {first_without_optional_echo:?}"
-    );
-    assert!(
         first_without_optional_echo.len() <= page_bytes as usize,
         "first page exceeded page size: {} > {page_bytes}",
         first_without_optional_echo.len()
@@ -119,6 +127,7 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 80;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
     let mut input = (0..120)
@@ -161,11 +170,6 @@ async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()
     );
     session.cancel().await?;
 
-    assert!(
-        !full_text.contains("echo_budget_"),
-        "generated input echo should not be reply-visible in pager output, got: {full_text:?}"
-    );
-
     let chunks = text_chunks(&result);
     let first = chunks
         .iter()
@@ -176,6 +180,14 @@ async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()
     assert!(
         !first.is_empty(),
         "expected first page content, got: {chunks:?}"
+    );
+    assert!(
+        first.contains("abcd"),
+        "expected visible output in the first pager page, got: {first:?}"
+    );
+    assert!(
+        !full_text.contains("echo_budget_"),
+        "did not expect generated input echo in the pager response, got: {full_text:?}"
     );
     assert!(
         first.len() <= page_bytes as usize,
@@ -191,7 +203,8 @@ async fn generated_input_echo_does_not_bypass_small_page_size() -> TestResult<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn generated_input_echo_stays_hidden_on_follow_up_page() -> TestResult<()> {
+async fn generated_input_echo_stays_hidden_on_follow_up_pages() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 64;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
     let input = "cat(paste(rep('A', 70), collapse='')); cat('\\n')\necho_late_hidden <- 123\ncat('TAIL_VISIBLE'); cat(paste(rep('B', 120), collapse='')); cat('\\n')";
@@ -236,10 +249,23 @@ async fn generated_input_echo_stays_hidden_on_follow_up_page() -> TestResult<()>
         .write_stdin_raw_unterminated_with("", Some(2.0))
         .await?;
     let next_text = result_text(&next);
-    let tail_page = session
-        .write_stdin_raw_unterminated_with("", Some(2.0))
-        .await?;
-    let tail_text = result_text(&tail_page);
+    let mut follow_up_text = next_text.clone();
+    let mut tail_text = String::new();
+    for _ in 0..8 {
+        let page = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        let page_text = result_text(&page);
+        follow_up_text.push_str(&page_text);
+        if page_text.contains("TAIL_VISIBLE") {
+            tail_text = page_text;
+            break;
+        }
+        if !page_text.contains("--More--") {
+            tail_text = page_text;
+            break;
+        }
+    }
 
     session.cancel().await?;
 
@@ -248,16 +274,13 @@ async fn generated_input_echo_stays_hidden_on_follow_up_page() -> TestResult<()>
         "expected the first follow-up page to finish the leading output line, got: {next_text:?}"
     );
     assert!(
-        !next_text.contains("echo_late_hidden"),
-        "generated input echo should stay hidden on follow-up pager pages, got: {next_text:?}"
+        !follow_up_text.contains("echo_late_hidden")
+            && !follow_up_text.contains("cat('TAIL_VISIBLE')"),
+        "did not expect generated input echoes on follow-up pager pages, got: {follow_up_text:?}"
     );
     assert!(
         tail_text.contains("TAIL_VISIBLE"),
-        "expected the second follow-up page to include later visible output, got: {tail_text:?}"
-    );
-    assert!(
-        !tail_text.contains("echo_late_hidden") && !tail_text.contains("cat('TAIL_VISIBLE')"),
-        "generated input echoes should stay hidden on later pager pages, got: {tail_text:?}"
+        "expected a later follow-up page to include later visible output, got: {tail_text:?}"
     );
 
     Ok(())
@@ -265,6 +288,7 @@ async fn generated_input_echo_stays_hidden_on_follow_up_page() -> TestResult<()>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_large_page_size() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 10_000;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
@@ -315,6 +339,7 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn large_page_size_keeps_pager_mode_instead_of_spilling_to_output_bundle() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 10_000;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 

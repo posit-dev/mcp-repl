@@ -40,6 +40,7 @@ expression: transcript
 >>> 
 >>> 1+1
 <<< [repl] new session started
+<<< 
 <<< [1] 2
 
 == session: quit_no ==
@@ -49,6 +50,7 @@ expression: transcript
 2) r_repl timeout_ms=10000
 >>> quit("no")
 <<< [repl] session ended
+<<< 
 
 3) r_repl timeout_ms=10000
 >>> 1+1
@@ -61,6 +63,7 @@ expression: transcript
 2) r_repl timeout_ms=10000
 >>> quit()
 <<< [repl] session ended
+<<< 
 
 3) r_repl timeout_ms=10000
 >>> 1+1
@@ -73,6 +76,7 @@ expression: transcript
 2) r_repl timeout_ms=10000
 >>> quit("yes")
 <<< [repl] session ended
+<<< 
 
 3) r_repl timeout_ms=10000
 >>> 1+1
