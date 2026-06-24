@@ -2513,11 +2513,21 @@ fn create_seatbelt_command_args(
 ) -> Vec<String> {
     let mut file_system = file_system_policy_from_legacy(sandbox_policy);
     let mut required_temp_roots = vec![session_temp_dir.to_path_buf()];
-    if matches!(
-        sandbox_policy,
-        SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. }
-    ) {
-        required_temp_roots.extend(temp_roots_from_system(false, false));
+    match sandbox_policy {
+        SandboxPolicy::ReadOnly { .. } => {
+            required_temp_roots.extend(temp_roots_from_system(false, false));
+        }
+        SandboxPolicy::WorkspaceWrite {
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+            ..
+        } => {
+            required_temp_roots.extend(temp_roots_from_system(
+                *exclude_tmpdir_env_var,
+                *exclude_slash_tmp,
+            ));
+        }
+        _ => {}
     }
     required_temp_roots.sort();
     required_temp_roots.dedup();
@@ -3951,6 +3961,61 @@ mod tests {
         let rendered = dynamic_network_policy(&policy, false, false, &proxy);
         assert!(rendered.contains("localhost:8080"));
         assert!(!rendered.contains("(allow network-inbound)\n"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prepare_worker_command_respects_legacy_workspace_temp_exclusions() {
+        let ambient_tmpdir = std::env::temp_dir();
+        let root = ambient_tmpdir.join(format!("mcp-repl-temp-exclusions-{}", std::process::id()));
+        let session_temp_dir = root.join("session-tempdir");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![workspace.clone()],
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+            sandbox_cwd: workspace,
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state);
+
+        let prepared = prepared.expect("prepare_worker_command should succeed");
+        let writable_roots = prepared
+            .args
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("-DWRITABLE_ROOT_"))
+            .filter_map(|definition| {
+                definition
+                    .split_once('=')
+                    .map(|(_, value)| PathBuf::from(value))
+            })
+            .collect::<Vec<_>>();
+
+        let required_session_variants = sandbox_path_variants(&session_temp_dir);
+        assert!(
+            required_session_variants
+                .iter()
+                .any(|path| writable_roots.iter().any(|root| root == path)),
+            "session temp dir must stay writable: {writable_roots:?}"
+        );
+
+        let mut excluded_temp_variants = sandbox_path_variants(Path::new("/tmp"));
+        excluded_temp_variants.extend(sandbox_path_variants(&ambient_tmpdir));
+        assert!(
+            excluded_temp_variants
+                .iter()
+                .all(|path| !writable_roots.iter().any(|root| root == path)),
+            "excluded temp roots must not be re-added as writable: {writable_roots:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(target_os = "macos")]
