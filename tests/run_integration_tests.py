@@ -1208,6 +1208,49 @@ def r_output_bundle_files(client: McpStdioClient) -> None:
             )
 
 
+def r_output_bundle_above_timeline_capacity(client: McpStdioClient) -> None:
+    files_output_timeline_capacity_bytes = 64 * 1024 * 1024
+    line_width = 4096
+    line_count = files_output_timeline_capacity_bytes // line_width + 1024
+    input_text = dedent(
+        f"""
+        chunk <- paste(rep("q", {line_width}), collapse = "")
+        cat("TIMELINE_FIRST\\n")
+        for (i in 1:{line_count}) cat(sprintf("timeline%05d %s\\n", i, chunk))
+        cat("TIMELINE_LAST\\n")
+        """
+    )
+
+    received = client.repl(input_text, timeout_ms=120000)
+    received_text = require_success(
+        received,
+        "output bundle above timeline capacity repl",
+    )
+    transcript_path = require_transcript_path(
+        received_text,
+        "output bundle above timeline capacity repl",
+    )
+    transcript = require_text_file(
+        transcript_path,
+        "output bundle above timeline capacity transcript",
+    )
+    if len(transcript) <= files_output_timeline_capacity_bytes:
+        raise SuiteFailure(
+            "expected transcript to exceed the files output timeline capacity, "
+            f"got {len(transcript)} bytes"
+        )
+    if "TIMELINE_FIRST" not in transcript:
+        raise SuiteFailure(
+            "expected transcript to retain output before the old files-mode timeline cap"
+        )
+    if "TIMELINE_LAST" not in transcript:
+        raise SuiteFailure("expected transcript to retain final worker output")
+    if "[repl] output truncated (older output dropped)" in transcript:
+        raise SuiteFailure(
+            "did not expect ring truncation notice in files-mode output bundle"
+        )
+
+
 def r_output_bundle_size_limit(client: McpStdioClient) -> None:
     received = client.repl(r_large_text_input("z", lines=120), timeout_ms=30000)
     assert_identical(
@@ -1338,6 +1381,15 @@ CASES: dict[str, SuiteCase] = {
             ("MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT", "2"),
             ("MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES", "1048576"),
             ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "2097152"),
+        ),
+    ),
+    "r-output-bundle-above-timeline-capacity": r_suite_case(
+        r_output_bundle_above_timeline_capacity,
+        server_args=("--oversized-output", "files"),
+        server_env=(
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT", "20"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES", "100663296"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "100663296"),
         ),
     ),
     "r-output-bundle-size-limit": r_suite_case(

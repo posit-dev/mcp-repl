@@ -12,6 +12,7 @@ use crate::pager::Pager;
 use crate::pending_output_tape::PendingOutputTape;
 use crate::sandbox::{SandboxState, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
+use crate::server::response::configured_output_bundle_max_bytes;
 pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
 use crate::worker_protocol::WorkerReply;
 use crate::worker_supervisor::{GuardrailEvent, GuardrailShared, WorkerProcess};
@@ -53,6 +54,16 @@ pub enum WorkerError {
     Timeout(Duration),
     Sandbox(String),
     Guardrail(String),
+}
+
+fn files_output_timeline_capacity_bytes() -> Result<usize, WorkerError> {
+    let max_bundle_bytes = configured_output_bundle_max_bytes()?;
+    let max_bundle_bytes = usize::try_from(max_bundle_bytes).map_err(|_| {
+        WorkerError::Protocol(
+            "output bundle max bytes exceeds platform timeline capacity".to_string(),
+        )
+    })?;
+    Ok(FILES_OUTPUT_TIMELINE_CAPACITY_BYTES.max(max_bundle_bytes))
 }
 
 pub(crate) fn is_prechecked_follow_up_requires_meta(err: &WorkerError) -> bool {
@@ -197,7 +208,7 @@ impl WorkerManager {
         }
         let (output_timeline, output) = {
             let timeline_capacity = match oversized_output {
-                OversizedOutputMode::Files => FILES_OUTPUT_TIMELINE_CAPACITY_BYTES,
+                OversizedOutputMode::Files => files_output_timeline_capacity_bytes()?,
                 OversizedOutputMode::Pager => OUTPUT_RING_CAPACITY_BYTES,
             };
             let timeline = OutputTimeline::with_capacity(timeline_capacity);

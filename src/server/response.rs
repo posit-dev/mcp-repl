@@ -1273,8 +1273,7 @@ impl OutputStoreLimits {
     fn from_env() -> Result<Self, WorkerError> {
         let max_bundle_count =
             parse_limit_env::<usize>(OUTPUT_BUNDLE_MAX_COUNT_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_COUNT)?;
-        let max_bundle_bytes =
-            parse_limit_env::<u64>(OUTPUT_BUNDLE_MAX_BYTES_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_BYTES)?;
+        let max_bundle_bytes = configured_output_bundle_max_bytes()?;
         let max_total_bytes = parse_limit_env::<u64>(
             OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV,
             DEFAULT_OUTPUT_BUNDLE_MAX_TOTAL_BYTES,
@@ -1805,6 +1804,10 @@ impl StagedTimeoutOutput {
             .cloned()
             .collect()
     }
+}
+
+pub(crate) fn configured_output_bundle_max_bytes() -> Result<u64, WorkerError> {
+    parse_limit_env::<u64>(OUTPUT_BUNDLE_MAX_BYTES_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_BYTES)
 }
 
 fn parse_limit_env<T>(name: &str, default: T) -> Result<T, WorkerError>
