@@ -524,6 +524,44 @@ async fn zod_pager_hidden_input_echoes_do_not_evict_visible_output() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_leading_hidden_input_echo_does_not_consume_first_page_budget() -> TestResult<()>
+{
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let hidden_payload = "h".repeat(30_000);
+    let input = format!("silent {hidden_payload}\nrepeat-output 10000");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("ZOD_BEGIN"),
+        "leading hidden input echo should not evict the first visible pager output, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--"),
+        "expected the visible output to remain paged, got: {text:?}"
+    );
+    assert!(
+        !text.contains("silent "),
+        "leading input echo should stay hidden in pager replies, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");

@@ -12,11 +12,7 @@ expression: transcript
 >>> for (i in 1:60) cat("beta line ", i, "\n", sep = "")
 >>> plot(5:1, type = "l")
 >>> for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
-<<< > 
-<<< > set.seed(1)
-<<< > cat("# Title\n")
 <<< # Title
-<<< > for (i in 1:60) cat("alpha line ", i, "\n", sep = "")
 <<< alpha line 1
 <<< alpha line 2
 <<< alpha line 3
@@ -31,33 +27,33 @@ expression: transcript
 <<< alpha line 12
 <<< alpha line 13
 <<< alpha line 14
-<<< 
-<<< [pager] elided output: @195..839
-<<< 
-<<< [image/png len=0]
-<<< [pager] elided output: @839..1610
-<<< 
-<<< [image/png len=0]
-<<< --More-- (Np, 10.6%, @0..287/2692)
-
-2) r_repl timeout_ms=10000
->>> :hits alpha
-<<< #1 @287 Title
-<<<   > alpha line 15
-<<< 
-<<< --More-- (Np, 11.1%, @287..301/2692)
-
-3) r_repl timeout_ms=10000
->>> :seek 0
-<<< [pager] elided output (already shown): @0..301
-<<< 
+<<< alpha line 15
 <<< alpha line 16
 <<< alpha line 17
 <<< alpha line 18
 <<< alpha line 19
 <<< alpha line 20
 <<< alpha line 21
-<<< alpha line 22
+<<< 
+<<< [pager] elided output: @293..839
+<<< 
+<<< [image/png len=0]
+<<< [pager] elided output: @839..1610
+<<< 
+<<< [image/png len=0]
+<<< --More-- (Np, 12.0%, @0..293/2441)
+
+2) r_repl timeout_ms=10000
+>>> :hits alpha
+<<< #1 @293 Title
+<<<   > alpha line 22
+<<< 
+<<< --More-- (Np, 12.5%, @293..307/2441)
+
+3) r_repl timeout_ms=10000
+>>> :seek 0
+<<< [pager] elided output (already shown): @0..307
+<<< 
 <<< alpha line 23
 <<< alpha line 24
 <<< alpha line 25
@@ -72,12 +68,19 @@ expression: transcript
 <<< alpha line 34
 <<< alpha line 35
 <<< alpha line 36
+<<< alpha line 37
+<<< alpha line 38
+<<< alpha line 39
+<<< alpha line 40
+<<< alpha line 41
+<<< alpha line 42
+<<< alpha line 43
 <<< 
-<<< --More-- (Np, 22.1%, @301..595/2692)
+<<< --More-- (Np, 24.6%, @307..601/2441)
 
 4) r_repl timeout_ms=10000
 >>> :hits beta
-<<< #1 @955 Title
-<<<   > > for (i in 1:60) cat("beta line ", i, "\n", sep = "")
+<<< #1 @839 Title
+<<<   > beta line 1
 <<< 
-<<< --More-- (Np, 37.5%, @955..1010/2692)
+<<< --More-- (Np, 34.8%, @839..851/2441)

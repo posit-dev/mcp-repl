@@ -5,7 +5,6 @@ expression: transcript
 == session: default ==
 1) r_repl timeout_ms=30000
 >>> cat('# Title\n\n## Alpha\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\n', i)); cat('\n## Beta\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\n', i))
-<<< > cat('# Title\n\n## Alpha\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\n', i)); cat('\n## Beta\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\n', i))
 <<< # Title
 <<< 
 <<< ## Alpha
@@ -15,225 +14,230 @@ expression: transcript
 <<< alpha line 04 foo
 <<< alpha line 05 foo
 <<< alpha line 06 foo
+<<< alpha line 07 foo
+<<< alpha line 08 foo
+<<< alpha line 09 foo
+<<< alpha line 10 foo
+<<< alpha line 11 foo
+<<< alpha line 12 foo
+<<< alpha line 13 foo
+<<< alpha line 14 foo
+<<< alpha line 15 foo
 <<< 
-<<< --More-- (3p, 32.6%, @0..292/893)
+<<< --More-- (2p, 39.6%, @0..288/727)
 
 2) r_repl timeout_ms=30000
 >>> :matches foo
-<<< [pager] matches: 41 (limit 50); use `:matches -n all`, `:goto N`, or `:n`/`:p`
-<<< #1 @77 root | > cat('# Title\n\n## Alpha\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\n', i)); cat('\n## Beta\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\n', i))
-<<< #2 @198 Title > Alpha | alpha line 01 foo
-<<< #3 @216 Title > Alpha | alpha line 02 foo
-<<< #4 @234 Title > Alpha | alpha line 03 foo
-<<< #5 @252 Title > Alpha | alpha line 04 foo
-<<< #6 @270 Title > Alpha | alpha line 05 foo
-<<< #7 @288 Title > Alpha | alpha line 06 foo
-<<< #8 @306 Title > Alpha | alpha line 07 foo
-<<< #9 @324 Title > Alpha | alpha line 08 foo
-<<< #10 @342 Title > Alpha | alpha line 09 foo
-<<< #11 @360 Title > Alpha | alpha line 10 foo
-<<< #12 @378 Title > Alpha | alpha line 11 foo
-<<< #13 @396 Title > Alpha | alpha line 12 foo
-<<< #14 @414 Title > Alpha | alpha line 13 foo
-<<< #15 @432 Title > Alpha | alpha line 14 foo
-<<< #16 @450 Title > Alpha | alpha line 15 foo
-<<< #17 @468 Title > Alpha | alpha line 16 foo
-<<< #18 @486 Title > Alpha | alpha line 17 foo
-<<< #19 @504 Title > Alpha | alpha line 18 foo
-<<< #20 @522 Title > Alpha | alpha line 19 foo
-<<< #21 @540 Title > Alpha | alpha line 20 foo
-<<< #22 @566 Title > Beta | beta line 01 foo
-<<< #23 @583 Title > Beta | beta line 02 foo
-<<< #24 @600 Title > Beta | beta line 03 foo
-<<< #25 @617 Title > Beta | beta line 04 foo
-<<< #26 @634 Title > Beta | beta line 05 foo
-<<< #27 @651 Title > Beta | beta line 06 foo
-<<< #28 @668 Title > Beta | beta line 07 foo
-<<< #29 @685 Title > Beta | beta line 08 foo
-<<< #30 @702 Title > Beta | beta line 09 foo
-<<< #31 @719 Title > Beta | beta line 10 foo
-<<< #32 @736 Title > Beta | beta line 11 foo
-<<< #33 @753 Title > Beta | beta line 12 foo
-<<< #34 @770 Title > Beta | beta line 13 foo
-<<< #35 @787 Title > Beta | beta line 14 foo
-<<< #36 @804 Title > Beta | beta line 15 foo
-<<< #37 @821 Title > Beta | beta line 16 foo
-<<< #38 @838 Title > Beta | beta line 17 foo
-<<< #39 @855 Title > Beta | beta line 18 foo
-<<< #40 @872 Title > Beta | beta line 19 foo
-<<< #41 @889 Title > Beta | beta line 20 foo
+<<< [pager] matches: 40 (limit 50); use `:matches -n all`, `:goto N`, or `:n`/`:p`
+<<< #1 @32 Title > Alpha | alpha line 01 foo
+<<< #2 @50 Title > Alpha | alpha line 02 foo
+<<< #3 @68 Title > Alpha | alpha line 03 foo
+<<< #4 @86 Title > Alpha | alpha line 04 foo
+<<< #5 @104 Title > Alpha | alpha line 05 foo
+<<< #6 @122 Title > Alpha | alpha line 06 foo
+<<< #7 @140 Title > Alpha | alpha line 07 foo
+<<< #8 @158 Title > Alpha | alpha line 08 foo
+<<< #9 @176 Title > Alpha | alpha line 09 foo
+<<< #10 @194 Title > Alpha | alpha line 10 foo
+<<< #11 @212 Title > Alpha | alpha line 11 foo
+<<< #12 @230 Title > Alpha | alpha line 12 foo
+<<< #13 @248 Title > Alpha | alpha line 13 foo
+<<< #14 @266 Title > Alpha | alpha line 14 foo
+<<< #15 @284 Title > Alpha | alpha line 15 foo
+<<< #16 @302 Title > Alpha | alpha line 16 foo
+<<< #17 @320 Title > Alpha | alpha line 17 foo
+<<< #18 @338 Title > Alpha | alpha line 18 foo
+<<< #19 @356 Title > Alpha | alpha line 19 foo
+<<< #20 @374 Title > Alpha | alpha line 20 foo
+<<< #21 @400 Title > Beta | beta line 01 foo
+<<< #22 @417 Title > Beta | beta line 02 foo
+<<< #23 @434 Title > Beta | beta line 03 foo
+<<< #24 @451 Title > Beta | beta line 04 foo
+<<< #25 @468 Title > Beta | beta line 05 foo
+<<< #26 @485 Title > Beta | beta line 06 foo
+<<< #27 @502 Title > Beta | beta line 07 foo
+<<< #28 @519 Title > Beta | beta line 08 foo
+<<< #29 @536 Title > Beta | beta line 09 foo
+<<< #30 @553 Title > Beta | beta line 10 foo
+<<< #31 @570 Title > Beta | beta line 11 foo
+<<< #32 @587 Title > Beta | beta line 12 foo
+<<< #33 @604 Title > Beta | beta line 13 foo
+<<< #34 @621 Title > Beta | beta line 14 foo
+<<< #35 @638 Title > Beta | beta line 15 foo
+<<< #36 @655 Title > Beta | beta line 16 foo
+<<< #37 @672 Title > Beta | beta line 17 foo
+<<< #38 @689 Title > Beta | beta line 18 foo
+<<< #39 @706 Title > Beta | beta line 19 foo
+<<< #40 @723 Title > Beta | beta line 20 foo
 <<< 
-<<< --More-- (3p, 32.6%, @0..292/893)
+<<< --More-- (2p, 39.6%, @0..288/727)
 
 3) r_repl timeout_ms=30000
 >>> :matches -C 1 foo
-<<< [pager] matches: 41 (limit 50); use `:matches -n all`, `:goto N`, or `:n`/`:p`
-<<< #1 @77 root
-<<<   > > cat('# Title\n\n## Alpha\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\n', i)); cat('\n## Beta\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\n', i))
-<<<     # Title
-<<< #2 @198 Title > Alpha
+<<< [pager] matches: 40 (limit 50); use `:matches -n all`, `:goto N`, or `:n`/`:p`
+<<< #1 @32 Title > Alpha
 <<<     ## Alpha
 <<<   > alpha line 01 foo
 <<<     alpha line 02 foo
-<<< #3 @216 Title > Alpha
+<<< #2 @50 Title > Alpha
 <<<     alpha line 01 foo
 <<<   > alpha line 02 foo
 <<<     alpha line 03 foo
-<<< #4 @234 Title > Alpha
+<<< #3 @68 Title > Alpha
 <<<     alpha line 02 foo
 <<<   > alpha line 03 foo
 <<<     alpha line 04 foo
-<<< #5 @252 Title > Alpha
+<<< #4 @86 Title > Alpha
 <<<     alpha line 03 foo
 <<<   > alpha line 04 foo
 <<<     alpha line 05 foo
-<<< #6 @270 Title > Alpha
+<<< #5 @104 Title > Alpha
 <<<     alpha line 04 foo
 <<<   > alpha line 05 foo
 <<<     alpha line 06 foo
-<<< #7 @288 Title > Alpha
+<<< #6 @122 Title > Alpha
 <<<     alpha line 05 foo
 <<<   > alpha line 06 foo
 <<<     alpha line 07 foo
-<<< #8 @306 Title > Alpha
+<<< #7 @140 Title > Alpha
 <<<     alpha line 06 foo
 <<<   > alpha line 07 foo
 <<<     alpha line 08 foo
-<<< #9 @324 Title > Alpha
+<<< #8 @158 Title > Alpha
 <<<     alpha line 07 foo
 <<<   > alpha line 08 foo
 <<<     alpha line 09 foo
-<<< #10 @342 Title > Alpha
+<<< #9 @176 Title > Alpha
 <<<     alpha line 08 foo
 <<<   > alpha line 09 foo
 <<<     alpha line 10 foo
-<<< #11 @360 Title > Alpha
+<<< #10 @194 Title > Alpha
 <<<     alpha line 09 foo
 <<<   > alpha line 10 foo
 <<<     alpha line 11 foo
-<<< #12 @378 Title > Alpha
+<<< #11 @212 Title > Alpha
 <<<     alpha line 10 foo
 <<<   > alpha line 11 foo
 <<<     alpha line 12 foo
-<<< #13 @396 Title > Alpha
+<<< #12 @230 Title > Alpha
 <<<     alpha line 11 foo
 <<<   > alpha line 12 foo
 <<<     alpha line 13 foo
-<<< #14 @414 Title > Alpha
+<<< #13 @248 Title > Alpha
 <<<     alpha line 12 foo
 <<<   > alpha line 13 foo
 <<<     alpha line 14 foo
-<<< #15 @432 Title > Alpha
+<<< #14 @266 Title > Alpha
 <<<     alpha line 13 foo
 <<<   > alpha line 14 foo
 <<<     alpha line 15 foo
-<<< #16 @450 Title > Alpha
+<<< #15 @284 Title > Alpha
 <<<     alpha line 14 foo
 <<<   > alpha line 15 foo
 <<<     alpha line 16 foo
-<<< #17 @468 Title > Alpha
+<<< #16 @302 Title > Alpha
 <<<     alpha line 15 foo
 <<<   > alpha line 16 foo
 <<<     alpha line 17 foo
-<<< #18 @486 Title > Alpha
+<<< #17 @320 Title > Alpha
 <<<     alpha line 16 foo
 <<<   > alpha line 17 foo
 <<<     alpha line 18 foo
-<<< #19 @504 Title > Alpha
+<<< #18 @338 Title > Alpha
 <<<     alpha line 17 foo
 <<<   > alpha line 18 foo
 <<<     alpha line 19 foo
-<<< #20 @522 Title > Alpha
+<<< #19 @356 Title > Alpha
 <<<     alpha line 18 foo
 <<<   > alpha line 19 foo
 <<<     alpha line 20 foo
-<<< #21 @540 Title > Alpha
+<<< #20 @374 Title > Alpha
 <<<     alpha line 19 foo
 <<<   > alpha line 20 foo
 <<<     
-<<< #22 @566 Title > Beta
+<<< #21 @400 Title > Beta
 <<<     ## Beta
 <<<   > beta line 01 foo
 <<<     beta line 02 foo
-<<< #23 @583 Title > Beta
+<<< #22 @417 Title > Beta
 <<<     beta line 01 foo
 <<<   > beta line 02 foo
 <<<     beta line 03 foo
-<<< #24 @600 Title > Beta
+<<< #23 @434 Title > Beta
 <<<     beta line 02 foo
 <<<   > beta line 03 foo
 <<<     beta line 04 foo
-<<< #25 @617 Title > Beta
+<<< #24 @451 Title > Beta
 <<<     beta line 03 foo
 <<<   > beta line 04 foo
 <<<     beta line 05 foo
-<<< #26 @634 Title > Beta
+<<< #25 @468 Title > Beta
 <<<     beta line 04 foo
 <<<   > beta line 05 foo
 <<<     beta line 06 foo
-<<< #27 @651 Title > Beta
+<<< #26 @485 Title > Beta
 <<<     beta line 05 foo
 <<<   > beta line 06 foo
 <<<     beta line 07 foo
-<<< #28 @668 Title > Beta
+<<< #27 @502 Title > Beta
 <<<     beta line 06 foo
 <<<   > beta line 07 foo
 <<<     beta line 08 foo
-<<< #29 @685 Title > Beta
+<<< #28 @519 Title > Beta
 <<<     beta line 07 foo
 <<<   > beta line 08 foo
 <<<     beta line 09 foo
-<<< #30 @702 Title > Beta
+<<< #29 @536 Title > Beta
 <<<     beta line 08 foo
 <<<   > beta line 09 foo
 <<<     beta line 10 foo
-<<< #31 @719 Title > Beta
+<<< #30 @553 Title > Beta
 <<<     beta line 09 foo
 <<<   > beta line 10 foo
 <<<     beta line 11 foo
-<<< #32 @736 Title > Beta
+<<< #31 @570 Title > Beta
 <<<     beta line 10 foo
 <<<   > beta line 11 foo
 <<<     beta line 12 foo
-<<< #33 @753 Title > Beta
+<<< #32 @587 Title > Beta
 <<<     beta line 11 foo
 <<<   > beta line 12 foo
 <<<     beta line 13 foo
-<<< #34 @770 Title > Beta
+<<< #33 @604 Title > Beta
 <<<     beta line 12 foo
 <<<   > beta line 13 foo
 <<<     beta line 14 foo
-<<< #35 @787 Title > Beta
+<<< #34 @621 Title > Beta
 <<<     beta line 13 foo
 <<<   > beta line 14 foo
 <<<     beta line 15 foo
-<<< #36 @804 Title > Beta
+<<< #35 @638 Title > Beta
 <<<     beta line 14 foo
 <<<   > beta line 15 foo
 <<<     beta line 16 foo
-<<< #37 @821 Title > Beta
+<<< #36 @655 Title > Beta
 <<<     beta line 15 foo
 <<<   > beta line 16 foo
 <<<     beta line 17 foo
-<<< #38 @838 Title > Beta
+<<< #37 @672 Title > Beta
 <<<     beta line 16 foo
 <<<   > beta line 17 foo
 <<<     beta line 18 foo
-<<< #39 @855 Title > Beta
+<<< #38 @689 Title > Beta
 <<<     beta line 17 foo
 <<<   > beta line 18 foo
 <<<     beta line 19 foo
-<<< #40 @872 Title > Beta
+<<< #39 @706 Title > Beta
 <<<     beta line 18 foo
 <<<   > beta line 19 foo
 <<<     beta line 20 foo
-<<< #41 @889 Title > Beta
+<<< #40 @723 Title > Beta
 <<<     beta line 19 foo
 <<<   > beta line 20 foo
 <<< 
-<<< --More-- (3p, 32.6%, @0..292/893)
+<<< --More-- (2p, 39.6%, @0..288/727)
 
 4) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 32.6%, @0..292/893)
+<<< (END, 39.6%, @0..288/727)
 <<< >

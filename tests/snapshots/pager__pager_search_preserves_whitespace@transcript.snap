@@ -5,36 +5,36 @@ expression: transcript
 == session: default ==
 1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) { suffix <- if (i == 25) " r" else if (i == 75) "r " else ""; cat(sprintf("line%04d %s%s\n", i, line, suffix)) }
-<<< > line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) { suffix <- if (i == 25) " r" else if (i == 75) "r " else ""; cat(sprintf("line%04d %s%s\n", i, line, suffix)) }
+<<< line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< 
-<<< --More-- (141p, 0.4%, @0..177/42181)
+<<< --More-- (140p, 0.4%, @0..210/42004)
 
 2) r_repl timeout_ms=30000
 >>> :where  r
-<<< [pager] next match is ~24 page(s) ahead: use :/ r or `:skip 24`
-<<< --More-- (141p, 0.4%, @177/42181)
+<<< [pager] next match is ~23 page(s) ahead: use :/ r or `:skip 23`
+<<< --More-- (140p, 0.4%, @210/42004)
 
 3) r_repl timeout_ms=30000
 >>> :/ r
-<<< [pager] search for ` r` @5426
+<<< [pager] search for ` r` @5249
 <<< [match] ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r
 <<< 
-<<< --More-- (124p, 12.3%, @5217/42181)
+<<< --More-- (124p, 11.9%, @5040/42004)
 
 4) r_repl timeout_ms=30000
 >>> :where r 
 <<< [pager] match is on the current/next page: use :/r
-<<< --More-- (124p, 12.3%, @5217/42181)
+<<< --More-- (124p, 11.9%, @5040/42004)
 
 5) r_repl timeout_ms=30000
 >>> :/r 
-<<< [pager] search for `r` @5427
-<<< [pager] shown earlier @5426..5428
+<<< [pager] search for `r` @5250
+<<< [pager] shown earlier @5249..5251
 <<< [match] ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r
 <<< 
-<<< --More-- (124p, 12.3%, @5217/42181)
+<<< --More-- (124p, 11.9%, @5040/42004)
 
 6) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 12.3%, @5217/42181)
+<<< (END, 11.9%, @5040/42004)
 <<< >

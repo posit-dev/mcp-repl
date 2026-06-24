@@ -19,11 +19,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) { suffix <- if (i == 25) \" r\" else if (i == 75) \"r \" else \"\"; cat(sprintf(\"line%04d %s%s\\n\", i, line, suffix)) }\n"
+      "text": "line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
     },
     {
       "type": "text",
-      "text": "--More-- (141p, 0.4%, @0..177/42181)"
+      "text": "--More-- (140p, 0.4%, @0..210/42004)"
     }
   ]
 }
@@ -43,11 +43,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] next match is ~24 page(s) ahead: use :/ r or `:skip 24`"
+      "text": "[pager] next match is ~23 page(s) ahead: use :/ r or `:skip 23`"
     },
     {
       "type": "text",
-      "text": "--More-- (141p, 0.4%, @177/42181)"
+      "text": "--More-- (140p, 0.4%, @210/42004)"
     }
   ]
 }
@@ -67,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] search for ` r` @5426"
+      "text": "[pager] search for ` r` @5249"
     },
     {
       "type": "text",
@@ -75,7 +75,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (124p, 12.3%, @5217/42181)"
+      "text": "--More-- (124p, 11.9%, @5040/42004)"
     }
   ]
 }
@@ -99,7 +99,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (124p, 12.3%, @5217/42181)"
+      "text": "--More-- (124p, 11.9%, @5040/42004)"
     }
   ]
 }
@@ -119,11 +119,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] search for `r` @5427"
+      "text": "[pager] search for `r` @5250"
     },
     {
       "type": "text",
-      "text": "[pager] shown earlier @5426..5428"
+      "text": "[pager] shown earlier @5249..5251"
     },
     {
       "type": "text",
@@ -131,7 +131,7 @@ response:
     },
     {
       "type": "text",
-      "text": "--More-- (124p, 12.3%, @5217/42181)"
+      "text": "--More-- (124p, 11.9%, @5040/42004)"
     }
   ]
 }
@@ -151,7 +151,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 12.3%, @5217/42181)"
+      "text": "(END, 11.9%, @5040/42004)"
     },
     {
       "type": "text",

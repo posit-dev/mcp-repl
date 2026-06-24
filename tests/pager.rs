@@ -94,8 +94,8 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
         "expected pager to activate, got: {initial_text:?}"
     );
     assert!(
-        initial_text.starts_with("> line <- paste("),
-        "expected pager page to include generated input echo, got: {initial_text:?}"
+        !initial_text.starts_with("> line <- paste("),
+        "did not expect pager page to include generated input echo, got: {initial_text:?}"
     );
     assert!(
         initial_text.contains("--More--"),

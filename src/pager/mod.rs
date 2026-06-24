@@ -77,6 +77,7 @@ pub(crate) struct SnapshotPage {
 }
 
 impl PagerBuffer {
+    #[cfg(test)]
     fn from_range(range: OutputRange) -> Self {
         Self::from_range_with_input_echo_materialization(range, true)
     }
@@ -1747,7 +1748,7 @@ fn take_snapshot_page_from_range(range: OutputRange, target_bytes: u64) -> Snaps
         take_next_page(&mut buffer, target_bytes, &mut seen, ProjectionMode::Reply);
     if pages_left > 0 {
         return take_snapshot_page_from_buffer_with_projection(
-            PagerBuffer::from_range(range),
+            pager_buffer,
             target_bytes,
             ProjectionMode::Pager,
         );

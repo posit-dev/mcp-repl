@@ -19,11 +19,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))\n"
+      "text": "line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.2%, @0..103/42103)"
+      "text": "--More-- (140p, 0.5%, @0..210/42000)"
     }
   ]
 }
@@ -43,11 +43,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+      "text": "line0002 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
     },
     {
       "type": "text",
-      "text": "--More-- (140p, 0.7%, @103..313/42103)"
+      "text": "--More-- (139p, 1.0%, @210..420/42000)"
     }
   ]
 }
@@ -67,7 +67,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 0.7%, @103..313/42103)"
+      "text": "(END, 1.0%, @210..420/42000)"
     },
     {
       "type": "text",
