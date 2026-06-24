@@ -581,6 +581,16 @@ async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestRe
         text.contains("stderr: err\n"),
         "interleaved stderr should remain visible, got: {text:?}"
     );
+    let stdout_index = text
+        .find("é")
+        .expect("split stdout UTF-8 should render as one character");
+    let stderr_index = text
+        .find("stderr: err\n")
+        .expect("interleaved stderr should remain visible");
+    assert!(
+        stdout_index < stderr_index,
+        "split stdout UTF-8 should keep its original position before stderr, got: {text:?}"
+    );
     assert!(
         !text.contains("\\xC3") && !text.contains("\\xA9"),
         "split stdout UTF-8 should not render as escaped bytes, got: {text:?}"

@@ -100,35 +100,18 @@ impl OutputTimeline {
             origin,
             source,
         };
-        let previous_tail = self.utf8_tails.lock().unwrap().take(key);
-        let (stale_tail, payload) = if previous_tail.is_empty() {
-            (Vec::new(), bytes.to_vec())
-        } else if is_continuation || matches!(source, OutputTextSource::Raw) {
-            let mut payload = previous_tail;
-            payload.extend_from_slice(bytes);
-            (Vec::new(), payload)
-        } else {
-            (previous_tail, bytes.to_vec())
-        };
-        if !stale_tail.is_empty() {
-            self.ring
-                .append_bytes_with_source(&stale_tail, is_stderr, origin, source);
-        }
-
-        let flushable_len = flushable_prefix_len(&payload);
-        if flushable_len > 0 {
+        let pending = self.utf8_tails.lock().unwrap().push(
+            key,
+            bytes,
+            is_continuation || matches!(source, OutputTextSource::Raw),
+        );
+        for entry in pending {
             self.ring.append_bytes_with_source(
-                &payload[..flushable_len],
-                is_stderr,
-                origin,
-                source,
+                &entry.bytes,
+                entry.key.is_stderr,
+                entry.key.origin,
+                entry.key.source,
             );
-        }
-        if flushable_len < payload.len() {
-            self.utf8_tails
-                .lock()
-                .unwrap()
-                .push(key, payload[flushable_len..].to_vec());
         }
     }
 
@@ -180,13 +163,13 @@ impl OutputTimeline {
     }
 
     pub(crate) fn flush_utf8_tails(&self) {
-        let tails = self.utf8_tails.lock().unwrap().drain();
-        for tail in tails {
+        let pending = self.utf8_tails.lock().unwrap().drain();
+        for entry in pending {
             self.ring.append_bytes_with_source(
-                &tail.bytes,
-                tail.key.is_stderr,
-                tail.key.origin,
-                tail.key.source,
+                &entry.bytes,
+                entry.key.is_stderr,
+                entry.key.origin,
+                entry.key.source,
             );
         }
     }
@@ -202,6 +185,7 @@ struct OutputUtf8TailKey {
 struct OutputUtf8Tail {
     key: OutputUtf8TailKey,
     bytes: Vec<u8>,
+    sealed: bool,
 }
 
 #[derive(Default)]
@@ -210,30 +194,82 @@ struct OutputUtf8Tails {
 }
 
 impl OutputUtf8Tails {
-    fn take(&mut self, key: OutputUtf8TailKey) -> Vec<u8> {
-        let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
-            return Vec::new();
-        };
-        self.entries.remove(index).bytes
-    }
-
-    fn push(&mut self, key: OutputUtf8TailKey, bytes: Vec<u8>) {
+    fn push(
+        &mut self,
+        key: OutputUtf8TailKey,
+        bytes: &[u8],
+        continue_previous_tail: bool,
+    ) -> Vec<OutputUtf8Tail> {
         if bytes.is_empty() {
-            return;
+            return Vec::new();
         }
-        debug_assert!(
-            !self.entries.iter().any(|entry| entry.key == key),
-            "UTF-8 tail key should have been drained before storing a new tail"
-        );
-        self.entries.push(OutputUtf8Tail { key, bytes });
+        if continue_previous_tail
+            && let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.key == key && !entry.sealed && !entry.is_flushable())
+        {
+            self.entries[index].bytes.extend_from_slice(bytes);
+        } else {
+            if let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.key == key && !entry.sealed && !entry.is_flushable())
+            {
+                entry.sealed = true;
+            }
+            self.entries.push(OutputUtf8Tail {
+                key,
+                bytes: bytes.to_vec(),
+                sealed: false,
+            });
+        }
+        self.drain_ready()
     }
 
     fn drain(&mut self) -> Vec<OutputUtf8Tail> {
-        self.entries.drain(..).collect()
+        for entry in &mut self.entries {
+            entry.sealed = true;
+        }
+        self.drain_ready()
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    fn drain_ready(&mut self) -> Vec<OutputUtf8Tail> {
+        let mut ready = Vec::new();
+        while let Some(front) = self.entries.first_mut() {
+            if front.sealed {
+                ready.push(self.entries.remove(0));
+                continue;
+            }
+            let flushable_len = flushable_prefix_len(&front.bytes);
+            if flushable_len == 0 {
+                break;
+            }
+            if flushable_len == front.bytes.len() {
+                ready.push(self.entries.remove(0));
+                continue;
+            }
+            let key = front.key;
+            let bytes = front.bytes[..flushable_len].to_vec();
+            front.bytes.drain(..flushable_len);
+            ready.push(OutputUtf8Tail {
+                key,
+                bytes,
+                sealed: true,
+            });
+            break;
+        }
+        ready
+    }
+}
+
+impl OutputUtf8Tail {
+    fn is_flushable(&self) -> bool {
+        self.sealed || flushable_prefix_len(&self.bytes) == self.bytes.len()
     }
 }
 
