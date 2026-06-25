@@ -168,6 +168,28 @@ mod tests {
     }
 
     #[test]
+    fn transcript_only_input_echo_resets_stderr_prefix_state() {
+        let tape = tape();
+
+        tape.append_stderr_bytes(b"warning");
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "input\n".to_string(),
+        });
+        tape.append_stderr_bytes(b"more\n");
+
+        let formatted = tape.drain_output();
+        assert_eq!(
+            formatted.contents,
+            vec![
+                WorkerContent::worker_stderr("stderr: warning"),
+                WorkerContent::worker_stdout_transcript_only("> input\n"),
+                WorkerContent::worker_stderr("stderr: more\n"),
+            ]
+        );
+    }
+
+    #[test]
     fn stdout_status_line_starts_after_partial_stdout() {
         let tape = tape();
 

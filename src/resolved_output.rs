@@ -454,6 +454,12 @@ pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: Tex
                     );
                     if let Some(rendered_text) = rendered_text {
                         *text_emitter.last_rendered_text = Some(rendered_text);
+                    } else if pushed_echo
+                        && (*text_emitter.last_rendered_text).is_some_and(|state| {
+                            matches!(state.stream, TextStream::Stderr) && !state.terminated
+                        })
+                    {
+                        *text_emitter.last_rendered_text = None;
                     }
                     if pushed_echo {
                         last_content_was_input_echo = true;

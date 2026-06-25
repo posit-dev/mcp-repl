@@ -132,7 +132,12 @@ impl PagerBuffer {
         if range.start_offset > self.source_end {
             let gap = range.start_offset.saturating_sub(self.source_end);
             let notice = format!("[pager] output gap detected ({} bytes skipped)\n", gap);
-            self.append_bytes_at_source_offset(notice.as_bytes(), self.source_end);
+            self.append_text_at_source_offset(
+                notice.as_bytes(),
+                self.source_end,
+                true,
+                ContentOrigin::Server,
+            );
             self.source_end = range.start_offset;
         }
 
@@ -535,6 +540,26 @@ impl PagerBuffer {
 
     fn append_bytes_at_source_offset(&mut self, bytes: &[u8], source_offset: u64) {
         self.append_bytes_with_source_offsets(bytes, |_| source_offset);
+    }
+
+    fn append_text_at_source_offset(
+        &mut self,
+        bytes: &[u8],
+        source_offset: u64,
+        is_stderr: bool,
+        origin: ContentOrigin,
+    ) {
+        let start = self.len();
+        self.append_bytes_at_source_offset(bytes, source_offset);
+        let end = self.len();
+        if start < end {
+            self.text_spans.push(PagerTextSpan {
+                start,
+                end,
+                is_stderr,
+                origin,
+            });
+        }
     }
 
     fn append_bytes_with_source_offsets(
@@ -4120,6 +4145,54 @@ mod tests {
                     if text.contains("output truncated") && matches!(origin, ContentOrigin::Server)
             )),
             "expected event replay to preserve server-originated text events, got: {:?}",
+            contents
+        );
+    }
+
+    #[test]
+    fn append_gap_notice_stays_server_originated() {
+        let initial = "before\n";
+        let later = "after\n";
+        let mut buffer = PagerBuffer::from_range(OutputRange {
+            start_offset: 0,
+            end_offset: initial.len() as u64,
+            bytes: initial.as_bytes().to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: initial.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Raw,
+            }],
+        });
+
+        buffer.append_timeline_range(OutputRange {
+            start_offset: 32,
+            end_offset: 32 + later.len() as u64,
+            bytes: later.as_bytes().to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: later.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Raw,
+            }],
+        });
+
+        let contents = buffer.contents_for_range(0, buffer.len());
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText {
+                    text,
+                    stream: TextStream::Stderr,
+                    origin: ContentOrigin::Server,
+                    ..
+                } if text.contains("[pager] output gap detected")
+            )),
+            "expected pager gap notice to be server stderr, got: {:?}",
             contents
         );
     }
