@@ -727,7 +727,9 @@ impl OutputRing {
 
             let mut guard = self.inner.lock().unwrap();
             let incoming_len = chunk_len.saturating_add(remaining.len());
-            guard.drop_input_echoes_for_room(incoming_len, self.capacity_bytes);
+            if guard.drop_input_echoes_for_room(incoming_len, self.capacity_bytes) > 0 {
+                self.append_omission_notice_locked(&mut guard);
+            }
             if guard.total_buffered_bytes().saturating_add(incoming_len) <= self.capacity_bytes {
                 Self::append_chunk_locked(&mut guard, head, is_stderr, origin, source);
                 continue;
@@ -735,7 +737,9 @@ impl OutputRing {
 
             let reserve = self.head_omission_notice_reserve_locked(&guard);
             let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
-            guard.drop_input_echoes_for_room(incoming_len, effective_capacity);
+            if guard.drop_input_echoes_for_room(incoming_len, effective_capacity) > 0 {
+                self.append_omission_notice_locked(&mut guard);
+            }
             let available = effective_capacity.saturating_sub(guard.total_buffered_bytes());
             if available == 0 {
                 self.append_omission_notice_locked(&mut guard);
@@ -847,11 +851,15 @@ impl OutputRing {
                 }
             }
             OutputRetention::Head => {
-                guard.drop_input_echoes_for_room(event_bytes, self.capacity_bytes);
+                if guard.drop_input_echoes_for_room(event_bytes, self.capacity_bytes) > 0 {
+                    self.append_omission_notice_locked(&mut guard);
+                }
                 if guard.total_buffered_bytes().saturating_add(event_bytes) > self.capacity_bytes {
                     let reserve = self.head_omission_notice_reserve_locked(&guard);
                     let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
-                    guard.drop_input_echoes_for_room(event_bytes, effective_capacity);
+                    if guard.drop_input_echoes_for_room(event_bytes, effective_capacity) > 0 {
+                        self.append_omission_notice_locked(&mut guard);
+                    }
                     if guard.total_buffered_bytes().saturating_add(event_bytes) > effective_capacity
                     {
                         self.append_omission_notice_locked(&mut guard);
@@ -1811,6 +1819,39 @@ mod tests {
                 } if text.contains("output omitted")
             )),
             "expected a server omission notice when a later visible event cannot fit"
+        );
+    }
+
+    #[test]
+    fn head_retention_marks_input_echo_dropped_for_later_text() {
+        let timeline = OutputTimeline::with_head_retention_capacity(160);
+        let output = timeline.buffer();
+        let line = format!("{}\n", "a".repeat(96));
+
+        timeline.append_input_echo("p> ", &line);
+        timeline.append_text(&[b'x'; 80], false, ContentOrigin::Worker);
+
+        let range = output.read_range(
+            0,
+            output
+                .end_offset()
+                .expect("output should have an end offset"),
+        );
+        assert!(
+            range.events.iter().any(|event| matches!(
+                &event.kind,
+                OutputEventKind::Text {
+                    text,
+                    origin: ContentOrigin::Server,
+                    ..
+                } if text.contains("output omitted")
+            )),
+            "expected a server omission notice when a hidden input echo is dropped for later text"
+        );
+        assert_eq!(
+            range.bytes.len(),
+            80,
+            "later visible text should be retained after the hidden input echo is dropped"
         );
     }
 

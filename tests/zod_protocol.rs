@@ -1381,6 +1381,63 @@ async fn zod_files_bundle_records_hidden_echo_omission_before_later_visible_text
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_reports_hidden_echo_dropped_for_later_raw_text() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            (64 * 1024 * 1024).to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let payload = "i".repeat(512 * 1024);
+    let mut input = String::new();
+    for index in 0..127 {
+        input.push_str(&format!("silent {index:03}-{payload}\n"));
+    }
+    input.push_str("repeat-output 600000\n");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    let transcript_path = disclosed_path(&text, "transcript.txt")
+        .unwrap_or_else(|| panic!("expected text output bundle, got: {text:?}"));
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "raw-text echo eviction bundle returned an error: {text:?}"
+    );
+    assert!(
+        text.contains("later content omitted"),
+        "expected dropped input echoes to be reported, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("ZOD_BEGIN") && transcript.contains("ZOD_END"),
+        "expected later raw text output to survive input echo eviction, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("silent 000-"),
+        "expected the first hidden input echo to be evicted, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_files_bundle_reports_omitted_input_echoes_past_timeline_capacity() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
