@@ -70,6 +70,11 @@ the next step. Because `mcp-repl` owns enough of the REPL loop, it does
 not need prompt-string polling, fixed sleeps, or output-timing
 heuristics.
 
+The MCP surface is deliberately small: `repl` and `repl_reset`. Most of
+the complexity sits below that interface, where `mcp-repl` supervises
+worker lifecycle, sandbox policy, output ordering, image capture,
+timeouts, interrupts, resets, and oversized-output bundles.
+
 The worker is sandboxed by default. Network access is disabled unless
 configured, and writes are constrained to the workspace and session
 temporary paths. The sandbox is enforced with OS-level primitives, not
