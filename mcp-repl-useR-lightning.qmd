@@ -11,11 +11,13 @@ format:
     height: 900
 ---
 
+<!-- fmt: off -->
+
 ## Start Where Users Are Today
 
 ::: {.columns}
 ::: {.column width="58%"}
-![](mcp-repl-useR-lightning-assets/chat-rscript-e.png){fig-alt="A chat interface where a user asks an agent to explore a dataset. The agent responds by running a bash tool call named bash with an inline Rscript command." width="100%"}
+<img src="mcp-repl-useR-lightning-assets/chat-rscript-e.png" alt="A chat interface where a user asks an agent to explore a dataset. The agent responds by running a bash tool call named bash with an inline Rscript command." style="width: 100%;">
 :::
 
 ::: {.column width="42%"}
@@ -28,16 +30,16 @@ Agents often meet it through a shell.
 ::: notes
 Start with the user experience. A user opens an interactive agent and
 asks for ordinary R help: explore a dataset, make a model, explain the
-result. The chat feels persistent. But the execution surface underneath is
-often a bash tool call. The agent starts with an inline Rscript command
-because that is the shortest path to asking R one question.
+result. The chat feels persistent. But the execution surface underneath
+is often a bash tool call. The agent starts with an inline Rscript
+command because that is the shortest path to asking R one question.
 :::
 
 ## The Batch Command Grows Up
 
 ::: {.columns}
 ::: {.column width="58%"}
-![](mcp-repl-useR-lightning-assets/chat-heredoc-script.png){fig-alt="A chat interface where the assistant uses a bash tool call named bash to write an R script with a heredoc, then runs it with Rscript." width="100%"}
+<img src="mcp-repl-useR-lightning-assets/chat-heredoc-script.png" alt="A chat interface where the assistant uses a bash tool call named bash to write an R script with a heredoc, then runs it with Rscript." style="width: 100%;">
 :::
 
 ::: {.column width="42%"}
@@ -48,26 +50,26 @@ So the agent starts making files.
 :::
 
 ::: notes
-The next step is predictable. Inline strings become too hard to quote and
-too easy to break. So the agent writes a temporary script, usually with a
-heredoc or a generated file, then calls Rscript on that file. This is more
-stable than one giant command string, but it is still batch execution.
+The next step is predictable. Inline strings become too hard to quote
+and too easy to break. So the agent writes a temporary script, usually
+with a heredoc or a generated file, then calls Rscript on that file.
+This is more stable than one giant command string, but it is still batch
+execution.
 :::
 
 ## The Hidden Loop
 
 ::: {.columns}
 ::: {.column width="58%"}
-![](mcp-repl-useR-lightning-assets/chat-rerun-loop.png){fig-alt="A chat interface where the assistant repeatedly runs the same Rscript file through a bash tool call named bash." width="100%"}
+<img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant repeatedly runs the same Rscript file through a bash tool call named bash." style="width: 100%;">
 :::
 
 ::: {.column width="42%"}
 Every attempt starts cold.
 
-Run 1: load data -> inspect columns
-Run 2: load data -> clean data -> plot
-Run 3: load data -> clean data -> fit model
-Run 4: load data -> clean data -> debug error
+Run 1: load data -> inspect columns Run 2: load data -> clean data ->
+plot Run 3: load data -> clean data -> fit model Run 4: load data ->
+clean data -> debug error
 
 The conversation persists.
 
@@ -162,8 +164,8 @@ look at plots, read help, step through browser, interrupt, and reset.
 - Private session for the agent
 
 ::: notes
-mcp-repl is one implementation of that idea. The MCP surface is small:
-a repl tool for input and a reset tool for starting over. Most of the
+mcp-repl is one implementation of that idea. The MCP surface is small: a
+repl tool for input and a reset tool for starting over. Most of the
 complexity is below the tool boundary: worker lifecycle, output capture,
 image capture, timeouts, interrupts, and response finalization. The
 important property for the agent is continuity.
