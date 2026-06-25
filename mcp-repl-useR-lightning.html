@@ -189,6 +189,9 @@
       margin-right: 0; 
     }
   </style>
+  <script src="mcp-repl-useR-lightning_files/libs/quarto-diagram/mermaid.min.js"></script>
+  <script src="mcp-repl-useR-lightning_files/libs/quarto-diagram/mermaid-init.js"></script>
+  <link href="mcp-repl-useR-lightning_files/libs/quarto-diagram/mermaid.css" rel="stylesheet">
 </head>
 <body class="quarto-dark">
   <div class="reveal">
@@ -481,72 +484,193 @@
           display:block!important;
       }</style></aside>
 </section>
-<section id="two-different-shapes" class="slide level2">
-<h2>Two Different Shapes</h2>
-<svg viewbox="0 0 1500 560" role="img" aria-label="Two diagrams. On the left, a human connects to an LLM harness, which connects to mcp-repl and its agent-owned R session. On the right, the human, LLM harness, and IDE R session are all connected in a triangle." style="width: 100%; height: auto;">
-  <defs>
-    <marker id="arrow-blue" viewbox="0 0 10 10" refx="8" refy="5" markerwidth="8" markerheight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9ee7ff"></path>
-    </marker>
-    <marker id="arrow-green" viewbox="0 0 10 10" refx="8" refy="5" markerwidth="8" markerheight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b8f5b0"></path>
-    </marker>
-    <style>
-      .panel-title { font: 700 34px system-ui, sans-serif; fill: #ffffff; }
-      .label { font: 650 28px system-ui, sans-serif; fill: #ffffff; }
-      .small { font: 500 22px system-ui, sans-serif; fill: #c8d3dc; }
-      .muted { font: 500 20px system-ui, sans-serif; fill: #9aa7b1; }
-      .box { fill: #17212b; stroke: #9ee7ff; stroke-width: 3; }
-      .ide-box { fill: #1f251f; stroke: #b8f5b0; stroke-width: 3; }
-      .line { stroke: #9ee7ff; stroke-width: 4; fill: none; marker-end: url(#arrow-blue); }
-      .ide-line { stroke: #b8f5b0; stroke-width: 4; fill: none; marker-end: url(#arrow-green); }
-      .human { stroke: #ffffff; stroke-width: 4; fill: none; }
-    </style>
-  </defs>
+<section id="two-different-shapes-mermaid" class="slide level2">
+<h2>Two Different Shapes (Mermaid)</h2>
+<!-- Future comparison candidates: D2, draw.io, and Excalidraw. -->
+<div class="columns">
+<div class="column" style="width:50%;">
+<div class="cell" data-reveal="true" data-layout-align="default">
+<div class="cell-output-display">
+<div>
+<p></p><figure class=""><p></p>
+<div>
+<pre class="mermaid mermaid-js">%%{init: {"theme": "base", "themeVariables": {"background": "transparent", "fontSize": "22px", "primaryColor": "#17212b", "primaryTextColor": "#ffffff", "primaryBorderColor": "#9ee7ff", "lineColor": "#9ee7ff", "fontFamily": "system-ui, sans-serif"}}}%%
+flowchart LR
+  human((Human)) --&gt; harness["LLM harness"] --&gt; repl["mcp-repl"]
 
-  <text class="panel-title" x="95" y="55">mcp-repl: agent-owned</text>
-  <text class="panel-title" x="875" y="55">IDE assistant: human in the loop</text>
+  classDef agentBox fill:#17212b,stroke:#9ee7ff,color:#ffffff,stroke-width:3px,font-size:22px;
+  class human,harness,repl agentBox;
+</pre>
+</div>
+<p></p></figure><p></p>
+</div>
+</div>
+</div>
+<p><strong>mcp-repl: agent-owned</strong></p>
+<p>No direct human access to the REPL.</p>
+</div><div class="column" style="width:50%;">
+<div class="cell" data-reveal="true" data-layout-align="default">
+<div class="cell-output-display">
+<div>
+<p></p><figure class=""><p></p>
+<div>
+<pre class="mermaid mermaid-js">%%{init: {"theme": "base", "themeVariables": {"background": "transparent", "fontSize": "22px", "primaryColor": "#1f251f", "primaryTextColor": "#ffffff", "primaryBorderColor": "#b8f5b0", "lineColor": "#b8f5b0", "fontFamily": "system-ui, sans-serif"}}}%%
+flowchart TB
+  human((Human))
+  harness["LLM harness"]
+  repl["IDE R session"]
+  human --&gt; harness
+  harness --&gt; repl
+  human --&gt; repl
 
-  <g transform="translate(80 120)">
-    <circle class="human" cx="70" cy="55" r="32"></circle>
-    <path class="human" d="M70 92 L70 168 M18 126 L122 126 M70 168 L30 226 M70 168 L110 226"></path>
-    <text class="label" x="70" y="275" text-anchor="middle">Human</text>
-  </g>
-
-  <rect class="box" x="275" y="175" width="240" height="150" rx="18"></rect>
-  <text class="label" x="395" y="235" text-anchor="middle">LLM harness</text>
-  <text class="small" x="395" y="275" text-anchor="middle">Codex / Claude Code</text>
-  <text class="small" x="395" y="307" text-anchor="middle">ellmer / chatlas / OpenCode</text>
-
-  <rect class="box" x="590" y="175" width="250" height="150" rx="18"></rect>
-  <text class="label" x="715" y="230" text-anchor="middle">mcp-repl</text>
-  <text class="small" x="715" y="270" text-anchor="middle">agent-owned</text>
-  <text class="small" x="715" y="302" text-anchor="middle">R session</text>
-
-  <path class="line" d="M205 250 L265 250"></path>
-  <path class="line" d="M525 250 L580 250"></path>
-  <text class="muted" x="460" y="405" text-anchor="middle">No direct human access to the REPL</text>
-
-  <g transform="translate(885 120)">
-    <circle class="human" cx="105" cy="45" r="30"></circle>
-    <path class="human" d="M105 80 L105 145 M55 112 L155 112 M105 145 L68 200 M105 145 L142 200"></path>
-    <text class="label" x="105" y="248" text-anchor="middle">Human</text>
-  </g>
-
-  <rect class="ide-box" x="1185" y="165" width="230" height="135" rx="18"></rect>
-  <text class="label" x="1300" y="222" text-anchor="middle">LLM harness</text>
-  <text class="small" x="1300" y="262" text-anchor="middle">IDE assistant</text>
-
-  <rect class="ide-box" x="1030" y="365" width="260" height="125" rx="18"></rect>
-  <text class="label" x="1160" y="420" text-anchor="middle">IDE R session</text>
-  <text class="small" x="1160" y="460" text-anchor="middle">shared context</text>
-
-  <path class="ide-line" d="M1045 230 L1175 230"></path>
-  <path class="ide-line" d="M1295 310 L1210 355"></path>
-  <path class="ide-line" d="M1045 335 L1105 355"></path>
-  <text class="muted" x="1180" y="535" text-anchor="middle">Human, agent, and REPL remain connected</text>
-</svg>
+  classDef ideBox fill:#1f251f,stroke:#b8f5b0,color:#ffffff,stroke-width:3px,font-size:22px;
+  class human,harness,repl ideBox;
+</pre>
+</div>
+<p></p></figure><p></p>
+</div>
+</div>
+</div>
+<p><strong>IDE assistant: human in the loop</strong></p>
+<p>Human, agent, and REPL remain connected.</p>
+</div></div>
 <aside class="notes">
+<p>Timing: ~0:45.</p>
+<p>These are different shapes. With <code>mcp-repl</code>, the human talks to an LLM harness, and the harness talks to <code>mcp-repl</code>. There is no direct line from the human to that R session. It is private runtime owned by the agent. The IDE experience is different: the human, the assistant, and the R session are connected, so it is designed for interactive, agent-assisted data analysis.</p>
+<style type="text/css">
+        span.MJX_Assistive_MathML {
+          position:absolute!important;
+          clip: rect(1px, 1px, 1px, 1px);
+          padding: 1px 0 0 0!important;
+          border: 0!important;
+          height: 1px!important;
+          width: 1px!important;
+          overflow: hidden!important;
+          display:block!important;
+      }</style></aside>
+</section>
+<section id="two-different-shapes-graphviz" class="slide level2">
+<h2>Two Different Shapes (Graphviz)</h2>
+<div class="cell" data-layout-align="default">
+<div class="cell-output-display">
+<div>
+<p></p><figure class=""><p></p>
+<div>
+<svg width="960" height="480" viewbox="0.00 0.00 1764.51 267.00" xmlns="http://www.w3.org/2000/svg" xlink="http://www.w3.org/1999/xlink" style="; max-width: none; max-height: none; display: block; margin: auto auto auto auto">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 263)">
+<title>two_shapes</title>
+<g id="clust1" class="cluster">
+<title>cluster_agent</title>
+<polygon fill="transparent" stroke="#3d4c59" points="8,-8 8,-209 930.97,-209 930.97,-8 8,-8"></polygon>
+<text text-anchor="middle" x="469.48" y="-174.4" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="34.00" fill="#ffffff">mcp-repl: agent-owned</text>
+</g>
+<g id="clust2" class="cluster">
+<title>cluster_ide</title>
+<polygon fill="transparent" stroke="#3d4c59" points="938.97,-8 938.97,-251 1748.51,-251 1748.51,-8 938.97,-8"></polygon>
+<text text-anchor="middle" x="1343.74" y="-216.4" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="34.00" fill="#ffffff">IDE assistant: human in the loop</text>
+</g>
+<!-- agent_human -->
+<g id="node1" class="node">
+<title>agent_human</title>
+<ellipse fill="#111820" stroke="#9ee7ff" stroke-width="3" cx="129.01" cy="-84" rx="91.02" ry="39.7"></ellipse>
+<text text-anchor="middle" x="129.01" y="-75" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">Human</text>
+</g>
+<!-- agent_harness -->
+<g id="node2" class="node">
+<title>agent_harness</title>
+<path fill="#17212b" stroke="#9ee7ff" stroke-width="3" d="M478.66,-112C478.66,-112 296.81,-112 296.81,-112 290.81,-112 284.81,-106 284.81,-100 284.81,-100 284.81,-68 284.81,-68 284.81,-62 290.81,-56 296.81,-56 296.81,-56 478.66,-56 478.66,-56 484.66,-56 490.66,-62 490.66,-68 490.66,-68 490.66,-100 490.66,-100 490.66,-106 484.66,-112 478.66,-112"></path>
+<text text-anchor="middle" x="387.73" y="-75" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">LLM harness</text>
+</g>
+<!-- agent_human&#45;&gt;agent_harness -->
+<g id="edge1" class="edge">
+<title>agent_human-&gt;agent_harness</title>
+<path fill="none" stroke="#9ee7ff" stroke-width="3" d="M220.16,-84C238.49,-84 257.97,-84 276.89,-84"></path>
+<polygon fill="#9ee7ff" stroke="#9ee7ff" stroke-width="3" points="276.96,-86.8 284.96,-84 276.96,-81.2 276.96,-86.8"></polygon>
+</g>
+<!-- agent_repl -->
+<g id="node3" class="node">
+<title>agent_repl</title>
+<path fill="#17212b" stroke="#9ee7ff" stroke-width="3" d="M888.73,-130C888.73,-130 567.68,-130 567.68,-130 561.68,-130 555.68,-124 555.68,-118 555.68,-118 555.68,-50 555.68,-50 555.68,-44 561.68,-38 567.68,-38 567.68,-38 888.73,-38 888.73,-38 894.73,-38 900.73,-44 900.73,-50 900.73,-50 900.73,-118 900.73,-118 900.73,-124 894.73,-130 888.73,-130"></path>
+<text text-anchor="middle" x="728.21" y="-93" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">mcp-repl</text>
+<text text-anchor="middle" x="728.21" y="-57" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">agent-owned R session</text>
+</g>
+<!-- agent_harness&#45;&gt;agent_repl -->
+<g id="edge2" class="edge">
+<title>agent_harness-&gt;agent_repl</title>
+<path fill="none" stroke="#9ee7ff" stroke-width="3" d="M490.75,-84C508.79,-84 528.06,-84 547.51,-84"></path>
+<polygon fill="#9ee7ff" stroke="#9ee7ff" stroke-width="3" points="547.56,-86.8 555.56,-84 547.56,-81.2 547.56,-86.8"></polygon>
+</g>
+<!-- ide_human -->
+<g id="node4" class="node">
+<title>ide_human</title>
+<ellipse fill="#111820" stroke="#b8f5b0" stroke-width="3" cx="1059.98" cy="-84" rx="91.02" ry="39.7"></ellipse>
+<text text-anchor="middle" x="1059.98" y="-75" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">Human</text>
+</g>
+<!-- agent_repl&#45;&gt;ide_human -->
+<!-- ide_harness -->
+<g id="node5" class="node">
+<title>ide_harness</title>
+<path fill="#1f251f" stroke="#b8f5b0" stroke-width="3" d="M1412.59,-130C1412.59,-130 1228.12,-130 1228.12,-130 1222.12,-130 1216.12,-124 1216.12,-118 1216.12,-118 1216.12,-50 1216.12,-50 1216.12,-44 1222.12,-38 1228.12,-38 1228.12,-38 1412.59,-38 1412.59,-38 1418.59,-38 1424.59,-44 1424.59,-50 1424.59,-50 1424.59,-118 1424.59,-118 1424.59,-124 1418.59,-130 1412.59,-130"></path>
+<text text-anchor="middle" x="1320.35" y="-93" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">LLM harness</text>
+<text text-anchor="middle" x="1320.35" y="-57" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">IDE assistant</text>
+</g>
+<!-- ide_human&#45;&gt;ide_harness -->
+<g id="edge3" class="edge">
+<title>ide_human-&gt;ide_harness</title>
+<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1151.34,-84C1169.55,-84 1188.9,-84 1207.73,-84"></path>
+<polygon fill="#b8f5b0" stroke="#b8f5b0" stroke-width="3" points="1207.77,-86.8 1215.77,-84 1207.77,-81.2 1207.77,-86.8"></polygon>
+</g>
+<!-- ide_repl -->
+<g id="node6" class="node">
+<title>ide_repl</title>
+<path fill="#1f251f" stroke="#b8f5b0" stroke-width="3" d="M1706.4,-151C1706.4,-151 1501.83,-151 1501.83,-151 1495.83,-151 1489.83,-145 1489.83,-139 1489.83,-139 1489.83,-71 1489.83,-71 1489.83,-65 1495.83,-59 1501.83,-59 1501.83,-59 1706.4,-59 1706.4,-59 1712.4,-59 1718.4,-65 1718.4,-71 1718.4,-71 1718.4,-139 1718.4,-139 1718.4,-145 1712.4,-151 1706.4,-151"></path>
+<text text-anchor="middle" x="1604.11" y="-114" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">IDE R session</text>
+<text text-anchor="middle" x="1604.11" y="-78" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">shared context</text>
+</g>
+<!-- ide_human&#45;&gt;ide_repl -->
+<g id="edge5" class="edge">
+<title>ide_human-&gt;ide_repl</title>
+<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1117.7,-114.67C1146.29,-128.42 1182.03,-143.07 1215.99,-150 1306.89,-168.55 1332.66,-161.43 1424.72,-150 1443.39,-147.68 1462.9,-144.05 1481.89,-139.83"></path>
+<polygon fill="#b8f5b0" stroke="#b8f5b0" stroke-width="3" points="1482.53,-142.56 1489.71,-138.05 1481.29,-137.1 1482.53,-142.56"></polygon>
+</g>
+<!-- ide_harness&#45;&gt;ide_repl -->
+<g id="edge4" class="edge">
+<title>ide_harness-&gt;ide_repl</title>
+<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1424.67,-91.7C1443.09,-93.07 1462.43,-94.51 1481.3,-95.92"></path>
+<polygon fill="#b8f5b0" stroke="#b8f5b0" stroke-width="3" points="1481.17,-98.72 1489.36,-96.52 1481.59,-93.13 1481.17,-98.72"></polygon>
+</g>
+</g>
+</svg>
+</div>
+<p></p></figure><p></p>
+</div>
+</div>
+</div>
+<div class="columns">
+<div class="column" style="width:50%;">
+<p>No direct human access to the REPL.</p>
+</div><div class="column" style="width:50%;">
+<p>Human, agent, and REPL remain connected.</p>
+</div></div>
+<aside class="notes">
+<p>Timing: ~0:45.</p>
+<p>These are different shapes. With <code>mcp-repl</code>, the human talks to an LLM harness, and the harness talks to <code>mcp-repl</code>. There is no direct line from the human to that R session. It is private runtime owned by the agent. The IDE experience is different: the human, the assistant, and the R session are connected, so it is designed for interactive, agent-assisted data analysis.</p>
+<style type="text/css">
+        span.MJX_Assistive_MathML {
+          position:absolute!important;
+          clip: rect(1px, 1px, 1px, 1px);
+          padding: 1px 0 0 0!important;
+          border: 0!important;
+          height: 1px!important;
+          width: 1px!important;
+          overflow: hidden!important;
+          display:block!important;
+      }</style></aside>
+</section>
+<section id="two-different-shapes-base-r" class="slide level2">
+<h2>Two Different Shapes (base R)</h2>
+
+<img data-src="mcp-repl-useR-lightning_files/figure-revealjs/unnamed-chunk-4-1.png" style="width:100.0%" class="r-stretch"><aside class="notes">
 <p>Timing: ~0:45.</p>
 <p>These are different shapes. With <code>mcp-repl</code>, the human talks to an LLM harness, and the harness talks to <code>mcp-repl</code>. There is no direct line from the human to that R session. It is private runtime owned by the agent. The IDE experience is different: the human, the assistant, and the R session are connected, so it is designed for interactive, agent-assisted data analysis.</p>
 <style type="text/css">
@@ -833,6 +957,44 @@
         ]
       });
     </script>
+    
+    <script>
+      // htmlwidgets need to know to resize themselves when slides are shown/hidden.
+      // Fire the "slideenter" event (handled by htmlwidgets.js) when the current
+      // slide changes (different for each slide format).
+      (function () {
+        // dispatch for htmlwidgets
+        function fireSlideEnter() {
+          const event = window.document.createEvent("Event");
+          event.initEvent("slideenter", true, true);
+          window.document.dispatchEvent(event);
+        }
+
+        function fireSlideChanged(previousSlide, currentSlide) {
+          fireSlideEnter();
+
+          // dispatch for shiny
+          if (window.jQuery) {
+            if (previousSlide) {
+              window.jQuery(previousSlide).trigger("hidden");
+            }
+            if (currentSlide) {
+              window.jQuery(currentSlide).trigger("shown");
+            }
+          }
+        }
+
+        // hookup for slidy
+        if (window.w3c_slidy) {
+          window.w3c_slidy.add_observer(function (slide_num) {
+            // slide_num starts at position 1
+            fireSlideChanged(null, w3c_slidy.slides[slide_num - 1]);
+          });
+        }
+
+      })();
+    </script>
+
     <script id="quarto-html-after-body" type="application/javascript">
       window.document.addEventListener("DOMContentLoaded", function (event) {
         const tabsets =  window.document.querySelectorAll(".panel-tabset-tabby")

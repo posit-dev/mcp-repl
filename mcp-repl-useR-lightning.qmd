@@ -262,7 +262,8 @@ This is the future-facing gap. The same primitive matters when there is
 not a human watching every turn: scheduled work, long-running
 investigations, agent evaluations, and optimization loops that tune
 prompts, tools, or analysis workflows. A human may review the result,
-but the session itself is owned by the agent while the work is happening.
+but the session itself is owned by the agent while the work is
+happening.
 :::
 
 ## Evaluate the Real Workflow
@@ -290,72 +291,242 @@ help, plots, debugger steps, and recovery after mistakes. A persistent
 REPL makes those behaviors observable and testable.
 :::
 
-## Two Different Shapes
+## Two Different Shapes (Mermaid)
 
-```{=html}
-<svg viewBox="0 0 1500 560" role="img" aria-label="Two diagrams. On the left, a human connects to an LLM harness, which connects to mcp-repl and its agent-owned R session. On the right, the human, LLM harness, and IDE R session are all connected in a triangle." style="width: 100%; height: auto;">
-  <defs>
-    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9ee7ff"/>
-    </marker>
-    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b8f5b0"/>
-    </marker>
-    <style>
-      .panel-title { font: 700 34px system-ui, sans-serif; fill: #ffffff; }
-      .label { font: 650 28px system-ui, sans-serif; fill: #ffffff; }
-      .small { font: 500 22px system-ui, sans-serif; fill: #c8d3dc; }
-      .muted { font: 500 20px system-ui, sans-serif; fill: #9aa7b1; }
-      .box { fill: #17212b; stroke: #9ee7ff; stroke-width: 3; }
-      .ide-box { fill: #1f251f; stroke: #b8f5b0; stroke-width: 3; }
-      .line { stroke: #9ee7ff; stroke-width: 4; fill: none; marker-end: url(#arrow-blue); }
-      .ide-line { stroke: #b8f5b0; stroke-width: 4; fill: none; marker-end: url(#arrow-green); }
-      .human { stroke: #ffffff; stroke-width: 4; fill: none; }
-    </style>
-  </defs>
+<!-- Future comparison candidates: D2, draw.io, and Excalidraw. -->
 
-  <text class="panel-title" x="95" y="55">mcp-repl: agent-owned</text>
-  <text class="panel-title" x="875" y="55">IDE assistant: human in the loop</text>
+::: {.columns}
+::: {.column width="50%"}
+```{mermaid}
+%%{init: {"theme": "base", "themeVariables": {"background": "transparent", "fontSize": "22px", "primaryColor": "#17212b", "primaryTextColor": "#ffffff", "primaryBorderColor": "#9ee7ff", "lineColor": "#9ee7ff", "fontFamily": "system-ui, sans-serif"}}}%%
+flowchart LR
+  human((Human)) <--> harness["LLM harness"] <--> repl["mcp-repl"]
 
-  <g transform="translate(80 120)">
-    <circle class="human" cx="70" cy="55" r="32"/>
-    <path class="human" d="M70 92 L70 168 M18 126 L122 126 M70 168 L30 226 M70 168 L110 226"/>
-    <text class="label" x="70" y="275" text-anchor="middle">Human</text>
-  </g>
+  classDef agentBox fill:#17212b,stroke:#9ee7ff,color:#ffffff,stroke-width:3px,font-size:22px;
+  class human,harness,repl agentBox;
+```
 
-  <rect class="box" x="275" y="175" width="240" height="150" rx="18"/>
-  <text class="label" x="395" y="235" text-anchor="middle">LLM harness</text>
-  <text class="small" x="395" y="275" text-anchor="middle">Codex / Claude Code</text>
-  <text class="small" x="395" y="307" text-anchor="middle">ellmer / chatlas / OpenCode</text>
+**mcp-repl: agent-owned**
 
-  <rect class="box" x="590" y="175" width="250" height="150" rx="18"/>
-  <text class="label" x="715" y="230" text-anchor="middle">mcp-repl</text>
-  <text class="small" x="715" y="270" text-anchor="middle">agent-owned</text>
-  <text class="small" x="715" y="302" text-anchor="middle">R session</text>
+No direct human access to the REPL.
+:::
 
-  <path class="line" d="M205 250 L265 250"/>
-  <path class="line" d="M525 250 L580 250"/>
-  <text class="muted" x="460" y="405" text-anchor="middle">No direct human access to the REPL</text>
+::: {.column width="50%"}
+```{mermaid}
+%%{init: {"theme": "base", "themeVariables": {"background": "transparent", "fontSize": "22px", "primaryColor": "#1f251f", "primaryTextColor": "#ffffff", "primaryBorderColor": "#b8f5b0", "lineColor": "#b8f5b0", "fontFamily": "system-ui, sans-serif"}}}%%
+flowchart TB
+  human((Human))
+  harness["LLM harness"]
+  repl["IDE R session"]
+  human <--> harness
+  harness <--> repl
+  human <--> repl
 
-  <g transform="translate(885 120)">
-    <circle class="human" cx="105" cy="45" r="30"/>
-    <path class="human" d="M105 80 L105 145 M55 112 L155 112 M105 145 L68 200 M105 145 L142 200"/>
-    <text class="label" x="105" y="248" text-anchor="middle">Human</text>
-  </g>
+  classDef ideBox fill:#1f251f,stroke:#b8f5b0,color:#ffffff,stroke-width:3px,font-size:22px;
+  class human,harness,repl ideBox;
+```
 
-  <rect class="ide-box" x="1185" y="165" width="230" height="135" rx="18"/>
-  <text class="label" x="1300" y="222" text-anchor="middle">LLM harness</text>
-  <text class="small" x="1300" y="262" text-anchor="middle">IDE assistant</text>
+**IDE assistant: human in the loop**
 
-  <rect class="ide-box" x="1030" y="365" width="260" height="125" rx="18"/>
-  <text class="label" x="1160" y="420" text-anchor="middle">IDE R session</text>
-  <text class="small" x="1160" y="460" text-anchor="middle">shared context</text>
+Human, agent, and REPL remain connected.
+:::
+:::
 
-  <path class="ide-line" d="M1045 230 L1175 230"/>
-  <path class="ide-line" d="M1295 310 L1210 355"/>
-  <path class="ide-line" d="M1045 335 L1105 355"/>
-  <text class="muted" x="1180" y="535" text-anchor="middle">Human, agent, and REPL remain connected</text>
-</svg>
+::: notes
+Timing: ~0:45.
+
+These are different shapes. With `mcp-repl`, the human talks to an LLM
+harness, and the harness talks to `mcp-repl`. There is no direct line
+from the human to that R session. It is private runtime owned by the
+agent. The IDE experience is different: the human, the assistant, and
+the R session are connected, so it is designed for interactive,
+agent-assisted data analysis.
+:::
+
+## Two Different Shapes (Graphviz)
+
+```{dot}
+digraph two_shapes {
+  graph [
+    bgcolor="transparent"
+    compound=true
+    margin=0
+    newrank=true
+    nodesep=0.55
+    rankdir=LR
+    ranksep=0.9
+  ];
+
+  node [
+    color="#9ee7ff"
+    fillcolor="#17212b"
+    fontcolor="#ffffff"
+    fontname="Helvetica"
+    fontsize=30
+    margin="0.22,0.14"
+    penwidth=3
+    shape=box
+    style="rounded,filled"
+  ];
+
+  edge [
+    arrowsize=0.8
+    color="#9ee7ff"
+    dir=both
+    penwidth=3
+  ];
+
+  subgraph cluster_agent {
+    color="#3d4c59";
+    fontcolor="#ffffff";
+    fontname="Helvetica-Bold";
+    fontsize=34;
+    label="mcp-repl: agent-owned";
+    margin=30;
+
+    agent_human [
+      fillcolor="#111820"
+      label="Human"
+      shape=ellipse
+    ];
+    agent_harness [label="LLM harness"];
+    agent_repl [label="mcp-repl\nagent-owned R session"];
+
+    agent_human -> agent_harness -> agent_repl;
+  }
+
+  subgraph cluster_ide {
+    color="#3d4c59";
+    fontcolor="#ffffff";
+    fontname="Helvetica-Bold";
+    fontsize=34;
+    label="IDE assistant: human in the loop";
+    margin=30;
+
+    node [
+      color="#b8f5b0"
+      fillcolor="#1f251f"
+    ];
+    edge [color="#b8f5b0"];
+
+    ide_human [
+      fillcolor="#111820"
+      label="Human"
+      shape=ellipse
+    ];
+    ide_harness [label="LLM harness\nIDE assistant"];
+    ide_repl [label="IDE R session\nshared context"];
+
+    ide_human -> ide_harness;
+    ide_harness -> ide_repl;
+    ide_human -> ide_repl;
+  }
+
+  agent_repl -> ide_human [
+    style=invis
+    weight=8
+  ];
+}
+```
+
+::: {.columns}
+::: {.column width="50%"}
+No direct human access to the REPL.
+:::
+
+::: {.column width="50%"}
+Human, agent, and REPL remain connected.
+:::
+:::
+
+::: notes
+Timing: ~0:45.
+
+These are different shapes. With `mcp-repl`, the human talks to an LLM
+harness, and the harness talks to `mcp-repl`. There is no direct line
+from the human to that R session. It is private runtime owned by the
+agent. The IDE experience is different: the human, the assistant, and
+the R session are connected, so it is designed for interactive,
+agent-assisted data analysis.
+:::
+
+## Two Different Shapes (base R)
+
+```{r}
+#| echo: false
+#| fig-width: 13.5
+#| fig-height: 6
+#| fig-bg: "#191919"
+#| out-width: "100%"
+bg <- "#191919"
+fg <- "#f6f7fb"
+muted <- "#c8d3dc"
+panel <- "#2f3944"
+blue <- "#9ee7ff"
+blue_fill <- "#17212b"
+green <- "#b8f5b0"
+green_fill <- "#1f251f"
+
+par(mar = c(0, 0, 0, 0), xaxs = "i", yaxs = "i", bg = bg, family = "sans")
+plot.new()
+plot.window(xlim = c(0, 100), ylim = c(0, 60))
+rect(0, 0, 100, 60, col = bg, border = NA)
+
+draw_box <- function(x0, y0, x1, y1, label, fill, border, cex = 1.05) {
+  rect(x0, y0, x1, y1, col = fill, border = border, lwd = 2.6)
+  text((x0 + x1) / 2, (y0 + y1) / 2, label, col = fg, cex = cex, font = 2)
+}
+
+draw_person <- function(x, y, border) {
+  symbols(
+    x,
+    y,
+    circles = 3.1,
+    inches = FALSE,
+    add = TRUE,
+    fg = border,
+    bg = bg,
+    lwd = 2.8
+  )
+  text(x, y, "Human", col = fg, cex = 0.88, font = 2)
+}
+
+  draw_arrow <- function(x0, y0, x1, y1, col) {
+  arrows(x0, y0, x1, y1, length = 0.11, angle = 24, code = 3, col = col, lwd = 2.8)
+}
+
+rect(2, 7, 48, 53, border = panel, col = NA, lwd = 1.8)
+rect(52, 7, 98, 53, border = panel, col = NA, lwd = 1.8)
+
+text(25, 49.5, "mcp-repl: agent-owned", col = fg, cex = 1.35, font = 2)
+draw_person(9, 31, blue)
+draw_box(18, 26.5, 32, 35.5, "LLM harness", blue_fill, blue)
+draw_box(37, 24.8, 47, 37.2, "mcp-repl\nR session", blue_fill, blue, cex = 0.95)
+draw_arrow(12.3, 31, 17.6, 31, blue)
+draw_arrow(32.4, 31, 36.6, 31, blue)
+text(25, 13, "No direct human access to the REPL.", col = muted, cex = 1.04)
+
+text(
+  75,
+  49.5,
+  "IDE assistant: human in the loop",
+  col = fg,
+  cex = 1.35,
+  font = 2
+)
+draw_person(62, 39, green)
+draw_box(76, 35.5, 92, 44.5, "LLM harness", green_fill, green)
+draw_box(70, 18.5, 88, 27.5, "IDE R session", green_fill, green)
+draw_arrow(65.2, 39, 75.5, 40, green)
+draw_arrow(84, 35.2, 79.5, 28, green)
+draw_arrow(63.8, 36.4, 70.2, 27.9, green)
+text(
+  75,
+  13,
+  "Human, agent, and REPL remain connected.",
+  col = muted,
+  cex = 0.98
+)
 ```
 
 ::: notes
