@@ -11,9 +11,29 @@ format:
     height: 900
 ---
 
-<!-- fmt: off -->
+## A Familiar Request
 
-## Start Where Users Are Today
+::: {.columns}
+::: {.column width="58%"}
+<img src="mcp-repl-useR-lightning-assets/chat-scenario.png" alt="A chat interface where a user asks an agent to explore a dataset and build a first model. The agent responds by running several bash tool calls with Rscript." style="width: 100%;">
+:::
+
+::: {.column width="42%"}
+R is interactive.
+
+Often, the first bridge is a shell.
+:::
+:::
+
+::: notes
+A user asks for ordinary R help: explore this dataset, make a first
+model, explain what you find. The chat looks persistent. The agent can
+remember the request and reason across turns. But underneath that chat,
+the first execution surface is often just a shell command. For R, that
+usually means `Rscript`.
+:::
+
+## The First Answer Is Batch
 
 ::: {.columns}
 ::: {.column width="58%"}
@@ -21,21 +41,22 @@ format:
 :::
 
 ::: {.column width="42%"}
-R is interactive.
+The shortest path works.
 
-Agents often meet it through a shell.
+Ask R one question.
+
+Return one answer.
 :::
 :::
 
 ::: notes
-Start with the user experience. A user opens an interactive agent and
-asks for ordinary R help: explore a dataset, make a model, explain the
-result. The chat feels persistent. But the execution surface underneath
-is often a bash tool call. The agent starts with an inline Rscript
-command because that is the shortest path to asking R one question.
+This is a reasonable starting point. An inline `Rscript -e` call is
+available almost everywhere. It is easy for the agent to generate and
+easy for the host to run. For a one-line calculation, it is enough. The
+problem is that real analysis does not stay one line for very long.
 :::
 
-## The Batch Command Grows Up
+## Then the Script Appears
 
 ::: {.columns}
 ::: {.column width="58%"}
@@ -43,21 +64,23 @@ command because that is the shortest path to asking R one question.
 :::
 
 ::: {.column width="42%"}
-The command gets bigger.
+The command gets longer.
 
-So the agent starts making files.
+Quoting gets fragile.
+
+The agent starts writing files.
 :::
 :::
 
 ::: notes
-The next step is predictable. Inline strings become too hard to quote
-and too easy to break. So the agent writes a temporary script, usually
-with a heredoc or a generated file, then calls Rscript on that file.
-This is more stable than one giant command string, but it is still batch
-execution.
+The next step is also predictable. The inline expression turns into a
+temporary script. The agent writes a file, runs `Rscript`, reads the
+output, edits the file, and runs it again. This is more stable than one
+huge shell string, but it is still batch execution wearing an
+interactive costume.
 :::
 
-## The Hidden Loop
+## The Cold-Start Loop
 
 ::: {.columns}
 ::: {.column width="58%"}
@@ -67,9 +90,12 @@ execution.
 ::: {.column width="42%"}
 Every attempt starts cold.
 
-Run 1: load data -> inspect columns Run 2: load data -> clean data ->
-plot Run 3: load data -> clean data -> fit model Run 4: load data ->
-clean data -> debug error
+```text
+Run 1: load -> inspect
+Run 2: load -> clean -> plot
+Run 3: load -> clean -> fit
+Run 4: load -> clean -> debug
+```
 
 The conversation persists.
 
@@ -78,21 +104,19 @@ The R session does not.
 :::
 
 ::: notes
-The agent is not being foolish. It is adapting to the interface it has.
-But every run starts cold. The agent reloads data, rebuilds objects,
-replays setup, and starts leaving files behind as fake memory:
-intermediate CSVs, RDS files, generated plots, and notes for itself.
-That is a workable hack for small one-shot tasks, but it is a bad shape
-for exploratory analysis.
+The agent is adapting to the interface it has. But every run starts
+cold. It reloads data, rebuilds objects, replays setup, and leaves files
+behind as fake memory: intermediate CSVs, RDS files, generated plots,
+and notes for itself. That can work for small one-shot tasks. It is the
+wrong shape for exploratory analysis.
 :::
 
-## Debugging Breaks the Illusion
+## R Is Interactive at the Edges
 
 ::: {.columns}
 ::: {.column width="33%"}
 ```text
-[PLACEHOLDER: debugger panel]
-
+Debugger
 browser()
 Browse[1]> str(x)
 Browse[1]> n
@@ -102,8 +126,7 @@ Browse[1]> where
 
 ::: {.column width="33%"}
 ```text
-[PLACEHOLDER: help/pager panel]
-
+Help and pager
 ?lm
 help("predict")
 vignette("...")
@@ -112,8 +135,7 @@ vignette("...")
 
 ::: {.column width="33%"}
 ```text
-[PLACEHOLDER: plot panel]
-
+Plots
 plot(fit)
 ggplot(df, aes(...))
 ```
@@ -123,36 +145,39 @@ ggplot(df, aes(...))
 These are interactive surfaces.
 
 ::: notes
-The mismatch gets obvious when the task stops being linear. R help,
+The mismatch becomes obvious when the task stops being linear. R help,
 vignettes, pagers, plots, readline prompts, and the debugger all assume
 there is a live session on the other side. Batch execution can only
-approximate that by making more files and re-running more setup. What
-the model needs is not just command execution. It needs a REPL.
+approximate that by making more files and replaying more setup. For
+serious R work, command execution is not the primitive we need.
 :::
 
 ## The Missing Primitive
 
 ```text
-[PLACEHOLDER: architecture render]
+Agent
+  |
+  | repl
+  v
+Live R session
 
-Agent  -- repl -->  Live R session
+df <- readRDS(...)
+fit <- lm(...)
+plot(fit)
+debugonce(fn)
 
-                   df <- readRDS(...)
-                   fit <- lm(...)
-                   plot(fit)
-                   debugonce(fn)
-
-                   state | help | plots | debugger | interrupt | reset
+state | help | plots | debugger | interrupt | reset
 ```
 
 Give the agent a real R session.
 
 ::: notes
-This is the turn in the talk. The missing primitive is not a smarter
-Rscript call. It is a persistent, interactive R session that the agent
-can own for the duration of the task. The agent should be able to create
-an object in one call and inspect it in the next. It should be able to
-look at plots, read help, step through browser, interrupt, and reset.
+The missing primitive is not a smarter `Rscript` call. It is a
+persistent, interactive R session that the agent can own for the length
+of the task. The agent should be able to create an object in one call
+and inspect it in the next. It should be able to view plots, read help,
+step through `browser()`, interrupt bad work, and reset when it needs a
+clean slate.
 :::
 
 ## mcp-repl
@@ -164,39 +189,37 @@ look at plots, read help, step through browser, interrupt, and reset.
 - Private session for the agent
 
 ::: notes
-mcp-repl is one implementation of that idea. The MCP surface is small: a
-repl tool for input and a reset tool for starting over. Most of the
-complexity is below the tool boundary: worker lifecycle, output capture,
+`mcp-repl` is one implementation of that idea. The MCP surface is small:
+a `repl` tool for input and a `repl_reset` tool for starting over. The
+hard parts sit below that boundary: worker lifecycle, output capture,
 image capture, timeouts, interrupts, and response finalization. The
-important property for the agent is continuity.
+user-visible property is continuity.
 :::
 
-## Why the Session Is Sandboxed
+## Keep the Session in a Box
 
 ```text
-[PLACEHOLDER: sandbox boundary render]
-
 Agent-owned R session
-  - private runtime
-  - workspace and temp writes
-  - network off unless configured
+  - private runtime state
   - explicit interrupt
   - explicit reset
+
+Sandbox
+  - workspace and temp writes only
+  - network off unless configured
 ```
 
 ::: notes
-This is not a human and model sharing one IDE session. It is built for
-unattended agent work, so the live session needs a security boundary.
-The model can run code and keep state, but writes are constrained,
-network access is off unless configured, and recovery controls are
-explicit. The sandbox is part of making a persistent session acceptable.
+This is not a human and a model sharing one IDE session. It is built for
+agent work, so the live session needs a security boundary. The model can
+run code and keep state, but writes are constrained, network access is
+off unless configured, and recovery controls are explicit. The sandbox
+is part of what makes persistence acceptable.
 :::
 
-## Evals Need the Real Thing
+## Evaluate the Real Workflow
 
 ```text
-[PLACEHOLDER: eval harness render]
-
 Task
 Analyze this package failure and explain the likely bug.
 
@@ -210,18 +233,18 @@ Agent capabilities under test
 ```
 
 ::: notes
-If we want to evaluate agents on serious R work, we should not evaluate
-only whether they can emit syntactically valid code. We need to know
-whether they can use the real surfaces R users depend on: object state,
+If we want to evaluate agents on serious R work, we should not only ask
+whether they can emit syntactically valid code. We should ask whether
+they can use the surfaces R users actually depend on: object state,
 help, plots, debugger steps, and recovery after mistakes. A persistent
-REPL makes those behaviors testable.
+REPL makes those behaviors observable and testable.
 :::
 
-## Where This Goes Next
+## Where This Matters
 
 ::: {.columns}
 ::: {.column width="50%"}
-Today
+**Today**
 
 - local R analysis help
 - package debugging
@@ -229,7 +252,7 @@ Today
 :::
 
 ::: {.column width="50%"}
-Soon
+**Soon**
 
 - recurring reports from fresh data
 - long-running dataset reconnaissance
@@ -239,11 +262,12 @@ Soon
 :::
 
 ::: notes
-Start where users are today: interactive agents helping with local R
-tasks. The more important direction is where this goes over the next
-year or two. Agents will run longer investigations, scheduled reports,
-and evals that need realistic R behavior. In that world, batch commands
-are too weak and an unconstrained terminal is too loose.
+This matters now for local analysis, package debugging, and the everyday
+work of refining plots and tables. It matters more as agents take on
+longer investigations: recurring reports from fresh data, dataset
+reconnaissance before a human review, and evals that need realistic R
+behavior. In that world, batch commands are too weak and an
+unconstrained terminal is too broad.
 :::
 
 ## Takeaway
@@ -256,8 +280,8 @@ sandboxed.
 https://github.com/posit-dev/mcp-repl
 
 ::: notes
-The takeaway is narrow. R support for agents should not stop at command
+The takeaway is narrow: R support for agents should not stop at command
 execution. A useful agent-facing R interface needs session state, help,
 plots, debugging, bounded output, recovery controls, and a security
-boundary. mcp-repl is one implementation of that idea over MCP.
+boundary. `mcp-repl` is one implementation of that interface over MCP.
 :::
