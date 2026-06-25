@@ -1710,12 +1710,22 @@ pub(crate) fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Ve
     let start_offset = output.current_offset().unwrap_or(end_offset);
     let previous_rendered_text = output.rendered_text_state();
     let range = output.read_range(start_offset, end_offset);
+    let consumed_end = range.end_offset;
+    let boundary_events_consumed = range
+        .events
+        .iter()
+        .filter(|event| event.offset == consumed_end)
+        .count();
     let (contents, last_rendered_text) = resolved_output::contents_from_output_range_with_state(
         range,
         ProjectionMode::Reply,
         previous_rendered_text,
     );
-    output.advance_offset_to_with_rendered_text(end_offset, last_rendered_text);
+    output.advance_offset_to_with_rendered_text_and_boundary_events(
+        consumed_end,
+        last_rendered_text,
+        boundary_events_consumed,
+    );
     contents
 }
 
@@ -1733,9 +1743,19 @@ pub(crate) fn take_snapshot_page_from_ring(
             last_range_end_byte: None,
         };
     };
+    let consumed_end = range.end_offset;
+    let boundary_events_consumed = range
+        .events
+        .iter()
+        .filter(|event| event.offset == consumed_end)
+        .count();
     let (snapshot, last_rendered_text) =
         take_snapshot_page_from_range(range, target_bytes, previous_rendered_text);
-    output.advance_offset_to_with_rendered_text(end_offset, last_rendered_text);
+    output.advance_offset_to_with_rendered_text_and_boundary_events(
+        consumed_end,
+        last_rendered_text,
+        boundary_events_consumed,
+    );
     snapshot
 }
 

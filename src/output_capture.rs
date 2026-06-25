@@ -477,16 +477,18 @@ impl OutputBuffer {
         guard.last_rendered_text
     }
 
-    pub(crate) fn advance_offset_to_with_rendered_text(
+    pub(crate) fn advance_offset_to_with_rendered_text_and_boundary_events(
         &self,
         offset: u64,
         last_rendered_text: Option<RenderedTextState>,
+        boundary_events_consumed: usize,
     ) {
         let mut guard = self.cursor.lock().unwrap();
         guard.offset = Some(offset);
         guard.last_rendered_text = last_rendered_text;
         drop(guard);
-        self.ring().consume_to(offset);
+        self.ring()
+            .consume_to_with_boundary_events(offset, boundary_events_consumed);
     }
 
     pub fn has_pending_output(&self) -> bool {
@@ -535,6 +537,7 @@ impl OutputBuffer {
         } else {
             trim_range_to_complete_utf8(&mut range)
         };
+        let boundary_events_consumed = output_range_boundary_event_count(&range, consumed_end);
         let saw_stderr = ring.saw_stderr_in_range(start_offset.min(consumed_end), consumed_end);
         let (contents, last_rendered_text) =
             crate::resolved_output::contents_from_output_range_with_state(
@@ -542,7 +545,11 @@ impl OutputBuffer {
                 projection_mode,
                 previous_rendered_text,
             );
-        self.advance_offset_to_with_rendered_text(consumed_end, last_rendered_text);
+        self.advance_offset_to_with_rendered_text_and_boundary_events(
+            consumed_end,
+            last_rendered_text,
+            boundary_events_consumed,
+        );
         FormattedPendingOutput {
             contents,
             saw_stderr,
@@ -1039,6 +1046,15 @@ impl OutputRing {
         guard.trim_to_offset(offset);
     }
 
+    fn consume_to_with_boundary_events(&self, offset: u64, boundary_events_consumed: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        let offset = offset.min(guard.end_offset);
+        if offset < guard.start_offset {
+            return;
+        }
+        guard.trim_to_offset_consuming_boundary_events(offset, boundary_events_consumed);
+    }
+
     fn reset(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.chunks.clear();
@@ -1390,6 +1406,54 @@ impl OutputRingInner {
         }
     }
 
+    fn trim_to_offset_consuming_boundary_events(
+        &mut self,
+        offset: u64,
+        boundary_events_consumed: usize,
+    ) {
+        let offset = offset.min(self.end_offset);
+        if offset < self.start_offset {
+            return;
+        }
+        if offset == self.start_offset {
+            self.cleanup_front_consuming_boundary_events(boundary_events_consumed);
+            return;
+        }
+
+        while let Some(front) = self.chunks.front_mut() {
+            let front_len: u64 = front.range.len().try_into().unwrap_or(u64::MAX);
+            let front_end = front.start_offset.saturating_add(front_len);
+
+            if front_end <= offset {
+                let consumed = self.chunks.pop_front().unwrap();
+                let consumed_len = consumed.range.len();
+                self.start_offset = front_end;
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(consumed_len);
+            } else if front.start_offset < offset {
+                let delta_u64 = offset.saturating_sub(front.start_offset);
+                let delta: usize = (delta_u64 as usize).min(front.range.len());
+                front.start_offset = front.start_offset.saturating_add(delta as u64);
+                front.range.start = front.range.start.saturating_add(delta);
+                self.start_offset = offset;
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(delta);
+            } else {
+                self.start_offset = offset;
+            }
+
+            self.cleanup_front_before_boundary();
+
+            if self.start_offset >= offset {
+                break;
+            }
+        }
+
+        if self.chunks.is_empty() {
+            self.start_offset = offset;
+            self.cleanup_front_before_boundary();
+        }
+        self.cleanup_front_consuming_boundary_events(boundary_events_consumed);
+    }
+
     fn retained_end_offset(&self) -> u64 {
         self.chunks
             .back()
@@ -1398,11 +1462,32 @@ impl OutputRingInner {
             .max(self.start_offset)
     }
 
-    fn cleanup_front(&mut self) {
+    fn cleanup_front_before_boundary(&mut self) {
         while matches!(self.line_ends.front(), Some(line_end) if *line_end <= self.start_offset) {
             let _ = self.line_ends.pop_front();
         }
+        while matches!(self.events.front(), Some(event) if event.offset < self.start_offset) {
+            if self.pop_front_event() {
+                // Dropping due to consumer progress; not tracked as truncation.
+            }
+        }
+    }
+
+    fn cleanup_front(&mut self) {
+        self.cleanup_front_before_boundary();
         while matches!(self.events.front(), Some(event) if event.offset <= self.start_offset) {
+            if self.pop_front_event() {
+                // Dropping due to consumer progress; not tracked as truncation.
+            }
+        }
+    }
+
+    fn cleanup_front_consuming_boundary_events(&mut self, boundary_events_consumed: usize) {
+        self.cleanup_front_before_boundary();
+        for _ in 0..boundary_events_consumed {
+            if !matches!(self.events.front(), Some(event) if event.offset == self.start_offset) {
+                break;
+            }
             if self.pop_front_event() {
                 // Dropping due to consumer progress; not tracked as truncation.
             }
@@ -1496,6 +1581,14 @@ fn trim_range_to_complete_utf8(range: &mut OutputRange) -> u64 {
         span.start_byte < span.end_byte
     });
     consumed_end
+}
+
+fn output_range_boundary_event_count(range: &OutputRange, offset: u64) -> usize {
+    range
+        .events
+        .iter()
+        .filter(|event| event.offset == offset)
+        .count()
 }
 
 fn flushable_prefix_len(bytes: &[u8]) -> usize {
@@ -1731,6 +1824,45 @@ mod tests {
                 OutputEventKind::Text { text, .. } if text.contains("output omitted")
             )),
             "did not expect an omission notice when all output fits"
+        );
+    }
+
+    #[test]
+    fn boundary_event_appended_after_snapshot_survives_advance() {
+        let timeline = OutputTimeline::with_capacity(1024);
+        let output = timeline.buffer();
+        output.start_capture();
+
+        timeline.append_text(b"ready", false, ContentOrigin::Worker);
+        let start = output
+            .current_offset()
+            .expect("output capture should start");
+        let end = output
+            .end_offset()
+            .expect("output should have an end offset");
+        let range = output.read_range(start, end);
+
+        timeline.append_image(
+            "plot-1".to_string(),
+            "image/png".to_string(),
+            "image-data".to_string(),
+            true,
+            0,
+        );
+        let boundary_events_consumed = output_range_boundary_event_count(&range, range.end_offset);
+        output.advance_offset_to_with_rendered_text_and_boundary_events(
+            range.end_offset,
+            None,
+            boundary_events_consumed,
+        );
+
+        let formatted = output.drain_formatted(ProjectionMode::Bundle, true);
+        assert!(
+            formatted.contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentImage { id, .. } if id == "plot-1"
+            )),
+            "expected the boundary image appended after the snapshot to survive"
         );
     }
 
