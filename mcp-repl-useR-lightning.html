@@ -496,7 +496,7 @@
 <div>
 <pre class="mermaid mermaid-js">%%{init: {"theme": "base", "themeVariables": {"background": "transparent", "fontSize": "22px", "primaryColor": "#17212b", "primaryTextColor": "#ffffff", "primaryBorderColor": "#9ee7ff", "lineColor": "#9ee7ff", "fontFamily": "system-ui, sans-serif"}}}%%
 flowchart LR
-  human((Human)) --&gt; harness["LLM harness"] --&gt; repl["mcp-repl"]
+  human((Human)) --- harness["LLM harness"] --- repl["mcp-repl"]
 
   classDef agentBox fill:#17212b,stroke:#9ee7ff,color:#ffffff,stroke-width:3px,font-size:22px;
   class human,harness,repl agentBox;
@@ -519,9 +519,9 @@ flowchart TB
   human((Human))
   harness["LLM harness"]
   repl["IDE R session"]
-  human --&gt; harness
-  harness --&gt; repl
-  human --&gt; repl
+  human --- harness
+  harness --- repl
+  human --- repl
 
   classDef ideBox fill:#1f251f,stroke:#b8f5b0,color:#ffffff,stroke-width:3px,font-size:22px;
   class human,harness,repl ideBox;
@@ -559,54 +559,52 @@ flowchart TB
 <svg width="960" height="480" viewbox="0.00 0.00 1764.51 267.00" xmlns="http://www.w3.org/2000/svg" xlink="http://www.w3.org/1999/xlink" style="; max-width: none; max-height: none; display: block; margin: auto auto auto auto">
 <g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 263)">
 <title>two_shapes</title>
-<g id="clust1" class="cluster">
-<title>cluster_agent</title>
-<polygon fill="transparent" stroke="#3d4c59" points="8,-8 8,-209 930.97,-209 930.97,-8 8,-8"></polygon>
-<text text-anchor="middle" x="469.48" y="-174.4" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="34.00" fill="#ffffff">mcp-repl: agent-owned</text>
-</g>
 <g id="clust2" class="cluster">
 <title>cluster_ide</title>
 <polygon fill="transparent" stroke="#3d4c59" points="938.97,-8 938.97,-251 1748.51,-251 1748.51,-8 938.97,-8"></polygon>
 <text text-anchor="middle" x="1343.74" y="-216.4" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="34.00" fill="#ffffff">IDE assistant: human in the loop</text>
 </g>
+<g id="clust1" class="cluster">
+<title>cluster_agent</title>
+<polygon fill="transparent" stroke="#3d4c59" points="8,-29 8,-230 930.97,-230 930.97,-29 8,-29"></polygon>
+<text text-anchor="middle" x="469.48" y="-195.4" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="34.00" fill="#ffffff">mcp-repl: agent-owned</text>
+</g>
 <!-- agent_human -->
 <g id="node1" class="node">
 <title>agent_human</title>
-<ellipse fill="#111820" stroke="#9ee7ff" stroke-width="3" cx="129.01" cy="-84" rx="91.02" ry="39.7"></ellipse>
-<text text-anchor="middle" x="129.01" y="-75" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">Human</text>
+<ellipse fill="#111820" stroke="#9ee7ff" stroke-width="3" cx="129.01" cy="-105" rx="91.02" ry="39.7"></ellipse>
+<text text-anchor="middle" x="129.01" y="-96" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">Human</text>
 </g>
 <!-- agent_harness -->
 <g id="node2" class="node">
 <title>agent_harness</title>
-<path fill="#17212b" stroke="#9ee7ff" stroke-width="3" d="M478.66,-112C478.66,-112 296.81,-112 296.81,-112 290.81,-112 284.81,-106 284.81,-100 284.81,-100 284.81,-68 284.81,-68 284.81,-62 290.81,-56 296.81,-56 296.81,-56 478.66,-56 478.66,-56 484.66,-56 490.66,-62 490.66,-68 490.66,-68 490.66,-100 490.66,-100 490.66,-106 484.66,-112 478.66,-112"></path>
-<text text-anchor="middle" x="387.73" y="-75" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">LLM harness</text>
+<path fill="#17212b" stroke="#9ee7ff" stroke-width="3" d="M478.66,-133C478.66,-133 296.81,-133 296.81,-133 290.81,-133 284.81,-127 284.81,-121 284.81,-121 284.81,-89 284.81,-89 284.81,-83 290.81,-77 296.81,-77 296.81,-77 478.66,-77 478.66,-77 484.66,-77 490.66,-83 490.66,-89 490.66,-89 490.66,-121 490.66,-121 490.66,-127 484.66,-133 478.66,-133"></path>
+<text text-anchor="middle" x="387.73" y="-96" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">LLM harness</text>
 </g>
-<!-- agent_human&#45;&gt;agent_harness -->
+<!-- agent_human&#45;&#45;agent_harness -->
 <g id="edge1" class="edge">
-<title>agent_human-&gt;agent_harness</title>
-<path fill="none" stroke="#9ee7ff" stroke-width="3" d="M220.16,-84C238.49,-84 257.97,-84 276.89,-84"></path>
-<polygon fill="#9ee7ff" stroke="#9ee7ff" stroke-width="3" points="276.96,-86.8 284.96,-84 276.96,-81.2 276.96,-86.8"></polygon>
+<title>agent_human--agent_harness</title>
+<path fill="none" stroke="#9ee7ff" stroke-width="3" d="M220.16,-105C241.11,-105 263.55,-105 284.96,-105"></path>
 </g>
 <!-- agent_repl -->
 <g id="node3" class="node">
 <title>agent_repl</title>
-<path fill="#17212b" stroke="#9ee7ff" stroke-width="3" d="M888.73,-130C888.73,-130 567.68,-130 567.68,-130 561.68,-130 555.68,-124 555.68,-118 555.68,-118 555.68,-50 555.68,-50 555.68,-44 561.68,-38 567.68,-38 567.68,-38 888.73,-38 888.73,-38 894.73,-38 900.73,-44 900.73,-50 900.73,-50 900.73,-118 900.73,-118 900.73,-124 894.73,-130 888.73,-130"></path>
-<text text-anchor="middle" x="728.21" y="-93" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">mcp-repl</text>
-<text text-anchor="middle" x="728.21" y="-57" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">agent-owned R session</text>
+<path fill="#17212b" stroke="#9ee7ff" stroke-width="3" d="M888.73,-151C888.73,-151 567.68,-151 567.68,-151 561.68,-151 555.68,-145 555.68,-139 555.68,-139 555.68,-71 555.68,-71 555.68,-65 561.68,-59 567.68,-59 567.68,-59 888.73,-59 888.73,-59 894.73,-59 900.73,-65 900.73,-71 900.73,-71 900.73,-139 900.73,-139 900.73,-145 894.73,-151 888.73,-151"></path>
+<text text-anchor="middle" x="728.21" y="-114" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">mcp-repl</text>
+<text text-anchor="middle" x="728.21" y="-78" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">agent-owned R session</text>
 </g>
-<!-- agent_harness&#45;&gt;agent_repl -->
+<!-- agent_harness&#45;&#45;agent_repl -->
 <g id="edge2" class="edge">
-<title>agent_harness-&gt;agent_repl</title>
-<path fill="none" stroke="#9ee7ff" stroke-width="3" d="M490.75,-84C508.79,-84 528.06,-84 547.51,-84"></path>
-<polygon fill="#9ee7ff" stroke="#9ee7ff" stroke-width="3" points="547.56,-86.8 555.56,-84 547.56,-81.2 547.56,-86.8"></polygon>
+<title>agent_harness--agent_repl</title>
+<path fill="none" stroke="#9ee7ff" stroke-width="3" d="M490.75,-105C511.28,-105 533.39,-105 555.56,-105"></path>
 </g>
 <!-- ide_human -->
 <g id="node4" class="node">
 <title>ide_human</title>
-<ellipse fill="#111820" stroke="#b8f5b0" stroke-width="3" cx="1059.98" cy="-84" rx="91.02" ry="39.7"></ellipse>
-<text text-anchor="middle" x="1059.98" y="-75" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">Human</text>
+<ellipse fill="#111820" stroke="#b8f5b0" stroke-width="3" cx="1059.98" cy="-105" rx="91.02" ry="39.7"></ellipse>
+<text text-anchor="middle" x="1059.98" y="-96" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">Human</text>
 </g>
-<!-- agent_repl&#45;&gt;ide_human -->
+<!-- agent_repl&#45;&#45;ide_human -->
 <!-- ide_harness -->
 <g id="node5" class="node">
 <title>ide_harness</title>
@@ -614,11 +612,10 @@ flowchart TB
 <text text-anchor="middle" x="1320.35" y="-93" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">LLM harness</text>
 <text text-anchor="middle" x="1320.35" y="-57" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">IDE assistant</text>
 </g>
-<!-- ide_human&#45;&gt;ide_harness -->
+<!-- ide_human&#45;&#45;ide_harness -->
 <g id="edge3" class="edge">
-<title>ide_human-&gt;ide_harness</title>
-<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1151.34,-84C1169.55,-84 1188.9,-84 1207.73,-84"></path>
-<polygon fill="#b8f5b0" stroke="#b8f5b0" stroke-width="3" points="1207.77,-86.8 1215.77,-84 1207.77,-81.2 1207.77,-86.8"></polygon>
+<title>ide_human--ide_harness</title>
+<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1149.53,-97.8C1170.86,-96.07 1193.84,-94.2 1215.78,-92.42"></path>
 </g>
 <!-- ide_repl -->
 <g id="node6" class="node">
@@ -627,17 +624,15 @@ flowchart TB
 <text text-anchor="middle" x="1604.11" y="-114" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">IDE R session</text>
 <text text-anchor="middle" x="1604.11" y="-78" font-family="Helvetica,sans-Serif" font-size="30.00" fill="#ffffff">shared context</text>
 </g>
-<!-- ide_human&#45;&gt;ide_repl -->
+<!-- ide_human&#45;&#45;ide_repl -->
 <g id="edge5" class="edge">
-<title>ide_human-&gt;ide_repl</title>
-<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1117.7,-114.67C1146.29,-128.42 1182.03,-143.07 1215.99,-150 1306.89,-168.55 1332.66,-161.43 1424.72,-150 1443.39,-147.68 1462.9,-144.05 1481.89,-139.83"></path>
-<polygon fill="#b8f5b0" stroke="#b8f5b0" stroke-width="3" points="1482.53,-142.56 1489.71,-138.05 1481.29,-137.1 1482.53,-142.56"></polygon>
+<title>ide_human--ide_repl</title>
+<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1131.05,-129.89C1157.33,-138.01 1187.69,-145.98 1215.99,-150 1307.83,-163.06 1332.66,-161.43 1424.72,-150 1445.96,-147.36 1468.3,-143.02 1489.71,-138.05"></path>
 </g>
-<!-- ide_harness&#45;&gt;ide_repl -->
+<!-- ide_harness&#45;&#45;ide_repl -->
 <g id="edge4" class="edge">
-<title>ide_harness-&gt;ide_repl</title>
-<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1424.67,-91.7C1443.09,-93.07 1462.43,-94.51 1481.3,-95.92"></path>
-<polygon fill="#b8f5b0" stroke="#b8f5b0" stroke-width="3" points="1481.17,-98.72 1489.36,-96.52 1481.59,-93.13 1481.17,-98.72"></polygon>
+<title>ide_harness--ide_repl</title>
+<path fill="none" stroke="#b8f5b0" stroke-width="3" d="M1424.67,-91.7C1445.72,-93.27 1467.97,-94.93 1489.36,-96.52"></path>
 </g>
 </g>
 </svg>
