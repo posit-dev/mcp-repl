@@ -259,12 +259,12 @@ fn push_generated_echo(
     text: &str,
     projection_mode: ProjectionMode,
     merge_with_previous_echo: bool,
-) {
+) -> (bool, Option<RenderedTextState>) {
     if text.is_empty() {
-        return;
+        return (false, None);
     }
     let Some(visibility) = projection_mode.input_echo_visibility() else {
-        return;
+        return (false, None);
     };
     let next = match visibility {
         ContentVisibility::ReplyAndTranscript => WorkerContent::worker_stdout(text.to_string()),
@@ -279,6 +279,9 @@ fn push_generated_echo(
     else {
         unreachable!("generated echoes are text");
     };
+    let rendered_text = visibility
+        .is_reply_visible()
+        .then(|| rendered_state(stream, origin, &text));
     if let Some(WorkerContent::ContentText {
         text: last_text,
         stream: last_stream,
@@ -291,7 +294,7 @@ fn push_generated_echo(
         && *last_visibility == visibility
     {
         last_text.push_str(&text);
-        return;
+        return (true, rendered_text);
     }
     contents.push(WorkerContent::ContentText {
         text,
@@ -299,6 +302,7 @@ fn push_generated_echo(
         origin,
         visibility,
     });
+    (true, rendered_text)
 }
 
 struct TextRangeEmitter<'a, S> {
@@ -442,14 +446,18 @@ pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: Tex
             }
             match event.kind() {
                 OutputEventKind::InputEcho { text } => {
-                    *text_emitter.last_rendered_text = None;
-                    push_generated_echo(
+                    let (pushed_echo, rendered_text) = push_generated_echo(
                         text_emitter.contents,
                         text,
                         projection_mode,
                         last_content_was_input_echo,
                     );
-                    last_content_was_input_echo = true;
+                    if let Some(rendered_text) = rendered_text {
+                        *text_emitter.last_rendered_text = Some(rendered_text);
+                    }
+                    if pushed_echo {
+                        last_content_was_input_echo = true;
+                    }
                 }
                 OutputEventKind::Image { .. } | OutputEventKind::Text { .. } => {
                     text_emitter
@@ -458,9 +466,10 @@ pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: Tex
                     last_content_was_input_echo = false;
                     *text_emitter.last_rendered_text = None;
                 }
-                OutputEventKind::InputWait
-                | OutputEventKind::RequestBoundary
-                | OutputEventKind::SessionEnd => {
+                OutputEventKind::InputWait => {
+                    last_content_was_input_echo = false;
+                }
+                OutputEventKind::RequestBoundary | OutputEventKind::SessionEnd => {
                     *text_emitter.last_rendered_text = None;
                     last_content_was_input_echo = false;
                 }

@@ -823,6 +823,41 @@ async fn zod_stderr_label_starts_after_unterminated_stdout() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_hidden_input_echo_preserves_unterminated_stdout_before_stderr() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stdout\nemit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("partial\nstderr: boom\n"),
+        "hidden input echo should not hide unterminated stdout before stderr, got: {text:?}"
+    );
+    assert!(
+        !text.contains("partialstderr:"),
+        "stderr label should not be concatenated to partial stdout across hidden input echo, got: {text:?}"
+    );
+    assert!(
+        !text.contains("v5> emit-stderr-after-input"),
+        "generated input_line echo should be absent, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
