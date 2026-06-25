@@ -25,6 +25,7 @@ mod r_graphics;
 mod r_htmd;
 mod r_session;
 mod reply_presentation;
+mod resolved_output;
 mod sandbox;
 mod sandbox_cli;
 mod server;

@@ -3,13 +3,15 @@ use std::sync::OnceLock;
 
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
-use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange};
+use crate::output_capture::OutputBuffer;
+use crate::resolved_output::{
+    self, OutputEventKind, OutputRange, ProjectionMode, RenderedTextState,
+};
 use crate::worker_protocol::{
     ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
 mod command;
-mod merge;
 mod presentation;
 mod ranges;
 mod search;
@@ -46,6 +48,7 @@ pub(crate) const IMAGE_EQUIV_CHARS: u64 = 800;
 pub(crate) struct PagerBuffer {
     bytes: Vec<u8>,
     char_to_byte: Vec<usize>,
+    source_offsets: Vec<u64>,
     line_ends: Vec<u64>,
     cursor: u64,
     events: Vec<PagerEvent>,
@@ -67,16 +70,6 @@ struct PagerTextSpan {
     origin: ContentOrigin,
 }
 
-impl merge::EventView for crate::output_capture::OutputEvent {
-    fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    fn kind(&self) -> &OutputEventKind {
-        &self.kind
-    }
-}
-
 pub(crate) struct SnapshotPage {
     pub(crate) contents: Vec<WorkerContent>,
     pub(crate) pages_left: u64,
@@ -86,59 +79,36 @@ pub(crate) struct SnapshotPage {
 }
 
 impl PagerBuffer {
+    #[cfg(test)]
     fn from_range(range: OutputRange) -> Self {
-        let base_offset = range.start_offset;
-        let end_offset = range.end_offset;
-        let bytes = range.bytes;
-        let char_to_byte = build_char_index(&bytes);
-        let events = range
-            .events
-            .into_iter()
-            .filter_map(|event| {
-                if event.offset < base_offset || event.offset > end_offset {
-                    return None;
-                }
-                Some(PagerEvent {
-                    offset: char_offset_for_byte_index(
-                        &char_to_byte,
-                        event.offset.saturating_sub(base_offset) as usize,
-                    ),
-                    kind: event.kind,
-                })
-            })
-            .collect();
-        let text_spans = range
-            .text_spans
-            .into_iter()
-            .filter_map(|span| {
-                if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
-                    return None;
-                }
-                Some(PagerTextSpan {
-                    start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
-                    end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
-                    is_stderr: span.is_stderr,
-                    origin: span.origin,
-                })
-            })
-            .collect();
-        let line_ends = line_end_offsets(&bytes, &char_to_byte, 0);
+        Self::from_timeline_range(range)
+    }
+
+    fn empty_at(source_offset: u64) -> Self {
         Self {
-            bytes,
-            char_to_byte,
-            line_ends,
+            bytes: Vec::new(),
+            char_to_byte: vec![0],
+            source_offsets: vec![source_offset],
+            line_ends: Vec::new(),
             cursor: 0,
-            events,
-            text_spans,
-            source_end: end_offset,
+            events: Vec::new(),
+            text_spans: Vec::new(),
+            source_end: source_offset,
         }
     }
 
-    /// Construct a pager buffer from text and event offsets expressed in byte
-    /// indices within `bytes`.
+    fn from_timeline_range(range: OutputRange) -> Self {
+        let start_offset = range.start_offset;
+        let mut buffer = Self::empty_at(start_offset);
+        buffer.append_timeline_range(range);
+        buffer
+    }
+
+    /// Construct a pager buffer from text and event offsets expressed in byte indices within
+    /// `bytes`.
     ///
-    /// `source_end` tracks the worker output ring offset consumed for this buffer, so the pager
-    /// can later append any new output that arrives while pager mode is active.
+    /// `source_end` tracks the worker output ring offset consumed for this buffer, so the pager can
+    /// later append any new output that arrives while pager mode is active.
     #[cfg(test)]
     pub(crate) fn from_bytes_and_events(
         bytes: Vec<u8>,
@@ -146,44 +116,92 @@ impl PagerBuffer {
         text_spans: Vec<crate::output_capture::OutputTextSpan>,
         source_end: u64,
     ) -> Self {
-        let char_to_byte = build_char_index(&bytes);
-        let line_ends = line_end_offsets(&bytes, &char_to_byte, 0);
-        let events = events
-            .into_iter()
-            .filter_map(|(byte_offset, kind)| {
-                let byte_offset: usize = byte_offset.try_into().unwrap_or(usize::MAX);
-                if byte_offset > bytes.len() {
-                    return None;
-                }
-                Some(PagerEvent {
-                    offset: char_offset_for_byte_index(&char_to_byte, byte_offset),
-                    kind,
-                })
-            })
-            .collect();
-        let text_spans = text_spans
-            .into_iter()
-            .filter_map(|span| {
-                if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
-                    return None;
-                }
-                Some(PagerTextSpan {
-                    start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
-                    end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
-                    is_stderr: span.is_stderr,
-                    origin: span.origin,
-                })
-            })
-            .collect();
-        Self {
+        Self::from_range(OutputRange {
+            start_offset: 0,
+            end_offset: source_end,
             bytes,
-            char_to_byte,
-            line_ends,
-            cursor: 0,
+            events: events
+                .into_iter()
+                .map(|(offset, kind)| resolved_output::OutputEvent { offset, kind })
+                .collect(),
+            text_spans,
+        })
+    }
+
+    fn append_timeline_range(&mut self, range: OutputRange) {
+        if range.start_offset > self.source_end {
+            let gap = range.start_offset.saturating_sub(self.source_end);
+            let notice = format!("[pager] output gap detected ({} bytes skipped)\n", gap);
+            self.append_text_at_source_offset(
+                notice.as_bytes(),
+                self.source_end,
+                true,
+                ContentOrigin::Server,
+            );
+            self.source_end = range.start_offset;
+        }
+
+        if range.bytes.is_empty() && range.events.is_empty() {
+            self.source_end = self.source_end.max(range.end_offset);
+            return;
+        }
+
+        let OutputRange {
+            start_offset,
+            end_offset,
+            bytes,
             events,
             text_spans,
-            source_end,
+        } = range;
+        let mut cursor = 0usize;
+        let mut events = events
+            .into_iter()
+            .enumerate()
+            .filter(|(_, event)| event.offset >= start_offset && event.offset <= end_offset)
+            .collect::<Vec<_>>();
+        events.sort_by_key(|(index, event)| (event.offset, *index));
+
+        for (_, event) in events {
+            let relative = event
+                .offset
+                .saturating_sub(start_offset)
+                .min(bytes.len() as u64) as usize;
+            self.append_raw_slice(&bytes, cursor, relative, start_offset, &text_spans);
+            match event.kind {
+                OutputEventKind::InputEcho { text } => {
+                    self.events.push(PagerEvent {
+                        offset: self.len(),
+                        kind: OutputEventKind::InputEcho { text },
+                    });
+                }
+                OutputEventKind::Text {
+                    text,
+                    is_stderr,
+                    origin,
+                } => {
+                    let start = self.len();
+                    self.append_bytes_at_source_offset(text.as_bytes(), event.offset);
+                    let end = self.len();
+                    if start < end {
+                        self.text_spans.push(PagerTextSpan {
+                            start,
+                            end,
+                            is_stderr,
+                            origin,
+                        });
+                    }
+                }
+                kind => {
+                    self.events.push(PagerEvent {
+                        offset: self.len(),
+                        kind,
+                    });
+                }
+            }
+            cursor = relative;
         }
+        self.append_raw_slice(&bytes, cursor, bytes.len(), start_offset, &text_spans);
+        self.source_end = end_offset.max(self.source_end);
     }
 
     fn len(&self) -> u64 {
@@ -210,6 +228,19 @@ impl PagerBuffer {
     }
 
     fn contents_for_range(&self, start_offset: u64, end_offset: u64) -> Vec<WorkerContent> {
+        self.contents_for_range_with_projection_mode(
+            start_offset,
+            end_offset,
+            ProjectionMode::Pager,
+        )
+    }
+
+    fn contents_for_range_with_projection_mode(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+        projection_mode: ProjectionMode,
+    ) -> Vec<WorkerContent> {
         let end_offset = end_offset.min(self.len());
         let start_offset = start_offset.min(end_offset);
         if start_offset > end_offset {
@@ -218,14 +249,17 @@ impl PagerBuffer {
         let start = self.byte_index_for_char_offset(start_offset);
         let end = self.byte_index_for_char_offset(end_offset);
         let bytes = &self.bytes[start..end];
-        merge::merge_bytes_with_events_and_spans(
+        let previous_rendered_text = self.render_state_before_range(start_offset);
+        resolved_output::render_bytes_with_events_and_spans_with_state(
             bytes,
             start as u64,
             end as u64,
             &self.text_spans_in_byte_offsets(start_offset, end_offset),
             &self.events_in_byte_offsets(start_offset, end_offset),
-            output_event_to_content,
+            projection_mode,
+            previous_rendered_text,
         )
+        .0
     }
 
     fn page_end_offset(&self, start_offset: u64, end_offset: u64, target_bytes: u64) -> u64 {
@@ -466,55 +500,73 @@ impl PagerBuffer {
         self.source_end
     }
 
-    fn append_range(&mut self, range: OutputRange) {
-        if range.start_offset > self.source_end {
-            let gap = range.start_offset.saturating_sub(self.source_end);
-            let notice = format!("[pager] output gap detected ({} bytes skipped)\n", gap);
-            self.append_bytes(notice.as_bytes());
-            self.source_end = range.start_offset;
-        }
-
-        if range.bytes.is_empty() && range.events.is_empty() {
-            self.source_end = self.source_end.max(range.end_offset);
+    fn append_raw_slice(
+        &mut self,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+        source_base_offset: u64,
+        text_spans: &[crate::output_capture::OutputTextSpan],
+    ) {
+        if start >= end || end > bytes.len() {
             return;
         }
-
-        let base_offset = range.start_offset;
         let old_char_len = self.len();
-        self.append_bytes(&range.bytes);
+        let slice = &bytes[start..end];
+        self.append_bytes_with_source_offsets(slice, |byte_offset| {
+            source_base_offset.saturating_add(start.saturating_add(byte_offset) as u64)
+        });
 
-        let chunk_char_index = build_char_index(&range.bytes);
-        for span in range.text_spans {
-            if span.start_byte >= span.end_byte || span.end_byte > range.bytes.len() {
+        let chunk_char_index = build_char_index(slice);
+        for span in text_spans {
+            if span.end_byte <= start || span.start_byte >= end {
+                continue;
+            }
+            let span_start = span.start_byte.max(start).saturating_sub(start);
+            let span_end = span.end_byte.min(end).saturating_sub(start);
+            if span_start >= span_end {
                 continue;
             }
             self.text_spans.push(PagerTextSpan {
-                start: old_char_len.saturating_add(char_offset_for_byte_index(
-                    &chunk_char_index,
-                    span.start_byte,
-                )),
+                start: old_char_len
+                    .saturating_add(char_offset_for_byte_index(&chunk_char_index, span_start)),
                 end: old_char_len
-                    .saturating_add(char_offset_for_byte_index(&chunk_char_index, span.end_byte)),
+                    .saturating_add(char_offset_for_byte_index(&chunk_char_index, span_end)),
                 is_stderr: span.is_stderr,
                 origin: span.origin,
             });
         }
-        for event in range.events {
-            if event.offset < base_offset || event.offset > range.end_offset {
-                continue;
-            }
-            let relative = event.offset.saturating_sub(base_offset) as usize;
-            let char_offset = char_offset_for_byte_index(&chunk_char_index, relative);
-            self.events.push(PagerEvent {
-                offset: old_char_len.saturating_add(char_offset),
-                kind: event.kind,
-            });
-        }
-
-        self.source_end = range.end_offset.max(self.source_end);
     }
 
-    fn append_bytes(&mut self, bytes: &[u8]) {
+    fn append_bytes_at_source_offset(&mut self, bytes: &[u8], source_offset: u64) {
+        self.append_bytes_with_source_offsets(bytes, |_| source_offset);
+    }
+
+    fn append_text_at_source_offset(
+        &mut self,
+        bytes: &[u8],
+        source_offset: u64,
+        is_stderr: bool,
+        origin: ContentOrigin,
+    ) {
+        let start = self.len();
+        self.append_bytes_at_source_offset(bytes, source_offset);
+        let end = self.len();
+        if start < end {
+            self.text_spans.push(PagerTextSpan {
+                start,
+                end,
+                is_stderr,
+                origin,
+            });
+        }
+    }
+
+    fn append_bytes_with_source_offsets(
+        &mut self,
+        bytes: &[u8],
+        source_offset_for_byte: impl Fn(usize) -> u64,
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -524,6 +576,11 @@ impl PagerBuffer {
 
         let chunk_index = build_char_index(bytes);
         extend_char_index(&mut self.char_to_byte, &chunk_index, old_byte_len);
+        extend_source_offsets(
+            &mut self.source_offsets,
+            &chunk_index,
+            source_offset_for_byte,
+        );
         self.line_ends
             .extend(line_end_offsets(bytes, &chunk_index, old_char_len));
     }
@@ -534,6 +591,18 @@ impl PagerBuffer {
 
     fn char_offset_for_byte_index(&self, byte_index: usize) -> u64 {
         char_offset_for_byte_index(&self.char_to_byte, byte_index)
+    }
+
+    fn source_offset_for_char_offset(&self, offset: u64) -> u64 {
+        if self.source_offsets.is_empty() {
+            return self.source_end;
+        }
+        let max = self.source_offsets.len().saturating_sub(1) as u64;
+        let idx = offset.min(max) as usize;
+        self.source_offsets
+            .get(idx)
+            .copied()
+            .unwrap_or(self.source_end)
     }
 
     fn events_in_byte_offsets(&self, start_offset: u64, end_offset: u64) -> Vec<PagerEventByte> {
@@ -570,6 +639,27 @@ impl PagerBuffer {
             });
         }
         spans
+    }
+
+    fn render_state_before_range(&self, start_offset: u64) -> Option<RenderedTextState> {
+        let mut boundary_continuation = None;
+        for span in &self.text_spans {
+            if span.start < start_offset && start_offset < span.end {
+                return Some(rendered_state_for_span(span));
+            }
+            if span.end == start_offset
+                && span.start < span.end
+                && !self.span_ends_with_newline(span)
+            {
+                boundary_continuation = Some(rendered_state_for_span(span));
+            }
+        }
+        boundary_continuation
+    }
+
+    fn span_ends_with_newline(&self, span: &PagerTextSpan) -> bool {
+        let end = self.byte_index_for_char_offset(span.end);
+        end > 0 && self.bytes.get(end.saturating_sub(1)) == Some(&b'\n')
     }
 
     fn image_offsets_in_range(&self, start_offset: u64, end_offset: u64, limit: usize) -> Vec<u64> {
@@ -615,6 +705,15 @@ impl PagerBuffer {
     }
 }
 
+fn rendered_state_for_span(span: &PagerTextSpan) -> RenderedTextState {
+    let stream = if span.is_stderr {
+        TextStream::Stderr
+    } else {
+        TextStream::Stdout
+    };
+    RenderedTextState::continuation(stream, span.origin)
+}
+
 fn ascii_lower(byte: u8) -> u8 {
     if byte.is_ascii_uppercase() {
         byte.to_ascii_lowercase()
@@ -629,7 +728,7 @@ struct PagerEventByte {
     kind: OutputEventKind,
 }
 
-impl merge::EventView for PagerEventByte {
+impl resolved_output::EventView for PagerEventByte {
     fn offset(&self) -> u64 {
         self.offset
     }
@@ -647,7 +746,7 @@ struct PagerTextSpanByte {
     origin: ContentOrigin,
 }
 
-impl merge::TextSpanView for PagerTextSpanByte {
+impl resolved_output::TextSpanView for PagerTextSpanByte {
     fn start(&self) -> u64 {
         self.start
     }
@@ -689,6 +788,19 @@ fn extend_char_index(target: &mut Vec<usize>, appended: &[usize], base_byte: usi
     }
     for offset in appended.iter().skip(1) {
         target.push(base_byte.saturating_add(*offset));
+    }
+}
+
+fn extend_source_offsets(
+    target: &mut Vec<u64>,
+    appended: &[usize],
+    source_offset_for_byte: impl Fn(usize) -> u64,
+) {
+    if target.is_empty() {
+        target.push(source_offset_for_byte(0));
+    }
+    for offset in appended.iter().skip(1) {
+        target.push(source_offset_for_byte(*offset));
     }
 }
 
@@ -893,7 +1005,7 @@ impl Pager {
         }
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
-        state.buffer.append_range(range);
+        state.buffer.append_timeline_range(range);
         if let Some(session) = state.search_session.as_mut() {
             session.buffer_len = 0;
         }
@@ -1543,8 +1655,12 @@ impl Pager {
                     } else {
                         let desired_offset = desired_offset.expect("seek offset missing");
                         state.buffer.advance_offset_to(desired_offset);
-                        let (contents, pages_left, span) =
-                            take_next_page(&mut state.buffer, page_bytes, &mut state.seen_ranges);
+                        let (contents, pages_left, span) = take_next_page(
+                            &mut state.buffer,
+                            page_bytes,
+                            &mut state.seen_ranges,
+                            ProjectionMode::Pager,
+                        );
                         CommandOutcome::page(contents, pages_left, is_error, span)
                     }
                 }
@@ -1627,65 +1743,32 @@ pub(crate) fn maybe_activate_and_append_footer(
     contents.push(WorkerContent::server_stderr(pager.footer(pages_left)));
 }
 
-pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
-    if range.bytes.is_empty() && range.events.is_empty() {
-        return Vec::new();
-    }
-    let buffer = PagerBuffer::from_range(range);
-    buffer.contents_for_range(0, buffer.len())
-}
-
 #[cfg(test)]
-pub(crate) fn contents_from_bytes_and_events(
-    bytes: Vec<u8>,
-    events: Vec<(u64, OutputEventKind)>,
-    text_spans: Vec<crate::output_capture::OutputTextSpan>,
-    source_end: u64,
-) -> Vec<WorkerContent> {
-    let buffer = PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
-    buffer.contents_for_range(0, buffer.len())
-}
-
-fn output_event_to_content(kind: &OutputEventKind) -> WorkerContent {
-    match kind {
-        OutputEventKind::Image {
-            data,
-            mime_type,
-            id,
-            is_new,
-            ..
-        } => WorkerContent::ContentImage {
-            data: data.clone(),
-            mime_type: mime_type.clone(),
-            id: id.clone(),
-            is_new: *is_new,
-        },
-        OutputEventKind::Text {
-            text,
-            is_stderr,
-            origin,
-            ..
-        } => {
-            if *is_stderr {
-                match origin {
-                    ContentOrigin::Worker => WorkerContent::worker_stderr(text.clone()),
-                    ContentOrigin::Server => WorkerContent::server_stderr(text.clone()),
-                }
-            } else {
-                match origin {
-                    ContentOrigin::Worker => WorkerContent::worker_stdout(text.clone()),
-                    ContentOrigin::Server => WorkerContent::server_stdout(text.clone()),
-                }
-            }
-        }
-    }
+pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
+    resolved_output::contents_from_output_range(range, ProjectionMode::Pager)
 }
 
 pub(crate) fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Vec<WorkerContent> {
     let start_offset = output.current_offset().unwrap_or(end_offset);
+    let previous_rendered_text = output.rendered_text_state();
     let range = output.read_range(start_offset, end_offset);
-    output.advance_offset_to(end_offset);
-    contents_from_output_range(range)
+    let consumed_end = range.end_offset;
+    let boundary_events_consumed = range
+        .events
+        .iter()
+        .filter(|event| event.offset == consumed_end)
+        .count();
+    let (contents, last_rendered_text) = resolved_output::contents_from_output_range_with_state(
+        range,
+        ProjectionMode::Reply,
+        previous_rendered_text,
+    );
+    output.advance_offset_to_with_rendered_text_and_boundary_events(
+        consumed_end,
+        last_rendered_text,
+        boundary_events_consumed,
+    );
+    contents
 }
 
 pub(crate) fn take_snapshot_page_from_ring(
@@ -1693,7 +1776,7 @@ pub(crate) fn take_snapshot_page_from_ring(
     end_offset: u64,
     target_bytes: u64,
 ) -> SnapshotPage {
-    let Some(range) = snapshot_from_ring(output, end_offset) else {
+    let Some((range, previous_rendered_text)) = snapshot_from_ring(output, end_offset) else {
         return SnapshotPage {
             contents: Vec::new(),
             pages_left: 0,
@@ -1702,28 +1785,90 @@ pub(crate) fn take_snapshot_page_from_ring(
             last_range_end_byte: None,
         };
     };
-    take_snapshot_page_from_buffer(PagerBuffer::from_range(range), target_bytes)
+    let consumed_end = range.end_offset;
+    let boundary_events_consumed = range
+        .events
+        .iter()
+        .filter(|event| event.offset == consumed_end)
+        .count();
+    let (snapshot, last_rendered_text) =
+        take_snapshot_page_from_range(range, target_bytes, previous_rendered_text);
+    output.advance_offset_to_with_rendered_text_and_boundary_events(
+        consumed_end,
+        last_rendered_text,
+        boundary_events_consumed,
+    );
+    snapshot
 }
 
-pub(crate) fn take_snapshot_page_from_buffer(
-    mut buffer: PagerBuffer,
+fn take_snapshot_page_from_range(
+    range: OutputRange,
     target_bytes: u64,
-) -> SnapshotPage {
+    previous_rendered_text: Option<RenderedTextState>,
+) -> (SnapshotPage, Option<RenderedTextState>) {
+    let mut buffer = PagerBuffer::from_timeline_range(range.clone());
     if buffer.bytes.is_empty() {
-        let contents = buffer.contents_for_range(0, buffer.len());
-        return SnapshotPage {
-            contents,
-            pages_left: 0,
-            buffer: Some(buffer),
-            last_range: None,
-            last_range_end_byte: None,
-        };
+        let (contents, last_rendered_text) = resolved_output::contents_from_output_range_with_state(
+            range,
+            ProjectionMode::Reply,
+            previous_rendered_text,
+        );
+        return (
+            SnapshotPage {
+                contents,
+                pages_left: 0,
+                buffer: Some(buffer),
+                last_range: None,
+                last_range_end_byte: None,
+            },
+            last_rendered_text,
+        );
     }
+    let pager_buffer = buffer.clone();
     let mut seen = RangeSet::default();
-    let (contents, pages_left, span) = take_next_page(&mut buffer, target_bytes, &mut seen);
+    let (_contents, pages_left, span) =
+        take_next_page(&mut buffer, target_bytes, &mut seen, ProjectionMode::Reply);
+    if pages_left > 0 {
+        return (
+            take_snapshot_page_from_buffer_with_projection(
+                pager_buffer,
+                target_bytes,
+                ProjectionMode::Pager,
+            ),
+            None,
+        );
+    }
     let last_range_end_byte = span
         .last
-        .map(|(_, end)| buffer.byte_index_for_char_offset(end) as u64);
+        .map(|(_, end)| buffer.source_offset_for_char_offset(end));
+    let (contents, last_rendered_text) = resolved_output::contents_from_output_range_with_state(
+        range,
+        ProjectionMode::Reply,
+        previous_rendered_text,
+    );
+    (
+        SnapshotPage {
+            contents,
+            pages_left,
+            buffer: Some(pager_buffer),
+            last_range: span.last,
+            last_range_end_byte,
+        },
+        last_rendered_text,
+    )
+}
+
+fn take_snapshot_page_from_buffer_with_projection(
+    mut buffer: PagerBuffer,
+    target_bytes: u64,
+    projection_mode: ProjectionMode,
+) -> SnapshotPage {
+    let mut seen = RangeSet::default();
+    let (contents, pages_left, span) =
+        take_next_page(&mut buffer, target_bytes, &mut seen, projection_mode);
+    let last_range_end_byte = span
+        .last
+        .map(|(_, end)| buffer.source_offset_for_char_offset(end));
     SnapshotPage {
         contents,
         pages_left,
@@ -1733,21 +1878,25 @@ pub(crate) fn take_snapshot_page_from_buffer(
     }
 }
 
-fn snapshot_from_ring(output: &OutputBuffer, end_offset: u64) -> Option<OutputRange> {
+fn snapshot_from_ring(
+    output: &OutputBuffer,
+    end_offset: u64,
+) -> Option<(OutputRange, Option<RenderedTextState>)> {
     output.start_capture();
     let start_offset = output.current_offset().unwrap_or(end_offset);
+    let previous_rendered_text = output.rendered_text_state();
     let range = output.read_range(start_offset, end_offset);
-    output.advance_offset_to(end_offset);
     if range.bytes.is_empty() && range.events.is_empty() {
         return None;
     }
-    Some(range)
+    Some((range, previous_rendered_text))
 }
 
 fn take_next_page(
     buffer: &mut PagerBuffer,
     target_bytes: u64,
     seen: &mut RangeSet,
+    projection_mode: ProjectionMode,
 ) -> (Vec<WorkerContent>, u64, RangeSpan) {
     let target_bytes = target_bytes.max(1);
     let end_offset = buffer.len();
@@ -1795,7 +1944,8 @@ fn take_next_page(
             contents.push(elision_marker(gap_start, gap_end));
         }
 
-        let segment_contents = buffer.contents_for_range(cursor, visible_end);
+        let segment_contents =
+            buffer.contents_for_range_with_projection_mode(cursor, visible_end, projection_mode);
         if !segment_contents.is_empty() {
             contents.extend(segment_contents);
         }
@@ -1899,7 +2049,8 @@ fn take_next_pages(
     let mut pages_left = 0;
     let mut span = RangeSpan::default();
     for _ in 0..count {
-        let (page_contents, left, range) = take_next_page(buffer, target_bytes, seen);
+        let (page_contents, left, range) =
+            take_next_page(buffer, target_bytes, seen, ProjectionMode::Pager);
         pages_left = left;
         if page_contents.is_empty() {
             break;
@@ -1998,7 +2149,7 @@ fn skip_pages_and_take_next(
     }
 
     buffer.advance_offset_to(cursor);
-    take_next_page(buffer, page_bytes, seen)
+    take_next_page(buffer, page_bytes, seen, ProjectionMode::Pager)
 }
 
 fn take_unseen_segments_in_range(
@@ -2182,13 +2333,10 @@ mod tests {
     use super::*;
     use crate::output_capture::{
         OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTextSpan, OutputTimeline,
-        ensure_output_ring, reset_output_ring,
     };
     use crate::worker_protocol::TextStream;
-    use std::sync::MutexGuard;
 
     struct OutputPagerFixture {
-        _guard: MutexGuard<'static, ()>,
         pager: Pager,
         output: OutputBuffer,
         timeline: OutputTimeline,
@@ -2234,18 +2382,9 @@ mod tests {
         pager
     }
 
-    fn output_ring_test_guard() -> MutexGuard<'static, ()> {
-        crate::output_capture::output_ring_test_mutex()
-            .lock()
-            .expect("output ring test lock")
-    }
-
     fn activate_pager_from_output(text: &str) -> OutputPagerFixture {
-        let guard = output_ring_test_guard();
-        reset_output_ring();
-        let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        let timeline = OutputTimeline::new(ring);
-        let output = OutputBuffer::default();
+        let timeline = OutputTimeline::with_capacity(OUTPUT_RING_CAPACITY_BYTES);
+        let output = timeline.buffer();
         output.start_capture();
         timeline.append_text(text.as_bytes(), false, ContentOrigin::Worker);
         let end_offset = output.end_offset().expect("output end offset");
@@ -2255,7 +2394,6 @@ mod tests {
         let mut pager = Pager::default();
         pager.activate(buffer, false);
         OutputPagerFixture {
-            _guard: guard,
             pager,
             output,
             timeline,
@@ -3502,11 +3640,8 @@ mod tests {
 
     #[test]
     fn compact_search_cards_preserve_original_stream() {
-        let guard = output_ring_test_guard();
-        reset_output_ring();
-        let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        let timeline = OutputTimeline::new(ring);
-        let output = OutputBuffer::default();
+        let timeline = OutputTimeline::with_capacity(OUTPUT_RING_CAPACITY_BYTES);
+        let output = timeline.buffer();
         output.start_capture();
         timeline.append_text(b"warning foo details\n", true, ContentOrigin::Worker);
         let end_offset = output.end_offset().expect("output end offset");
@@ -3541,8 +3676,6 @@ mod tests {
             "expected compact search body to stay worker-originated, got: {:?}",
             body.1
         );
-
-        drop(guard);
     }
 
     #[test]
@@ -3704,7 +3837,7 @@ mod tests {
             .as_mut()
             .expect("pager active")
             .buffer
-            .append_range(OutputRange {
+            .append_timeline_range(OutputRange {
                 start_offset: "stderr: init\n".len() as u64,
                 end_offset: ("stderr: init\n".len() + appended_text.len()) as u64,
                 bytes: appended_text.as_bytes().to_vec(),
@@ -3962,11 +4095,11 @@ mod tests {
     }
 
     #[test]
-    fn buffer_replay_preserves_server_origin() {
+    fn event_replay_preserves_server_origin() {
         let server_line = "[repl] session ended\n";
         let worker_line = "worker output\n";
         let bytes = format!("{server_line}{worker_line}").into_bytes();
-        let contents = contents_from_bytes_and_events(
+        let buffer = PagerBuffer::from_bytes_and_events(
             bytes,
             vec![(
                 0,
@@ -3994,6 +4127,7 @@ mod tests {
             ],
             (server_line.len() + worker_line.len()) as u64,
         );
+        let contents = buffer.contents_for_range(0, buffer.len());
 
         assert!(
             contents.iter().any(|content| matches!(
@@ -4001,7 +4135,7 @@ mod tests {
                 WorkerContent::ContentText { text, origin, .. }
                     if text.contains(server_line) && matches!(origin, ContentOrigin::Server)
             )),
-            "expected replay to preserve server-originated pager text, got: {:?}",
+            "expected event replay to preserve server-originated pager text, got: {:?}",
             contents
         );
         assert!(
@@ -4010,7 +4144,124 @@ mod tests {
                 WorkerContent::ContentText { text, origin, .. }
                     if text.contains("output truncated") && matches!(origin, ContentOrigin::Server)
             )),
-            "expected replay to preserve server-originated text events, got: {:?}",
+            "expected event replay to preserve server-originated text events, got: {:?}",
+            contents
+        );
+    }
+
+    #[test]
+    fn append_gap_notice_stays_server_originated() {
+        let initial = "before\n";
+        let later = "after\n";
+        let mut buffer = PagerBuffer::from_range(OutputRange {
+            start_offset: 0,
+            end_offset: initial.len() as u64,
+            bytes: initial.as_bytes().to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: initial.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Raw,
+            }],
+        });
+
+        buffer.append_timeline_range(OutputRange {
+            start_offset: 32,
+            end_offset: 32 + later.len() as u64,
+            bytes: later.as_bytes().to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: later.len(),
+                is_stderr: false,
+                origin: ContentOrigin::Worker,
+                source: crate::output_capture::OutputTextSource::Raw,
+            }],
+        });
+
+        let contents = buffer.contents_for_range(0, buffer.len());
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText {
+                    text,
+                    stream: TextStream::Stderr,
+                    origin: ContentOrigin::Server,
+                    ..
+                } if text.contains("[pager] output gap detected")
+            )),
+            "expected pager gap notice to be server stderr, got: {:?}",
+            contents
+        );
+    }
+
+    #[test]
+    fn adjacent_stderr_span_at_page_boundary_continues_without_prefix() {
+        let first = "a".repeat(64);
+        let second = "tail continues\n";
+        let bytes = format!("{first}{second}").into_bytes();
+        let first_len = first.len();
+        let mut buffer = PagerBuffer::from_bytes_and_events(
+            bytes,
+            Vec::new(),
+            vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: first_len,
+                    is_stderr: true,
+                    origin: ContentOrigin::Worker,
+                    source: crate::output_capture::OutputTextSource::Ipc,
+                },
+                OutputTextSpan {
+                    start_byte: first_len,
+                    end_byte: first_len + second.len(),
+                    is_stderr: true,
+                    origin: ContentOrigin::Worker,
+                    source: crate::output_capture::OutputTextSource::Ipc,
+                },
+            ],
+            (first_len + second.len()) as u64,
+        );
+        buffer.advance_offset_to(first_len as u64);
+        let mut pager = Pager::default();
+        pager.activate(buffer, true);
+
+        let text = text_from_reply(pager.handle_command(":next\n"));
+
+        assert!(
+            text.contains(second),
+            "expected second stderr span on next page, got: {text:?}"
+        );
+        assert!(
+            !text.contains("stderr: tail"),
+            "adjacent stderr continuation should not repeat the stderr prefix, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn ring_range_replay_rebases_text_spans_after_advanced_cursor() {
+        let timeline = OutputTimeline::with_capacity(OUTPUT_RING_CAPACITY_BYTES);
+        let output = timeline.buffer();
+
+        output.start_capture();
+        timeline.append_text(b"already consumed\n", false, ContentOrigin::Worker);
+        let consumed_end = output.end_offset().expect("output end offset");
+        output.advance_offset_to(consumed_end);
+
+        timeline.append_text(b"warning details\n", true, ContentOrigin::Worker);
+        let end_offset = output.end_offset().expect("output end offset");
+        let contents = take_range_from_ring(&output, end_offset);
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream, .. }
+                    if text.contains("warning details")
+                        && matches!(stream, TextStream::Stderr)
+            )),
+            "expected nonzero ring range replay to preserve stderr, got: {:?}",
             contents
         );
     }

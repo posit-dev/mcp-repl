@@ -19,11 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "TMPDIR_SET=TRUE\nTMPDIR_MATCH=TRUE\nTEMPDIR_UNDER_TMPDIR=TRUE\nTEMPDIR_MARKER_OK\nTEMPFILE_OK\nTEMPDIR_LIST=mcp-repl-snapshot.txt\nROOT_MARKER_OK\nROOT_MARKER_EXISTS=TRUE"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "TMPDIR_SET=TRUE\nTMPDIR_MATCH=TRUE\nTEMPDIR_UNDER_TMPDIR=TRUE\nTEMPDIR_MARKER_OK\nTEMPFILE_OK\nTEMPDIR_LIST=mcp-repl-snapshot.txt\nROOT_MARKER_OK\nROOT_MARKER_EXISTS=TRUE\n> "
     }
   ]
 }
@@ -62,11 +58,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "ROOT_MARKER_EXISTS=FALSE\nTEMPDIR_LIST=\nTEMPDIR_UNDER_TMPDIR=TRUE"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "ROOT_MARKER_EXISTS=FALSE\nTEMPDIR_LIST=\nTEMPDIR_UNDER_TMPDIR=TRUE\n> "
     }
   ]
 }
@@ -105,11 +97,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "ROOT_MARKER_EXISTS=FALSE\nTEMPDIR_LIST=\nTEMPDIR_UNDER_TMPDIR=TRUE"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "ROOT_MARKER_EXISTS=FALSE\nTEMPDIR_LIST=\nTEMPDIR_UNDER_TMPDIR=TRUE\n> "
     }
   ]
 }

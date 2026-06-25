@@ -18,7 +18,6 @@ pub(crate) struct InputContext {
 
 pub(crate) struct ReplyWithOffset {
     pub(crate) reply: WorkerReply,
-    pub(crate) end_offset: u64,
 }
 
 pub(crate) struct CompletionInfo {
@@ -74,7 +73,6 @@ impl PagerCompletionPrompt {
 pub(crate) fn build_completed_reply(
     mut contents: Vec<WorkerContent>,
     is_error: bool,
-    end_offset: u64,
     completion: &CompletionInfo,
     session_end: bool,
     mode: CompletionReplyMode,
@@ -131,18 +129,13 @@ pub(crate) fn build_completed_reply(
                 prompt: reply_prompt,
                 prompt_variants: completion.prompt_variants.clone(),
             },
-            end_offset,
         },
         prompt_to_remember: raw_prompt,
         pager_prompt,
     }
 }
 
-pub(crate) fn build_timeout_reply(
-    contents: Vec<WorkerContent>,
-    is_error: bool,
-    end_offset: u64,
-) -> ReplyWithOffset {
+pub(crate) fn build_timeout_reply(contents: Vec<WorkerContent>, is_error: bool) -> ReplyWithOffset {
     ReplyWithOffset {
         reply: WorkerReply::Output {
             contents,
@@ -151,7 +144,6 @@ pub(crate) fn build_timeout_reply(
             prompt: None,
             prompt_variants: None,
         },
-        end_offset,
     }
 }
 

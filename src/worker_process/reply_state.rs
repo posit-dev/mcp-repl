@@ -40,8 +40,7 @@ impl WorkerManager {
             append_prompt_if_missing(contents, resolved_prompt.clone());
             *prompt = resolved_prompt;
         }
-        let end_offset = self.output.end_offset().unwrap_or(0);
-        Some(ReplyWithOffset { reply, end_offset })
+        Some(ReplyWithOffset { reply })
     }
 
     pub(super) fn guardrail_event_pending(&self) -> bool {
@@ -121,7 +120,6 @@ impl WorkerManager {
     }
 
     pub(super) fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        let _ = reply.end_offset;
         reply.reply
     }
 
@@ -140,19 +138,15 @@ impl WorkerManager {
     }
 
     pub(super) fn drain_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape.drain_snapshot().format_contents()
+        self.pending_output_tape.drain_output()
     }
 
     pub(super) fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_final_snapshot()
-            .format_contents_for_reply()
+        self.pending_output_tape.drain_final_output()
     }
 
     pub(super) fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_sealed_snapshot()
-            .format_contents()
+        self.pending_output_tape.drain_sealed_output()
     }
 
     pub(super) fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
@@ -168,7 +162,6 @@ impl WorkerManager {
                 prompt,
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -185,7 +178,6 @@ impl WorkerManager {
                 prompt,
                 prompt_variants: None,
             },
-            end_offset: self.output.end_offset().unwrap_or(0),
         }
     }
 }

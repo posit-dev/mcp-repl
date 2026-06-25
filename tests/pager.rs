@@ -93,7 +93,14 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
         initial_text.contains("--More--"),
         "expected pager to activate, got: {initial_text:?}"
     );
-
+    assert!(
+        !initial_text.starts_with("> line <- paste("),
+        "did not expect pager page to include generated input echo, got: {initial_text:?}"
+    );
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager page to include pager footer, got: {initial_text:?}"
+    );
     let next = session.write_stdin_raw_with(":next", Some(30.0)).await?;
     let next_text = result_text(&next);
     assert!(
