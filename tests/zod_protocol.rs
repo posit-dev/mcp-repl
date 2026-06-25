@@ -2058,7 +2058,7 @@ async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> Te
         "input-wait Ctrl-C must use cached readiness instead of timing out, got: {interrupted_text:?}"
     );
 
-    let log = read_optional(&control_log);
+    let log = wait_for_log_contains(&control_log, "interrupt")?;
     assert!(
         log.contains("interrupt"),
         "input-wait Ctrl-C must send payload-free sideband interrupt, got log: {log:?}"
