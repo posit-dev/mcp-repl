@@ -3,6 +3,16 @@ use crate::backend::Backend;
 use crate::worker_protocol::TextStream;
 use crate::worker_protocol::{ContentOrigin, WorkerContent};
 
+pub(crate) fn input_echo_text(prompt: &str, line: &str) -> Option<String> {
+    if prompt.is_empty() && line.is_empty() {
+        return None;
+    }
+    let mut text = String::with_capacity(prompt.len().saturating_add(line.len()));
+    text.push_str(prompt);
+    text.push_str(line);
+    Some(text)
+}
+
 pub(crate) fn normalize_prompt(prompt: Option<String>) -> Option<String> {
     prompt.filter(|value| !value.is_empty())
 }
@@ -116,7 +126,13 @@ pub(crate) fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &
     let Some(idx) = idx else {
         return;
     };
-    let WorkerContent::ContentText { text, stream, .. } = &contents[idx] else {
+    let WorkerContent::ContentText {
+        text,
+        stream,
+        visibility,
+        ..
+    } = &contents[idx]
+    else {
         return;
     };
     let Some(prefix) = text.strip_suffix(prompt) else {
@@ -129,6 +145,7 @@ pub(crate) fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &
             text: prefix.to_string(),
             stream: *stream,
             origin: ContentOrigin::Worker,
+            visibility: *visibility,
         };
     }
 }
@@ -151,6 +168,7 @@ fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt
                 text,
                 stream: TextStream::Stdout,
                 origin: ContentOrigin::Worker,
+                visibility,
             } => {
                 let Some(prefix) = text.strip_suffix(prompt) else {
                     return;
@@ -162,6 +180,7 @@ fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt
                         text: prefix.to_string(),
                         stream: TextStream::Stdout,
                         origin: ContentOrigin::Worker,
+                        visibility: *visibility,
                     };
                 }
                 return;
@@ -172,5 +191,20 @@ fn strip_trailing_worker_stdout_prompt(contents: &mut Vec<WorkerContent>, prompt
             }
             | WorkerContent::ContentImage { .. } => return,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_echo_text_combines_prompt_and_consumed_line() {
+        assert_eq!(input_echo_text("> ", "1+1\n").as_deref(), Some("> 1+1\n"));
+    }
+
+    #[test]
+    fn input_echo_text_skips_empty_events() {
+        assert_eq!(input_echo_text("", ""), None);
     }
 }

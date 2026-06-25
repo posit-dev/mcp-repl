@@ -25,6 +25,10 @@
   libr = { git = "https://github.com/t-kalinowski/ark", rev = "43441280f5bb84d9566e8f47f1c6b8614d056340" }
   memchr = "2.8.0"
   regex-lite = "0.1"
+  # Harp loads embedded R module assets during R startup. In debug builds,
+  # rust-embed defaults to reading those assets from Cargo's source checkout,
+  # which is outside Codex's `:minimal` read profile.
+  rust-embed = { version = "8.2.0", features = ["debug-embed"] }
   rmcp = { version = "1.2.0", features = [
     "client",
     "transport-child-process",

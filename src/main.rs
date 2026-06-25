@@ -25,6 +25,7 @@ mod r_graphics;
 mod r_htmd;
 mod r_session;
 mod reply_presentation;
+mod resolved_output;
 mod sandbox;
 mod sandbox_cli;
 mod server;
@@ -565,7 +566,10 @@ If no --interpreter is specified, install uses the full interpreter grid for eac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::{SandboxPolicy, SandboxState};
+    use crate::sandbox::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxKind,
+        FileSystemSandboxPolicy, FileSystemSpecialPath, NetworkAccess, SandboxPolicy, SandboxState,
+    };
     use crate::sandbox_cli::{
         SandboxConfigOperation, resolve_effective_sandbox_state,
         sandbox_plan_requests_inherited_state,
@@ -859,6 +863,58 @@ mod tests {
 
         let err = resolve_effective_sandbox_state(&plan, None)
             .expect_err("earlier invalid ordered op should still fail");
+        assert!(
+            err.contains(
+                "--add-writable-root can only be used while sandbox mode is workspace-write"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn managed_inherit_does_not_validate_as_workspace_write() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::Inherit),
+                SandboxCliOperation::AddWritableRoot(std::env::temp_dir()),
+                SandboxCliOperation::SetMode(SandboxModeArg::DangerFullAccess),
+            ],
+        };
+        let inherited = SandboxState {
+            sandbox_policy: SandboxPolicy::Managed {
+                file_system: FileSystemSandboxPolicy {
+                    kind: FileSystemSandboxKind::Restricted,
+                    glob_scan_max_depth: None,
+                    entries: vec![
+                        FileSystemSandboxEntry {
+                            path: FileSystemPath::Special {
+                                value: FileSystemSpecialPath::Root,
+                            },
+                            access: FileSystemAccessMode::Read,
+                        },
+                        FileSystemSandboxEntry {
+                            path: FileSystemPath::Special {
+                                value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                            },
+                            access: FileSystemAccessMode::Write,
+                        },
+                        FileSystemSandboxEntry {
+                            path: FileSystemPath::Special {
+                                value: FileSystemSpecialPath::ProjectRoots {
+                                    subpath: Some("restricted".into()),
+                                },
+                            },
+                            access: FileSystemAccessMode::Read,
+                        },
+                    ],
+                },
+                network_access: NetworkAccess::Restricted,
+            },
+            ..SandboxState::default()
+        };
+
+        let err = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect_err("managed policies must not accept workspace-write-only refinements");
         assert!(
             err.contains(
                 "--add-writable-root can only be used while sandbox mode is workspace-write"

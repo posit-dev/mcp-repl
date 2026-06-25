@@ -613,11 +613,11 @@ def expected_large_text_preview(label: str, output_number: int) -> str:
 
 
 def expected_capped_text_preview(label: str, output_number: int) -> str:
-    lines = "".join(repeated_text_line(label, index) for index in range(1, 17))
+    lines = "".join(repeated_text_line(label, index) for index in range(1, 15))
     return (
         lines
-        + f"{label}017 {label}\n"
-        + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt; "
+        + f"{label}01\n"
+        + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/events.log; "
         "later content omitted]..."
     )
 
@@ -642,10 +642,7 @@ def require_text_file(path: Path, context: str) -> str:
 def r_console_basic(client: McpStdioClient) -> None:
     received = client.repl("1+1\n", timeout_ms=30000)
 
-    expected = tool_result(
-        text("[1] 2\n"),
-        text("> "),
-    )
+    expected = tool_result(text("[1] 2\n> "))
 
     assert_identical(expected, received, "repl")
 
@@ -660,7 +657,7 @@ def r_write_stdin_multiple_calls(client: McpStdioClient) -> None:
 
     add_var = client.repl("x + 1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         add_var,
         "write_stdin follow-up repl",
     )
@@ -671,7 +668,7 @@ def r_write_stdin_timeout_polling_returns_pending_output(
 ) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         warmup,
         "timeout polling warmup repl",
     )
@@ -720,7 +717,7 @@ def r_write_stdin_recovers_after_error(client: McpStdioClient) -> None:
         )
 
 
-def r_write_stdin_does_not_synthesize_huge_input_only_transcript(
+def r_write_stdin_files_bundle_includes_huge_assignment_input_echoes(
     client: McpStdioClient,
 ) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 2001))
@@ -728,17 +725,31 @@ def r_write_stdin_does_not_synthesize_huge_input_only_transcript(
     received_text = require_success(received, "write_stdin huge input-only repl")
     if is_busy_response(received):
         raise SuiteFailure(
-            f"expected huge input-only request to complete, got: {received_text!r}"
+            f"expected huge assignment input to complete, got: {received_text!r}"
         )
     if "--More--" in received_text:
         raise SuiteFailure(
-            f"did not expect pager activation for input-only request, got: {received_text!r}"
+            f"did not expect pager activation for huge assignment input, got: {received_text!r}"
         )
-    if received_text != "> ":
-        raise SuiteFailure(f"expected prompt-only reply, got: {received_text!r}")
+    if "x500 <- 500" in received_text or "x2000 <- 2000" in received_text:
+        raise SuiteFailure(
+            f"assignment-only generated echoes should be absent inline, got: {received_text!r}"
+        )
+    transcript_path = require_transcript_path(
+        received_text,
+        "write_stdin huge assignment repl",
+    )
+    spill_text = require_text_file(
+        transcript_path,
+        "write_stdin huge assignment transcript",
+    )
+    if "x500 <- 500" not in spill_text or "x2000 <- 2000" not in spill_text:
+        raise SuiteFailure(
+            f"expected full assignment input echo in spill file, got: {spill_text!r}"
+        )
 
 
-def r_write_stdin_does_not_synthesize_huge_submitted_input(
+def r_write_stdin_files_bundle_includes_huge_interleaved_input_echoes(
     client: McpStdioClient,
 ) -> None:
     input_text = "".join(f"x{idx} <- {idx}\n" for idx in range(1, 1001))
@@ -750,52 +761,38 @@ def r_write_stdin_does_not_synthesize_huge_submitted_input(
     received_text = require_success(received, "write_stdin huge interleaved input repl")
     if is_busy_response(received):
         raise SuiteFailure(
-            f"expected huge interleaved input to complete, got: {received_text!r}"
+            f"expected huge interleaved echo input to complete, got: {received_text!r}"
         )
     if "--More--" in received_text:
         raise SuiteFailure(
-            "did not expect pager activation for huge input with small output, "
+            "did not expect pager activation for huge generated input text with small output, "
             f"got: {received_text!r}"
         )
-
-    transcript_path = bundle_transcript_path(received_text)
-    if transcript_path is not None:
-        spill_text = require_text_file(
-            transcript_path,
-            "write_stdin huge interleaved input transcript",
-        )
-        if "x500 <- 500" in spill_text:
-            raise SuiteFailure(
-                "did not expect submitted assignment input in spill file, "
-                f"got: {spill_text!r}"
-            )
-        if "y500 <- 500" in spill_text:
-            raise SuiteFailure(
-                "did not expect submitted trailing input in spill file, "
-                f"got: {spill_text!r}"
-            )
-        if "ok" not in spill_text or "done" not in spill_text:
-            raise SuiteFailure(
-                f"expected output from both cat() calls in spill file, got: {spill_text!r}"
-            )
-        if "done" not in received_text:
-            raise SuiteFailure(
-                f"expected the inline tail to keep the final output, got: {received_text!r}"
-            )
-        return
 
     if "ok" not in received_text or "done" not in received_text:
         raise SuiteFailure(
             f"expected output from both cat() calls inline, got: {received_text!r}"
         )
-    if "x500 <- 500" in received_text:
+    if "x500 <- 500" in received_text or "y500 <- 500" in received_text:
         raise SuiteFailure(
-            f"did not expect submitted assignment input inline, got: {received_text!r}"
+            f"generated input text should be absent inline, got: {received_text!r}"
         )
-    if "y500 <- 500" in received_text:
+
+    transcript_path = require_transcript_path(
+        received_text,
+        "write_stdin huge interleaved echo repl",
+    )
+    spill_text = require_text_file(
+        transcript_path,
+        "write_stdin huge interleaved echo transcript",
+    )
+    if "x500 <- 500" not in spill_text or "y500 <- 500" not in spill_text:
         raise SuiteFailure(
-            "did not expect submitted trailing input inline, "
-            f"got: {received_text!r}"
+            f"expected full generated input echo in spill file, got: {spill_text!r}"
+        )
+    if "ok" not in spill_text or "done" not in spill_text:
+        raise SuiteFailure(
+            f"expected output from both cat() calls in spill file, got: {spill_text!r}"
         )
 
 
@@ -861,7 +858,7 @@ def python_busy_discards_input(client: McpStdioClient) -> None:
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         warmup,
         "warmup repl",
     )
@@ -894,7 +891,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
 
     recovered = client.repl("1+1\n", timeout_ms=5000)
     assert_identical(
-        tool_result(text("[1] 2\n"), text("> ")),
+        tool_result(text("[1] 2\n> ")),
         recovered,
         "recovery repl",
     )
@@ -917,7 +914,7 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
 
     after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
     assert_identical(
-        tool_result(text("[1] FALSE\n"), text("> ")),
+        tool_result(text("[1] FALSE\n> ")),
         after_reset,
         "after reset repl",
     )
@@ -1057,8 +1054,7 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
     assert_identical(
         tool_result(
             text("[repl] new session started\n"),
-            text("[1] FALSE\n"),
-            text("> "),
+            text("[1] FALSE\n> "),
         ),
         restarted,
         "restart prefix repl",
@@ -1086,8 +1082,12 @@ def r_interrupt_restart_prefixes(client: McpStdioClient) -> None:
 
     expected_interrupted = tool_result(
         text("interrupt received\n"),
-        text("AFTER_INTERRUPT\n"),
-        text("> "),
+        text("AFTER_INTERRUPT\n> "),
+    )
+    expected_interrupted_with_stderr_prefix = tool_result(
+        text("interrupt received\n"),
+        text("\nstderr: \n"),
+        text("AFTER_INTERRUPT\n> "),
     )
     interrupted = client.repl('\u0003cat("AFTER_INTERRUPT\\n")', timeout_ms=5000)
     if is_busy_response(interrupted):
@@ -1220,6 +1220,52 @@ def r_output_bundle_files(client: McpStdioClient) -> None:
             )
 
 
+def r_output_bundle_above_timeline_capacity(client: McpStdioClient) -> None:
+    files_output_timeline_capacity_bytes = 64 * 1024 * 1024
+    line_width = 4096
+    line_count = files_output_timeline_capacity_bytes // line_width + 1024
+    input_text = dedent(
+        f"""
+        chunk <- paste(rep("q", {line_width}), collapse = "")
+        cat("TIMELINE_FIRST\\n")
+        for (i in 1:{line_count}) cat(sprintf("timeline%05d %s\\n", i, chunk))
+        cat("TIMELINE_LAST\\n")
+        """
+    )
+
+    received = client.repl(input_text, timeout_ms=120000)
+    received_text = require_success(
+        received,
+        "output bundle above timeline capacity repl",
+    )
+    transcript_path = require_transcript_path(
+        received_text,
+        "output bundle above timeline capacity repl",
+    )
+    transcript = require_text_file(
+        transcript_path,
+        "output bundle above timeline capacity transcript",
+    )
+    if "TIMELINE_FIRST" not in transcript:
+        raise SuiteFailure(
+            "expected capped transcript to retain output before the old files-mode timeline cap"
+        )
+    if "timeline00001" not in transcript:
+        raise SuiteFailure("expected capped transcript to start with the first worker lines")
+    if "timeline16000" in transcript or "TIMELINE_LAST" in transcript:
+        raise SuiteFailure(
+            f"did not expect capped transcript to contain omitted tail, got: {transcript!r}"
+        )
+    if "later content omitted" not in received_text:
+        raise SuiteFailure(
+            f"expected capped output bundle reply to report omitted tail, got: {received_text!r}"
+        )
+    if "[repl] output truncated (older output dropped)" in transcript:
+        raise SuiteFailure(
+            "did not expect ring truncation notice in files-mode output bundle"
+        )
+
+
 def r_output_bundle_size_limit(client: McpStdioClient) -> None:
     received = client.repl(r_large_text_input("z", lines=120), timeout_ms=30000)
     assert_identical(
@@ -1228,16 +1274,16 @@ def r_output_bundle_size_limit(client: McpStdioClient) -> None:
         "output bundle size limit repl",
     )
     received_text = result_text(received)
-    transcript_path = require_transcript_path(
-        received_text,
-        "output bundle size limit repl",
-    )
+    events_log_path = disclosed_path(received_text, "events.log")
+    if events_log_path is None:
+        raise SuiteFailure(
+            f"output bundle size limit repl expected events.log path, got: {received_text!r}"
+        )
+    transcript_path = events_log_path.parent / "transcript.txt"
     transcript = require_text_file(
         transcript_path,
         "output bundle size limit transcript",
     )
-    if (transcript_path.parent / "events.log").exists():
-        raise SuiteFailure("did not expect events.log for text-only capped bundle")
     if "z120" in transcript:
         raise SuiteFailure(
             f"did not expect capped transcript to contain omitted tail, got: {transcript!r}"
@@ -1352,6 +1398,15 @@ CASES: dict[str, SuiteCase] = {
             ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "2097152"),
         ),
     ),
+    "r-output-bundle-above-timeline-capacity": r_suite_case(
+        r_output_bundle_above_timeline_capacity,
+        server_args=("--oversized-output", "files"),
+        server_env=(
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_COUNT", "20"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES", "1048576"),
+            ("MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES", "2097152"),
+        ),
+    ),
     "r-output-bundle-size-limit": r_suite_case(
         r_output_bundle_size_limit,
         server_args=("--oversized-output", "files"),
@@ -1373,8 +1428,9 @@ CASES: dict[str, SuiteCase] = {
     ),
     "r-reset-clears-state": r_suite_case(r_reset_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
-    "r-write-stdin-no-huge-input-only-transcript": r_suite_case(
-        r_write_stdin_does_not_synthesize_huge_input_only_transcript
+    "r-write-stdin-bundles-huge-assignment-input-echoes": r_suite_case(
+        r_write_stdin_files_bundle_includes_huge_assignment_input_echoes,
+        server_args=("--oversized-output", "files"),
     ),
     "r-write-stdin-multiple-calls": r_suite_case(r_write_stdin_multiple_calls),
     "r-write-stdin-recovers-after-error": r_suite_case(
@@ -1383,8 +1439,8 @@ CASES: dict[str, SuiteCase] = {
     "r-write-stdin-timeout-polling-returns-pending-output": r_suite_case(
         r_write_stdin_timeout_polling_returns_pending_output
     ),
-    "r-write-stdin-no-huge-submitted-input-transcript": r_suite_case(
-        r_write_stdin_does_not_synthesize_huge_submitted_input,
+    "r-write-stdin-bundles-huge-interleaved-input-echoes": r_suite_case(
+        r_write_stdin_files_bundle_includes_huge_interleaved_input_echoes,
         server_args=("--oversized-output", "files"),
     ),
     "r-workspace-write-sandbox": r_suite_case(

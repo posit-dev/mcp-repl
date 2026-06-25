@@ -87,20 +87,44 @@ fn normalize_interrupt_empty_stderr(text: String) -> String {
         "    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \"\n    },\n",
         "",
     )
+    .replace(
+        "    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \\n\"\n    },\n",
+        "",
+    )
+    .replace(
+        "    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }",
+        "    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n> \"\n    }",
+    )
     .replace("<<< stderr: \n", "")
+    .replace("<<< interrupt received\n<<< \n<<< \n<<< > ", "<<< interrupt received\n<<< > ")
 }
 
 #[test]
 fn interrupt_empty_stderr_normalizer_drops_blank_chunks() {
     let rendered = "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]";
+    let rendered_with_newline = "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]";
+    let rendered_with_interrupt_newline = "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]";
     let transcript = "<<< interrupt received\n<<< stderr: \n<<< > ";
+    let transcript_with_blank_lines = "<<< interrupt received\n<<< \n<<< \n<<< > ";
 
     assert_eq!(
         normalize_interrupt_empty_stderr(rendered.to_string()),
         "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]"
     );
     assert_eq!(
+        normalize_interrupt_empty_stderr(rendered_with_newline.to_string()),
+        "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]"
+    );
+    assert_eq!(
+        normalize_interrupt_empty_stderr(rendered_with_interrupt_newline.to_string()),
+        "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n> \"\n    }\n]"
+    );
+    assert_eq!(
         normalize_interrupt_empty_stderr(transcript.to_string()),
+        "<<< interrupt received\n<<< > "
+    );
+    assert_eq!(
+        normalize_interrupt_empty_stderr(transcript_with_blank_lines.to_string()),
         "<<< interrupt received\n<<< > "
     );
 }

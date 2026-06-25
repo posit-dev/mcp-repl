@@ -412,6 +412,7 @@ fn append_text_content(
         text: last_text,
         stream: last_stream,
         origin: last_origin,
+        ..
     }) = contents.last_mut()
         && same_text_content(*last_stream, *last_origin, stream, origin)
     {
@@ -422,6 +423,7 @@ fn append_text_content(
         text: text.to_string(),
         stream,
         origin,
+        visibility: Default::default(),
     });
 }
 
@@ -438,6 +440,7 @@ fn prepend_text_content(
         text: first_text,
         stream: first_stream,
         origin: first_origin,
+        ..
     }) = contents.first_mut()
         && same_text_content(*first_stream, *first_origin, stream, origin)
     {
@@ -453,6 +456,7 @@ fn prepend_text_content(
             text: text.to_string(),
             stream,
             origin,
+            visibility: Default::default(),
         },
     );
 }

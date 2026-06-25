@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "loop 0\nloop 1\ndone"
+      "text": "loop 0\nloop 1\ndone\n"
     }
   ]
 }

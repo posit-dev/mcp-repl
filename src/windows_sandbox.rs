@@ -628,6 +628,10 @@ fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> S
                 "mode": "unsupported",
             })
         }
+        SandboxPolicy::Managed { .. } => serde_json::json!({
+            "mode": "managed-unsupported",
+            "policy": policy,
+        }),
     };
     let seed = format!(
         "mcp-repl-windows-sandbox-v2\0{}\0{}",
@@ -797,7 +801,9 @@ fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
 fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
     match policy {
         SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. } => Ok(()),
-        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+        SandboxPolicy::DangerFullAccess
+        | SandboxPolicy::ExternalSandbox { .. }
+        | SandboxPolicy::Managed { .. } => {
             Err("windows sandbox runner only supports read-only/workspace-write".to_string())
         }
     }
@@ -3853,6 +3859,22 @@ mod tests {
         }
     }
 
+    fn managed_policy() -> SandboxPolicy {
+        SandboxPolicy::Managed {
+            file_system: crate::sandbox::FileSystemSandboxPolicy {
+                kind: crate::sandbox::FileSystemSandboxKind::Restricted,
+                glob_scan_max_depth: None,
+                entries: vec![crate::sandbox::FileSystemSandboxEntry {
+                    path: crate::sandbox::FileSystemPath::Special {
+                        value: crate::sandbox::FileSystemSpecialPath::Root,
+                    },
+                    access: crate::sandbox::FileSystemAccessMode::Read,
+                }],
+            },
+            network_access: crate::sandbox::NetworkAccess::Restricted,
+        }
+    }
+
     fn prepared_launch_test_root() -> PathBuf {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -4446,6 +4468,19 @@ mod tests {
         })
         .expect_err("external-sandbox should be rejected");
         assert!(err.contains("read-only/workspace-write"));
+    }
+
+    #[test]
+    fn rejects_managed_policy() {
+        let policy = managed_policy();
+        let err = validate_windows_policy(&policy).expect_err("managed should be rejected");
+        assert!(err.contains("read-only/workspace-write"));
+
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        let sid = stable_cap_sid_string(&policy, &cwd);
+        assert!(sid.starts_with("S-1-5-21-"));
     }
 
     #[test]

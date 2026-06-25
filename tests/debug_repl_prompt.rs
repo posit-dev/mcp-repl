@@ -88,6 +88,12 @@ fn lock_debug_repl_test_mutex() -> MutexGuard<'static, ()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn debug_repl_args_include_sandbox(args: &[&str]) -> bool {
+    args.iter()
+        .any(|arg| *arg == "--sandbox" || arg.starts_with("--sandbox="))
+}
+
 fn wait_for_prompt_or_idle(
     rx: &mpsc::Receiver<Vec<u8>>,
     seen: &mut Vec<u8>,
@@ -128,6 +134,10 @@ fn assert_debug_repl_starts(extra_args: &[&str]) -> TestResult<()> {
     cmd.args(extra_args);
     #[cfg(target_os = "macos")]
     if !sandbox_exec_available() {
+        cmd.arg("--sandbox").arg("danger-full-access");
+    }
+    #[cfg(target_os = "windows")]
+    if !debug_repl_args_include_sandbox(extra_args) {
         cmd.arg("--sandbox").arg("danger-full-access");
     }
     let mut child = cmd
@@ -224,6 +234,8 @@ fn python_debug_repl_accepts_prompt_free_startup() -> TestResult<()> {
     if !sandbox_exec_available() {
         cmd.arg("--sandbox").arg("danger-full-access");
     }
+    #[cfg(target_os = "windows")]
+    cmd.arg("--sandbox").arg("danger-full-access");
     let mut child = cmd
         .env("MCP_REPL_IMAGES", "0")
         .env("MCP_REPL_PAGER_PAGE_CHARS", "1000000")
@@ -302,6 +314,8 @@ fn debug_repl_files_mode_uses_output_bundle_dir_for_large_output() -> TestResult
     if !sandbox_exec_available() {
         cmd.arg("--sandbox").arg("danger-full-access");
     }
+    #[cfg(target_os = "windows")]
+    cmd.arg("--sandbox").arg("danger-full-access");
     let mut child = cmd
         .env("MCP_REPL_IMAGES", "0")
         .env("MCP_REPL_PAGER_PAGE_CHARS", "1000000")

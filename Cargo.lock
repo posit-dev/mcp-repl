@@ -923,6 +923,7 @@ dependencies = [
  "portable-pty",
  "regex-lite",
  "rmcp",
+ "rust-embed",
  "schemars",
  "seccompiler",
  "serde",

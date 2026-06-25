@@ -6,12 +6,14 @@ expression: transcript
 1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) cat(sprintf("line%04d %s\n", i, line))
 <<< line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< 
 <<< --More-- (140p, 0.5%, @0..210/42000)
 
 2) r_repl timeout_ms=30000
 >>> :/line0050
 <<< [pager] search for `line0050` @10290
 <<< [match] line0050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
+<<< 
 <<< --More-- (106p, 24.5%, @10290/42000)
 
 3) r_repl timeout_ms=30000
@@ -22,3 +24,4 @@ expression: transcript
 4) r_repl timeout_ms=30000
 >>> :q
 <<< (END, 24.5%, @10290/42000)
+<<< >

@@ -23,6 +23,7 @@ expression: transcript
 <<< alpha line 13 foo
 <<< alpha line 14 foo
 <<< alpha line 15 foo
+<<< 
 <<< --More-- (2p, 39.6%, @0..288/727)
 
 2) r_repl timeout_ms=30000
@@ -68,6 +69,7 @@ expression: transcript
 <<< #38 @689 Title > Beta | beta line 18 foo
 <<< #39 @706 Title > Beta | beta line 19 foo
 <<< #40 @723 Title > Beta | beta line 20 foo
+<<< 
 <<< --More-- (2p, 39.6%, @0..288/727)
 
 3) r_repl timeout_ms=30000
@@ -232,8 +234,10 @@ expression: transcript
 <<< #40 @723 Title > Beta
 <<<     beta line 19 foo
 <<<   > beta line 20 foo
+<<< 
 <<< --More-- (2p, 39.6%, @0..288/727)
 
 4) r_repl timeout_ms=30000
 >>> :q
 <<< (END, 39.6%, @0..288/727)
+<<< >

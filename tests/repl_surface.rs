@@ -218,9 +218,9 @@ async fn explicit_plot_emit_orders_r_owned_output_around_image() -> TestResult<(
     }
 
     let before_idx =
-        first_text_index_containing(&result, "before").ok_or("expected before text in reply")?;
+        first_text_index_containing(&result, "before\n").ok_or("expected before text in reply")?;
     let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
-    let after_idx = first_text_index_containing(&result, "after").ok_or("expected after text")?;
+    let after_idx = first_text_index_containing(&result, "after\n").ok_or("expected after text")?;
     assert!(
         before_idx < image_idx && image_idx < after_idx,
         "expected R-owned output to preserve order around image, got content order: {:?}",
@@ -257,26 +257,26 @@ async fn explicit_plot_emit_orders_r_owned_stderr_and_stdout_around_image() -> T
     }
 
     let stdout_before = text
-        .find("stdout-before")
+        .find("stdout-before\n")
         .ok_or("expected stdout-before text in reply")?;
     let stderr_before = text
-        .find("stderr-before")
+        .find("stderr: stderr-before")
         .ok_or("expected stderr-before text in reply")?;
     let stderr_after = text
-        .find("stderr-after")
+        .find("stderr: stderr-after")
         .ok_or("expected stderr-after text in reply")?;
     let stdout_after = text
-        .find("stdout-after")
+        .find("stdout-after\n")
         .ok_or("expected stdout-after text in reply")?;
     assert!(
         stdout_before < stderr_before && stderr_after < stdout_after,
         "expected stdout/stderr text order to match R callback order, got: {text:?}"
     );
 
-    let before_idx = first_text_index_containing(&result, "stderr-before")
+    let before_idx = first_text_index_containing(&result, "stderr: stderr-before")
         .ok_or("expected stderr-before text item in reply")?;
     let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
-    let after_idx = first_text_index_containing(&result, "stderr-after")
+    let after_idx = first_text_index_containing(&result, "stderr: stderr-after")
         .ok_or("expected stderr-after text item in reply")?;
     assert!(
         before_idx < image_idx && image_idx < after_idx,
@@ -453,7 +453,7 @@ async fn files_child_stdout_matching_later_input_line_remains_visible() -> TestR
     let matching_lines = text.matches("> 1 + 1\n").count();
     assert_eq!(
         matching_lines, 1,
-        "expected only raw child text, not synthesized R input, got: {text:?}"
+        "expected raw child text without a generated echo, got: {text:?}"
     );
     let raw_child_line = text
         .find("> 1 + 1\n")
