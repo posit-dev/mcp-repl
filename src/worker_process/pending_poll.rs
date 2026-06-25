@@ -112,7 +112,9 @@ impl WorkerManager {
             } => (completion, session_end, None),
             PendingPollState::NoCompletion => (CompletionInfo::empty(), false, None),
         };
-        if observed_completion && timed_out_elapsed.is_none() {
+        if timed_out_elapsed.is_some() {
+            self.output_timeline.flush_ready_utf8_tails();
+        } else if observed_completion {
             self.output_timeline.flush_utf8_tails();
         }
         if observed_completion {

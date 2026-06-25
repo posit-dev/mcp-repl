@@ -151,11 +151,12 @@ impl PagerBuffer {
         let mut cursor = 0usize;
         let mut events = events
             .into_iter()
-            .filter(|event| event.offset >= start_offset && event.offset <= end_offset)
+            .enumerate()
+            .filter(|(_, event)| event.offset >= start_offset && event.offset <= end_offset)
             .collect::<Vec<_>>();
-        events.sort_by_key(|event| event.offset);
+        events.sort_by_key(|(index, event)| (event.offset, *index));
 
-        for event in events {
+        for (_, event) in events {
             let relative = event
                 .offset
                 .saturating_sub(start_offset)
@@ -616,17 +617,24 @@ impl PagerBuffer {
     }
 
     fn render_state_before_range(&self, start_offset: u64) -> Option<RenderedTextState> {
+        let mut boundary_continuation = None;
         for span in &self.text_spans {
             if span.start < start_offset && start_offset < span.end {
-                let stream = if span.is_stderr {
-                    TextStream::Stderr
-                } else {
-                    TextStream::Stdout
-                };
-                return Some(RenderedTextState::continuation(stream, span.origin));
+                return Some(rendered_state_for_span(span));
+            }
+            if span.end == start_offset
+                && span.start < span.end
+                && !self.span_ends_with_newline(span)
+            {
+                boundary_continuation = Some(rendered_state_for_span(span));
             }
         }
-        None
+        boundary_continuation
+    }
+
+    fn span_ends_with_newline(&self, span: &PagerTextSpan) -> bool {
+        let end = self.byte_index_for_char_offset(span.end);
+        end > 0 && self.bytes.get(end.saturating_sub(1)) == Some(&b'\n')
     }
 
     fn image_offsets_in_range(&self, start_offset: u64, end_offset: u64, limit: usize) -> Vec<u64> {
@@ -670,6 +678,15 @@ impl PagerBuffer {
         }
         count
     }
+}
+
+fn rendered_state_for_span(span: &PagerTextSpan) -> RenderedTextState {
+    let stream = if span.is_stderr {
+        TextStream::Stderr
+    } else {
+        TextStream::Stdout
+    };
+    RenderedTextState::continuation(stream, span.origin)
 }
 
 fn ascii_lower(byte: u8) -> u8 {
@@ -4104,6 +4121,49 @@ mod tests {
             )),
             "expected event replay to preserve server-originated text events, got: {:?}",
             contents
+        );
+    }
+
+    #[test]
+    fn adjacent_stderr_span_at_page_boundary_continues_without_prefix() {
+        let first = "a".repeat(64);
+        let second = "tail continues\n";
+        let bytes = format!("{first}{second}").into_bytes();
+        let first_len = first.len();
+        let mut buffer = PagerBuffer::from_bytes_and_events(
+            bytes,
+            Vec::new(),
+            vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: first_len,
+                    is_stderr: true,
+                    origin: ContentOrigin::Worker,
+                    source: crate::output_capture::OutputTextSource::Ipc,
+                },
+                OutputTextSpan {
+                    start_byte: first_len,
+                    end_byte: first_len + second.len(),
+                    is_stderr: true,
+                    origin: ContentOrigin::Worker,
+                    source: crate::output_capture::OutputTextSource::Ipc,
+                },
+            ],
+            (first_len + second.len()) as u64,
+        );
+        buffer.advance_offset_to(first_len as u64);
+        let mut pager = Pager::default();
+        pager.activate(buffer, true);
+
+        let text = text_from_reply(pager.handle_command(":next\n"));
+
+        assert!(
+            text.contains(second),
+            "expected second stderr span on next page, got: {text:?}"
+        );
+        assert!(
+            !text.contains("stderr: tail"),
+            "adjacent stderr continuation should not repeat the stderr prefix, got: {text:?}"
         );
     }
 

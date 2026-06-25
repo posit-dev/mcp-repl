@@ -31,6 +31,23 @@ fn result_image_count(result: &rmcp::model::CallToolResult) -> usize {
         .count()
 }
 
+fn first_image_index(result: &rmcp::model::CallToolResult) -> Option<usize> {
+    result
+        .content
+        .iter()
+        .position(|item| matches!(item.raw, RawContent::Image(_)))
+}
+
+fn first_text_index_containing(
+    result: &rmcp::model::CallToolResult,
+    needle: &str,
+) -> Option<usize> {
+    result.content.iter().position(|item| match &item.raw {
+        RawContent::Text(text) => text.text.contains(needle),
+        _ => false,
+    })
+}
+
 fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
     let end = text.find(suffix)?.saturating_add(suffix.len());
     let start = text[..end]
@@ -948,6 +965,93 @@ async fn zod_pager_session_end_flushes_partial_utf8_before_notice() -> TestResul
     assert!(
         !text.contains("\\xC3[repl]"),
         "session-end notice should not be concatenated to an escaped UTF-8 tail, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_timeout_drains_event_after_incomplete_utf8() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-before-delayed-image",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let timeout_text = result_text(&timed_out);
+
+    session.cancel().await?;
+
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert!(
+        timeout_text.contains("\\xC3"),
+        "pager timeout should flush an incomplete leading UTF-8 tail before later output, got: {timeout_text:?}"
+    );
+    assert_eq!(
+        result_image_count(&timed_out),
+        1,
+        "pager timeout should expose later complete events after flushing an incomplete UTF-8 tail"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_preserves_equal_offset_update_notice_before_image() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 1_000).await?;
+
+    let initial = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "output-source-image",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    assert_eq!(
+        result_image_count(&initial),
+        1,
+        "expected initial image to establish update state"
+    );
+
+    let update = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "output-image-update-with-tail",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+
+    session.cancel().await?;
+
+    let notice = "[repl] image update from previous request shown as a new image";
+    let notice_index = first_text_index_containing(&update, notice)
+        .ok_or("expected image update notice in pager reply")?;
+    let image_index = first_image_index(&update).ok_or_else(|| {
+        format!(
+            "expected updated image in pager reply, got content order: {:?}",
+            update.content
+        )
+    })?;
+    assert!(
+        notice_index < image_index,
+        "expected equal-offset update notice before image, got content order: {:?}",
+        update.content
     );
 
     Ok(())

@@ -233,6 +233,7 @@ impl WorkerManager {
 
                 self.pending_request = true;
                 self.pending_request_started_at = Some(request.started_at);
+                self.output_timeline.flush_ready_utf8_tails();
                 let end_offset = self.output.end_offset().unwrap_or(0);
                 let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
                 let mut contents = context.detached_prefix_contents;

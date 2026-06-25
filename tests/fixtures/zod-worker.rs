@@ -310,6 +310,17 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "output-source-image" {
+        output_source_image(writer, control_log_path, b"img", "zod-source")?;
+        return Ok(false);
+    }
+
+    if command == "output-image-update-with-tail" {
+        output_source_image_update(writer, control_log_path, b"updated-img", "zod-source")?;
+        output_text(writer, control_log_path, &vec![b'z'; 2_000])?;
+        return Ok(false);
+    }
+
     if let Some(len) = command.strip_prefix("repeat-output ") {
         let len: usize = parse_millis(len)?
             .try_into()
@@ -491,6 +502,26 @@ fn output_image(
 ) -> io::Result<()> {
     append_control_log(control_log_path.as_deref(), "output_image")?;
     writer.output_image("image/png", bytes)
+}
+
+fn output_source_image(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    source: &str,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_source_image")?;
+    writer.output_image_with_source("image/png", bytes, false, Some(source))
+}
+
+fn output_source_image_update(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    source: &str,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_image_update")?;
+    writer.output_image_with_source("image/png", bytes, true, Some(source))
 }
 
 fn send_session_end(writer: &IpcWriter, reason: &str) -> io::Result<()> {
@@ -701,11 +732,21 @@ impl IpcWriter {
     }
 
     fn output_image(&self, mime_type: &str, bytes: &[u8]) -> io::Result<()> {
+        self.output_image_with_source(mime_type, bytes, false, None)
+    }
+
+    fn output_image_with_source(
+        &self,
+        mime_type: &str,
+        bytes: &[u8],
+        is_update: bool,
+        source: Option<&str>,
+    ) -> io::Result<()> {
         self.send(&WorkerToServer::OutputImage {
             mime_type: mime_type.to_string(),
             data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
-            is_update: false,
-            source: None,
+            is_update,
+            source: source.map(str::to_string),
         })
     }
 }
