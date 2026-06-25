@@ -68,6 +68,36 @@ pub(crate) fn snapshot_page_with_images(
     }
 }
 
+pub(crate) fn snapshot_pending_timeout_page_with_images(
+    output: &OutputBuffer,
+    end_offset: u64,
+    target_bytes: u64,
+) -> SnapshotWithImages {
+    let start_offset = output.current_offset().unwrap_or(end_offset);
+    let range = output.read_range(start_offset, end_offset);
+    if range.bytes.is_empty()
+        && !range.events.is_empty()
+        && range.events.iter().all(|event| {
+            matches!(
+                event.kind,
+                OutputEventKind::InputEcho { .. }
+                    | OutputEventKind::InputWait
+                    | OutputEventKind::RequestBoundary
+                    | OutputEventKind::SessionEnd
+            )
+        })
+    {
+        return SnapshotWithImages {
+            contents: Vec::new(),
+            pages_left: 0,
+            buffer: None,
+            last_range: None,
+        };
+    }
+
+    snapshot_page_with_images(output, end_offset, target_bytes)
+}
+
 pub(crate) fn snapshot_after_completion(
     output: &OutputBuffer,
     start_offset: u64,
@@ -101,13 +131,13 @@ fn page_end_offset(
     start_offset: u64,
     end_offset: u64,
     pages_left: u64,
-    last_range_end_byte: Option<u64>,
+    last_range_end_offset: Option<u64>,
 ) -> u64 {
     if pages_left == 0 {
         return end_offset;
     }
-    if let Some(end_byte) = last_range_end_byte {
-        return start_offset.saturating_add(end_byte);
+    if let Some(end_offset) = last_range_end_offset {
+        return end_offset;
     }
     start_offset
 }

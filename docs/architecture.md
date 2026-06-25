@@ -56,8 +56,8 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 ### Output, images, and debug surfaces
 
-- `src/pending_output_tape.rs` and `src/output_stream.rs` stage worker text and images until reply sealing.
-- `docs/output_timeline.md` describes how the server reconstructs one visible timeline from stdout/stderr capture plus sideband IPC, and how request completion only gates final-reply cleanup rather than ordering.
+- `src/output_capture.rs` owns the canonical output timeline for raw stdout/stderr bytes, worker IPC text, sideband markers, images, and server notices. `src/pending_output_tape.rs` is a files-mode facade over that timeline, not a separate formatter.
+- `docs/output_timeline.md` describes how the server reconstructs one visible timeline from stdout/stderr capture plus sideband IPC, how projection modes decide echo visibility, and how request completion only gates final-reply presentation rather than ordering.
 - PTY-backed workers may expose one raw terminal output stream rather than
   independent raw stdout and stderr pipes. Worker-owned `output_text` frames
   preserve their declared stream, but raw PTY output can have terminal effects
@@ -65,7 +65,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
   identity.
 - `src/server/response.rs` is the server-owned response finalizer. It separates worker-originated text from server-only notices, creates oversized-output bundle directories with lazily materialized `transcript.txt`, `events.log`, and `images/`, applies bundle retention and cleanup policy, and decides the bounded inline preview at seal time.
 - `src/pager/` implements the pager-mode oversized-output path used by bare CLI defaults and explicit `--oversized-output pager` installs.
-- Longer-term output follow-ons such as per-turn history bundles and a unified resolved-timeline pipeline live in `docs/futurework/per-turn-history-bundles.md` and `docs/futurework/unified-output-timeline-pipeline.md`.
+- Longer-term output follow-ons such as per-turn history bundles live in `docs/futurework/per-turn-history-bundles.md`.
 - `src/debug_logs.rs`, `src/event_log.rs`, and `src/debug_repl.rs` make the runtime legible to agents and humans during investigation.
 
 ### Validation harnesses

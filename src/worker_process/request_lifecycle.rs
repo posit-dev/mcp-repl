@@ -288,27 +288,49 @@ impl WorkerManager {
         }
         let poll = Duration::from_millis(5);
         let start = Instant::now();
+        let requires_input_echo = self
+            .pending_request_input
+            .as_deref()
+            .is_some_and(|input| !input.is_empty());
 
         let mut last = match self.oversized_output {
             OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
-            OversizedOutputMode::Pager => self.output.end_offset().unwrap_or(0),
+            OversizedOutputMode::Pager => self.output.current_progress_seq(),
         };
+        let mut input_echo_ready = !requires_input_echo || self.pending_input_echoes_seen() > 0;
         let mut stable_for = Duration::from_millis(0);
         while start.elapsed() < total {
             thread::sleep(poll);
             let now = match self.oversized_output {
                 OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
-                OversizedOutputMode::Pager => self.output.end_offset().unwrap_or(0),
+                OversizedOutputMode::Pager => self.output.current_progress_seq(),
             };
+            if !input_echo_ready && self.pending_input_echoes_seen() > 0 {
+                input_echo_ready = true;
+                stable_for = Duration::from_millis(0);
+                last = now;
+                continue;
+            }
             if now == last {
                 stable_for = stable_for.saturating_add(poll);
-                if stable_for >= stable_needed {
+                if input_echo_ready && stable_for >= stable_needed {
                     return;
                 }
             } else {
                 last = now;
                 stable_for = Duration::from_millis(0);
             }
+        }
+    }
+
+    fn pending_input_echoes_seen(&self) -> usize {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.pending_output_tape
+                    .current_settle_state()
+                    .readline_results_seen
+            }
+            OversizedOutputMode::Pager => self.output.current_settle_state().input_echoes_seen,
         }
     }
 

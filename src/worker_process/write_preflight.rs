@@ -325,13 +325,11 @@ impl WorkerManager {
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, ensure_output_ring, reset_output_ring,
-    };
+    use crate::output_capture::OUTPUT_RING_CAPACITY_BYTES;
     use crate::oversized_output::OversizedOutputMode;
     use crate::sandbox_cli::SandboxCliPlan;
     use crate::worker_process::test_support::{
-        contents_text, output_ring_test_guard, pager_buffer_from_worker_text, sleeping_test_child,
+        contents_text, pager_buffer_from_worker_text, sleeping_test_child,
         static_pager_buffer_from_worker_text, successful_test_child, test_worker_process,
     };
     use crate::worker_protocol::{ContentOrigin, WorkerReply};
@@ -403,9 +401,6 @@ mod tests {
             OversizedOutputMode::Pager,
         )
         .expect("worker manager");
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
         manager.process = Some(test_worker_process(sleeping_test_child()));
 
         manager.pager.activate(
@@ -449,9 +444,6 @@ mod tests {
             OversizedOutputMode::Pager,
         )
         .expect("worker manager");
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
         let mut process = test_worker_process(successful_test_child());
         let status = process.wait_child_for_test().expect("wait test child");
         process.set_exit_status_for_test(status);
@@ -507,9 +499,6 @@ mod tests {
                 OversizedOutputMode::Pager,
             )
             .expect("worker manager");
-            let _guard = output_ring_test_guard();
-            let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-            reset_output_ring();
             manager.process = Some(test_worker_process(sleeping_test_child()));
             {
                 let mut slot = manager

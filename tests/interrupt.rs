@@ -412,7 +412,7 @@ async fn ctrl_d_prefix_in_files_mode_separates_restart_notice_from_output() -> T
     }
     assert!(
         text.contains("[repl] new session started\nAFTER_RESET"),
-        "expected ctrl-d files reply to preserve a newline between restart notice and output, got: {text:?}"
+        "expected ctrl-d files reply to preserve the restart notice and output, got: {text:?}"
     );
 
     session.cancel().await?;

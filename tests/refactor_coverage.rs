@@ -145,6 +145,10 @@ fn normalize_pager_footer_page_counts(text: &str) -> String {
 
 fn normalize_restart_interrupt_empty_stderr(text: &str) -> String {
     text.replace(r#""text": "\nstderr: \nstderr: ""#, r#""text": "stderr: ""#)
+        .replace(
+            r#""text": "stderr: \nstderr: \n""#,
+            r#""text": "stderr: \n""#,
+        )
         .replace("<<< \n<<< stderr: \n<<< stderr: \n", "<<< stderr: \n")
         .replace("<<< stderr: \n<<< stderr: \n", "<<< stderr: \n")
 }
@@ -243,4 +247,11 @@ async fn restart_interrupt_plot_smoke() -> TestResult<()> {
 
     session.cancel().await?;
     Ok(())
+}
+
+#[test]
+fn restart_interrupt_empty_stderr_normalizer_collapses_json_pair_without_leading_newline() {
+    let input = r#"{ "type": "text", "text": "stderr: \nstderr: \n" }"#;
+    let expected = r#"{ "type": "text", "text": "stderr: \n" }"#;
+    assert_eq!(normalize_restart_interrupt_empty_stderr(input), expected);
 }

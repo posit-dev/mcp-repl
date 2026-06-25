@@ -815,6 +815,141 @@ emit_at_wait = True; value = input("plot wait> ")
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn python_timeout_drains_later_stderr_after_incomplete_stdout_utf8_tail() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+import time
+sys.stdout.buffer.write(bytes([0xC3]))
+sys.stdout.flush()
+sys.stderr.write("STDERR_READY\\n")
+sys.stderr.flush()
+time.sleep(1)
+sys.stdout.buffer.write(bytes([0xA9]))
+sys.stdout.flush()
+time.sleep(0.1)
+sys.stdout.write("STDOUT_DONE\\n")
+sys.stdout.flush()
+""")"#,
+            Some(0.2),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        is_busy_response(&text),
+        "expected request to remain pending after timeout, got: {text:?}"
+    );
+    assert!(
+        text.contains("\\xC3"),
+        "timeout reply should flush the incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: STDERR_READY\n"),
+        "timeout reply should expose later stderr after the incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+    let head_idx = text
+        .find("\\xC3")
+        .ok_or_else(|| format!("expected sealed UTF-8 head in timeout reply, got: {text:?}"))?;
+    let stderr_idx = text
+        .find("STDERR_READY")
+        .ok_or_else(|| format!("expected stderr in timeout reply, got: {text:?}"))?;
+    assert!(
+        head_idx < stderr_idx,
+        "expected sealed UTF-8 head before later stderr, got: {text:?}"
+    );
+
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll = common::wait_until_not_busy(
+        &mut session,
+        poll,
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let poll_text = result_text(&poll);
+
+    session.cancel().await?;
+
+    assert!(
+        !poll_text.contains("STDERR_READY"),
+        "stderr already drained in timeout reply should not repeat on completion poll, got: {poll_text:?}"
+    );
+    let tail_idx = poll_text
+        .find("\\xA9")
+        .ok_or_else(|| format!("expected remaining UTF-8 continuation byte, got: {poll_text:?}"))?;
+    let done_idx = poll_text
+        .find("STDOUT_DONE")
+        .ok_or_else(|| format!("expected trailing stdout, got: {poll_text:?}"))?;
+    assert!(
+        tail_idx < done_idx,
+        "expected continuation byte before later stdout, got: {poll_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_pager_timeout_preserves_unterminated_stderr_state_on_poll() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(mut session) = start_python_pager_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+import time
+sys.stderr.write("ERR_PART")
+sys.stderr.flush()
+time.sleep(1)
+sys.stderr.write("ERR_REST\\n")
+sys.stderr.flush()
+""")"#,
+            Some(0.2),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        is_busy_response(&text),
+        "expected request to remain pending after timeout, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: ERR_PART"),
+        "expected timeout reply to include the first stderr fragment, got: {text:?}"
+    );
+
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll = common::wait_until_not_busy(
+        &mut session,
+        poll,
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let poll_text = result_text(&poll);
+
+    session.cancel().await?;
+
+    assert!(
+        poll_text.contains("ERR_REST"),
+        "expected stderr continuation on poll, got: {poll_text:?}"
+    );
+    assert!(
+        !poll_text.contains("stderr: ERR_REST"),
+        "stderr continuation should not receive a second prefix, got: {poll_text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(not(target_family = "unix"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn python_input_prompt_is_not_duplicated_on_builtin_adapter_stdio() -> TestResult<()> {
@@ -2451,18 +2586,37 @@ async fn python_smoke_without_register_at_fork() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_follow_up_after_resolved_timeout_does_not_synthesize_input_in_files_mode()
+async fn python_follow_up_after_resolved_timeout_skips_leading_fresh_echo_in_files_mode()
 -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp = tempdir()?;
+    let release_path = temp.path().join("release-timeout");
+    let done_path = temp.path().join("done-timeout");
+    let release_literal = serde_json::to_string(
+        release_path
+            .to_str()
+            .ok_or("timeout release path must be valid utf-8")?,
+    )?;
+    let done_literal = serde_json::to_string(
+        done_path
+            .to_str()
+            .ok_or("timeout done path must be valid utf-8")?,
+    )?;
+    let first_input = format!(
+        r#"import pathlib, time
+release_path = pathlib.Path({release_literal})
+while not release_path.exists():
+    time.sleep(0.01)
+print('DETACHED_OK', flush=True)
+pathlib.Path({done_literal}).write_text('done')
+"#
+    );
 
     let first = session
-        .write_stdin_raw_with(
-            "import time; time.sleep(0.2); print('DETACHED_OK')",
-            Some(0.05),
-        )
+        .write_stdin_raw_with(first_input.as_str(), Some(0.05))
         .await?;
     let first_text = result_text(&first);
     assert!(
@@ -2470,12 +2624,8 @@ async fn python_follow_up_after_resolved_timeout_does_not_synthesize_input_in_fi
         "expected the initial Python request to time out, got: {first_text:?}"
     );
 
-    sleep(Duration::from_millis(if cfg!(target_os = "macos") {
-        700
-    } else {
-        350
-    }))
-    .await;
+    fs::write(&release_path, "go")?;
+    wait_for_file_text(&done_path, "done").await?;
 
     let follow_up = session
         .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
@@ -2500,8 +2650,13 @@ async fn python_follow_up_after_resolved_timeout_does_not_synthesize_input_in_fi
         "expected the fresh Python follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("import time; time.sleep(0.2); print('DETACHED_OK')"),
+        !follow_up_text.contains(">>> import pathlib, time")
+            && !follow_up_text.contains("release_path = pathlib.Path"),
         "did not expect timed-out Python source to be synthesized into the next visible reply, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains(">>> print('FOLLOWUP_OK')"),
+        "fresh Python follow-up input echo should be absent, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -3395,7 +3550,7 @@ async fn python_cell_custom_input_loop_consumes_follow_up_stdin() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_multiline_block_does_not_synthesize_input_in_visible_reply() -> TestResult<()> {
+async fn python_multiline_block_skips_leading_consumed_input_echo() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3407,7 +3562,7 @@ async fn python_multiline_block_does_not_synthesize_input_in_visible_reply() -> 
     let text = result_text(&result);
     if is_busy_response(&text) {
         eprintln!(
-            "python_multiline_block_does_not_synthesize_input_in_visible_reply remained busy; skipping"
+            "python_multiline_block_skips_leading_consumed_input_echo remained busy; skipping"
         );
         session.cancel().await?;
         return Ok(());
@@ -3419,11 +3574,11 @@ async fn python_multiline_block_does_not_synthesize_input_in_visible_reply() -> 
     assert!(visible.contains("3"), "expected 3, got: {visible:?}");
     assert!(
         !visible.contains("def f():"),
-        "did not expect the multiline function definition to be synthesized into output, got: {visible:?}"
+        "multiline function definition echo should be absent, got: {visible:?}"
     );
     assert!(
         !visible.contains("return 3"),
-        "did not expect the multiline body to be synthesized into output, got: {visible:?}"
+        "multiline body echo should be absent, got: {visible:?}"
     );
     Ok(())
 }

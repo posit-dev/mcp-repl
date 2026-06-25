@@ -1,33 +1,39 @@
 ---
 source: tests/pager.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: default ==
 1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 120), collapse = ""); for (i in 1:40) cat(sprintf("line%02d %s\n", i, line))
 <<< line01 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line02 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< 
 <<< --More-- (17p, 5.0%, @0..256/5120)
 
 2) r_repl timeout_ms=30000
 >>> :next
 <<< line03 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line04 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< 
 <<< --More-- (16p, 10.0%, @256..512/5120)
 
 3) r_repl timeout_ms=30000
 >>> :seek 0
 <<< [pager] elided output (already shown): @0..512
+<<< 
 <<< line05 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line06 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< 
 <<< --More-- (15p, 15.0%, @512..768/5120)
 
 4) r_repl timeout_ms=30000
 >>> :next
 <<< line07 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line08 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< 
 <<< --More-- (14p, 20.0%, @768..1024/5120)
 
 5) r_repl timeout_ms=30000
 >>> :q
 <<< (END, 20.0%, @768..1024/5120)
+<<< >

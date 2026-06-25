@@ -1084,6 +1084,41 @@ async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_image_only_files_mode_output_drains_once() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let plot_input = format!(
+        "{}; plt.figure(191); plt.clf(); plt.plot([1, 2, 3]); plt.show()",
+        python_plot_preamble()
+    );
+    let plot_result = session
+        .write_stdin_raw_with(&plot_input, Some(30.0))
+        .await?;
+    let first_poll = session.write_stdin_raw_with("", Some(30.0)).await?;
+    let second_poll = session.write_stdin_raw_with("", Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        plot_result.is_error,
+        Some(true),
+        "plot reported an error: {}",
+        result_text(&plot_result)
+    );
+    assert_eq!(
+        extract_images(&plot_result).len(),
+        1,
+        "expected initial plot request to emit one image"
+    );
+    assert_no_images(&first_poll, "first empty poll after image-only output");
+    assert_no_images(&second_poll, "second empty poll after image-only output");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_explicit_repeat_plot_and_show_emit_images_in_same_session() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());

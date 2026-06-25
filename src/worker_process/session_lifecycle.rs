@@ -79,11 +79,24 @@ impl WorkerManager {
                             .pending_output_tape
                             .append_stdout_status_line(message.as_bytes()),
                         OversizedOutputMode::Pager => {
-                            self.output_timeline.append_text(
-                                message.as_bytes(),
-                                false,
-                                ContentOrigin::Server,
-                            );
+                            self.output_timeline.flush_utf8_tails();
+                            if self.output_timeline.last_text_ends_with_newline() {
+                                self.output_timeline.append_text(
+                                    message.as_bytes(),
+                                    false,
+                                    ContentOrigin::Server,
+                                );
+                            } else {
+                                let mut status =
+                                    Vec::with_capacity(message.len().saturating_add(1));
+                                status.push(b'\n');
+                                status.extend_from_slice(message.as_bytes());
+                                self.output_timeline.append_text(
+                                    &status,
+                                    false,
+                                    ContentOrigin::Server,
+                                );
+                            }
                         }
                     }
                 }

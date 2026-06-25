@@ -92,7 +92,10 @@ cp "$FAKE_ARCHIVE_SOURCE" "$out"
         Ok(archive_path)
     }
 
-    fn run_install_script(getconf_body: &str) -> TestResult<std::process::Output> {
+    fn run_install_script_with_args(
+        args: &[&str],
+        getconf_body: &str,
+    ) -> TestResult<std::process::Output> {
         let temp = tempdir()?;
         let bin_dir = temp.path().join("bin");
         fs::create_dir(&bin_dir)?;
@@ -104,10 +107,34 @@ cp "$FAKE_ARCHIVE_SOURCE" "$out"
         let script = repo_root().join("scripts/install.sh");
         let output = Command::new("sh")
             .arg(&script)
+            .args(args)
             .env("HOME", temp.path())
             .env("PATH", path)
             .output()?;
         Ok(output)
+    }
+
+    fn run_install_script(getconf_body: &str) -> TestResult<std::process::Output> {
+        run_install_script_with_args(&[], getconf_body)
+    }
+
+    #[test]
+    fn install_script_rejects_dev_channel_argument() -> TestResult<()> {
+        let output = run_install_script_with_args(&["--dev"], "exit 127")?;
+        assert!(
+            !output.status.success(),
+            "expected stale dev channel argument to be rejected"
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("unexpected argument: --dev"),
+            "expected explicit unexpected argument error, got: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("curl called"),
+            "expected install script to fail before download, got: {stderr:?}"
+        );
+        Ok(())
     }
 
     #[test]

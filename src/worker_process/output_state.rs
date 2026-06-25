@@ -2,7 +2,6 @@ use std::sync::atomic::Ordering;
 
 use super::WorkerManager;
 use crate::completion_reply::{CompletionInfo, InputContext};
-use crate::output_capture::{OutputBuffer, reset_output_ring};
 use crate::output_snapshot::take_range_from_ring_after_completion;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
@@ -226,8 +225,9 @@ impl WorkerManager {
             self.pending_output_tape.clear();
         }
         if !preserve_detached_output {
-            reset_output_ring();
-            self.output = OutputBuffer::default();
+            self.output_timeline.clear();
+            self.output = self.output_timeline.buffer();
+            self.output.start_capture();
         }
         if !preserve_pager {
             self.pager = Pager::default();
@@ -294,8 +294,9 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
             WorkerContent::ContentText {
                 text,
                 origin: ContentOrigin::Worker,
+                visibility,
                 ..
-            } => text.len() as u64,
+            } if visibility.is_reply_visible() => text.len() as u64,
             WorkerContent::ContentText { .. } | WorkerContent::ContentImage { .. } => 0,
         })
         .sum()
@@ -305,12 +306,9 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, ensure_output_ring, reset_output_ring,
-    };
     use crate::pending_output_tape::PendingSidebandKind;
     use crate::sandbox_cli::SandboxCliPlan;
-    use crate::worker_process::test_support::{contents_text, output_ring_test_guard};
+    use crate::worker_process::test_support::contents_text;
 
     #[test]
     fn files_prepare_input_context_preserves_output_matching_input() {
@@ -428,9 +426,6 @@ mod tests {
             OversizedOutputMode::Pager,
         )
         .expect("worker manager");
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
         manager.pending_request = true;
         manager.last_prompt = Some(">>> ".to_string());
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
@@ -508,8 +503,11 @@ mod tests {
 
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected an in-flight files-mode drain to keep runtime output visible"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+            ],
+            "expected an in-flight files-mode drain to keep generated echoes as transcript-only text"
         );
     }
 
@@ -537,8 +535,12 @@ mod tests {
 
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\nstart\n")],
-            "expected files-mode drain to preserve all worker stdout"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+                WorkerContent::stdout("start\n"),
+            ],
+            "expected worker output to preserve raw output and transcript-only generated echoes"
         );
     }
 
@@ -565,8 +567,11 @@ mod tests {
 
         assert_eq!(
             context.detached_prefix_contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected a sealed files-mode prefix without settled completion metadata to keep runtime output"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+            ],
+            "expected a sealed files-mode prefix without settled completion metadata to keep generated echoes as transcript-only text"
         );
     }
 

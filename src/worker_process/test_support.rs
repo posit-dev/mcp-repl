@@ -1,9 +1,9 @@
 #[cfg(target_family = "unix")]
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-use crate::output_capture::{OutputTextSpan, output_ring_test_mutex};
+use crate::output_capture::OutputTextSpan;
 use crate::worker_protocol::{ContentOrigin, WorkerContent};
 use crate::worker_supervisor::WorkerProcess;
 
@@ -16,12 +16,6 @@ pub(super) fn cwd_test_mutex() -> &'static Mutex<()> {
 pub(super) fn env_test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
-}
-
-pub(super) fn output_ring_test_guard() -> MutexGuard<'static, ()> {
-    output_ring_test_mutex()
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
 }
 
 #[cfg(target_family = "unix")]
