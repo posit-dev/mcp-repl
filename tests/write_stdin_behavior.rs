@@ -1018,6 +1018,40 @@ async fn pager_long_r_stderr_after_prior_reply_keeps_one_stream_prefix() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_stderr_prefix_resets_between_completed_requests() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(40_000).await?;
+
+    let first = session
+        .write_stdin_raw_with("cat('first', file=stderr())", Some(30.0))
+        .await?;
+    let first = wait_until_not_busy(&mut session, first).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("stderr: first"),
+        "expected first stderr fragment, got: {first_text:?}"
+    );
+
+    let second = session
+        .write_stdin_raw_with("cat('boom\\n', file=stderr())", Some(30.0))
+        .await?;
+    let second = wait_until_not_busy(&mut session, second).await?;
+    let second_text = result_text(&second);
+    session.cancel().await?;
+
+    assert!(
+        second_text.contains("stderr: boom\n"),
+        "expected fresh stderr prefix after request boundary, got: {second_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pager_truncated_r_stderr_keeps_stream_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_pager_behavior_session(40_000).await?;

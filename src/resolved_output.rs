@@ -442,6 +442,7 @@ pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: Tex
             }
             match event.kind() {
                 OutputEventKind::InputEcho { text } => {
+                    *text_emitter.last_rendered_text = None;
                     push_generated_echo(
                         text_emitter.contents,
                         text,
@@ -459,7 +460,10 @@ pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: Tex
                 }
                 OutputEventKind::InputWait
                 | OutputEventKind::RequestBoundary
-                | OutputEventKind::SessionEnd => {}
+                | OutputEventKind::SessionEnd => {
+                    *text_emitter.last_rendered_text = None;
+                    last_content_was_input_echo = false;
+                }
             }
             cursor = event.offset();
         }
