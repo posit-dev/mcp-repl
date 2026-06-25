@@ -380,7 +380,7 @@ mod unix_impl {
 
         let mcp_repl = resolve_mcp_repl_path()?;
         let env = create_isolated_live_codex_env(&mcp_repl, auth_json)?;
-        let prompt = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CODEX_LIVE_MCP_OK\") Then answer with exactly CODEX_LIVE_DONE, with no punctuation or extra text.";
+        let prompt = "Call the MCP tool with server `r` and tool `repl` exactly once. Use this exact argument: {\"input\":\"cat(\\\"CODEX_LIVE_MCP_OK\\\")\\n\"}. Do not use shell or command execution. Do not inspect or list MCP resources. After the r.repl result, answer exactly CODEX_LIVE_DONE, with no punctuation or extra text.";
         let cmd = codex_exec_command(
             &env,
             None,
@@ -1358,6 +1358,10 @@ animations = false
 steer = true
 remote_models = true
 responses_websockets = false
+shell_tool = false
+apps = false
+plugins = false
+tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
@@ -1388,6 +1392,10 @@ animations = false
 steer = true
 remote_models = true
 responses_websockets = false
+shell_tool = false
+apps = false
+plugins = false
+tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
