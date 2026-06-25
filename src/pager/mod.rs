@@ -1708,9 +1708,15 @@ pub(crate) fn contents_from_output_range(range: OutputRange) -> Vec<WorkerConten
 
 pub(crate) fn take_range_from_ring(output: &OutputBuffer, end_offset: u64) -> Vec<WorkerContent> {
     let start_offset = output.current_offset().unwrap_or(end_offset);
+    let previous_rendered_text = output.rendered_text_state();
     let range = output.read_range(start_offset, end_offset);
-    output.advance_offset_to(end_offset);
-    resolved_output::contents_from_output_range(range, ProjectionMode::Reply)
+    let (contents, last_rendered_text) = resolved_output::contents_from_output_range_with_state(
+        range,
+        ProjectionMode::Reply,
+        previous_rendered_text,
+    );
+    output.advance_offset_to_with_rendered_text(end_offset, last_rendered_text);
+    contents
 }
 
 pub(crate) fn take_snapshot_page_from_ring(
@@ -1718,7 +1724,7 @@ pub(crate) fn take_snapshot_page_from_ring(
     end_offset: u64,
     target_bytes: u64,
 ) -> SnapshotPage {
-    let Some(range) = snapshot_from_ring(output, end_offset) else {
+    let Some((range, previous_rendered_text)) = snapshot_from_ring(output, end_offset) else {
         return SnapshotPage {
             contents: Vec::new(),
             pages_left: 0,
@@ -1727,43 +1733,67 @@ pub(crate) fn take_snapshot_page_from_ring(
             last_range_end_byte: None,
         };
     };
-    take_snapshot_page_from_range(range, target_bytes)
+    let (snapshot, last_rendered_text) =
+        take_snapshot_page_from_range(range, target_bytes, previous_rendered_text);
+    output.advance_offset_to_with_rendered_text(end_offset, last_rendered_text);
+    snapshot
 }
 
-fn take_snapshot_page_from_range(range: OutputRange, target_bytes: u64) -> SnapshotPage {
+fn take_snapshot_page_from_range(
+    range: OutputRange,
+    target_bytes: u64,
+    previous_rendered_text: Option<RenderedTextState>,
+) -> (SnapshotPage, Option<RenderedTextState>) {
     let mut buffer = PagerBuffer::from_timeline_range(range.clone());
     if buffer.bytes.is_empty() {
-        let contents =
-            buffer.contents_for_range_with_projection_mode(0, buffer.len(), ProjectionMode::Reply);
-        return SnapshotPage {
-            contents,
-            pages_left: 0,
-            buffer: Some(buffer),
-            last_range: None,
-            last_range_end_byte: None,
-        };
+        let (contents, last_rendered_text) = resolved_output::contents_from_output_range_with_state(
+            range,
+            ProjectionMode::Reply,
+            previous_rendered_text,
+        );
+        return (
+            SnapshotPage {
+                contents,
+                pages_left: 0,
+                buffer: Some(buffer),
+                last_range: None,
+                last_range_end_byte: None,
+            },
+            last_rendered_text,
+        );
     }
     let pager_buffer = buffer.clone();
     let mut seen = RangeSet::default();
-    let (contents, pages_left, span) =
+    let (_contents, pages_left, span) =
         take_next_page(&mut buffer, target_bytes, &mut seen, ProjectionMode::Reply);
     if pages_left > 0 {
-        return take_snapshot_page_from_buffer_with_projection(
-            pager_buffer,
-            target_bytes,
-            ProjectionMode::Pager,
+        return (
+            take_snapshot_page_from_buffer_with_projection(
+                pager_buffer,
+                target_bytes,
+                ProjectionMode::Pager,
+            ),
+            None,
         );
     }
     let last_range_end_byte = span
         .last
         .map(|(_, end)| buffer.source_offset_for_char_offset(end));
-    SnapshotPage {
-        contents,
-        pages_left,
-        buffer: Some(pager_buffer),
-        last_range: span.last,
-        last_range_end_byte,
-    }
+    let (contents, last_rendered_text) = resolved_output::contents_from_output_range_with_state(
+        range,
+        ProjectionMode::Reply,
+        previous_rendered_text,
+    );
+    (
+        SnapshotPage {
+            contents,
+            pages_left,
+            buffer: Some(pager_buffer),
+            last_range: span.last,
+            last_range_end_byte,
+        },
+        last_rendered_text,
+    )
 }
 
 fn take_snapshot_page_from_buffer_with_projection(
@@ -1786,15 +1816,18 @@ fn take_snapshot_page_from_buffer_with_projection(
     }
 }
 
-fn snapshot_from_ring(output: &OutputBuffer, end_offset: u64) -> Option<OutputRange> {
+fn snapshot_from_ring(
+    output: &OutputBuffer,
+    end_offset: u64,
+) -> Option<(OutputRange, Option<RenderedTextState>)> {
     output.start_capture();
     let start_offset = output.current_offset().unwrap_or(end_offset);
+    let previous_rendered_text = output.rendered_text_state();
     let range = output.read_range(start_offset, end_offset);
-    output.advance_offset_to(end_offset);
     if range.bytes.is_empty() && range.events.is_empty() {
         return None;
     }
-    Some(range)
+    Some((range, previous_rendered_text))
 }
 
 fn take_next_page(

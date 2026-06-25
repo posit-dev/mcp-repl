@@ -470,6 +470,7 @@ pub(crate) fn render_bytes_with_events_and_spans_with_state<E: EventView, S: Tex
     (contents, last_rendered_text)
 }
 
+#[cfg(test)]
 pub(crate) fn contents_from_output_range(
     range: OutputRange,
     projection_mode: ProjectionMode,

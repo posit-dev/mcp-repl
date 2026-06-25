@@ -341,10 +341,10 @@ impl OutputUtf8Tails {
         let mut index = 0usize;
         let mut blocked_by_incomplete_tail = false;
         while index < self.entries.len() {
+            if blocked_by_incomplete_tail {
+                break;
+            }
             let OutputPendingEntry::Text(entry) = &mut self.entries[index] else {
-                if blocked_by_incomplete_tail {
-                    break;
-                }
                 ready.push(self.entries.remove(index));
                 continue;
             };
@@ -472,7 +472,12 @@ impl OutputBuffer {
         self.ring().consume_to(offset);
     }
 
-    fn advance_offset_to_with_rendered_text(
+    pub(crate) fn rendered_text_state(&self) -> Option<RenderedTextState> {
+        let guard = self.cursor.lock().unwrap();
+        guard.last_rendered_text
+    }
+
+    pub(crate) fn advance_offset_to_with_rendered_text(
         &self,
         offset: u64,
         last_rendered_text: Option<RenderedTextState>,
@@ -714,13 +719,17 @@ impl OutputRing {
             remaining = tail;
 
             let mut guard = self.inner.lock().unwrap();
+            let incoming_len = chunk_len.saturating_add(remaining.len());
+            guard.drop_input_echoes_for_room(incoming_len, self.capacity_bytes);
+            if guard.total_buffered_bytes().saturating_add(incoming_len) <= self.capacity_bytes {
+                Self::append_chunk_locked(&mut guard, head, is_stderr, origin, source);
+                continue;
+            }
+
             let reserve = self.head_omission_notice_reserve_locked(&guard);
             let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
-            guard.drop_input_echoes_for_room(chunk_len, effective_capacity);
-            let available = self
-                .capacity_bytes
-                .saturating_sub(reserve)
-                .saturating_sub(guard.total_buffered_bytes());
+            guard.drop_input_echoes_for_room(incoming_len, effective_capacity);
+            let available = effective_capacity.saturating_sub(guard.total_buffered_bytes());
             if available == 0 {
                 self.append_omission_notice_locked(&mut guard);
                 break;
@@ -831,12 +840,16 @@ impl OutputRing {
                 }
             }
             OutputRetention::Head => {
-                let reserve = self.head_omission_notice_reserve_locked(&guard);
-                let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
-                guard.drop_input_echoes_for_room(event_bytes, effective_capacity);
-                if guard.total_buffered_bytes().saturating_add(event_bytes) > effective_capacity {
-                    self.append_omission_notice_locked(&mut guard);
-                    return;
+                guard.drop_input_echoes_for_room(event_bytes, self.capacity_bytes);
+                if guard.total_buffered_bytes().saturating_add(event_bytes) > self.capacity_bytes {
+                    let reserve = self.head_omission_notice_reserve_locked(&guard);
+                    let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
+                    guard.drop_input_echoes_for_room(event_bytes, effective_capacity);
+                    if guard.total_buffered_bytes().saturating_add(event_bytes) > effective_capacity
+                    {
+                        self.append_omission_notice_locked(&mut guard);
+                        return;
+                    }
                 }
             }
         }
@@ -1153,13 +1166,15 @@ impl OutputRing {
             return;
         }
         guard.drop_input_echoes_for_room(notice_bytes, self.capacity_bytes);
+        guard.trim_tail_for_room(notice_bytes, self.capacity_bytes);
         if guard.total_buffered_bytes().saturating_add(notice_bytes) > self.capacity_bytes {
             return;
         }
+        let notice_offset = guard.retained_end_offset();
         guard.note_progress();
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(notice_bytes);
         guard.events.push_back(OutputEvent {
-            offset: guard.end_offset.max(guard.start_offset),
+            offset: notice_offset,
             kind: notice_kind,
         });
     }
@@ -1213,6 +1228,14 @@ impl OutputRingInner {
         true
     }
 
+    fn pop_back_event(&mut self) -> Option<OutputEvent> {
+        let event = self.events.pop_back()?;
+        self.buffered_event_bytes = self
+            .buffered_event_bytes
+            .saturating_sub(event_size_bytes(&event.kind));
+        Some(event)
+    }
+
     fn drop_input_echoes_for_room(&mut self, needed_bytes: usize, capacity_bytes: usize) -> usize {
         let mut dropped = 0usize;
         while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
@@ -1220,6 +1243,50 @@ impl OutputRingInner {
                 break;
             }
             dropped = dropped.saturating_add(1);
+        }
+        dropped
+    }
+
+    fn trim_tail_for_room(&mut self, needed_bytes: usize, capacity_bytes: usize) -> DropStats {
+        let mut dropped = DropStats::default();
+        while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
+            let last_chunk_end = self
+                .chunks
+                .back()
+                .map(|chunk| chunk.start_offset.saturating_add(chunk.range.len() as u64));
+            let last_event_offset = self.events.back().map(|event| event.offset);
+
+            if last_event_offset.is_some()
+                && last_event_offset.unwrap_or(0) >= last_chunk_end.unwrap_or(0)
+            {
+                let Some(event) = self.pop_back_event() else {
+                    break;
+                };
+                if !matches!(event.kind, OutputEventKind::InputEcho { .. }) {
+                    dropped.dropped_visible_events =
+                        dropped.dropped_visible_events.saturating_add(1);
+                }
+                continue;
+            }
+
+            let excess = self
+                .total_buffered_bytes()
+                .saturating_add(needed_bytes)
+                .saturating_sub(capacity_bytes);
+            let Some(back) = self.chunks.back_mut() else {
+                break;
+            };
+            let drop_len = excess.min(back.range.len());
+            if drop_len == 0 {
+                break;
+            }
+            back.range.end = back.range.end.saturating_sub(drop_len);
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(drop_len);
+            dropped.dropped_bytes = dropped.dropped_bytes.saturating_add(drop_len as u64);
+            if back.range.is_empty() {
+                let _ = self.chunks.pop_back();
+            }
+            self.cleanup_back();
         }
         dropped
     }
@@ -1323,6 +1390,14 @@ impl OutputRingInner {
         }
     }
 
+    fn retained_end_offset(&self) -> u64 {
+        self.chunks
+            .back()
+            .map(|chunk| chunk.start_offset.saturating_add(chunk.range.len() as u64))
+            .unwrap_or(self.start_offset)
+            .max(self.start_offset)
+    }
+
     fn cleanup_front(&mut self) {
         while matches!(self.line_ends.front(), Some(line_end) if *line_end <= self.start_offset) {
             let _ = self.line_ends.pop_front();
@@ -1331,6 +1406,16 @@ impl OutputRingInner {
             if self.pop_front_event() {
                 // Dropping due to consumer progress; not tracked as truncation.
             }
+        }
+    }
+
+    fn cleanup_back(&mut self) {
+        let retained_end = self.retained_end_offset();
+        while matches!(self.line_ends.back(), Some(line_end) if *line_end > retained_end) {
+            let _ = self.line_ends.pop_back();
+        }
+        while matches!(self.events.back(), Some(event) if event.offset > retained_end) {
+            let _ = self.pop_back_event();
         }
     }
 }
@@ -1616,6 +1701,36 @@ mod tests {
                 } if text.contains("output omitted")
             )),
             "expected a server omission notice when a later visible event cannot fit"
+        );
+    }
+
+    #[test]
+    fn head_retention_keeps_text_that_fits_full_capacity_without_omission() {
+        let notice_bytes = event_size_bytes(&omission_notice_kind());
+        let capacity = notice_bytes.saturating_add(64);
+        let timeline = OutputTimeline::with_head_retention_capacity(capacity);
+        let output = timeline.buffer();
+        let payload = vec![b'x'; capacity];
+
+        timeline.append_text(&payload, false, ContentOrigin::Worker);
+
+        let range = output.read_range(
+            0,
+            output
+                .end_offset()
+                .expect("output should have an end offset"),
+        );
+        assert_eq!(
+            range.bytes.len(),
+            capacity,
+            "text that fits the full head-retention capacity should be retained"
+        );
+        assert!(
+            range.events.iter().all(|event| !matches!(
+                &event.kind,
+                OutputEventKind::Text { text, .. } if text.contains("output omitted")
+            )),
+            "did not expect an omission notice when all output fits"
         );
     }
 

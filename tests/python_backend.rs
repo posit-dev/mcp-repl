@@ -816,9 +816,9 @@ emit_at_wait = True; value = input("plot wait> ")
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_timeout_shows_later_stderr_after_incomplete_stdout_utf8_tail() -> TestResult<()> {
+async fn python_timeout_holds_later_stderr_behind_incomplete_stdout_utf8_tail() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
+    let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -831,22 +831,107 @@ sys.stdout.buffer.write(bytes([0xC3]))
 sys.stdout.flush()
 sys.stderr.write("STDERR_READY\\n")
 sys.stderr.flush()
-time.sleep(2)
+time.sleep(1)
+sys.stdout.buffer.write(bytes([0xA9]))
+sys.stdout.flush()
+time.sleep(0.1)
+sys.stdout.write("STDOUT_DONE\\n")
+sys.stdout.flush()
 """)"#,
-            Some(0.5),
+            Some(0.2),
         )
         .await?;
     let text = result_text(&result);
-
-    session.cancel().await?;
 
     assert!(
         is_busy_response(&text),
         "expected request to remain pending after timeout, got: {text:?}"
     );
     assert!(
-        text.contains("STDERR_READY"),
-        "expected timeout reply to show later stderr despite incomplete stdout UTF-8 tail, got: {text:?}"
+        !text.contains("STDERR_READY"),
+        "timeout reply should hold later stderr behind the incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll = common::wait_until_not_busy(
+        &mut session,
+        poll,
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let poll_text = result_text(&poll);
+
+    session.cancel().await?;
+
+    let head_idx = poll_text
+        .find('\u{00e9}')
+        .or_else(|| poll_text.find("\\xC3"))
+        .ok_or_else(|| format!("expected completed or sealed UTF-8 head, got: {poll_text:?}"))?;
+    let stderr_idx = poll_text
+        .find("STDERR_READY")
+        .ok_or_else(|| format!("expected stderr after UTF-8 completion, got: {poll_text:?}"))?;
+    let done_idx = poll_text
+        .find("STDOUT_DONE")
+        .ok_or_else(|| format!("expected trailing stdout, got: {poll_text:?}"))?;
+    assert!(
+        head_idx < stderr_idx && stderr_idx < done_idx,
+        "expected UTF-8 head before held stderr and later stdout, got: {poll_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_pager_timeout_preserves_unterminated_stderr_state_on_poll() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(mut session) = start_python_pager_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+import time
+sys.stderr.write("ERR_PART")
+sys.stderr.flush()
+time.sleep(1)
+sys.stderr.write("ERR_REST\\n")
+sys.stderr.flush()
+""")"#,
+            Some(0.2),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        is_busy_response(&text),
+        "expected request to remain pending after timeout, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: ERR_PART"),
+        "expected timeout reply to include the first stderr fragment, got: {text:?}"
+    );
+
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll = common::wait_until_not_busy(
+        &mut session,
+        poll,
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let poll_text = result_text(&poll);
+
+    session.cancel().await?;
+
+    assert!(
+        poll_text.contains("ERR_REST"),
+        "expected stderr continuation on poll, got: {poll_text:?}"
+    );
+    assert!(
+        !poll_text.contains("stderr: ERR_REST"),
+        "stderr continuation should not receive a second prefix, got: {poll_text:?}"
     );
     Ok(())
 }
