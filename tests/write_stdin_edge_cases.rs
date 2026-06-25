@@ -68,7 +68,7 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
     let session = common::spawn_server().await?;
 
     let timeout_result = session
-        .write_stdin_raw_unterminated_with("1+1", Some(0.0))
+        .write_stdin_raw_unterminated_with("Sys.sleep(0.25); 6 * 7", Some(0.0))
         .await?;
     let timeout_text = result_text(&timeout_result);
     if backend_unavailable(&timeout_text) {
@@ -76,26 +76,28 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if timeout_text.contains("<<repl status: busy") {
-        let completed = session
-            .write_stdin_raw_unterminated_with("", Some(5.0))
-            .await?;
-        let completed_text = result_text(&completed);
-        if backend_unavailable(&completed_text) {
-            eprintln!("write_stdin_edge_cases backend unavailable in this environment; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
-        assert!(
-            completed_text.contains("2") || completed_text.contains(">"),
-            "expected pending result or idle prompt after non-blocking call, got: {completed_text:?}"
-        );
-    } else {
-        assert!(
-            timeout_text.contains("2"),
-            "expected timeout status or immediate evaluation result, got: {timeout_text:?}"
-        );
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected zero-timeout call to return busy before expression completes, got: {timeout_text:?}"
+    );
+    assert!(
+        !timeout_text.contains("[1] 42"),
+        "did not expect zero-timeout call to include final result, got: {timeout_text:?}"
+    );
+
+    let completed = session
+        .write_stdin_raw_unterminated_with("", Some(5.0))
+        .await?;
+    let completed_text = result_text(&completed);
+    if backend_unavailable(&completed_text) {
+        eprintln!("write_stdin_edge_cases backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
     }
+    assert!(
+        completed_text.contains("[1] 42"),
+        "expected empty poll to return pending result, got: {completed_text:?}"
+    );
 
     let follow_up = session
         .write_stdin_raw_unterminated_with("1+1", Some(5.0))
