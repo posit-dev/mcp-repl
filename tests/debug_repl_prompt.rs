@@ -226,10 +226,6 @@ fn python_debug_repl_accepts_prompt_free_startup() -> TestResult<()> {
     let exe = resolve_mcp_repl_path()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--debug-repl").arg("--interpreter").arg("python");
-    #[cfg(target_os = "windows")]
-    {
-        cmd.arg("--sandbox").arg("danger-full-access");
-    }
     #[cfg(target_os = "macos")]
     if !sandbox_exec_available() {
         cmd.arg("--sandbox").arg("danger-full-access");
