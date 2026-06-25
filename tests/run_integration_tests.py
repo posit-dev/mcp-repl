@@ -604,8 +604,8 @@ def expected_capped_text_preview(label: str, output_number: int) -> str:
     lines = "".join(repeated_text_line(label, index) for index in range(1, 15))
     return (
         lines
-        + f"{label}015 {label * 91}\n"
-        + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt; "
+        + f"{label}01\n"
+        + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/events.log; "
         "later content omitted]..."
     )
 
@@ -1262,16 +1262,16 @@ def r_output_bundle_size_limit(client: McpStdioClient) -> None:
         "output bundle size limit repl",
     )
     received_text = result_text(received)
-    transcript_path = require_transcript_path(
-        received_text,
-        "output bundle size limit repl",
-    )
+    events_log_path = disclosed_path(received_text, "events.log")
+    if events_log_path is None:
+        raise SuiteFailure(
+            f"output bundle size limit repl expected events.log path, got: {received_text!r}"
+        )
+    transcript_path = events_log_path.parent / "transcript.txt"
     transcript = require_text_file(
         transcript_path,
         "output bundle size limit transcript",
     )
-    if (transcript_path.parent / "events.log").exists():
-        raise SuiteFailure("did not expect events.log for text-only capped bundle")
     if "z120" in transcript:
         raise SuiteFailure(
             f"did not expect capped transcript to contain omitted tail, got: {transcript!r}"

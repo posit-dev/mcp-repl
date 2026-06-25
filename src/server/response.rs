@@ -1446,7 +1446,10 @@ impl ActiveOutputBundle {
         if text.is_empty() {
             return Ok(None);
         }
-        if self.has_images() && !self.has_events_log() {
+        if !self.has_events_log()
+            && (self.has_images()
+                || (self.omitted_tail && !self.omission_recorded && visibility.is_reply_visible()))
+        {
             self.materialize_events_log(store)?;
         }
         self.ensure_transcript(store)?;

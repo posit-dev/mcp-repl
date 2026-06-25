@@ -871,13 +871,31 @@ impl OutputRing {
         let mut guard = self.inner.lock().unwrap();
         guard.note_progress();
         let event_bytes = event_size_bytes(&kind);
-        if event_bytes > self.capacity_bytes {
-            return;
+
+        match self.retention {
+            OutputRetention::Tail => {
+                if event_bytes > self.capacity_bytes {
+                    return;
+                }
+                if !guard.make_room_for_input_echo(event_bytes, self.capacity_bytes) {
+                    return;
+                }
+            }
+            OutputRetention::Head => {
+                if event_bytes > self.capacity_bytes {
+                    self.append_omission_notice_locked(&mut guard);
+                    return;
+                }
+                if guard.has_omission_notice() {
+                    return;
+                }
+                if guard.total_buffered_bytes().saturating_add(event_bytes) > self.capacity_bytes {
+                    self.append_omission_notice_locked(&mut guard);
+                    return;
+                }
+            }
         }
 
-        if !guard.make_room_for_input_echo(event_bytes, self.capacity_bytes) {
-            return;
-        }
         let event_offset = guard.end_offset.max(guard.start_offset);
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
         guard.events.push_back(OutputEvent {
@@ -1181,7 +1199,6 @@ impl OutputRing {
         if notice_bytes > self.capacity_bytes {
             return;
         }
-        guard.drop_input_echoes_for_room(notice_bytes, self.capacity_bytes);
         guard.trim_tail_for_room(notice_bytes, self.capacity_bytes);
         if guard.total_buffered_bytes().saturating_add(notice_bytes) > self.capacity_bytes {
             return;

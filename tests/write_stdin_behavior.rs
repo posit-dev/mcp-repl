@@ -56,6 +56,13 @@ fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
     disclosed_path(text, "transcript.txt")
 }
 
+fn bundle_disclosed_transcript_path(text: &str) -> Option<PathBuf> {
+    bundle_transcript_path(text).or_else(|| {
+        bundle_events_log_path(text)
+            .and_then(|events_log| events_log.parent().map(|dir| dir.join("transcript.txt")))
+    })
+}
+
 fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
     let end = text.find(suffix)?.saturating_add(suffix.len());
     let start = text[..end]
@@ -529,7 +536,7 @@ async fn write_stdin_hidden_echo_quota_omission_keeps_later_visible_stdout() -> 
         session.cancel().await?;
         return Ok(());
     }
-    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+    let transcript_path = bundle_disclosed_transcript_path(&text).unwrap_or_else(|| {
         panic!("expected hidden echo quota truncation to disclose a bundle, got: {text:?}")
     });
     let transcript = fs::read_to_string(&transcript_path)?;
@@ -579,7 +586,7 @@ async fn write_stdin_hidden_echo_quota_omission_bundles_later_visible_stdout() -
         session.cancel().await?;
         return Ok(());
     }
-    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+    let transcript_path = bundle_disclosed_transcript_path(&text).unwrap_or_else(|| {
         panic!("expected hidden echo quota truncation to disclose a bundle, got: {text:?}")
     });
     let transcript = fs::read_to_string(&transcript_path)?;

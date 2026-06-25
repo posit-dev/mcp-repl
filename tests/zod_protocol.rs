@@ -31,6 +31,18 @@ fn result_image_count(result: &rmcp::model::CallToolResult) -> usize {
         .count()
 }
 
+fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+    let end = text.find(suffix)?.saturating_add(suffix.len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
+}
+
+fn events_log_path(text: &str) -> Option<PathBuf> {
+    disclosed_path(text, "events.log")
+}
+
 fn read_optional(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
@@ -1302,6 +1314,137 @@ async fn zod_files_bundle_preserves_image_after_large_hidden_input_echo() -> Tes
         "expected the later reply-visible image to remain visible, got: {text:?}"
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_records_hidden_echo_omission_before_later_visible_text() -> TestResult<()>
+{
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "14000".to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let hidden = "h".repeat(24_000);
+    let input = format!("silent {hidden}\nvisible-after-omission\noutput-image-bytes 100");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    let events_log = events_log_path(&text)
+        .unwrap_or_else(|| panic!("expected mixed output bundle events.log, got: {text:?}"));
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "hidden echo ordering bundle returned an error: {text:?}"
+    );
+    let omission_row = events
+        .lines()
+        .position(|line| line.contains("output bundle quota reached"))
+        .unwrap_or_else(|| panic!("expected omission row in events.log, got: {events:?}"));
+    let visible_row = events
+        .lines()
+        .position(|line| {
+            text_row_byte_range(line)
+                .and_then(|(start, end)| transcript.get(start..end))
+                .is_some_and(|slice| slice.contains("v5-output: visible-after-omission"))
+        })
+        .unwrap_or_else(|| {
+            panic!("expected a text row for later visible output in events.log, got: {events:?}")
+        });
+    assert!(
+        omission_row < visible_row,
+        "expected omission row before later visible text row, got events={events:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_reports_omitted_input_echoes_past_timeline_capacity() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "1048576".to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let payload = "i".repeat(512 * 1024);
+    let mut input = String::new();
+    for index in 0..140 {
+        input.push_str(&format!("silent {index:03}-{payload}\n"));
+    }
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    let bundle_path = events_log_path(&text)
+        .or_else(|| disclosed_path(&text, "transcript.txt"))
+        .unwrap_or_else(|| panic!("expected input echo output bundle, got: {text:?}"));
+    let bundle_dir = bundle_path
+        .parent()
+        .unwrap_or_else(|| panic!("bundle path missing parent: {bundle_path:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "oversized input echo bundle returned an error: {text:?}"
+    );
+    assert!(
+        text.contains("later content omitted"),
+        "expected omitted input echoes to be reported, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("silent 000-"),
+        "expected files-mode head retention to keep the first input echo, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("silent 139-"),
+        "expected later input echoes past timeline capacity to be omitted, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+fn text_row_byte_range(line: &str) -> Option<(usize, usize)> {
+    let range = line.strip_prefix('T')?.split(" bytes=").nth(1)?;
+    let range = range.split_whitespace().next()?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 #[cfg(target_family = "unix")]
