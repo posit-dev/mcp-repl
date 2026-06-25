@@ -157,6 +157,7 @@ fn managed_profile(entries: Vec<Value>, network: &str) -> Value {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn managed_unrestricted_profile(network: &str) -> Value {
     json!({
         "type": "managed",
@@ -190,6 +191,7 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Value {
     let mut entries = vec![
         root_read_entry(),
@@ -210,6 +212,7 @@ fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Val
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
+#[cfg(target_os = "macos")]
 fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
     let mut entries = vec![
         root_read_entry(),
@@ -230,6 +233,7 @@ fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
+#[cfg(target_os = "macos")]
 fn workspace_write_with_path_deny_and_child_write_meta(
     sandbox_cwd: &Path,
     denied_path: &Path,
@@ -261,6 +265,7 @@ fn workspace_write_with_path_deny_and_child_write_meta(
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
+#[cfg(target_os = "macos")]
 fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -283,6 +288,7 @@ fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -341,6 +347,7 @@ fn read_only_with_unknown_special_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -356,6 +363,7 @@ fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn minimal_read_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -394,6 +402,7 @@ fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn full_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_unrestricted_profile("restricted"),
@@ -402,6 +411,7 @@ fn full_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn root_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -511,6 +521,7 @@ async fn spawn_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     .await
 }
 
+#[cfg(target_os = "macos")]
 async fn spawn_python_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     common::spawn_server_with_args_env_and_cwd(
         vec![
@@ -787,6 +798,7 @@ fn worker_spawn_policy_types(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn read_only_meta_policy_type() -> &'static str {
     if cfg!(target_os = "macos") {
         "managed"
