@@ -133,8 +133,8 @@ fn run_worker(
             ControlMessage::Interrupt => {
                 if let Some(millis) = delay_ready_after_interrupt_ms {
                     thread::sleep(Duration::from_millis(millis));
-                    writer.send(&WorkerToServer::Ready {})?;
                     append_control_log(control_log_path.as_deref(), "fresh_ready_after_interrupt")?;
+                    writer.send(&WorkerToServer::Ready {})?;
                 }
             }
             ControlMessage::Shutdown => {
