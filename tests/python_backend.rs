@@ -2592,12 +2592,31 @@ async fn python_follow_up_after_resolved_timeout_skips_leading_fresh_echo_in_fil
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp = tempdir()?;
+    let release_path = temp.path().join("release-timeout");
+    let done_path = temp.path().join("done-timeout");
+    let release_literal = serde_json::to_string(
+        release_path
+            .to_str()
+            .ok_or("timeout release path must be valid utf-8")?,
+    )?;
+    let done_literal = serde_json::to_string(
+        done_path
+            .to_str()
+            .ok_or("timeout done path must be valid utf-8")?,
+    )?;
+    let first_input = format!(
+        r#"import pathlib, time
+release_path = pathlib.Path({release_literal})
+while not release_path.exists():
+    time.sleep(0.01)
+print('DETACHED_OK', flush=True)
+pathlib.Path({done_literal}).write_text('done')
+"#
+    );
 
     let first = session
-        .write_stdin_raw_with(
-            "import time; time.sleep(0.2); print('DETACHED_OK')",
-            Some(0.05),
-        )
+        .write_stdin_raw_with(first_input.as_str(), Some(0.05))
         .await?;
     let first_text = result_text(&first);
     assert!(
@@ -2605,12 +2624,8 @@ async fn python_follow_up_after_resolved_timeout_skips_leading_fresh_echo_in_fil
         "expected the initial Python request to time out, got: {first_text:?}"
     );
 
-    sleep(Duration::from_millis(if cfg!(target_os = "macos") {
-        700
-    } else {
-        350
-    }))
-    .await;
+    fs::write(&release_path, "go")?;
+    wait_for_file_text(&done_path, "done").await?;
 
     let follow_up = session
         .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
@@ -2635,7 +2650,8 @@ async fn python_follow_up_after_resolved_timeout_skips_leading_fresh_echo_in_fil
         "expected the fresh Python follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("import time; time.sleep(0.2); print('DETACHED_OK')"),
+        !follow_up_text.contains(">>> import pathlib, time")
+            && !follow_up_text.contains("release_path = pathlib.Path"),
         "did not expect timed-out Python source to be synthesized into the next visible reply, got: {follow_up_text:?}"
     );
     assert!(
