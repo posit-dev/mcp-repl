@@ -288,7 +288,6 @@ impl WorkerManager {
                 prompt: (!session_end).then_some(()).and(resolved_prompt),
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -298,6 +297,9 @@ impl WorkerManager {
         timeout: Duration,
         page_bytes: u64,
     ) -> ReplyWithOffset {
+        if !prompt_wait.timed_out {
+            self.output_timeline.flush_utf8_tails();
+        }
         let start_offset = self.output.current_offset().unwrap_or(0);
         let mut end_offset = self.output.end_offset().unwrap_or(start_offset);
         if end_offset < start_offset {
@@ -361,7 +363,6 @@ impl WorkerManager {
                     .and(resolved_prompt),
                 prompt_variants: None,
             },
-            end_offset,
         }
     }
 }

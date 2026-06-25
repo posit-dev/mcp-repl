@@ -34,9 +34,12 @@ expression: transcript
 <<< alpha line 19
 <<< alpha line 20
 <<< alpha line 21
+<<< 
 <<< [pager] elided output: @293..839
+<<< 
 <<< [image/png len=0]
 <<< [pager] elided output: @839..1610
+<<< 
 <<< [image/png len=0]
 <<< --More-- (Np, 12.0%, @0..293/2441)
 
@@ -44,11 +47,13 @@ expression: transcript
 >>> :hits alpha
 <<< #1 @293 Title
 <<<   > alpha line 22
+<<< 
 <<< --More-- (Np, 12.5%, @293..307/2441)
 
 3) r_repl timeout_ms=10000
 >>> :seek 0
 <<< [pager] elided output (already shown): @0..307
+<<< 
 <<< alpha line 23
 <<< alpha line 24
 <<< alpha line 25
@@ -70,10 +75,12 @@ expression: transcript
 <<< alpha line 41
 <<< alpha line 42
 <<< alpha line 43
+<<< 
 <<< --More-- (Np, 24.6%, @307..601/2441)
 
 4) r_repl timeout_ms=10000
 >>> :hits beta
 <<< #1 @839 Title
 <<<   > beta line 1
+<<< 
 <<< --More-- (Np, 34.8%, @839..851/2441)

@@ -39,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "hello Ada"
+      "text": "hello Ada\n"
     }
   ]
 }

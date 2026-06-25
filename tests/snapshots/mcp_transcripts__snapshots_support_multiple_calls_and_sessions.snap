@@ -39,11 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 42"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "[1] 42\n> "
     }
   ]
 }
@@ -84,7 +80,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "stderr: Error: object 'x' not found"
+      "text": "stderr: Error: object 'x' not found\n"
     },
     {
       "type": "text",

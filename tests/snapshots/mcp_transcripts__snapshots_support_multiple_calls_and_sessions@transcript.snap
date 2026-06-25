@@ -5,10 +5,12 @@ expression: transcript
 == session: session_1 ==
 1) r_repl timeout_ms=10000
 >>> x <- 40 + 2
+<<< > 
 
 2) r_repl timeout_ms=10000
 >>> x
 <<< [1] 42
+<<< > 
 
 3) r_repl
 >>> 
@@ -18,3 +20,5 @@ expression: transcript
 1) r_repl timeout_ms=10000
 >>> x
 <<< stderr: Error: object 'x' not found
+<<< 
+<<< >

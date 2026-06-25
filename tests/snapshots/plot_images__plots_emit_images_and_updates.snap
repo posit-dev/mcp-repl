@@ -72,11 +72,7 @@ expression: serialized
         "content": [
           {
             "type": "text",
-            "text": "[1] 2\n"
-          },
-          {
-            "type": "text",
-            "text": "> "
+            "text": "[1] 2\n> "
           }
         ],
         "isError": false

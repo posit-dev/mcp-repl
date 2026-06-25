@@ -139,11 +139,6 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(
-            &env.debug_dir,
-            codex_exec_expected_sandbox_log(),
-            Duration::from_secs(10),
-        )?;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -153,6 +148,11 @@ mod unix_impl {
             )
             .into());
         }
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
 
         render_wire_snapshot(&env.debug_dir, &env.workspace, &env.codex_home)
     }
@@ -296,11 +296,6 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(
-            &env.debug_dir,
-            codex_exec_expected_sandbox_log(),
-            Duration::from_secs(10),
-        )?;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -310,6 +305,11 @@ mod unix_impl {
             )
             .into());
         }
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
 
         render_exec_snapshot(mode, &stdout, &stderr, &env.workspace, &env.codex_home)
     }
@@ -453,8 +453,12 @@ mod unix_impl {
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write before full access"
         ))?;
-        driver.wait_for_contains("WRITE_ERROR:", Duration::from_secs(20))?;
         driver.wait_for_contains("Tool call 1 completed", Duration::from_secs(20))?;
+        let outputs = mock_server.function_call_outputs().await;
+        assert!(
+            outputs.iter().any(|out| out.contains("WRITE_ERROR:")),
+            "expected pre-full-access tool call to fail outside workspace: {outputs:?}"
+        );
         wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
 
         driver.send_line("/permissions")?;
@@ -468,8 +472,12 @@ mod unix_impl {
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write after full access"
         ))?;
-        driver.wait_for_contains("WRITE_OK", Duration::from_secs(20))?;
         driver.wait_for_contains("Tool call 2 completed", Duration::from_secs(20))?;
+        let outputs = mock_server.function_call_outputs().await;
+        assert!(
+            outputs.iter().any(|out| out.contains("WRITE_OK")),
+            "expected post-full-access tool call to succeed outside workspace: {outputs:?}"
+        );
         wait_for_log_contains(
             &env.debug_dir,
             "danger-full-access",
@@ -477,16 +485,6 @@ mod unix_impl {
         )?;
         wait_for_log_contains(&env.debug_dir, "tool-call-meta", Duration::from_secs(20))?;
         driver.kill()?;
-
-        let outputs = mock_server.function_call_outputs().await;
-        assert!(
-            outputs.iter().any(|out| out.contains("WRITE_ERROR:")),
-            "expected pre-full-access tool call to fail outside workspace: {outputs:?}"
-        );
-        assert!(
-            outputs.iter().any(|out| out.contains("WRITE_OK")),
-            "expected post-full-access tool call to succeed outside workspace: {outputs:?}"
-        );
         Ok(())
     }
 
@@ -2895,8 +2893,9 @@ tryCatch({
         let call_id = format!("call-{ordinal}");
         state.pending_call_id = Some(call_id.clone());
         state.pending_call_ordinal = Some(ordinal);
-        let tool_call =
-            resolve_tool_call_spec(request, &state.tool_name).unwrap_or_else(|| MockToolCallSpec {
+        let tool_call = resolve_tool_call_spec(request, &state.tool_name)
+            .or_else(|| legacy_tool_call_spec(&state.tool_name))
+            .unwrap_or_else(|| MockToolCallSpec {
                 name: state.tool_name.clone(),
                 namespace: None,
             });
@@ -2963,6 +2962,14 @@ tryCatch({
         let name_start = split + 2;
         (split > 0 && name_start < legacy_tool_name.len())
             .then(|| (&legacy_tool_name[..split], &legacy_tool_name[name_start..]))
+    }
+
+    fn legacy_tool_call_spec(legacy_tool_name: &str) -> Option<MockToolCallSpec> {
+        let (namespace, name) = split_legacy_tool_name(legacy_tool_name)?;
+        Some(MockToolCallSpec {
+            name: name.to_string(),
+            namespace: Some(namespace.to_string()),
+        })
     }
 
     fn message_item(text: &str) -> Value {

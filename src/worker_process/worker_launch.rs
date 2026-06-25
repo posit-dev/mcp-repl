@@ -84,7 +84,6 @@ impl WorkerManager {
             &self.sandbox_state,
             WorkerSpawnContext {
                 oversized_output: self.oversized_output,
-                pending_output_tape: self.pending_output_tape.clone(),
                 output_timeline: self.output_timeline.clone(),
                 guardrail: self.guardrail.clone(),
                 managed_network_proxy: self.managed_network_proxy.as_ref(),
@@ -295,8 +294,8 @@ mod tests {
             "expected inherited sandbox state to disable bwrap after fallback"
         );
 
-        let snapshot = manager.pending_output_tape.drain_final_snapshot();
-        let text = contents_text(&snapshot.format_contents().contents);
+        let output = manager.pending_output_tape.drain_final_output();
+        let text = contents_text(&output.contents);
         assert!(
             text.contains("continuing without bwrap"),
             "expected fallback notice in visible output, got: {text:?}"

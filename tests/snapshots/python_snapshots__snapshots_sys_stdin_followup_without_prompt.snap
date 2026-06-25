@@ -39,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "stdin bravo"
+      "text": "stdin bravo\n"
     }
   ]
 }

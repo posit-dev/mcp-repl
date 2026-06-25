@@ -56,6 +56,13 @@ fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
     disclosed_path(text, "transcript.txt")
 }
 
+fn bundle_disclosed_transcript_path(text: &str) -> Option<PathBuf> {
+    bundle_transcript_path(text).or_else(|| {
+        bundle_events_log_path(text)
+            .and_then(|events_log| events_log.parent().map(|dir| dir.join("transcript.txt")))
+    })
+}
+
 fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
     let end = text.find(suffix)?.saturating_add(suffix.len());
     let start = text[..end]
@@ -325,7 +332,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<()> {
+async fn write_stdin_batch_generates_input_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -340,26 +347,26 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
         !text.contains("> 1+"),
-        "did not expect structural first line input to be synthesized into output, got: {text:?}"
+        "leading generated echo should be absent, got: {text:?}"
     );
     assert!(
         !text.contains("\n+ 1"),
-        "did not expect structural continuation input to be synthesized into output, got: {text:?}"
+        "leading continuation echo should be absent, got: {text:?}"
     );
 
     let result = session
-        .write_stdin_raw_with("plain_x <- 1\nplain_x + 1", Some(30.0))
+        .write_stdin_raw_with("echo_keep_x <- 1\necho_keep_x + 1", Some(30.0))
         .await?;
     let result = wait_until_not_busy(&mut session, result).await?;
     let text = result_text(&result);
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        !text.contains("> plain_x <- 1"),
-        "did not expect structural assignment input to be synthesized into output, got: {text:?}"
+        !text.contains("> echo_keep_x <- 1"),
+        "leading assignment echo should be absent, got: {text:?}"
     );
     assert!(
-        !text.contains("> plain_x + 1"),
-        "did not expect structural expression input to be synthesized into output, got: {text:?}"
+        !text.contains("> echo_keep_x + 1"),
+        "expression echo before first output should be absent, got: {text:?}"
     );
 
     let result = session
@@ -369,7 +376,7 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
     let text = result_text(&result);
     assert!(
         !text.contains("> plain_drop_x <- 1") && !text.contains("> plain_drop_y <- 2"),
-        "did not expect structural assignment input to be synthesized into output, got: {text:?}"
+        "assignment-only leading echoes should be absent, got: {text:?}"
     );
 
     let result = session
@@ -387,11 +394,11 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
     );
     assert!(
         !text.contains("> cat('A\\n')"),
-        "did not expect structural cat input to be synthesized into output, got: {text:?}"
+        "leading expression echo should be absent, got: {text:?}"
     );
     assert!(
         !text.contains("> 1+1"),
-        "did not expect structural expression input to be synthesized into output, got: {text:?}"
+        "normal replies should not include generated expression echo after output interleaving, got: {text:?}"
     );
 
     let result = session
@@ -408,11 +415,32 @@ async fn write_stdin_batch_does_not_synthesize_input_transcript() -> TestResult<
     );
     assert!(
         !text.contains("> cat('SECOND\\n')"),
-        "did not expect structural second submitted expression to be synthesized into output, got: {text:?}"
+        "normal replies should not include second submitted expression echo, got: {text:?}"
     );
     assert!(
         !text.contains("> cat('THIRD\\n')"),
-        "did not expect structural third submitted expression to be synthesized into output, got: {text:?}"
+        "normal replies should not include third submitted expression echo, got: {text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            "cat('BEFORE\\n')\necho_collapse_x <- 1\necho_collapse_y <- 2\ncat('AFTER\\n')",
+            Some(30.0),
+        )
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("BEFORE\n") && text.contains("AFTER\n"),
+        "expected surrounding output, got: {text:?}"
+    );
+    assert!(
+        !text.contains("> cat('BEFORE\\n')"),
+        "leading generated echo before first output should be absent, got: {text:?}"
+    );
+    assert!(
+        !text.contains("> echo_collapse_x <- 1") && !text.contains("> echo_collapse_y <- 2"),
+        "normal replies should not include generated echoes after real output, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -445,13 +473,223 @@ async fn write_stdin_preserves_prompt_shaped_child_stdout_before_matching_r_inpu
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
         text.matches("> 1+1").count() == 1,
-        "expected raw child stdout to remain visible without synthesized submitted input, got: {text:?}"
+        "expected raw child stdout to remain visible without a generated echo, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_does_not_synthesize_readline_answers() -> TestResult<()> {
+async fn write_stdin_files_bundle_uses_full_input_echo_transcript() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let huge_value = "e".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("full_echo_assignment <- {huge_literal}\ncat('VISIBLE_DONE\\n')");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected full echo transcript to force a files-mode bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        !text.contains("full_echo_assignment"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> full_echo_assignment <- "),
+        "expected transcript.txt to include the generated input echo, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("VISIBLE_DONE"),
+        "expected transcript.txt to include worker output, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_hidden_echo_quota_omission_keeps_later_visible_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session_with_env_vars(vec![(
+        "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+        "2048".to_string(),
+    )])
+    .await?;
+
+    let huge_value = "q".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("hidden_quota_assignment <- {huge_literal}\ncat('VISIBLE_DONE\\n')");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_disclosed_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected hidden echo quota truncation to disclose a bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("later content omitted"),
+        "expected the bundle notice to report quota truncation, got: {text:?}"
+    );
+    assert!(
+        text.contains("VISIBLE_DONE"),
+        "expected later visible stdout to survive hidden echo truncation, got: {text:?}"
+    );
+    assert!(
+        !text.contains("hidden_quota_assignment"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> hidden_quota_assignment <- "),
+        "expected transcript.txt to include the retained generated input echo, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_hidden_echo_quota_omission_bundles_later_visible_stdout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session_with_env_vars(vec![(
+        "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+        "7000".to_string(),
+    )])
+    .await?;
+
+    let hidden_value = "q".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let hidden_literal = serde_json::to_string(&hidden_value)?;
+    let visible_len = OVER_HARD_SPILL_TEXT_LEN;
+    let visible_value = "v".repeat(visible_len);
+    let input = format!(
+        "hidden_quota_assignment <- {hidden_literal}\nvisible_tail <- paste(rep('v', {visible_len}), collapse = '')\ncat('VISIBLE_START\\n'); cat(visible_tail); cat('\\nVISIBLE_END\\n')"
+    );
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_disclosed_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected hidden echo quota truncation to disclose a bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("VISIBLE_START") && text.contains("VISIBLE_END"),
+        "expected visible stdout preview to survive hidden echo truncation, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("VISIBLE_START") && transcript.contains("VISIBLE_END"),
+        "expected transcript.txt to include later visible stdout, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains(&visible_value),
+        "expected transcript.txt to include the full later visible stdout, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_hidden_only_echo_spill_uses_clean_bundle_notice() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let huge_value = "h".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("hidden_only_assignment <- {huge_literal}");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected hidden-only echo to force a files-mode bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("full output:"),
+        "expected a bundle disclosure in the reply, got: {text:?}"
+    );
+    assert!(
+        !text.contains("shown chars") && !text.contains("shown lines"),
+        "hidden-only spills should not claim to truncate visible output, got: {text:?}"
+    );
+    assert!(
+        text.matches("> ").count() <= 1,
+        "hidden-only spills should not duplicate the prompt in the preview, got: {text:?}"
+    );
+    assert!(
+        !text.contains("hidden_only_assignment"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> hidden_only_assignment <- "),
+        "expected transcript.txt to include the generated input echo, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_error_bundle_preserves_transcript_only_echo_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let huge_value = "h".repeat(OVER_HARD_SPILL_TEXT_LEN);
+    let huge_literal = serde_json::to_string(&huge_value)?;
+    let input = format!("hidden_error_payload <- {huge_literal}\nError <- stop('x')");
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected hidden error echo to force a files-mode bundle, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        !text.contains("hidden_error_payload"),
+        "normal MCP response text should not include generated input echo, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("> Error <- stop('x')"),
+        "expected transcript.txt to preserve the generated input prompt, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_generates_readline_input_echoes() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -475,7 +713,7 @@ async fn write_stdin_does_not_synthesize_readline_answers() -> TestResult<()> {
     let second_text = result_text(&second);
     assert!(
         !second_text.contains("FIRST> alpha"),
-        "did not expect synthetic readline answer in follow-up reply, got: {second_text:?}"
+        "did not expect leading generated readline transcript in follow-up reply, got: {second_text:?}"
     );
     assert!(
         second_text.contains("SECOND> "),
@@ -493,8 +731,8 @@ async fn write_stdin_does_not_synthesize_readline_answers() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        !transcript.contains("SECOND> beta"),
-        "did not expect synthetic readline answer in transcript.txt, got: {transcript:?}"
+        transcript.contains("SECOND> beta"),
+        "expected files-mode transcript.txt to include generated readline transcript, got: {transcript:?}"
     );
     assert!(
         transcript.contains("DONE_START") && transcript.contains("DONE_END"),
@@ -543,7 +781,7 @@ async fn write_stdin_readline_reports_input_wait_then_consumes_fresh_turn() -> T
     );
     assert!(
         !second_text.contains("ASK> alpha"),
-        "did not expect synthetic readline input in reply, got: {second_text:?}"
+        "leading synthetic readline input echo should be absent, got: {second_text:?}"
     );
     Ok(())
 }
@@ -706,6 +944,45 @@ async fn pager_long_r_stderr_keeps_one_stream_prefix() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_long_r_stderr_continuation_page_keeps_one_stream_prefix() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(120).await?;
+
+    let result = session
+        .write_stdin_raw_with("message(strrep('x', 20000))", Some(30.0))
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let first_text = result_text(&result);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("--More--"),
+        "expected pager to activate, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("stderr: "),
+        "expected first page to carry stderr prefix, got: {first_text:?}"
+    );
+
+    let next = session.write_stdin_raw_with(":next", Some(30.0)).await?;
+    let next_text = result_text(&next);
+    session.cancel().await?;
+
+    assert!(
+        next_text.contains("xxxxxxxx"),
+        "expected second page to contain stderr continuation text, got: {next_text:?}"
+    );
+    assert!(
+        !next_text.contains("stderr: "),
+        "did not expect a fresh stderr prefix inside one stderr write, got: {next_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pager_long_r_stderr_after_prior_reply_keeps_one_stream_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_pager_behavior_session(40_000).await?;
@@ -736,6 +1013,40 @@ async fn pager_long_r_stderr_after_prior_reply_keeps_one_stream_prefix() -> Test
     assert_eq!(
         prefix_count, 1,
         "expected one stderr prefix after prior consumed output, got {prefix_count}: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_stderr_prefix_resets_between_completed_requests() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_pager_behavior_session(40_000).await?;
+
+    let first = session
+        .write_stdin_raw_with("cat('first', file=stderr())", Some(30.0))
+        .await?;
+    let first = wait_until_not_busy(&mut session, first).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("stderr: first"),
+        "expected first stderr fragment, got: {first_text:?}"
+    );
+
+    let second = session
+        .write_stdin_raw_with("cat('boom\\n', file=stderr())", Some(30.0))
+        .await?;
+    let second = wait_until_not_busy(&mut session, second).await?;
+    let second_text = result_text(&second);
+    session.cancel().await?;
+
+    assert!(
+        second_text.contains("stderr: boom\n"),
+        "expected fresh stderr prefix after request boundary, got: {second_text:?}"
     );
     Ok(())
 }
@@ -1218,7 +1529,7 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
     let spilled_before_delete =
         wait_until_file_contains_via_polls(&mut session, &transcript_path, "mid080").await?;
     assert!(
-        !spilled_before_delete.contains("tail"),
+        !spilled_before_delete.lines().any(|line| line == "tail"),
         "did not expect tail before test releases the R-side gate, got: {spilled_before_delete:?}"
     );
 
@@ -1246,7 +1557,7 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
         );
     }
     assert!(
-        recreated_transcript.contains("tail"),
+        recreated_transcript.lines().any(|line| line == "tail"),
         "expected later small poll output to recreate the deleted spill file, got: {recreated_transcript:?}"
     );
     assert!(
@@ -1688,8 +1999,8 @@ async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_follow_up_after_resolved_timeout_does_not_synthesize_input_transcript()
--> TestResult<()> {
+async fn pager_follow_up_after_resolved_timeout_skips_leading_detached_input_echo() -> TestResult<()>
+{
     let _guard = lock_test_mutex();
     let session = spawn_pager_behavior_session(20_000).await?;
     let temp = workspace_tempdir()?;
@@ -1755,12 +2066,61 @@ async fn pager_follow_up_after_resolved_timeout_does_not_synthesize_input_transc
         "expected the fresh pager follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("[repl] input:"),
-        "did not expect synthetic input summary in pager reply, got: {follow_up_text:?}"
+        !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
+        "timed-out request echo should not lead the next pager reply, got: {follow_up_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_hidden_only_detached_echo_does_not_consume_follow_up_page_budget() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let session = spawn_pager_behavior_session(80).await?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("hidden-prefix-start-ready");
+    let done_path = temp.path().join("hidden-prefix-done");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let done_literal = r_path_literal(&done_path)?;
+
+    let hidden_payload = "h".repeat(500);
+    let hidden_literal = serde_json::to_string(&hidden_payload)?;
+    let first_input = format!(
+        "while (!file.exists({start_gate_literal})) Sys.sleep(0.01); hidden_prefix_assignment <- {hidden_literal}; writeLines('done', {done_literal})"
+    );
+    let first = session
+        .write_stdin_raw_with(&first_input, Some(0.05))
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial gated pager request to time out, got: {first_text:?}"
+    );
+
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&done_path, "pager hidden-prefix output marker").await?;
+    sleep(Duration::from_millis(100)).await;
+
+    let follow_up = session
+        .write_stdin_raw_with("cat('FRESH_VISIBLE\\n')", Some(2.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        !follow_up_text.contains("hidden_prefix_assignment"),
+        "timed-out request echo should stay hidden in the next pager reply, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("file.exists(") && !follow_up_text.contains("print(1+1)"),
-        "did not expect structural timed-out input to be synthesized into the next pager reply, got: {follow_up_text:?}"
+        follow_up_text.contains("FRESH_VISIBLE"),
+        "hidden-only detached echo should not consume the fresh reply page budget, got: {follow_up_text:?}"
     );
 
     Ok(())
