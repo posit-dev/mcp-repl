@@ -282,6 +282,13 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "partial-utf8-stderr-then-sleep" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_stderr_text(writer, control_log_path, b"tail-visible\n")?;
+        sleep_for(200, sideband_interrupted, false);
+        return Ok(false);
+    }
+
     if command == "raw-split-utf8-around-input-wait" {
         io::stdout().write_all(&[0xC3])?;
         io::stdout().flush()?;

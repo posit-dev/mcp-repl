@@ -837,7 +837,7 @@ async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> Tes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_files_timeout_does_not_drain_event_after_incomplete_utf8() -> TestResult<()> {
+async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -856,10 +856,14 @@ async fn zod_files_timeout_does_not_drain_event_after_incomplete_utf8() -> TestR
         timeout_text.contains("<<repl status: busy"),
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
+    assert!(
+        timeout_text.contains("\\xC3"),
+        "timeout drain should flush an incomplete leading UTF-8 tail before later output, got: {timeout_text:?}"
+    );
     assert_eq!(
         result_image_count(&timed_out),
-        0,
-        "timeout drain should not pass an incomplete leading UTF-8 tail"
+        1,
+        "timeout drain should pass later complete events after flushing an incomplete UTF-8 tail"
     );
 
     let completed = session
@@ -875,32 +879,75 @@ async fn zod_files_timeout_does_not_drain_event_after_incomplete_utf8() -> TestR
 
     session.cancel().await?;
 
-    let image_index = completed
-        .content
-        .iter()
-        .position(|item| matches!(item.raw, RawContent::Image(_)))
-        .ok_or("expected interleaved image in completion reply")?;
-    let text_before_image = completed.content[..image_index]
-        .iter()
-        .filter_map(|item| match &item.raw {
-            RawContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    assert!(
+        text.contains("\\xA9"),
+        "the later continuation byte should flush separately after the timeout drained the prefix, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-stderr-then-sleep",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let timeout_text = result_text(&timed_out);
+
+    session.cancel().await?;
 
     assert!(
-        text_before_image.contains("é"),
-        "split stdout UTF-8 should render before the following image, got contents: {:?}",
-        completed.content
+        timeout_text.contains("<<repl status: busy"),
+        "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        text.contains("é"),
-        "split stdout UTF-8 should render as one character, got: {text:?}"
+        timeout_text.contains("\\xC3"),
+        "timeout drain should flush an incomplete leading UTF-8 tail, got: {timeout_text:?}"
     );
     assert!(
-        !text.contains("\\xC3") && !text.contains("\\xA9"),
-        "split stdout UTF-8 should not render as escaped bytes, got: {text:?}"
+        timeout_text.contains("stderr: tail-visible\n"),
+        "timeout drain should expose later stderr after an incomplete UTF-8 tail, got: {timeout_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-then-exit",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xC3\n[repl] session ended\n"),
+        "pager final reply should flush the partial UTF-8 tail before the session-end notice, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3[repl]"),
+        "session-end notice should not be concatenated to an escaped UTF-8 tail, got: {text:?}"
     );
 
     Ok(())

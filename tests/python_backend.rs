@@ -816,7 +816,7 @@ emit_at_wait = True; value = input("plot wait> ")
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_timeout_holds_later_stderr_behind_incomplete_stdout_utf8_tail() -> TestResult<()> {
+async fn python_timeout_drains_later_stderr_after_incomplete_stdout_utf8_tail() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
@@ -848,8 +848,22 @@ sys.stdout.flush()
         "expected request to remain pending after timeout, got: {text:?}"
     );
     assert!(
-        !text.contains("STDERR_READY"),
-        "timeout reply should hold later stderr behind the incomplete stdout UTF-8 tail, got: {text:?}"
+        text.contains("\\xC3"),
+        "timeout reply should flush the incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: STDERR_READY\n"),
+        "timeout reply should expose later stderr after the incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+    let head_idx = text
+        .find("\\xC3")
+        .ok_or_else(|| format!("expected sealed UTF-8 head in timeout reply, got: {text:?}"))?;
+    let stderr_idx = text
+        .find("STDERR_READY")
+        .ok_or_else(|| format!("expected stderr in timeout reply, got: {text:?}"))?;
+    assert!(
+        head_idx < stderr_idx,
+        "expected sealed UTF-8 head before later stderr, got: {text:?}"
     );
 
     let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
@@ -864,19 +878,19 @@ sys.stdout.flush()
 
     session.cancel().await?;
 
-    let head_idx = poll_text
-        .find('\u{00e9}')
-        .or_else(|| poll_text.find("\\xC3"))
-        .ok_or_else(|| format!("expected completed or sealed UTF-8 head, got: {poll_text:?}"))?;
-    let stderr_idx = poll_text
-        .find("STDERR_READY")
-        .ok_or_else(|| format!("expected stderr after UTF-8 completion, got: {poll_text:?}"))?;
+    assert!(
+        !poll_text.contains("STDERR_READY"),
+        "stderr already drained in timeout reply should not repeat on completion poll, got: {poll_text:?}"
+    );
+    let tail_idx = poll_text
+        .find("\\xA9")
+        .ok_or_else(|| format!("expected remaining UTF-8 continuation byte, got: {poll_text:?}"))?;
     let done_idx = poll_text
         .find("STDOUT_DONE")
         .ok_or_else(|| format!("expected trailing stdout, got: {poll_text:?}"))?;
     assert!(
-        head_idx < stderr_idx && stderr_idx < done_idx,
-        "expected UTF-8 head before held stderr and later stdout, got: {poll_text:?}"
+        tail_idx < done_idx,
+        "expected continuation byte before later stdout, got: {poll_text:?}"
     );
     Ok(())
 }

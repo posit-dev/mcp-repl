@@ -45,6 +45,7 @@ impl WorkerManager {
         page_bytes: u64,
         meta: &str,
     ) -> ReplyWithOffset {
+        self.output_timeline.flush_utf8_tails();
         let end_offset = self.output.end_offset().unwrap_or(0);
         self.build_session_reset_reply_pager_to_offset(page_bytes, meta, end_offset)
     }

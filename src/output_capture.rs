@@ -1,6 +1,7 @@
 #![cfg_attr(not(target_family = "unix"), allow(dead_code))]
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -119,6 +120,7 @@ impl OutputTimeline {
             key,
             bytes,
             is_continuation || matches!(source, OutputTextSource::Raw),
+            self.ring.capacity_bytes,
         );
         self.append_pending_locked(pending);
     }
@@ -199,7 +201,7 @@ impl OutputTimeline {
 
     fn append_event(&self, kind: OutputEventKind) {
         let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.push_event(kind);
+        let pending = guard.utf8_tails.push_event(kind, self.ring.capacity_bytes);
         self.append_pending_locked(pending);
     }
 
@@ -249,6 +251,7 @@ impl OutputUtf8Tails {
         key: OutputUtf8TailKey,
         bytes: &[u8],
         continue_previous_tail: bool,
+        side_buffer_capacity_bytes: usize,
     ) -> Vec<OutputPendingEntry> {
         if bytes.is_empty() {
             return Vec::new();
@@ -282,12 +285,16 @@ impl OutputUtf8Tails {
                 sealed: false,
             }));
         }
-        self.drain_ready()
+        self.drain_ready_bounded(side_buffer_capacity_bytes)
     }
 
-    fn push_event(&mut self, kind: OutputEventKind) -> Vec<OutputPendingEntry> {
+    fn push_event(
+        &mut self,
+        kind: OutputEventKind,
+        side_buffer_capacity_bytes: usize,
+    ) -> Vec<OutputPendingEntry> {
         self.entries.push(OutputPendingEntry::Event(kind));
-        self.drain_ready()
+        self.drain_ready_bounded(side_buffer_capacity_bytes)
     }
 
     fn drain(&mut self) -> Vec<OutputPendingEntry> {
@@ -311,7 +318,7 @@ impl OutputUtf8Tails {
                 continue;
             };
             if front.sealed {
-                ready.push(self.entries.remove(0));
+                ready.push(materialize_pending_entry(self.entries.remove(0)));
                 continue;
             }
 
@@ -336,51 +343,115 @@ impl OutputUtf8Tails {
         ready
     }
 
+    fn drain_ready_bounded(
+        &mut self,
+        side_buffer_capacity_bytes: usize,
+    ) -> Vec<OutputPendingEntry> {
+        let mut ready = self.drain_ready();
+        if self.blocked_side_buffer_bytes() > side_buffer_capacity_bytes {
+            ready.extend(self.drain_ready_after_gaps());
+        }
+        ready
+    }
+
     fn drain_ready_after_gaps(&mut self) -> Vec<OutputPendingEntry> {
         let mut ready = Vec::new();
-        let mut index = 0usize;
-        let mut blocked_by_incomplete_tail = false;
-        while index < self.entries.len() {
-            if blocked_by_incomplete_tail {
-                break;
-            }
-            let OutputPendingEntry::Text(entry) = &mut self.entries[index] else {
-                ready.push(self.entries.remove(index));
+        while !self.entries.is_empty() {
+            let has_later_entries = self.entries.len() > 1;
+            let OutputPendingEntry::Text(front) = &mut self.entries[0] else {
+                ready.push(self.entries.remove(0));
                 continue;
             };
-            if entry.sealed {
-                ready.push(self.entries.remove(index));
+            if front.sealed {
+                ready.push(materialize_pending_entry(self.entries.remove(0)));
                 continue;
             }
 
-            let flushable_len = flushable_prefix_len(&entry.bytes);
+            let flushable_len = flushable_prefix_len(&front.bytes);
             if flushable_len == 0 {
-                blocked_by_incomplete_tail = true;
-                index += 1;
+                if has_later_entries {
+                    front.sealed = true;
+                    ready.push(materialize_pending_entry(self.entries.remove(0)));
+                    continue;
+                }
+                break;
+            }
+            if flushable_len == front.bytes.len() {
+                ready.push(self.entries.remove(0));
                 continue;
             }
-            if flushable_len == entry.bytes.len() {
-                ready.push(self.entries.remove(index));
-                continue;
-            }
-            let key = entry.key;
-            let bytes = entry.bytes[..flushable_len].to_vec();
-            entry.bytes.drain(..flushable_len);
+            let key = front.key;
+            let bytes = front.bytes[..flushable_len].to_vec();
+            front.bytes.drain(..flushable_len);
             ready.push(OutputPendingEntry::Text(OutputUtf8Tail {
                 key,
                 bytes,
                 sealed: true,
             }));
-            blocked_by_incomplete_tail = true;
-            index += 1;
+            if !has_later_entries {
+                break;
+            }
         }
         ready
+    }
+
+    fn blocked_side_buffer_bytes(&self) -> usize {
+        let Some(OutputPendingEntry::Text(front)) = self.entries.first() else {
+            return 0;
+        };
+        if front.sealed || front.is_flushable() {
+            return 0;
+        }
+        self.entries.iter().skip(1).fold(0usize, |total, entry| {
+            total.saturating_add(pending_entry_size_bytes(entry))
+        })
     }
 }
 
 impl OutputUtf8Tail {
     fn is_flushable(&self) -> bool {
         self.sealed || flushable_prefix_len(&self.bytes) == self.bytes.len()
+    }
+}
+
+fn materialize_pending_entry(entry: OutputPendingEntry) -> OutputPendingEntry {
+    match entry {
+        OutputPendingEntry::Text(entry) => OutputPendingEntry::Text(entry.materialize()),
+        OutputPendingEntry::Event(kind) => OutputPendingEntry::Event(kind),
+    }
+}
+
+impl OutputUtf8Tail {
+    fn materialize(mut self) -> Self {
+        if self.sealed {
+            self.bytes = escape_incomplete_utf8_tail(&self.bytes);
+        }
+        self
+    }
+}
+
+fn escape_incomplete_utf8_tail(bytes: &[u8]) -> Vec<u8> {
+    let flushable_len = flushable_prefix_len(bytes);
+    if flushable_len == bytes.len() {
+        return bytes.to_vec();
+    }
+
+    let mut escaped = Vec::with_capacity(
+        flushable_len.saturating_add(bytes.len().saturating_sub(flushable_len).saturating_mul(4)),
+    );
+    escaped.extend_from_slice(&bytes[..flushable_len]);
+    let mut tail = String::new();
+    for byte in &bytes[flushable_len..] {
+        let _ = write!(&mut tail, "\\x{byte:02X}");
+    }
+    escaped.extend_from_slice(tail.as_bytes());
+    escaped
+}
+
+fn pending_entry_size_bytes(entry: &OutputPendingEntry) -> usize {
+    match entry {
+        OutputPendingEntry::Text(entry) => entry.bytes.len(),
+        OutputPendingEntry::Event(kind) => event_size_bytes(kind),
     }
 }
 

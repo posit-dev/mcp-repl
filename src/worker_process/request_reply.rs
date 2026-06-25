@@ -43,6 +43,7 @@ impl WorkerManager {
         page_bytes: u64,
     ) -> ReplyWithOffset {
         self.last_detached_prefix_item_count = context.detached_prefix_contents.len();
+        self.output_timeline.flush_utf8_tails();
         let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
         let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
         let mut contents = context.detached_prefix_contents;
@@ -169,6 +170,7 @@ impl WorkerManager {
                 if session_end {
                     self.note_session_end(true);
                 }
+                self.output_timeline.flush_utf8_tails();
                 let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
                 let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
                 let mut contents = context.detached_prefix_contents;

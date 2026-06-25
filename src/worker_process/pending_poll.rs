@@ -101,13 +101,6 @@ impl WorkerManager {
 
         let state = self.observe_pending_poll_state(timeout, poll_start)?;
         let observed_completion = !matches!(state, PendingPollState::NoCompletion);
-        if observed_completion {
-            end_offset = self.output.end_offset().unwrap_or(end_offset);
-        }
-        if end_offset < start_offset {
-            end_offset = start_offset;
-        }
-
         let (completion, session_end, timed_out_elapsed) = match state {
             PendingPollState::TimedOut { elapsed } => {
                 (CompletionInfo::empty(), false, Some(elapsed))
@@ -119,6 +112,15 @@ impl WorkerManager {
             } => (completion, session_end, None),
             PendingPollState::NoCompletion => (CompletionInfo::empty(), false, None),
         };
+        if observed_completion && timed_out_elapsed.is_none() {
+            self.output_timeline.flush_utf8_tails();
+        }
+        if observed_completion {
+            end_offset = self.output.end_offset().unwrap_or(end_offset);
+        }
+        if end_offset < start_offset {
+            end_offset = start_offset;
+        }
 
         let (saw_stderr, snapshot) = if observed_completion && timed_out_elapsed.is_none() {
             let completed =
