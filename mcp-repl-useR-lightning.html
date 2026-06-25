@@ -212,6 +212,7 @@
 <p>Often, the first bridge is a shell.</p>
 </div></div>
 <aside class="notes">
+<p>Timing: ~0:20.</p>
 <p>A user asks for ordinary R help: explore this dataset, make a first model, explain what you find. The chat looks persistent. The agent can remember the request and reason across turns. But underneath that chat, the first execution surface is often just a shell command. For R, that usually means <code>Rscript</code>.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -236,6 +237,7 @@
 <p>Return one answer.</p>
 </div></div>
 <aside class="notes">
+<p>Timing: ~0:18.</p>
 <p>This is a reasonable starting point. An inline <code>Rscript -e</code> call is available almost everywhere. It is easy for the agent to generate and easy for the host to run. For a one-line calculation, it is enough. The problem is that real analysis does not stay one line for very long.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -260,6 +262,7 @@
 <p>The agent starts writing files.</p>
 </div></div>
 <aside class="notes">
+<p>Timing: ~0:20.</p>
 <p>The next step is also predictable. The inline expression turns into a temporary script. The agent writes a file, runs <code>Rscript</code>, reads the output, edits the file, and runs it again. This is more stable than one huge shell string, but it is still batch execution wearing an interactive costume.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -288,6 +291,7 @@
 <p>The R session does not.</p>
 </div></div>
 <aside class="notes">
+<p>Timing: ~0:25.</p>
 <p>The agent is adapting to the interface it has. But every run starts cold. It reloads data, rebuilds objects, replays setup, and leaves files behind as fake memory: intermediate CSVs, RDS files, generated plots, and notes for itself. That can work for small one-shot tasks. It is the wrong shape for exploratory analysis.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -322,6 +326,7 @@
 </div></div>
 <p>These are interactive surfaces.</p>
 <aside class="notes">
+<p>Timing: ~0:25.</p>
 <p>The mismatch becomes obvious when the task stops being linear. R help, vignettes, pagers, plots, readline prompts, and the debugger all assume there is a live session on the other side. Batch execution can only approximate that by making more files and replaying more setup. For serious R work, command execution is not the primitive we need.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -351,6 +356,7 @@
 <span id="cb5-12"><a href=""></a>state | help | plots | debugger | interrupt | reset</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <p>Give the agent a real R session.</p>
 <aside class="notes">
+<p>Timing: ~0:25.</p>
 <p>The missing primitive is not a smarter <code>Rscript</code> call. It is a persistent, interactive R session that the agent can own for the length of the task. The agent should be able to create an object in one call and inspect it in the next. It should be able to view plots, read help, step through <code>browser()</code>, interrupt bad work, and reset when it needs a clean slate.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -374,6 +380,7 @@
 <li>Private session for the agent</li>
 </ul>
 <aside class="notes">
+<p>Timing: ~0:25.</p>
 <p><code>mcp-repl</code> is one implementation of that idea. The MCP surface is small: a <code>repl</code> tool for input and a <code>repl_reset</code> tool for starting over. The hard parts sit below that boundary: worker lifecycle, output capture, image capture, timeouts, interrupts, and response finalization. The user-visible property is continuity.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -398,7 +405,43 @@
 <span id="cb6-7"><a href=""></a>  - workspace and temp writes only</span>
 <span id="cb6-8"><a href=""></a>  - network off unless configured</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <aside class="notes">
+<p>Timing: ~0:25.</p>
 <p>This is not a human and a model sharing one IDE session. It is built for agent work, so the live session needs a security boundary. The model can run code and keep state, but writes are constrained, network access is off unless configured, and recovery controls are explicit. The sandbox is part of what makes persistence acceptable.</p>
+<style type="text/css">
+        span.MJX_Assistive_MathML {
+          position:absolute!important;
+          clip: rect(1px, 1px, 1px, 1px);
+          padding: 1px 0 0 0!important;
+          border: 0!important;
+          height: 1px!important;
+          width: 1px!important;
+          overflow: hidden!important;
+          display:block!important;
+      }</style></aside>
+</section>
+<section id="when-no-one-is-sitting-there" class="slide level2">
+<h2>When No One Is Sitting There</h2>
+<div class="columns">
+<div class="column" style="width:50%;">
+<p><strong>Unattended sessions</strong></p>
+<ul>
+<li>scheduled jobs</li>
+<li>fresh-data reconnaissance</li>
+<li>overnight failure analysis</li>
+<li>autonomous report drafts</li>
+</ul>
+</div><div class="column" style="width:50%;">
+<p><strong>Workflow optimization</strong></p>
+<ul>
+<li>evals on realistic R tasks</li>
+<li>prompt and policy sweeps</li>
+<li>regression tests for tool use</li>
+<li>LLM-powered pipeline tuning</li>
+</ul>
+</div></div>
+<aside class="notes">
+<p>Timing: ~0:35.</p>
+<p>This is the future-facing gap. The same primitive matters when there is not a human watching every turn: scheduled work, long-running investigations, agent evaluations, and optimization loops that tune prompts, tools, or analysis workflows. A human may review the result, but the session itself is owned by the agent while the work is happening.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -424,6 +467,7 @@
 <span id="cb7-9"><a href=""></a>  - step through browser()</span>
 <span id="cb7-10"><a href=""></a>  - recover after errors</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 <aside class="notes">
+<p>Timing: ~0:30.</p>
 <p>If we want to evaluate agents on serious R work, we should not only ask whether they can emit syntactically valid code. We should ask whether they can use the surfaces R users actually depend on: object state, help, plots, debugger steps, and recovery after mistakes. A persistent REPL makes those behaviors observable and testable.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
@@ -437,27 +481,109 @@
           display:block!important;
       }</style></aside>
 </section>
-<section id="where-this-matters" class="slide level2">
-<h2>Where This Matters</h2>
+<section id="two-different-shapes" class="slide level2">
+<h2>Two Different Shapes</h2>
+<svg viewbox="0 0 1500 560" role="img" aria-label="Two diagrams. On the left, a human connects to an LLM harness, which connects to mcp-repl and its agent-owned R session. On the right, the human, LLM harness, and IDE R session are all connected in a triangle." style="width: 100%; height: auto;">
+  <defs>
+    <marker id="arrow-blue" viewbox="0 0 10 10" refx="8" refy="5" markerwidth="8" markerheight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9ee7ff"></path>
+    </marker>
+    <marker id="arrow-green" viewbox="0 0 10 10" refx="8" refy="5" markerwidth="8" markerheight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b8f5b0"></path>
+    </marker>
+    <style>
+      .panel-title { font: 700 34px system-ui, sans-serif; fill: #ffffff; }
+      .label { font: 650 28px system-ui, sans-serif; fill: #ffffff; }
+      .small { font: 500 22px system-ui, sans-serif; fill: #c8d3dc; }
+      .muted { font: 500 20px system-ui, sans-serif; fill: #9aa7b1; }
+      .box { fill: #17212b; stroke: #9ee7ff; stroke-width: 3; }
+      .ide-box { fill: #1f251f; stroke: #b8f5b0; stroke-width: 3; }
+      .line { stroke: #9ee7ff; stroke-width: 4; fill: none; marker-end: url(#arrow-blue); }
+      .ide-line { stroke: #b8f5b0; stroke-width: 4; fill: none; marker-end: url(#arrow-green); }
+      .human { stroke: #ffffff; stroke-width: 4; fill: none; }
+    </style>
+  </defs>
+
+  <text class="panel-title" x="95" y="55">mcp-repl: agent-owned</text>
+  <text class="panel-title" x="875" y="55">IDE assistant: human in the loop</text>
+
+  <g transform="translate(80 120)">
+    <circle class="human" cx="70" cy="55" r="32"></circle>
+    <path class="human" d="M70 92 L70 168 M18 126 L122 126 M70 168 L30 226 M70 168 L110 226"></path>
+    <text class="label" x="70" y="275" text-anchor="middle">Human</text>
+  </g>
+
+  <rect class="box" x="275" y="175" width="240" height="150" rx="18"></rect>
+  <text class="label" x="395" y="235" text-anchor="middle">LLM harness</text>
+  <text class="small" x="395" y="275" text-anchor="middle">Codex / Claude Code</text>
+  <text class="small" x="395" y="307" text-anchor="middle">ellmer / chatlas / OpenCode</text>
+
+  <rect class="box" x="590" y="175" width="250" height="150" rx="18"></rect>
+  <text class="label" x="715" y="230" text-anchor="middle">mcp-repl</text>
+  <text class="small" x="715" y="270" text-anchor="middle">agent-owned</text>
+  <text class="small" x="715" y="302" text-anchor="middle">R session</text>
+
+  <path class="line" d="M205 250 L265 250"></path>
+  <path class="line" d="M525 250 L580 250"></path>
+  <text class="muted" x="460" y="405" text-anchor="middle">No direct human access to the REPL</text>
+
+  <g transform="translate(885 120)">
+    <circle class="human" cx="105" cy="45" r="30"></circle>
+    <path class="human" d="M105 80 L105 145 M55 112 L155 112 M105 145 L68 200 M105 145 L142 200"></path>
+    <text class="label" x="105" y="248" text-anchor="middle">Human</text>
+  </g>
+
+  <rect class="ide-box" x="1185" y="165" width="230" height="135" rx="18"></rect>
+  <text class="label" x="1300" y="222" text-anchor="middle">LLM harness</text>
+  <text class="small" x="1300" y="262" text-anchor="middle">IDE assistant</text>
+
+  <rect class="ide-box" x="1030" y="365" width="260" height="125" rx="18"></rect>
+  <text class="label" x="1160" y="420" text-anchor="middle">IDE R session</text>
+  <text class="small" x="1160" y="460" text-anchor="middle">shared context</text>
+
+  <path class="ide-line" d="M1045 230 L1175 230"></path>
+  <path class="ide-line" d="M1295 310 L1210 355"></path>
+  <path class="ide-line" d="M1045 335 L1105 355"></path>
+  <text class="muted" x="1180" y="535" text-anchor="middle">Human, agent, and REPL remain connected</text>
+</svg>
+<aside class="notes">
+<p>Timing: ~0:45.</p>
+<p>These are different shapes. With <code>mcp-repl</code>, the human talks to an LLM harness, and the harness talks to <code>mcp-repl</code>. There is no direct line from the human to that R session. It is private runtime owned by the agent. The IDE experience is different: the human, the assistant, and the R session are connected, so it is designed for interactive, agent-assisted data analysis.</p>
+<style type="text/css">
+        span.MJX_Assistive_MathML {
+          position:absolute!important;
+          clip: rect(1px, 1px, 1px, 1px);
+          padding: 1px 0 0 0!important;
+          border: 0!important;
+          height: 1px!important;
+          width: 1px!important;
+          overflow: hidden!important;
+          display:block!important;
+      }</style></aside>
+</section>
+<section id="posit-ai" class="slide level2">
+<h2>Posit AI</h2>
 <div class="columns">
 <div class="column" style="width:50%;">
-<p><strong>Today</strong></p>
+<p><strong>mcp-repl</strong></p>
 <ul>
-<li>local R analysis help</li>
-<li>package debugging</li>
-<li>plot and table refinement</li>
+<li>open source</li>
+<li>agent-owned sessions</li>
+<li>works with external LLM harnesses</li>
+<li>better than shell-only R access</li>
 </ul>
 </div><div class="column" style="width:50%;">
-<p><strong>Soon</strong></p>
+<p><strong>IDE assistant</strong></p>
 <ul>
-<li>recurring reports from fresh data</li>
-<li>long-running dataset reconnaissance</li>
-<li>evals with realistic R workflows</li>
-<li>autonomous investigations before review</li>
+<li>built into the IDE experience</li>
+<li>human, agent, and R stay connected</li>
+<li>designed for interactive data analysis</li>
+<li>the richer human-in-the-loop path</li>
 </ul>
 </div></div>
 <aside class="notes">
-<p>This matters now for local analysis, package debugging, and the everyday work of refining plots and tables. It matters more as agents take on longer investigations: recurring reports from fresh data, dataset reconnaissance before a human review, and evals that need realistic R behavior. In that world, batch commands are too weak and an unconstrained terminal is too broad.</p>
+<p>Timing: ~0:25.</p>
+<p>The closing distinction is that <code>mcp-repl</code> is for agents. It is open source, and it helps external harnesses use R more effectively than raw shell commands. Posit AI is the product path for the integrated experience: the IDE has the assistant and the R session in the same human-in-the-loop environment.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -472,11 +598,13 @@
 </section>
 <section id="takeaway" class="slide level2">
 <h2>Takeaway</h2>
-<p>If an LLM is going to work in R, it should get a live R session.</p>
-<p><code>mcp-repl</code> provides one over MCP: persistent, interactive, private, and sandboxed.</p>
+<p>If an agent is going to work in R, it should get a live R session.</p>
+<p><code>mcp-repl</code> is the open source, agent-facing path: persistent, interactive, private, and sandboxed.</p>
+<p>For interactive work with a human in the loop, use the integrated IDE assistant experience.</p>
 <p>https://github.com/posit-dev/mcp-repl</p>
 <aside class="notes">
-<p>The takeaway is narrow: R support for agents should not stop at command execution. A useful agent-facing R interface needs session state, help, plots, debugging, bounded output, recovery controls, and a security boundary. <code>mcp-repl</code> is one implementation of that interface over MCP.</p>
+<p>Timing: ~0:20.</p>
+<p>The takeaway is narrow: R support for agents should not stop at command execution. For agent-owned sessions, <code>mcp-repl</code> provides that interface over MCP. For human-in-the-loop interactive analysis, the better shape is the integrated Posit AI assistant experience in the IDE.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
