@@ -10,3 +10,6 @@ tools/drain-*
 prompts/*
 WORKPAD.md
 mcp-repl-useR-lightning_files
+
+/.quarto/
+**/*.quarto_ipynb

@@ -1,9 +1,9 @@
 ---
-title: "Making R a First-Class Environment for LLMs"
+title: Making R a First-Class Environment for LLMs
 subtitle: "mcp-repl: exposing interactive R through MCP"
 format:
   revealjs:
-    theme: simple
+    theme: dark
     slide-number: true
     controls: true
     progress: true
@@ -18,7 +18,11 @@ R is an interactive environment.
 LLMs need more than code execution to work effectively in it.
 
 ::: notes
-The claim of this talk is narrow: making LLMs effective in R means exposing more than a way to run code. R work often depends on a live session. Users load data, inspect objects, look at plots, read help, and step through code in browser. Those are not secondary features of R. They are part of how R is used.
+The claim of this talk is narrow: making LLMs effective in R means
+exposing more than a way to run code. R work often depends on a live
+session. Users load data, inspect objects, look at plots, read help, and
+step through code in browser. Those are not secondary features of R.
+They are part of how R is used.
 :::
 
 ## Current Interfaces Are Awkward
@@ -29,7 +33,12 @@ The claim of this talk is narrow: making LLMs effective in R means exposing more
 - Debuggers and pagers need interaction
 
 ::: notes
-Most general-purpose agents can already run shell commands, so the obvious baseline is Rscript. That works for isolated probes, but every call starts from a fresh process. A terminal session preserves state, but then the model has to poll the screen and infer whether R is idle. It also has to interpret prompts, pagers, plots, and debugger state from an unstructured text stream.
+Most general-purpose agents can already run shell commands, so the
+obvious baseline is Rscript. That works for isolated probes, but every
+call starts from a fresh process. A terminal session preserves state,
+but then the model has to poll the screen and infer whether R is idle.
+It also has to interpret prompts, pagers, plots, and debugger state from
+an unstructured text stream.
 :::
 
 ## mcp-repl
@@ -42,7 +51,13 @@ Most general-purpose agents can already run shell commands, so the obvious basel
 - Sandboxed by default
 
 ::: notes
-mcp-repl is an MCP server that gives the agent a long-lived R or Python worker. The tool surface is intentionally small: a repl tool for input, and a reset tool for starting over. Most complexity sits below that surface: worker lifecycle, sandboxing, output capture, image capture, timeouts, interrupts, and resets. The result is still a persistent session: the agent can create an object in one call and use it in the next.
+mcp-repl is an MCP server that gives the agent a long-lived R or Python
+worker. The tool surface is intentionally small: a repl tool for input,
+and a reset tool for starting over. Most complexity sits below that
+surface: worker lifecycle, sandboxing, output capture, image capture,
+timeouts, interrupts, and resets. The result is still a persistent
+session: the agent can create an object in one call and use it in the
+next.
 :::
 
 ## Interactive R Surfaces
@@ -54,7 +69,12 @@ mcp-repl is an MCP server that gives the agent a long-lived R or Python worker. 
 - interrupt and reset
 
 ::: notes
-The goal is not to create a new programming model. The goal is to expose normal R interfaces in a form a model can use. Help and vignettes render in the response. Plots are returned as MCP image content. Debugging uses browser, debug, and trace. Interrupt and reset are explicit because long-running computations and confused session state are normal in exploratory work.
+The goal is not to create a new programming model. The goal is to expose
+normal R interfaces in a form a model can use. Help and vignettes render
+in the response. Plots are returned as MCP image content. Debugging uses
+browser, debug, and trace. Interrupt and reset are explicit because
+long-running computations and confused session state are normal in
+exploratory work.
 :::
 
 ## Design Choice
@@ -66,7 +86,12 @@ Do not scrape a terminal.
 - Responses are bounded before they fill context
 
 ::: notes
-The important implementation choice is that mcp-repl is not primarily a terminal scraper. Prompt text is display data; it should not be the protocol for determining whether work is complete. Instead, R and Python run embedded in the worker, and runtime-side hooks report output, input waits, and readiness. This avoids fixed sleeps and prompt regexes, and it lets the server bound large output before it fills the model context.
+The important implementation choice is that mcp-repl is not primarily a
+terminal scraper. Prompt text is display data; it should not be the
+protocol for determining whether work is complete. Instead, R and Python
+run embedded in the worker, and runtime-side hooks report output, input
+waits, and readiness. This avoids fixed sleeps and prompt regexes, and
+it lets the server bound large output before it fills the model context.
 :::
 
 ## Why the Session Is Private
@@ -78,7 +103,12 @@ The important implementation choice is that mcp-repl is not primarily a terminal
 - Writes constrained to workspace and temp paths
 
 ::: notes
-The private session is a tradeoff. It is not the right interface for a human and model sharing one live IDE session. It is useful for unattended work: evals, scheduled reports, or investigations that run for a while before a human reviews the result. Since the model owns this runtime, the sandbox is part of the design. By default, network access is off and writes are constrained.
+The private session is a tradeoff. It is not the right interface for a
+human and model sharing one live IDE session. It is useful for
+unattended work: evals, scheduled reports, or investigations that run
+for a while before a human reviews the result. Since the model owns this
+runtime, the sandbox is part of the design. By default, network access
+is off and writes are constrained.
 :::
 
 ## What This Enables
@@ -90,7 +120,12 @@ The private session is a tradeoff. It is not the right interface for a human and
 - plot and table refinement before review
 
 ::: notes
-The practical cases are the ones where the agent benefits from continuity. An eval harness can test whether agents handle data-analysis tasks with a persistent R runtime. A recurring report can load fresh data, compare it with recent history, make plots, and return the findings. For package work, the agent can reproduce a failure, inspect live objects, step through browser, and propose a small fix.
+The practical cases are the ones where the agent benefits from
+continuity. An eval harness can test whether agents handle data-analysis
+tasks with a persistent R runtime. A recurring report can load fresh
+data, compare it with recent history, make plots, and return the
+findings. For package work, the agent can reproduce a failure, inspect
+live objects, step through browser, and propose a small fix.
 :::
 
 ## Relation to Posit Assistant
@@ -100,17 +135,26 @@ The practical cases are the ones where the agent benefits from continuity. An ev
 - Same motivation, different interface boundary
 
 ::: notes
-mcp-repl also makes the product boundary visible. It can improve R support in existing MCP-capable agents such as Claude Code or Codex. Posit Assistant addresses a different interface: the human and model share project context inside the IDE. These are complementary approaches to the same underlying issue, which is that R's interactive workflow needs to be available to the model.
+mcp-repl also makes the product boundary visible. It can improve R
+support in existing MCP-capable agents such as Claude Code or Codex.
+Posit Assistant addresses a different interface: the human and model
+share project context inside the IDE. These are complementary approaches
+to the same underlying issue, which is that R's interactive workflow
+needs to be available to the model.
 :::
 
 ## Takeaway
 
 If an LLM is going to work in R, it should get a live R session.
 
-`mcp-repl` provides one over MCP: persistent, interactive, private, and sandboxed.
+`mcp-repl` provides one over MCP: persistent, interactive, private, and
+sandboxed.
 
 https://github.com/posit-dev/mcp-repl
 
 ::: notes
-The takeaway is simple. R support for agents should not stop at command execution. A useful agent-facing R interface needs session state, help, plots, debugging, bounded output, recovery controls, and a security boundary. mcp-repl is one implementation of that idea over MCP.
+The takeaway is simple. R support for agents should not stop at command
+execution. A useful agent-facing R interface needs session state, help,
+plots, debugging, bounded output, recovery controls, and a security
+boundary. mcp-repl is one implementation of that idea over MCP.
 :::
