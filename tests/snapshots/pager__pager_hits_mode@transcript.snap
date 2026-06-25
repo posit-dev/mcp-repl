@@ -13,12 +13,14 @@ expression: transcript
 <<< filler 05 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< filler 06 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< filler 07 xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< 
 <<< --More-- (5p, 16.5%, @0..288/1736)
 
 2) r_repl timeout_ms=30000
 >>> :hits configure
 <<< #1 @1617 Title > Alpha
 <<<   > alpha configure 01
+<<< 
 <<< (END, 94.2%, @1617..1636/1736)
 
 3) r_repl timeout_ms=30000
@@ -29,8 +31,10 @@ expression: transcript
 <<< beta configure 01
 <<< beta configure 02
 <<< beta configure 03
+<<< 
 <<< (END, 100.0%, @1636..1736/1736)
 
 4) r_repl timeout_ms=30000
 >>> :q
 <<< (END, 100.0%, @1636..1736/1736)
+<<< >

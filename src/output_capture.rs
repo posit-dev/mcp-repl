@@ -1,81 +1,66 @@
 #![cfg_attr(not(target_family = "unix"), allow(dead_code))]
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-use crate::worker_protocol::ContentOrigin;
-
-static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
-static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
+pub(crate) use crate::resolved_output::{
+    OutputEvent, OutputEventKind, OutputRange, OutputTextSource, OutputTextSpan, ProjectionMode,
+    RenderedTextState,
+};
+use crate::worker_protocol::{ContentOrigin, WorkerContent};
 
 pub(crate) const OUTPUT_RING_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const FILES_OUTPUT_TIMELINE_CAPACITY_BYTES: usize = 64 * 1024 * 1024;
 const OUTPUT_RING_APPEND_CHUNK_MAX_BYTES: usize = 8 * 1024;
-const STDERR_PREFIX: &[u8] = b"stderr: ";
-const OUTPUT_TRUNCATION_NOTICE: &str = "[repl] output truncated (older output dropped)\n";
-
-pub(crate) fn ensure_output_ring(capacity_bytes: usize) -> Arc<OutputRing> {
-    OUTPUT_RING
-        .get_or_init(|| Arc::new(OutputRing::new(capacity_bytes)))
-        .clone()
-}
-
-fn output_ring_opt() -> Option<Arc<OutputRing>> {
-    OUTPUT_RING.get().cloned()
-}
-
-pub(crate) fn reset_output_ring() {
-    if let Some(ring) = OUTPUT_RING.get() {
-        ring.reset();
-    }
-}
-
-pub(crate) fn set_last_reply_marker_offset(offset: u64) {
-    LAST_REPLY_MARKER_OFFSET.store(offset, Ordering::SeqCst);
-}
-
-pub(crate) fn update_last_reply_marker_offset_max(offset: u64) {
-    let mut current = LAST_REPLY_MARKER_OFFSET.load(Ordering::SeqCst);
-    loop {
-        if current != u64::MAX && current >= offset {
-            return;
-        }
-        match LAST_REPLY_MARKER_OFFSET.compare_exchange(
-            current,
-            offset,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => return,
-            Err(next) => current = next,
-        }
-    }
-}
-
-fn last_reply_marker_offset() -> Option<u64> {
-    let value = LAST_REPLY_MARKER_OFFSET.load(Ordering::SeqCst);
-    (value != u64::MAX).then_some(value)
-}
-
-pub(crate) fn reset_last_reply_marker_offset() {
-    LAST_REPLY_MARKER_OFFSET.store(u64::MAX, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-pub(crate) fn output_ring_test_mutex() -> &'static Mutex<()> {
-    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_MUTEX.get_or_init(|| Mutex::new(()))
-}
+pub(crate) const OUTPUT_TRUNCATION_NOTICE: &str =
+    "[repl] output truncated (older output dropped)\n";
+const OUTPUT_OMISSION_NOTICE: &str = "[repl] output omitted (later content omitted)\n";
 
 #[derive(Clone)]
 pub(crate) struct OutputTimeline {
     ring: Arc<OutputRing>,
+    state: Arc<Mutex<OutputTimelineState>>,
+}
+
+#[derive(Default)]
+struct OutputTimelineState {
+    utf8_tails: OutputUtf8Tails,
 }
 
 impl OutputTimeline {
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new(ring: Arc<OutputRing>) -> Self {
-        Self { ring }
+        Self {
+            ring,
+            state: Arc::new(Mutex::new(OutputTimelineState::default())),
+        }
+    }
+
+    pub(crate) fn with_capacity(capacity_bytes: usize) -> Self {
+        Self {
+            ring: Arc::new(OutputRing::new(capacity_bytes)),
+            state: Arc::new(Mutex::new(OutputTimelineState::default())),
+        }
+    }
+
+    pub(crate) fn with_head_retention_capacity(capacity_bytes: usize) -> Self {
+        Self {
+            ring: Arc::new(OutputRing::preserving_head(capacity_bytes)),
+            state: Arc::new(Mutex::new(OutputTimelineState::default())),
+        }
+    }
+
+    pub(crate) fn buffer(&self) -> OutputBuffer {
+        OutputBuffer::new(self.ring.clone())
+    }
+
+    pub(crate) fn clear(&self) {
+        let mut guard = self.state.lock().unwrap();
+        guard.utf8_tails.clear();
+        self.ring.reset();
     }
 
     pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool, origin: ContentOrigin) {
@@ -125,41 +110,19 @@ impl OutputTimeline {
         if bytes.is_empty() {
             return;
         }
-        if !is_stderr {
-            self.ring
-                .append_bytes_with_source(bytes, false, origin, source);
-            return;
-        }
-        if is_continuation {
-            self.ring
-                .append_bytes_with_source(bytes, true, origin, source);
-            return;
-        }
-
-        self.append_prefixed_stderr(bytes, origin, source);
-    }
-
-    fn append_prefixed_stderr(
-        &self,
-        bytes: &[u8],
-        origin: ContentOrigin,
-        source: OutputTextSource,
-    ) {
-        // Keep stderr attribution in-band (as text) while ensuring the prefix starts on a new
-        // line. This avoids confusing merges like `> xstderr: ...` when stdout/stderr reader
-        // threads append chunks out-of-order.
-        //
-        // NOTE: We always insert a leading newline once any output has been captured. This is
-        // conservative (it can introduce blank lines), but it prevents `stderr:` from being
-        // spliced into the middle of a partially-read stdout line.
-        let mut payload = Vec::with_capacity(STDERR_PREFIX.len() + bytes.len() + 1);
-        if !self.ring.is_empty() {
-            payload.push(b'\n');
-        }
-        payload.extend_from_slice(STDERR_PREFIX);
-        payload.extend_from_slice(bytes);
-        self.ring
-            .append_bytes_with_source(&payload, true, origin, source);
+        let key = OutputUtf8TailKey {
+            is_stderr,
+            origin,
+            source,
+        };
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.push(
+            key,
+            bytes,
+            is_continuation || matches!(source, OutputTextSource::Raw),
+            self.ring.capacity_bytes,
+        );
+        self.append_pending_locked(pending);
     }
 
     pub(crate) fn append_image(
@@ -168,10 +131,14 @@ impl OutputTimeline {
         mime_type: String,
         data: String,
         is_new: bool,
-        readline_results_seen: usize,
+        _readline_results_seen: usize,
     ) {
-        self.ring
-            .append_image_event(id, mime_type, data, is_new, readline_results_seen);
+        self.append_event(OutputEventKind::Image {
+            id,
+            data,
+            mime_type,
+            is_new,
+        });
     }
 
     pub(crate) fn append_text_event(
@@ -179,44 +146,355 @@ impl OutputTimeline {
         text: String,
         is_stderr: bool,
         origin: ContentOrigin,
-        readline_results_seen: Option<usize>,
+        _readline_results_seen: Option<usize>,
     ) {
+        self.append_event(OutputEventKind::Text {
+            text,
+            is_stderr,
+            origin,
+        });
+    }
+
+    pub(crate) fn append_input_echo(&self, prompt: &str, line: &str) {
+        if let Some(kind) = OutputEventKind::input_echo(prompt, line) {
+            self.append_event(kind);
+        }
+    }
+
+    pub(crate) fn append_input_wait(&self) {
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
+        self.append_pending_locked(pending);
+        self.ring.append_marker_event(OutputEventKind::InputWait);
+    }
+
+    pub(crate) fn append_request_boundary(&self) {
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
+        self.append_pending_locked(pending);
         self.ring
-            .append_text_event(text, is_stderr, origin, readline_results_seen);
+            .append_marker_event(OutputEventKind::RequestBoundary);
+    }
+
+    pub(crate) fn append_session_end(&self) {
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
+        self.append_pending_locked(pending);
+        self.ring.append_marker_event(OutputEventKind::SessionEnd);
+    }
+
+    pub(crate) fn last_text_ends_with_newline(&self) -> bool {
+        self.ring.last_text_ends_with_newline()
+    }
+
+    pub(crate) fn flush_utf8_tails(&self) {
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain();
+        self.append_pending_locked(pending);
+    }
+
+    pub(crate) fn flush_ready_utf8_tails(&self) {
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.drain_ready_after_gaps();
+        self.append_pending_locked(pending);
+    }
+
+    fn append_event(&self, kind: OutputEventKind) {
+        let mut guard = self.state.lock().unwrap();
+        let pending = guard.utf8_tails.push_event(kind, self.ring.capacity_bytes);
+        self.append_pending_locked(pending);
+    }
+
+    fn append_pending_locked(&self, pending: Vec<OutputPendingEntry>) {
+        for entry in pending {
+            match entry {
+                OutputPendingEntry::Text(entry) => {
+                    self.ring.append_bytes_with_source(
+                        &entry.bytes,
+                        entry.key.is_stderr,
+                        entry.key.origin,
+                        entry.key.source,
+                    );
+                }
+                OutputPendingEntry::Event(kind) => self.ring.append_materialized_event(kind),
+            }
+        }
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputUtf8TailKey {
+    is_stderr: bool,
+    origin: ContentOrigin,
+    source: OutputTextSource,
+}
+
+struct OutputUtf8Tail {
+    key: OutputUtf8TailKey,
+    bytes: Vec<u8>,
+    sealed: bool,
+}
+
+enum OutputPendingEntry {
+    Text(OutputUtf8Tail),
+    Event(OutputEventKind),
+}
+
+#[derive(Default)]
+struct OutputUtf8Tails {
+    entries: Vec<OutputPendingEntry>,
+}
+
+impl OutputUtf8Tails {
+    fn push(
+        &mut self,
+        key: OutputUtf8TailKey,
+        bytes: &[u8],
+        continue_previous_tail: bool,
+        side_buffer_capacity_bytes: usize,
+    ) -> Vec<OutputPendingEntry> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        if continue_previous_tail
+            && let Some(index) = self.entries.iter().position(|entry| match entry {
+                OutputPendingEntry::Text(entry) => {
+                    entry.key == key && !entry.sealed && !entry.is_flushable()
+                }
+                OutputPendingEntry::Event(_) => false,
+            })
+        {
+            let OutputPendingEntry::Text(entry) = &mut self.entries[index] else {
+                unreachable!("matching pending UTF-8 entry must be text");
+            };
+            entry.bytes.extend_from_slice(bytes);
+        } else {
+            if let Some(entry) = self.entries.iter_mut().find_map(|entry| match entry {
+                OutputPendingEntry::Text(entry)
+                    if entry.key == key && !entry.sealed && !entry.is_flushable() =>
+                {
+                    Some(entry)
+                }
+                OutputPendingEntry::Text(_) | OutputPendingEntry::Event(_) => None,
+            }) {
+                entry.sealed = true;
+            }
+            self.entries.push(OutputPendingEntry::Text(OutputUtf8Tail {
+                key,
+                bytes: bytes.to_vec(),
+                sealed: false,
+            }));
+        }
+        self.drain_ready_bounded(side_buffer_capacity_bytes)
+    }
+
+    fn push_event(
+        &mut self,
+        kind: OutputEventKind,
+        side_buffer_capacity_bytes: usize,
+    ) -> Vec<OutputPendingEntry> {
+        self.entries.push(OutputPendingEntry::Event(kind));
+        self.drain_ready_bounded(side_buffer_capacity_bytes)
+    }
+
+    fn drain(&mut self) -> Vec<OutputPendingEntry> {
+        for entry in &mut self.entries {
+            if let OutputPendingEntry::Text(entry) = entry {
+                entry.sealed = true;
+            }
+        }
+        self.drain_ready()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn drain_ready(&mut self) -> Vec<OutputPendingEntry> {
+        let mut ready = Vec::new();
+        while !self.entries.is_empty() {
+            let OutputPendingEntry::Text(front) = &mut self.entries[0] else {
+                ready.push(self.entries.remove(0));
+                continue;
+            };
+            if front.sealed {
+                ready.push(materialize_pending_entry(self.entries.remove(0)));
+                continue;
+            }
+
+            let flushable_len = flushable_prefix_len(&front.bytes);
+            if flushable_len == 0 {
+                break;
+            }
+            if flushable_len == front.bytes.len() {
+                ready.push(self.entries.remove(0));
+                continue;
+            }
+            let key = front.key;
+            let bytes = front.bytes[..flushable_len].to_vec();
+            front.bytes.drain(..flushable_len);
+            ready.push(OutputPendingEntry::Text(OutputUtf8Tail {
+                key,
+                bytes,
+                sealed: true,
+            }));
+            break;
+        }
+        ready
+    }
+
+    fn drain_ready_bounded(
+        &mut self,
+        side_buffer_capacity_bytes: usize,
+    ) -> Vec<OutputPendingEntry> {
+        let mut ready = self.drain_ready();
+        if self.blocked_side_buffer_bytes() > side_buffer_capacity_bytes {
+            ready.extend(self.drain_ready_after_gaps());
+        }
+        ready
+    }
+
+    fn drain_ready_after_gaps(&mut self) -> Vec<OutputPendingEntry> {
+        let mut ready = Vec::new();
+        while !self.entries.is_empty() {
+            let has_later_entries = self.entries.len() > 1;
+            let OutputPendingEntry::Text(front) = &mut self.entries[0] else {
+                ready.push(self.entries.remove(0));
+                continue;
+            };
+            if front.sealed {
+                ready.push(materialize_pending_entry(self.entries.remove(0)));
+                continue;
+            }
+
+            let flushable_len = flushable_prefix_len(&front.bytes);
+            if flushable_len == 0 {
+                if has_later_entries {
+                    front.sealed = true;
+                    ready.push(materialize_pending_entry(self.entries.remove(0)));
+                    continue;
+                }
+                break;
+            }
+            if flushable_len == front.bytes.len() {
+                ready.push(self.entries.remove(0));
+                continue;
+            }
+            let key = front.key;
+            let bytes = front.bytes[..flushable_len].to_vec();
+            front.bytes.drain(..flushable_len);
+            ready.push(OutputPendingEntry::Text(OutputUtf8Tail {
+                key,
+                bytes,
+                sealed: true,
+            }));
+            if !has_later_entries {
+                break;
+            }
+        }
+        ready
+    }
+
+    fn blocked_side_buffer_bytes(&self) -> usize {
+        let Some(OutputPendingEntry::Text(front)) = self.entries.first() else {
+            return 0;
+        };
+        if front.sealed || front.is_flushable() {
+            return 0;
+        }
+        self.entries.iter().skip(1).fold(0usize, |total, entry| {
+            total.saturating_add(pending_entry_size_bytes(entry))
+        })
+    }
+}
+
+impl OutputUtf8Tail {
+    fn is_flushable(&self) -> bool {
+        self.sealed || flushable_prefix_len(&self.bytes) == self.bytes.len()
+    }
+}
+
+fn materialize_pending_entry(entry: OutputPendingEntry) -> OutputPendingEntry {
+    match entry {
+        OutputPendingEntry::Text(entry) => OutputPendingEntry::Text(entry.materialize()),
+        OutputPendingEntry::Event(kind) => OutputPendingEntry::Event(kind),
+    }
+}
+
+impl OutputUtf8Tail {
+    fn materialize(mut self) -> Self {
+        if self.sealed {
+            self.bytes = escape_incomplete_utf8_tail(&self.bytes);
+        }
+        self
+    }
+}
+
+fn escape_incomplete_utf8_tail(bytes: &[u8]) -> Vec<u8> {
+    let flushable_len = flushable_prefix_len(bytes);
+    if flushable_len == bytes.len() {
+        return bytes.to_vec();
+    }
+
+    let mut escaped = Vec::with_capacity(
+        flushable_len.saturating_add(bytes.len().saturating_sub(flushable_len).saturating_mul(4)),
+    );
+    escaped.extend_from_slice(&bytes[..flushable_len]);
+    let mut tail = String::new();
+    for byte in &bytes[flushable_len..] {
+        let _ = write!(&mut tail, "\\x{byte:02X}");
+    }
+    escaped.extend_from_slice(tail.as_bytes());
+    escaped
+}
+
+fn pending_entry_size_bytes(entry: &OutputPendingEntry) -> usize {
+    match entry {
+        OutputPendingEntry::Text(entry) => entry.bytes.len(),
+        OutputPendingEntry::Event(kind) => event_size_bytes(kind),
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct OutputBuffer {
     cursor: Arc<Mutex<OutputCursor>>,
+    ring: Arc<OutputRing>,
 }
 
 #[derive(Default)]
 struct OutputCursor {
     offset: Option<u64>,
+    last_rendered_text: Option<RenderedTextState>,
 }
 
 impl OutputBuffer {
+    pub(crate) fn new(ring: Arc<OutputRing>) -> Self {
+        Self {
+            cursor: Arc::new(Mutex::new(OutputCursor::default())),
+            ring,
+        }
+    }
+
+    fn ring(&self) -> Arc<OutputRing> {
+        self.ring.clone()
+    }
+
     pub(crate) fn current_offset(&self) -> Option<u64> {
         let guard = self.cursor.lock().unwrap();
         guard.offset
     }
 
     pub(crate) fn end_offset(&self) -> Option<u64> {
-        output_ring_opt().map(|ring| ring.end_offset())
+        Some(self.ring().end_offset())
     }
 
     pub(crate) fn saw_stderr_in_range(&self, start_offset: u64, end_offset: u64) -> bool {
-        let Some(ring) = output_ring_opt() else {
-            return false;
-        };
+        let ring = self.ring();
         ring.saw_stderr_in_range(start_offset, end_offset)
     }
 
     pub(crate) fn read_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
-        let Some(ring) = output_ring_opt() else {
-            return OutputRange::empty(start_offset, end_offset);
-        };
+        let ring = self.ring();
         ring.read_range(start_offset, end_offset)
     }
 
@@ -228,9 +506,7 @@ impl OutputBuffer {
             }
         }
 
-        let Some(ring) = output_ring_opt() else {
-            return;
-        };
+        let ring = self.ring();
         let start_offset = ring.start_offset();
 
         let mut guard = self.cursor.lock().unwrap();
@@ -240,7 +516,7 @@ impl OutputBuffer {
     }
 
     fn read_offset_with_ring(&self) -> Option<(u64, Arc<OutputRing>)> {
-        let ring = output_ring_opt()?;
+        let ring = self.ring();
         let offset = {
             let guard = self.cursor.lock().unwrap();
             guard.offset?
@@ -248,39 +524,133 @@ impl OutputBuffer {
         Some((offset, ring))
     }
 
+    fn read_offset_state_with_ring(
+        &self,
+    ) -> Option<(u64, Option<RenderedTextState>, Arc<OutputRing>)> {
+        let ring = self.ring();
+        let (offset, last_rendered_text) = {
+            let guard = self.cursor.lock().unwrap();
+            (guard.offset?, guard.last_rendered_text)
+        };
+        Some((offset, last_rendered_text, ring))
+    }
+
     pub(crate) fn advance_offset_to(&self, offset: u64) {
         let mut guard = self.cursor.lock().unwrap();
         guard.offset = Some(offset);
+        guard.last_rendered_text = None;
         drop(guard);
-        if let Some(ring) = output_ring_opt() {
-            ring.consume_to(offset);
-        }
+        self.ring().consume_to(offset);
+    }
+
+    pub(crate) fn rendered_text_state(&self) -> Option<RenderedTextState> {
+        let guard = self.cursor.lock().unwrap();
+        guard.last_rendered_text
+    }
+
+    pub(crate) fn advance_offset_to_with_rendered_text_and_boundary_events(
+        &self,
+        offset: u64,
+        last_rendered_text: Option<RenderedTextState>,
+        boundary_events_consumed: usize,
+    ) {
+        let mut guard = self.cursor.lock().unwrap();
+        guard.offset = Some(offset);
+        guard.last_rendered_text = last_rendered_text;
+        drop(guard);
+        self.ring()
+            .consume_to_with_boundary_events(offset, boundary_events_consumed);
     }
 
     pub fn has_pending_output(&self) -> bool {
         let Some((offset, ring)) = self.read_offset_with_ring() else {
             return false;
         };
-        ring.end_offset() > offset || ring.has_events_at_or_after(offset)
+        ring.end_offset() > offset || ring.has_materialized_events_at_or_after(offset)
     }
 
-    pub fn pending_output_since_last_reply(&self) -> bool {
-        let Some((offset, ring)) = self.read_offset_with_ring() else {
-            return false;
-        };
-        if ring.end_offset() <= offset && !ring.has_events_at_or_after(offset) {
-            return false;
-        }
-        let Some(last_reply_marker) = last_reply_marker_offset() else {
-            return false;
-        };
-        offset >= last_reply_marker
+    pub(crate) fn clear(&self) {
+        let mut guard = self.cursor.lock().unwrap();
+        guard.offset = None;
+        guard.last_rendered_text = None;
+        drop(guard);
+        self.ring().reset();
     }
+
+    pub(crate) fn current_progress_seq(&self) -> u64 {
+        self.ring().progress_seq()
+    }
+
+    pub(crate) fn current_settle_state(&self) -> TimelineSettleState {
+        let Some((offset, ring)) = self.read_offset_with_ring() else {
+            return TimelineSettleState {
+                progress_seq: self.current_progress_seq(),
+                input_echoes_seen: 0,
+                has_image: false,
+            };
+        };
+        ring.settle_state_at_or_after(offset)
+    }
+
+    pub(crate) fn drain_formatted(
+        &self,
+        projection_mode: ProjectionMode,
+        flush_incomplete: bool,
+    ) -> FormattedPendingOutput {
+        let Some((start_offset, previous_rendered_text, ring)) = self.read_offset_state_with_ring()
+        else {
+            return FormattedPendingOutput::default();
+        };
+        let end_offset = ring.end_offset();
+        let mut range = ring.read_range(start_offset, end_offset);
+        let consumed_end = if flush_incomplete {
+            range.end_offset
+        } else {
+            trim_range_to_complete_utf8(&mut range)
+        };
+        let boundary_events_consumed = output_range_boundary_event_count(&range, consumed_end);
+        let saw_stderr = ring.saw_stderr_in_range(start_offset.min(consumed_end), consumed_end);
+        let (contents, last_rendered_text) =
+            crate::resolved_output::contents_from_output_range_with_state(
+                range,
+                projection_mode,
+                previous_rendered_text,
+            );
+        self.advance_offset_to_with_rendered_text_and_boundary_events(
+            consumed_end,
+            last_rendered_text,
+            boundary_events_consumed,
+        );
+        FormattedPendingOutput {
+            contents,
+            saw_stderr,
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FormattedPendingOutput {
+    pub(crate) contents: Vec<WorkerContent>,
+    pub(crate) saw_stderr: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TimelineSettleState {
+    pub(crate) progress_seq: u64,
+    pub(crate) input_echoes_seen: usize,
+    pub(crate) has_image: bool,
 }
 
 pub(crate) struct OutputRing {
     capacity_bytes: usize,
+    retention: OutputRetention,
     inner: Mutex<OutputRingInner>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputRetention {
+    Tail,
+    Head,
 }
 
 struct OutputRingInner {
@@ -291,6 +661,7 @@ struct OutputRingInner {
     end_offset: u64,
     buffered_bytes: usize,
     buffered_event_bytes: usize,
+    progress_seq: u64,
 }
 
 struct OutputChunk {
@@ -310,65 +681,6 @@ struct OutputSlice {
     source: OutputTextSource,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum OutputTextSource {
-    #[default]
-    Raw,
-    Ipc,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct OutputTextSpan {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub is_stderr: bool,
-    pub origin: ContentOrigin,
-    pub source: OutputTextSource,
-}
-
-pub(crate) struct OutputRange {
-    pub start_offset: u64,
-    pub end_offset: u64,
-    pub bytes: Vec<u8>,
-    pub events: Vec<OutputEvent>,
-    pub text_spans: Vec<OutputTextSpan>,
-}
-
-impl OutputRange {
-    fn empty(start_offset: u64, end_offset: u64) -> Self {
-        Self {
-            start_offset,
-            end_offset,
-            bytes: Vec::new(),
-            events: Vec::new(),
-            text_spans: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct OutputEvent {
-    pub offset: u64,
-    pub kind: OutputEventKind,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum OutputEventKind {
-    Image {
-        id: String,
-        data: String,
-        mime_type: String,
-        is_new: bool,
-        readline_results_seen: usize,
-    },
-    Text {
-        text: String,
-        is_stderr: bool,
-        origin: ContentOrigin,
-        readline_results_seen: Option<usize>,
-    },
-}
-
 struct CollectedRange {
     slices: Vec<OutputSlice>,
     events: Vec<OutputEvent>,
@@ -378,8 +690,17 @@ struct CollectedRange {
 
 impl OutputRing {
     fn new(capacity_bytes: usize) -> Self {
+        Self::with_retention(capacity_bytes, OutputRetention::Tail)
+    }
+
+    fn preserving_head(capacity_bytes: usize) -> Self {
+        Self::with_retention(capacity_bytes, OutputRetention::Head)
+    }
+
+    fn with_retention(capacity_bytes: usize, retention: OutputRetention) -> Self {
         Self {
             capacity_bytes,
+            retention,
             inner: Mutex::new(OutputRingInner {
                 chunks: VecDeque::new(),
                 line_ends: VecDeque::new(),
@@ -388,6 +709,7 @@ impl OutputRing {
                 end_offset: 0,
                 buffered_bytes: 0,
                 buffered_event_bytes: 0,
+                progress_seq: 0,
             }),
         }
     }
@@ -417,6 +739,28 @@ impl OutputRing {
             return;
         }
 
+        {
+            let mut guard = self.inner.lock().unwrap();
+            guard.note_progress();
+        }
+
+        match self.retention {
+            OutputRetention::Tail => {
+                self.append_bytes_retaining_tail(bytes, is_stderr, origin, source);
+            }
+            OutputRetention::Head => {
+                self.append_bytes_retaining_head(bytes, is_stderr, origin, source);
+            }
+        }
+    }
+
+    fn append_bytes_retaining_tail(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
         let mut dropped_any = false;
         let mut remaining = bytes;
         let max_chunk_len = output_ring_append_chunk_len(self.capacity_bytes);
@@ -425,37 +769,10 @@ impl OutputRing {
             let (head, tail) = remaining.split_at(chunk_len);
             remaining = tail;
 
-            let newline_indices: Vec<usize> = head
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, byte)| (*byte == b'\n').then_some(idx))
-                .collect();
-            let bytes: Arc<[u8]> = head.to_vec().into();
-            let bytes_len = bytes.len();
-
             let mut guard = self.inner.lock().unwrap();
-            let dropped = guard.make_room_for(bytes_len, self.capacity_bytes);
-            dropped_any |= dropped.dropped_any();
-
-            let start_offset = guard.end_offset;
-            guard.end_offset = guard
-                .end_offset
-                .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
-            guard.buffered_bytes = guard.buffered_bytes.saturating_add(bytes_len);
-
-            for idx in newline_indices {
-                let offset = start_offset.saturating_add((idx + 1) as u64);
-                guard.line_ends.push_back(offset);
-            }
-
-            guard.chunks.push_back(OutputChunk {
-                start_offset,
-                bytes,
-                range: 0..bytes_len,
-                is_stderr,
-                origin,
-                source,
-            });
+            let dropped = guard.make_room_for(head.len(), self.capacity_bytes);
+            dropped_any |= dropped.dropped_visible();
+            Self::append_chunk_locked(&mut guard, head, is_stderr, origin, source);
         }
 
         if dropped_any {
@@ -465,18 +782,95 @@ impl OutputRing {
         }
     }
 
-    pub(crate) fn end_offset(&self) -> u64 {
-        self.inner.lock().unwrap().end_offset
+    fn append_bytes_retaining_head(
+        &self,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
+        let mut remaining = bytes;
+        let max_chunk_len = output_ring_append_chunk_len(self.capacity_bytes);
+        while !remaining.is_empty() {
+            let chunk_len = remaining.len().min(max_chunk_len);
+            let (head, tail) = remaining.split_at(chunk_len);
+            remaining = tail;
+
+            let mut guard = self.inner.lock().unwrap();
+            let incoming_len = chunk_len.saturating_add(remaining.len());
+            if guard.drop_input_echoes_for_room(incoming_len, self.capacity_bytes) > 0 {
+                self.append_omission_notice_locked(&mut guard);
+            }
+            if guard.total_buffered_bytes().saturating_add(incoming_len) <= self.capacity_bytes {
+                Self::append_chunk_locked(&mut guard, head, is_stderr, origin, source);
+                continue;
+            }
+
+            let reserve = self.head_omission_notice_reserve_locked(&guard);
+            let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
+            if guard.drop_input_echoes_for_room(incoming_len, effective_capacity) > 0 {
+                self.append_omission_notice_locked(&mut guard);
+            }
+            let available = effective_capacity.saturating_sub(guard.total_buffered_bytes());
+            if available == 0 {
+                self.append_omission_notice_locked(&mut guard);
+                break;
+            }
+            let retained_len = chunk_len.min(available);
+            Self::append_chunk_locked(&mut guard, &head[..retained_len], is_stderr, origin, source);
+            if retained_len < chunk_len {
+                self.append_omission_notice_locked(&mut guard);
+                break;
+            }
+        }
     }
 
-    fn is_empty(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        guard.chunks.is_empty() && guard.events.is_empty()
+    fn append_chunk_locked(
+        guard: &mut OutputRingInner,
+        bytes: &[u8],
+        is_stderr: bool,
+        origin: ContentOrigin,
+        source: OutputTextSource,
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        let newline_indices: Vec<usize> = bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, byte)| (*byte == b'\n').then_some(idx))
+            .collect();
+        let bytes: Arc<[u8]> = bytes.to_vec().into();
+        let bytes_len = bytes.len();
+        let start_offset = guard.end_offset;
+        guard.end_offset = guard
+            .end_offset
+            .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
+        guard.buffered_bytes = guard.buffered_bytes.saturating_add(bytes_len);
+
+        for idx in newline_indices {
+            let offset = start_offset.saturating_add((idx + 1) as u64);
+            guard.line_ends.push_back(offset);
+        }
+
+        guard.chunks.push_back(OutputChunk {
+            start_offset,
+            bytes,
+            range: 0..bytes_len,
+            is_stderr,
+            origin,
+            source,
+        });
+    }
+
+    pub(crate) fn end_offset(&self) -> u64 {
+        self.inner.lock().unwrap().end_offset
     }
 
     #[cfg(test)]
     pub(crate) fn append_event(&self, offset: u64, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
+        guard.note_progress();
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
             return;
@@ -484,7 +878,7 @@ impl OutputRing {
 
         let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = offset.max(guard.start_offset);
-        if dropped.dropped_any() {
+        if dropped.dropped_visible() {
             self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
             event_offset = event_offset.max(guard.start_offset);
         }
@@ -495,32 +889,55 @@ impl OutputRing {
         });
     }
 
-    pub(crate) fn append_image_event(
-        &self,
-        id: String,
-        mime_type: String,
-        data: String,
-        is_new: bool,
-        readline_results_seen: usize,
-    ) {
+    fn append_materialized_event(&self, kind: OutputEventKind) {
+        match kind {
+            OutputEventKind::Image { .. } | OutputEventKind::Text { .. } => {
+                self.append_visible_event(kind);
+            }
+            OutputEventKind::InputEcho { .. } => self.append_input_echo_event(kind),
+            OutputEventKind::InputWait
+            | OutputEventKind::RequestBoundary
+            | OutputEventKind::SessionEnd => self.append_marker_event(kind),
+        }
+    }
+
+    fn append_visible_event(&self, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
-        let kind = OutputEventKind::Image {
-            id,
-            data,
-            mime_type,
-            is_new,
-            readline_results_seen,
-        };
+        guard.note_progress();
         let event_bytes = event_size_bytes(&kind);
         if event_bytes > self.capacity_bytes {
+            if self.retention == OutputRetention::Head {
+                self.append_omission_notice_locked(&mut guard);
+            }
             return;
         }
 
-        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = guard.end_offset.max(guard.start_offset);
-        if dropped.dropped_any() {
-            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
-            event_offset = event_offset.max(guard.start_offset);
+        match self.retention {
+            OutputRetention::Tail => {
+                let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
+                if dropped.dropped_visible() {
+                    self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
+                    event_offset = event_offset.max(guard.start_offset);
+                }
+            }
+            OutputRetention::Head => {
+                if guard.drop_input_echoes_for_room(event_bytes, self.capacity_bytes) > 0 {
+                    self.append_omission_notice_locked(&mut guard);
+                }
+                if guard.total_buffered_bytes().saturating_add(event_bytes) > self.capacity_bytes {
+                    let reserve = self.head_omission_notice_reserve_locked(&guard);
+                    let effective_capacity = self.capacity_bytes.saturating_sub(reserve);
+                    if guard.drop_input_echoes_for_room(event_bytes, effective_capacity) > 0 {
+                        self.append_omission_notice_locked(&mut guard);
+                    }
+                    if guard.total_buffered_bytes().saturating_add(event_bytes) > effective_capacity
+                    {
+                        self.append_omission_notice_locked(&mut guard);
+                        return;
+                    }
+                }
+            }
         }
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
         guard.events.push_back(OutputEvent {
@@ -529,32 +946,47 @@ impl OutputRing {
         });
     }
 
-    pub(crate) fn append_text_event(
-        &self,
-        text: String,
-        is_stderr: bool,
-        origin: ContentOrigin,
-        readline_results_seen: Option<usize>,
-    ) {
+    fn append_input_echo_event(&self, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
-        let kind = OutputEventKind::Text {
-            text,
-            is_stderr,
-            origin,
-            readline_results_seen,
-        };
+        guard.note_progress();
         let event_bytes = event_size_bytes(&kind);
-        if event_bytes > self.capacity_bytes {
-            return;
+
+        match self.retention {
+            OutputRetention::Tail => {
+                if event_bytes > self.capacity_bytes {
+                    return;
+                }
+                if !guard.make_room_for_input_echo(event_bytes, self.capacity_bytes) {
+                    return;
+                }
+            }
+            OutputRetention::Head => {
+                if event_bytes > self.capacity_bytes {
+                    self.append_omission_notice_locked(&mut guard);
+                    return;
+                }
+                if guard.has_omission_notice() {
+                    return;
+                }
+                if guard.total_buffered_bytes().saturating_add(event_bytes) > self.capacity_bytes {
+                    self.append_omission_notice_locked(&mut guard);
+                    return;
+                }
+            }
         }
 
-        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
-        let mut event_offset = guard.end_offset.max(guard.start_offset);
-        if dropped.dropped_any() {
-            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
-            event_offset = event_offset.max(guard.start_offset);
-        }
+        let event_offset = guard.end_offset.max(guard.start_offset);
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: event_offset,
+            kind,
+        });
+    }
+
+    pub(crate) fn append_marker_event(&self, kind: OutputEventKind) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.note_progress();
+        let event_offset = guard.end_offset.max(guard.start_offset);
         guard.events.push_back(OutputEvent {
             offset: event_offset,
             kind,
@@ -564,7 +996,6 @@ impl OutputRing {
     pub(crate) fn read_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
         let collected = self.collect_range(start_offset, Some(end_offset));
         let bytes = assemble_bytes(&collected.slices);
-        let leading_stderr_prefix_origin = leading_stderr_prefix_needed(&collected.slices);
         let mut text_spans: Vec<OutputTextSpan> = Vec::new();
         let mut cursor = 0usize;
         for slice in &collected.slices {
@@ -592,15 +1023,11 @@ impl OutputRing {
             }
             cursor = end_byte;
         }
-        let mut events = collected.events;
-        if let Some(origin) = leading_stderr_prefix_origin {
-            insert_leading_stderr_prefix_event(&mut events, collected.start_offset, origin);
-        }
         OutputRange {
             start_offset: collected.start_offset,
             end_offset: collected.end_offset,
             bytes,
-            events,
+            events: collected.events,
             text_spans,
         }
     }
@@ -629,18 +1056,100 @@ impl OutputRing {
         false
     }
 
-    fn has_events_at_or_after(&self, offset: u64) -> bool {
+    fn has_materialized_events_at_or_after(&self, offset: u64) -> bool {
         let guard = self.inner.lock().unwrap();
-        guard.events.iter().any(|event| event.offset >= offset)
+        guard.events.iter().any(|event| {
+            event.offset >= offset
+                && matches!(
+                    event.kind,
+                    OutputEventKind::Image { .. } | OutputEventKind::Text { .. }
+                )
+        })
+    }
+
+    fn last_text_ends_with_newline(&self) -> bool {
+        let guard = self.inner.lock().unwrap();
+        let last_chunk = guard.chunks.back().and_then(|chunk| {
+            chunk
+                .range
+                .is_empty()
+                .then_some((chunk.start_offset, true))
+                .or_else(|| {
+                    chunk.range.clone().last().map(|idx| {
+                        (
+                            chunk.start_offset.saturating_add(chunk.range.len() as u64),
+                            chunk.bytes[idx] == b'\n',
+                        )
+                    })
+                })
+        });
+        let last_event = guard.events.iter().rev().find_map(|event| {
+            event
+                .kind
+                .text_ends_with_newline()
+                .map(|ends_with_newline| (event.offset, ends_with_newline))
+        });
+        match (last_chunk, last_event) {
+            (Some((chunk_offset, chunk_newline)), Some((event_offset, event_newline))) => {
+                if event_offset >= chunk_offset {
+                    event_newline
+                } else {
+                    chunk_newline
+                }
+            }
+            (Some((_, chunk_newline)), None) => chunk_newline,
+            (None, Some((_, event_newline))) => event_newline,
+            (None, None) => true,
+        }
+    }
+
+    fn progress_seq(&self) -> u64 {
+        self.inner.lock().unwrap().progress_seq
+    }
+
+    fn settle_state_at_or_after(&self, offset: u64) -> TimelineSettleState {
+        let guard = self.inner.lock().unwrap();
+        let mut input_echoes_seen = 0usize;
+        let mut has_image = false;
+        for event in guard.events.iter().filter(|event| event.offset >= offset) {
+            match event.kind {
+                OutputEventKind::InputEcho { .. } => {
+                    input_echoes_seen = input_echoes_seen.saturating_add(1);
+                }
+                OutputEventKind::Image { .. } => has_image = true,
+                OutputEventKind::Text { .. }
+                | OutputEventKind::InputWait
+                | OutputEventKind::RequestBoundary
+                | OutputEventKind::SessionEnd => {}
+            }
+        }
+        TimelineSettleState {
+            progress_seq: guard.progress_seq,
+            input_echoes_seen,
+            has_image,
+        }
     }
 
     fn consume_to(&self, offset: u64) {
         let mut guard = self.inner.lock().unwrap();
         let offset = offset.min(guard.end_offset);
-        if offset <= guard.start_offset {
+        if offset < guard.start_offset {
+            return;
+        }
+        if offset == guard.start_offset {
+            guard.cleanup_front();
             return;
         }
         guard.trim_to_offset(offset);
+    }
+
+    fn consume_to_with_boundary_events(&self, offset: u64, boundary_events_consumed: usize) {
+        let mut guard = self.inner.lock().unwrap();
+        let offset = offset.min(guard.end_offset);
+        if offset < guard.start_offset {
+            return;
+        }
+        guard.trim_to_offset_consuming_boundary_events(offset, boundary_events_consumed);
     }
 
     fn reset(&self) {
@@ -652,6 +1161,7 @@ impl OutputRing {
         guard.end_offset = 0;
         guard.buffered_bytes = 0;
         guard.buffered_event_bytes = 0;
+        guard.progress_seq = 0;
     }
 
     fn collect_range(&self, start_offset: u64, end_offset: Option<u64>) -> CollectedRange {
@@ -729,7 +1239,6 @@ impl OutputRing {
             text: OUTPUT_TRUNCATION_NOTICE.to_string(),
             is_stderr: false,
             origin: ContentOrigin::Server,
-            readline_results_seen: None,
         };
         let notice_bytes = event_size_bytes(&notice_kind);
         if notice_bytes.saturating_add(extra_bytes) > self.capacity_bytes {
@@ -740,6 +1249,41 @@ impl OutputRing {
             self.capacity_bytes,
         );
         let notice_offset = offset.max(guard.start_offset);
+        guard.note_progress();
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(notice_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: notice_offset,
+            kind: notice_kind,
+        });
+    }
+
+    fn head_omission_notice_reserve_locked(&self, guard: &OutputRingInner) -> usize {
+        if self.retention != OutputRetention::Head || guard.has_omission_notice() {
+            return 0;
+        }
+        let notice_bytes = event_size_bytes(&omission_notice_kind());
+        if notice_bytes <= self.capacity_bytes {
+            notice_bytes
+        } else {
+            0
+        }
+    }
+
+    fn append_omission_notice_locked(&self, guard: &mut OutputRingInner) {
+        if self.retention != OutputRetention::Head || guard.has_omission_notice() {
+            return;
+        }
+        let notice_kind = omission_notice_kind();
+        let notice_bytes = event_size_bytes(&notice_kind);
+        if notice_bytes > self.capacity_bytes {
+            return;
+        }
+        guard.trim_tail_for_room(notice_bytes, self.capacity_bytes);
+        if guard.total_buffered_bytes().saturating_add(notice_bytes) > self.capacity_bytes {
+            return;
+        }
+        let notice_offset = guard.retained_end_offset();
+        guard.note_progress();
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(notice_bytes);
         guard.events.push_back(OutputEvent {
             offset: notice_offset,
@@ -749,9 +1293,24 @@ impl OutputRing {
 }
 
 impl OutputRingInner {
+    fn note_progress(&mut self) {
+        self.progress_seq = self.progress_seq.saturating_add(1);
+    }
+
     fn total_buffered_bytes(&self) -> usize {
         self.buffered_bytes
             .saturating_add(self.buffered_event_bytes)
+    }
+
+    fn has_omission_notice(&self) -> bool {
+        self.events.iter().any(|event| match &event.kind {
+            OutputEventKind::Text {
+                text,
+                origin: ContentOrigin::Server,
+                ..
+            } => text == OUTPUT_OMISSION_NOTICE,
+            _ => false,
+        })
     }
 
     fn pop_front_event(&mut self) -> bool {
@@ -764,12 +1323,105 @@ impl OutputRingInner {
         false
     }
 
+    fn pop_oldest_input_echo_event(&mut self) -> bool {
+        let Some(index) = self
+            .events
+            .iter()
+            .position(|event| matches!(event.kind, OutputEventKind::InputEcho { .. }))
+        else {
+            return false;
+        };
+        let Some(event) = self.events.remove(index) else {
+            return false;
+        };
+        self.buffered_event_bytes = self
+            .buffered_event_bytes
+            .saturating_sub(event_size_bytes(&event.kind));
+        true
+    }
+
+    fn pop_back_event(&mut self) -> Option<OutputEvent> {
+        let event = self.events.pop_back()?;
+        self.buffered_event_bytes = self
+            .buffered_event_bytes
+            .saturating_sub(event_size_bytes(&event.kind));
+        Some(event)
+    }
+
+    fn drop_input_echoes_for_room(&mut self, needed_bytes: usize, capacity_bytes: usize) -> usize {
+        let mut dropped = 0usize;
+        while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
+            if !self.pop_oldest_input_echo_event() {
+                break;
+            }
+            dropped = dropped.saturating_add(1);
+        }
+        dropped
+    }
+
+    fn trim_tail_for_room(&mut self, needed_bytes: usize, capacity_bytes: usize) -> DropStats {
+        let mut dropped = DropStats::default();
+        while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
+            let last_chunk_end = self
+                .chunks
+                .back()
+                .map(|chunk| chunk.start_offset.saturating_add(chunk.range.len() as u64));
+            let last_event_offset = self.events.back().map(|event| event.offset);
+
+            if last_event_offset.is_some()
+                && last_event_offset.unwrap_or(0) >= last_chunk_end.unwrap_or(0)
+            {
+                let Some(event) = self.pop_back_event() else {
+                    break;
+                };
+                if !matches!(event.kind, OutputEventKind::InputEcho { .. }) {
+                    dropped.dropped_visible_events =
+                        dropped.dropped_visible_events.saturating_add(1);
+                }
+                continue;
+            }
+
+            let excess = self
+                .total_buffered_bytes()
+                .saturating_add(needed_bytes)
+                .saturating_sub(capacity_bytes);
+            let Some(back) = self.chunks.back_mut() else {
+                break;
+            };
+            let drop_len = excess.min(back.range.len());
+            if drop_len == 0 {
+                break;
+            }
+            back.range.end = back.range.end.saturating_sub(drop_len);
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(drop_len);
+            dropped.dropped_bytes = dropped.dropped_bytes.saturating_add(drop_len as u64);
+            if back.range.is_empty() {
+                let _ = self.chunks.pop_back();
+            }
+            self.cleanup_back();
+        }
+        dropped
+    }
+
+    fn make_room_for_input_echo(&mut self, needed_bytes: usize, capacity_bytes: usize) -> bool {
+        if needed_bytes >= capacity_bytes {
+            return false;
+        }
+        self.drop_input_echoes_for_room(needed_bytes, capacity_bytes);
+        self.total_buffered_bytes().saturating_add(needed_bytes) <= capacity_bytes
+    }
+
     fn make_room_for(&mut self, needed_bytes: usize, capacity_bytes: usize) -> DropStats {
         let mut dropped = DropStats::default();
         if needed_bytes >= capacity_bytes {
             // If a single chunk consumes the full capacity, drop everything else.
             dropped.dropped_bytes = self.end_offset.saturating_sub(self.start_offset);
-            dropped.dropped_events = self.events.len();
+            for event in &self.events {
+                if !matches!(event.kind, OutputEventKind::InputEcho { .. }) {
+                    dropped.dropped_visible_events =
+                        dropped.dropped_visible_events.saturating_add(1);
+                }
+            }
             self.chunks.clear();
             self.line_ends.clear();
             self.events.clear();
@@ -778,6 +1430,8 @@ impl OutputRingInner {
             self.buffered_event_bytes = 0;
             return dropped;
         }
+
+        let _ = self.drop_input_echoes_for_room(needed_bytes, capacity_bytes);
 
         while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
             if !self.chunks.is_empty() {
@@ -797,7 +1451,8 @@ impl OutputRingInner {
 
             if !self.events.is_empty() {
                 if self.pop_front_event() {
-                    dropped.dropped_events = dropped.dropped_events.saturating_add(1);
+                    dropped.dropped_visible_events =
+                        dropped.dropped_visible_events.saturating_add(1);
                 }
                 continue;
             }
@@ -847,14 +1502,101 @@ impl OutputRingInner {
         }
     }
 
-    fn cleanup_front(&mut self) {
+    fn trim_to_offset_consuming_boundary_events(
+        &mut self,
+        offset: u64,
+        boundary_events_consumed: usize,
+    ) {
+        let offset = offset.min(self.end_offset);
+        if offset < self.start_offset {
+            return;
+        }
+        if offset == self.start_offset {
+            self.cleanup_front_consuming_boundary_events(boundary_events_consumed);
+            return;
+        }
+
+        while let Some(front) = self.chunks.front_mut() {
+            let front_len: u64 = front.range.len().try_into().unwrap_or(u64::MAX);
+            let front_end = front.start_offset.saturating_add(front_len);
+
+            if front_end <= offset {
+                let consumed = self.chunks.pop_front().unwrap();
+                let consumed_len = consumed.range.len();
+                self.start_offset = front_end;
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(consumed_len);
+            } else if front.start_offset < offset {
+                let delta_u64 = offset.saturating_sub(front.start_offset);
+                let delta: usize = (delta_u64 as usize).min(front.range.len());
+                front.start_offset = front.start_offset.saturating_add(delta as u64);
+                front.range.start = front.range.start.saturating_add(delta);
+                self.start_offset = offset;
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(delta);
+            } else {
+                self.start_offset = offset;
+            }
+
+            self.cleanup_front_before_boundary();
+
+            if self.start_offset >= offset {
+                break;
+            }
+        }
+
+        if self.chunks.is_empty() {
+            self.start_offset = offset;
+            self.cleanup_front_before_boundary();
+        }
+        self.cleanup_front_consuming_boundary_events(boundary_events_consumed);
+    }
+
+    fn retained_end_offset(&self) -> u64 {
+        self.chunks
+            .back()
+            .map(|chunk| chunk.start_offset.saturating_add(chunk.range.len() as u64))
+            .unwrap_or(self.start_offset)
+            .max(self.start_offset)
+    }
+
+    fn cleanup_front_before_boundary(&mut self) {
         while matches!(self.line_ends.front(), Some(line_end) if *line_end <= self.start_offset) {
             let _ = self.line_ends.pop_front();
         }
+        while matches!(self.events.front(), Some(event) if event.offset < self.start_offset) {
+            if self.pop_front_event() {
+                // Dropping due to consumer progress; not tracked as truncation.
+            }
+        }
+    }
+
+    fn cleanup_front(&mut self) {
+        self.cleanup_front_before_boundary();
         while matches!(self.events.front(), Some(event) if event.offset <= self.start_offset) {
             if self.pop_front_event() {
                 // Dropping due to consumer progress; not tracked as truncation.
             }
+        }
+    }
+
+    fn cleanup_front_consuming_boundary_events(&mut self, boundary_events_consumed: usize) {
+        self.cleanup_front_before_boundary();
+        for _ in 0..boundary_events_consumed {
+            if !matches!(self.events.front(), Some(event) if event.offset == self.start_offset) {
+                break;
+            }
+            if self.pop_front_event() {
+                // Dropping due to consumer progress; not tracked as truncation.
+            }
+        }
+    }
+
+    fn cleanup_back(&mut self) {
+        let retained_end = self.retained_end_offset();
+        while matches!(self.line_ends.back(), Some(line_end) if *line_end > retained_end) {
+            let _ = self.line_ends.pop_back();
+        }
+        while matches!(self.events.back(), Some(event) if event.offset > retained_end) {
+            let _ = self.pop_back_event();
         }
     }
 }
@@ -862,12 +1604,12 @@ impl OutputRingInner {
 #[derive(Default, Clone, Copy)]
 struct DropStats {
     dropped_bytes: u64,
-    dropped_events: usize,
+    dropped_visible_events: usize,
 }
 
 impl DropStats {
-    fn dropped_any(self) -> bool {
-        self.dropped_bytes > 0 || self.dropped_events > 0
+    fn dropped_visible(self) -> bool {
+        self.dropped_bytes > 0 || self.dropped_visible_events > 0
     }
 }
 
@@ -878,48 +1620,26 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
             mime_type,
             id,
             is_new: _,
-            readline_results_seen: _,
         } => data
             .len()
             .saturating_add(mime_type.len())
             .saturating_add(id.len())
             .saturating_add(32),
-        OutputEventKind::Text { text, .. } => text.len().saturating_add(16),
+        OutputEventKind::Text { text, .. } | OutputEventKind::InputEcho { text } => {
+            text.len().saturating_add(16)
+        }
+        OutputEventKind::InputWait
+        | OutputEventKind::RequestBoundary
+        | OutputEventKind::SessionEnd => 0,
     }
 }
 
-fn leading_stderr_prefix_needed(slices: &[OutputSlice]) -> Option<ContentOrigin> {
-    let first = slices.first()?;
-    if !first.is_stderr {
-        return None;
+fn omission_notice_kind() -> OutputEventKind {
+    OutputEventKind::Text {
+        text: OUTPUT_OMISSION_NOTICE.to_string(),
+        is_stderr: false,
+        origin: ContentOrigin::Server,
     }
-    let bytes = &first.bytes[first.range.clone()];
-    (!starts_with_stderr_prefix(bytes)).then_some(first.origin)
-}
-
-fn starts_with_stderr_prefix(bytes: &[u8]) -> bool {
-    bytes.starts_with(STDERR_PREFIX) || bytes.starts_with(b"\nstderr: ")
-}
-
-fn insert_leading_stderr_prefix_event(
-    events: &mut Vec<OutputEvent>,
-    offset: u64,
-    origin: ContentOrigin,
-) {
-    let event = OutputEvent {
-        offset,
-        kind: OutputEventKind::Text {
-            text: String::from_utf8_lossy(STDERR_PREFIX).into_owned(),
-            is_stderr: true,
-            origin,
-            readline_results_seen: None,
-        },
-    };
-    let insert_at = events
-        .iter()
-        .position(|existing| existing.offset > offset)
-        .unwrap_or(events.len());
-    events.insert(insert_at, event);
 }
 
 fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {
@@ -940,6 +1660,54 @@ fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {
     bytes
 }
 
+fn trim_range_to_complete_utf8(range: &mut OutputRange) -> u64 {
+    let flushable_len = flushable_prefix_len(&range.bytes);
+    if flushable_len == range.bytes.len() {
+        return range.end_offset;
+    }
+    range.bytes.truncate(flushable_len);
+    let consumed_end = range.start_offset.saturating_add(flushable_len as u64);
+    range.end_offset = consumed_end;
+    range.events.retain(|event| event.offset <= consumed_end);
+    range.text_spans.retain_mut(|span| {
+        if span.start_byte >= flushable_len {
+            return false;
+        }
+        span.end_byte = span.end_byte.min(flushable_len);
+        span.start_byte < span.end_byte
+    });
+    consumed_end
+}
+
+fn output_range_boundary_event_count(range: &OutputRange, offset: u64) -> usize {
+    range
+        .events
+        .iter()
+        .filter(|event| event.offset == offset)
+        .count()
+}
+
+fn flushable_prefix_len(bytes: &[u8]) -> usize {
+    let mut offset: usize = 0;
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(_) => return bytes.len(),
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if let Some(error_len) = err.error_len() {
+                    let invalid_end = valid_up_to.saturating_add(error_len);
+                    offset = offset.saturating_add(invalid_end);
+                    remaining = &remaining[invalid_end..];
+                } else {
+                    return offset.saturating_add(valid_up_to);
+                }
+            }
+        }
+    }
+    offset
+}
+
 fn output_ring_append_chunk_len(capacity_bytes: usize) -> usize {
     capacity_bytes
         .max(1)
@@ -950,6 +1718,7 @@ fn output_ring_append_chunk_len(capacity_bytes: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn output_ring_truncates_instead_of_blocking() {
@@ -970,6 +1739,43 @@ mod tests {
     }
 
     #[test]
+    fn clear_waits_for_in_flight_timeline_append() {
+        let timeline = OutputTimeline::with_capacity(64);
+        let output = timeline.buffer();
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        let payload_len = payload.len() as u64;
+
+        std::thread::scope(|scope| {
+            let writer = timeline.clone();
+            let handle = scope.spawn(move || {
+                writer.append_text(&payload, false, ContentOrigin::Worker);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let end_offset = output.end_offset().expect("output ring should exist");
+                if end_offset > 0 && end_offset < payload_len {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "expected to observe an in-flight append before it completed"
+                );
+                std::thread::yield_now();
+            }
+
+            timeline.clear();
+            handle.join().expect("append thread should not panic");
+        });
+
+        assert_eq!(
+            output.end_offset(),
+            Some(0),
+            "clear should not leave stale bytes from an in-flight append"
+        );
+    }
+
+    #[test]
     fn output_ring_truncates_old_events() {
         let ring = OutputRing::with_capacity(128);
         ring.append_bytes(b"hello\n", false, ContentOrigin::Worker);
@@ -982,7 +1788,6 @@ mod tests {
                     data,
                     mime_type: format!("image/{idx}"),
                     is_new: true,
-                    readline_results_seen: 0,
                 },
             );
         }
@@ -1039,7 +1844,6 @@ mod tests {
                 data: "img".to_string(),
                 mime_type: "image/png".to_string(),
                 is_new: true,
-                readline_results_seen: 0,
             },
         );
 
@@ -1053,6 +1857,141 @@ mod tests {
         assert!(
             image_event.offset >= range.start_offset,
             "expected event offset to be clamped into retained range"
+        );
+    }
+
+    #[test]
+    fn head_retention_marks_visible_events_dropped_at_capacity() {
+        let timeline = OutputTimeline::with_head_retention_capacity(128);
+        let output = timeline.buffer();
+
+        timeline.append_text(&[b'x'; 120], false, ContentOrigin::Worker);
+        timeline.append_image(
+            "plot-1".to_string(),
+            "image/png".to_string(),
+            "image-data".to_string(),
+            true,
+            0,
+        );
+
+        let range = output.read_range(
+            0,
+            output
+                .end_offset()
+                .expect("output should have an end offset"),
+        );
+        assert!(
+            range.events.iter().any(|event| matches!(
+                &event.kind,
+                OutputEventKind::Text {
+                    text,
+                    origin: ContentOrigin::Server,
+                    ..
+                } if text.contains("output omitted")
+            )),
+            "expected a server omission notice when a later visible event cannot fit"
+        );
+    }
+
+    #[test]
+    fn head_retention_marks_input_echo_dropped_for_later_text() {
+        let timeline = OutputTimeline::with_head_retention_capacity(160);
+        let output = timeline.buffer();
+        let line = format!("{}\n", "a".repeat(96));
+
+        timeline.append_input_echo("p> ", &line);
+        timeline.append_text(&[b'x'; 80], false, ContentOrigin::Worker);
+
+        let range = output.read_range(
+            0,
+            output
+                .end_offset()
+                .expect("output should have an end offset"),
+        );
+        assert!(
+            range.events.iter().any(|event| matches!(
+                &event.kind,
+                OutputEventKind::Text {
+                    text,
+                    origin: ContentOrigin::Server,
+                    ..
+                } if text.contains("output omitted")
+            )),
+            "expected a server omission notice when a hidden input echo is dropped for later text"
+        );
+        assert_eq!(
+            range.bytes.len(),
+            80,
+            "later visible text should be retained after the hidden input echo is dropped"
+        );
+    }
+
+    #[test]
+    fn head_retention_keeps_text_that_fits_full_capacity_without_omission() {
+        let notice_bytes = event_size_bytes(&omission_notice_kind());
+        let capacity = notice_bytes.saturating_add(64);
+        let timeline = OutputTimeline::with_head_retention_capacity(capacity);
+        let output = timeline.buffer();
+        let payload = vec![b'x'; capacity];
+
+        timeline.append_text(&payload, false, ContentOrigin::Worker);
+
+        let range = output.read_range(
+            0,
+            output
+                .end_offset()
+                .expect("output should have an end offset"),
+        );
+        assert_eq!(
+            range.bytes.len(),
+            capacity,
+            "text that fits the full head-retention capacity should be retained"
+        );
+        assert!(
+            range.events.iter().all(|event| !matches!(
+                &event.kind,
+                OutputEventKind::Text { text, .. } if text.contains("output omitted")
+            )),
+            "did not expect an omission notice when all output fits"
+        );
+    }
+
+    #[test]
+    fn boundary_event_appended_after_snapshot_survives_advance() {
+        let timeline = OutputTimeline::with_capacity(1024);
+        let output = timeline.buffer();
+        output.start_capture();
+
+        timeline.append_text(b"ready", false, ContentOrigin::Worker);
+        let start = output
+            .current_offset()
+            .expect("output capture should start");
+        let end = output
+            .end_offset()
+            .expect("output should have an end offset");
+        let range = output.read_range(start, end);
+
+        timeline.append_image(
+            "plot-1".to_string(),
+            "image/png".to_string(),
+            "image-data".to_string(),
+            true,
+            0,
+        );
+        let boundary_events_consumed = output_range_boundary_event_count(&range, range.end_offset);
+        output.advance_offset_to_with_rendered_text_and_boundary_events(
+            range.end_offset,
+            None,
+            boundary_events_consumed,
+        );
+
+        let formatted = output.drain_formatted(ProjectionMode::Bundle, true);
+        assert!(
+            formatted.contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentImage { id, .. } if id == "plot-1"
+            )),
+            "expected the boundary image appended after the snapshot to survive"
         );
     }
 
@@ -1095,7 +2034,6 @@ mod tests {
                         text,
                         is_stderr: false,
                         origin: ContentOrigin::Worker,
-                        readline_results_seen: None,
                     },
                 );
             }

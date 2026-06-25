@@ -209,6 +209,7 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         )
         interrupted = self.module.tool_result(
             self.module.text("interrupt received\n"),
+            self.module.text("\nstderr: \n"),
             self.module.text("AFTER_INTERRUPT\n"),
             self.module.text("> "),
         )

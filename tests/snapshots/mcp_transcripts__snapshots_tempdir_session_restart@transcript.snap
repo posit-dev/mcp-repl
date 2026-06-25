@@ -40,6 +40,7 @@ expression: transcript
 <<< TEMPDIR_LIST=mcp-repl-snapshot.txt
 <<< ROOT_MARKER_OK
 <<< ROOT_MARKER_EXISTS=TRUE
+<<< > 
 
 2) r_repl
 >>> 
@@ -54,6 +55,7 @@ expression: transcript
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
 <<< TEMPDIR_UNDER_TMPDIR=TRUE
+<<< > 
 
 4) r_repl
 >>> 
@@ -68,3 +70,4 @@ expression: transcript
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
 <<< TEMPDIR_UNDER_TMPDIR=TRUE
+<<< >

@@ -3,16 +3,16 @@ use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::Duration;
 
 use crate::backend::{Backend, WorkerLaunch};
-use crate::completion_reply::CompletionInfo;
+use crate::completion_reply::{CompletionInfo, PagerCompletionPrompt};
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline, ensure_output_ring,
-    reset_last_reply_marker_offset, reset_output_ring,
+    FILES_OUTPUT_TIMELINE_CAPACITY_BYTES, OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputTimeline,
 };
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::Pager;
 use crate::pending_output_tape::PendingOutputTape;
 use crate::sandbox::{SandboxState, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
+use crate::server::response::configured_output_bundle_max_bytes;
 pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
 use crate::worker_protocol::WorkerReply;
 use crate::worker_supervisor::{GuardrailEvent, GuardrailShared, WorkerProcess};
@@ -54,6 +54,16 @@ pub enum WorkerError {
     Timeout(Duration),
     Sandbox(String),
     Guardrail(String),
+}
+
+fn files_output_timeline_capacity_bytes() -> Result<usize, WorkerError> {
+    let max_bundle_bytes = configured_output_bundle_max_bytes()?;
+    let max_bundle_bytes = usize::try_from(max_bundle_bytes).map_err(|_| {
+        WorkerError::Protocol(
+            "output bundle max bytes exceeds platform timeline capacity".to_string(),
+        )
+    })?;
+    Ok(FILES_OUTPUT_TIMELINE_CAPACITY_BYTES.max(max_bundle_bytes))
 }
 
 pub(crate) fn is_prechecked_follow_up_requires_meta(err: &WorkerError) -> bool {
@@ -146,9 +156,8 @@ pub struct WorkerManager {
     reply_owned_prefix: PrefixCapture,
     next_live_prefix_belongs_to_reply: bool,
     last_detached_prefix_item_count: usize,
-    pager_prompt: Option<String>,
+    pager_prompt: Option<PagerCompletionPrompt>,
     last_prompt: Option<String>,
-    stdin_waiting: bool,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
     guardrail: GuardrailShared,
@@ -197,11 +206,20 @@ impl WorkerManager {
             });
             crate::sandbox::log_initial_sandbox_policy(&sandbox_state.sandbox_policy);
         }
-        let output_timeline = {
-            let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-            reset_output_ring();
-            reset_last_reply_marker_offset();
-            OutputTimeline::new(output_ring)
+        let (output_timeline, output) = {
+            let timeline_capacity = match oversized_output {
+                OversizedOutputMode::Files => files_output_timeline_capacity_bytes()?,
+                OversizedOutputMode::Pager => OUTPUT_RING_CAPACITY_BYTES,
+            };
+            let timeline = match oversized_output {
+                OversizedOutputMode::Files => {
+                    OutputTimeline::with_head_retention_capacity(timeline_capacity)
+                }
+                OversizedOutputMode::Pager => OutputTimeline::with_capacity(timeline_capacity),
+            };
+            let output = timeline.buffer();
+            output.start_capture();
+            (timeline, output)
         };
         Ok(Self {
             exe_path,
@@ -216,8 +234,8 @@ impl WorkerManager {
             #[cfg(target_os = "windows")]
             windows_sandbox_launch: None,
             oversized_output,
-            pending_output_tape: PendingOutputTape::new(),
-            output: OutputBuffer::default(),
+            pending_output_tape: PendingOutputTape::with_timeline(output_timeline.clone()),
+            output,
             pager: Pager::default(),
             output_timeline,
             driver: new_backend_driver(&worker_launch),
@@ -233,7 +251,6 @@ impl WorkerManager {
             last_detached_prefix_item_count: 0,
             pager_prompt: None,
             last_prompt: None,
-            stdin_waiting: false,
             last_spawn: None,
             spawn_count: 0,
             guardrail: GuardrailShared {
@@ -400,11 +417,14 @@ mod tests {
     fn worker_manager_new_does_not_panic_for_non_utf8_tmpdir_env() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
 
         let _guard = env_test_mutex().lock().expect("env mutex");
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_tmpdir = std::env::var_os("TMPDIR");
-        let non_utf8_tmpdir = OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec());
+        let non_utf8_tmpdir = PathBuf::from(OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec()));
+        #[cfg(target_os = "linux")]
+        std::fs::create_dir_all(&non_utf8_tmpdir).expect("create non-UTF-8 TMPDIR parent");
 
         unsafe {
             std::env::set_var("TMPDIR", &non_utf8_tmpdir);
@@ -425,6 +445,8 @@ mod tests {
                 std::env::remove_var("TMPDIR");
             },
         }
+        #[cfg(target_os = "linux")]
+        let _ = std::fs::remove_dir(&non_utf8_tmpdir);
 
         assert!(result.is_ok(), "WorkerManager::new should not panic");
     }

@@ -1,0 +1,25 @@
+---
+source: tests/python_snapshots.rs
+expression: rendered
+---
+== session: multiline_cell_no_continuation_prompt ==
+-- step 1 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "for i in range(2):\n    print(\"loop\", i)\nprint(\"done\")\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "loop 0\nloop 1\ndone\n"
+    }
+  ]
+}

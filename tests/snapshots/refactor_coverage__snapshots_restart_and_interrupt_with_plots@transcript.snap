@@ -8,6 +8,7 @@ expression: transcript
 >>> set.seed(1)
 >>> plot(1:5, type = "l")
 <<< [image/png len=0]
+<<< > 
 
 2) r_repl timeout_ms=10000
 >>> 
@@ -15,6 +16,7 @@ expression: transcript
 >>> cat("plots_done\n")
 <<< [image/png len=0]
 <<< plots_done
+<<< > 
 
 3) r_repl
 >>> 
@@ -23,6 +25,7 @@ expression: transcript
 4) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< > 
 
 5) r_repl timeout_ms=200
 >>> Sys.sleep(5)
@@ -31,7 +34,10 @@ expression: transcript
 6) r_repl timeout_ms=5000
 >>> 
 <<< stderr: 
+<<< 
+<<< > 
 
 7) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< >

@@ -2,14 +2,11 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::completion_reply::{CompletionInfo, InputFallback};
+use crate::completion_reply::CompletionInfo;
 use crate::ipc::{IpcWaitError, ServerIpcConnection};
-use crate::output_capture::{OutputTextSource, update_last_reply_marker_offset_max};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::PendingSidebandKind;
-use crate::reply_presentation::build_input_transcript;
 
-use super::backend_driver::output_echo_source_for_backend;
 use super::{WorkerError, WorkerManager};
 
 pub(super) const REQUEST_COMPLETION_STABLE_WAIT: Duration = Duration::from_millis(20);
@@ -32,8 +29,8 @@ pub(super) struct RequestState {
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt();
     let mut prompt_variants = ipc.take_prompt_history();
-    let mut echo_event_count = ipc.pending_echo_event_count();
-    let mut saw_late_echo_event = false;
+    let mut input_line_event_count = ipc.pending_input_line_event_count();
+    let mut saw_late_input_line_event = false;
 
     let start = Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -41,25 +38,25 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         thread::sleep(COMPLETION_METADATA_SETTLE_POLL);
         let next_prompt = ipc.try_take_prompt();
         let mut next_prompt_variants = ipc.take_prompt_history();
-        let next_echo_event_count = ipc.pending_echo_event_count();
-        if next_echo_event_count > echo_event_count {
-            saw_late_echo_event = true;
+        let next_input_line_event_count = ipc.pending_input_line_event_count();
+        if next_input_line_event_count > input_line_event_count {
+            saw_late_input_line_event = true;
         }
         let changed = next_prompt.is_some()
             || !next_prompt_variants.is_empty()
-            || next_echo_event_count != echo_event_count;
+            || next_input_line_event_count != input_line_event_count;
 
         if let Some(value) = next_prompt {
             prompt = Some(value);
         }
         prompt_variants.append(&mut next_prompt_variants);
-        echo_event_count = next_echo_event_count;
+        input_line_event_count = next_input_line_event_count;
 
         if changed {
             stable_for = Duration::from_millis(0);
         } else {
             stable_for = stable_for.saturating_add(COMPLETION_METADATA_SETTLE_POLL);
-            if !saw_late_echo_event && stable_for >= COMPLETION_METADATA_STABLE {
+            if !saw_late_input_line_event && stable_for >= COMPLETION_METADATA_STABLE {
                 break;
             }
         }
@@ -79,7 +76,6 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
 pub(super) fn completion_info_from_ipc(
     ipc: &ServerIpcConnection,
     session_end_seen: bool,
-    echo_source: OutputTextSource,
 ) -> CompletionInfo {
     let (prompt, prompt_variants) = if session_end_seen {
         (None, None)
@@ -88,16 +84,9 @@ pub(super) fn completion_info_from_ipc(
         (prompt, Some(prompt_variants))
     };
 
-    let mut echo_events = ipc.take_echo_events();
-    for event in &mut echo_events {
-        event.source = echo_source;
-    }
-
     CompletionInfo {
         prompt,
-        stdin_wait_prompt: ipc.take_stdin_wait_prompt(),
         prompt_variants,
-        echo_events,
         protocol_warnings: ipc.take_protocol_warnings(),
         session_end_seen,
     }
@@ -128,21 +117,15 @@ impl WorkerManager {
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
         }
-        let payload = self.driver.prepare_input_payload(&text);
-        self.driver
-            .on_input_start(&text, &payload, &ipc, remaining)?;
+        if let Some(process) = self.process.as_ref() {
+            process.note_accepted_input_starting();
+        }
+        self.driver.on_input_start(&text, &ipc, remaining)?;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         let remaining = server_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(WorkerError::Timeout(server_timeout));
-        }
-        if self.driver.should_write_stdin_payload() {
-            self.process
-                .as_mut()
-                .expect("worker process should be available")
-                .write_stdin_payload(payload, remaining)?;
-            self.driver.on_input_written(&ipc)?;
         }
         Ok(RequestState {
             timeout: worker_timeout,
@@ -169,6 +152,9 @@ impl WorkerManager {
             Err(WorkerError::Protocol(message))
                 if message.contains("ipc disconnected while waiting for request completion")
         ) {
+            crate::diagnostics::startup_log(
+                "worker-request: ipc disconnected while waiting for completion; checking process",
+            );
             let deadline = Instant::now() + Duration::from_millis(500);
             let mut worker_exited = self.process.is_none();
             while !worker_exited {
@@ -182,14 +168,19 @@ impl WorkerManager {
                 thread::sleep(Duration::from_millis(20));
             }
             if worker_exited {
+                crate::diagnostics::startup_log(
+                    "worker-request: treating disconnected exited worker as session end",
+                );
                 result = Ok(CompletionInfo {
                     prompt: None,
-                    stdin_wait_prompt: None,
                     prompt_variants: None,
-                    echo_events: Vec::new(),
                     protocol_warnings: ipc.take_protocol_warnings(),
                     session_end_seen: true,
                 });
+            } else {
+                crate::diagnostics::startup_log(
+                    "worker-request: disconnected worker did not exit during grace period",
+                );
             }
         }
         // Best-effort: after IPC completion, give the output reader threads a brief window to
@@ -297,27 +288,49 @@ impl WorkerManager {
         }
         let poll = Duration::from_millis(5);
         let start = Instant::now();
+        let requires_input_echo = self
+            .pending_request_input
+            .as_deref()
+            .is_some_and(|input| !input.is_empty());
 
         let mut last = match self.oversized_output {
             OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
-            OversizedOutputMode::Pager => self.output.end_offset().unwrap_or(0),
+            OversizedOutputMode::Pager => self.output.current_progress_seq(),
         };
+        let mut input_echo_ready = !requires_input_echo || self.pending_input_echoes_seen() > 0;
         let mut stable_for = Duration::from_millis(0);
         while start.elapsed() < total {
             thread::sleep(poll);
             let now = match self.oversized_output {
                 OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
-                OversizedOutputMode::Pager => self.output.end_offset().unwrap_or(0),
+                OversizedOutputMode::Pager => self.output.current_progress_seq(),
             };
+            if !input_echo_ready && self.pending_input_echoes_seen() > 0 {
+                input_echo_ready = true;
+                stable_for = Duration::from_millis(0);
+                last = now;
+                continue;
+            }
             if now == last {
                 stable_for = stable_for.saturating_add(poll);
-                if stable_for >= stable_needed {
+                if input_echo_ready && stable_for >= stable_needed {
                     return;
                 }
             } else {
                 last = now;
                 stable_for = Duration::from_millis(0);
             }
+        }
+    }
+
+    fn pending_input_echoes_seen(&self) -> usize {
+        match self.oversized_output {
+            OversizedOutputMode::Files => {
+                self.pending_output_tape
+                    .current_settle_state()
+                    .readline_results_seen
+            }
+            OversizedOutputMode::Pager => self.output.current_settle_state().input_echoes_seen,
         }
     }
 
@@ -350,17 +363,10 @@ impl WorkerManager {
         };
         match status {
             Ok(()) => {
-                let mut settled_completion = completion_info_from_ipc(
-                    &ipc,
-                    false,
-                    output_echo_source_for_backend(self.backend),
-                );
+                let mut settled_completion = completion_info_from_ipc(&ipc, false);
                 self.pending_output_tape
                     .append_sideband(PendingSidebandKind::RequestBoundary);
                 self.settle_output_after_completion(Duration::from_millis(120));
-                if matches!(self.oversized_output, OversizedOutputMode::Pager) {
-                    update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));
-                }
                 let worker_exited = match self.process.as_mut() {
                     Some(process) => match process.is_running() {
                         Ok(running) => !running,
@@ -381,7 +387,7 @@ impl WorkerManager {
                 self.settle_pending_session_end(&ipc);
             }
             Err(IpcWaitError::Protocol(message)) => {
-                self.driver.clear_active_turn();
+                self.driver.clear_active_input();
                 self.settled_pending_error = Some(WorkerError::Protocol(message));
             }
             Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
@@ -398,8 +404,7 @@ impl WorkerManager {
     }
 
     pub(super) fn settle_pending_session_end(&mut self, ipc: &ServerIpcConnection) {
-        let settled_completion =
-            completion_info_from_ipc(ipc, true, output_echo_source_for_backend(self.backend));
+        let settled_completion = completion_info_from_ipc(ipc, true);
         self.pending_output_tape
             .append_sideband(PendingSidebandKind::RequestBoundary);
         self.settle_output_after_completion(Duration::from_millis(120));
@@ -409,26 +414,17 @@ impl WorkerManager {
     }
 
     pub(super) fn clear_pending_request_state(&mut self) {
+        self.clear_pending_request_state_with_active_turn(false);
+    }
+
+    pub(super) fn clear_pending_request_state_with_active_turn(&mut self, preserve: bool) {
         self.pending_request = false;
         self.pending_request_started_at = None;
-        self.driver.clear_active_turn();
+        if !preserve {
+            self.driver.clear_active_input();
+        }
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
-    }
-
-    pub(super) fn take_input_fallback(&mut self, completion: &CompletionInfo) -> InputFallback {
-        let raw_input = completion
-            .echo_events
-            .is_empty()
-            .then(|| self.pending_request_input.take())
-            .flatten();
-        let transcript = raw_input
-            .as_deref()
-            .and_then(|input| build_input_transcript(completion.prompt.as_deref(), input));
-        InputFallback {
-            transcript,
-            raw_input,
-        }
     }
 }

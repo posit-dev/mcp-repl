@@ -8,7 +8,7 @@ call:
 {
   "tool": "py_repl",
   "arguments": {
-    "input": "import sys\nsys.ps1 = \"same> \"\nvalue = input(\"same> \")\nbuffered\nprint(\"MATCHED_PROMPT_VALUE\", value)\n",
+    "input": "import sys\nsys.ps1 = \"same> \"\nvalue = input(\"same> \")\nprint(\"MATCHED_PROMPT_VALUE\", value)\n",
     "timeout_ms": 5000
   }
 }
@@ -19,11 +19,27 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "same> MATCHED_PROMPT_VALUE buffered"
-    },
+      "text": "same> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "buffered\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
     {
       "type": "text",
-      "text": "same> "
+      "text": "MATCHED_PROMPT_VALUE buffered\n"
     }
   ]
 }

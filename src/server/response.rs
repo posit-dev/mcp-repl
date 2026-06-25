@@ -11,10 +11,11 @@ use rmcp::model::{
 use serde_json::Value;
 use tempfile::Builder;
 
+use crate::output_capture::OUTPUT_TRUNCATION_NOTICE;
 pub(crate) use crate::stdin_payload::{TimeoutBundleReuse, timeout_bundle_reuse_for_input};
 use crate::worker_process::WorkerError;
 use crate::worker_protocol::{
-    ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
+    ContentOrigin, ContentVisibility, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
 };
 
 const INLINE_TEXT_BUDGET: usize = 3500;
@@ -68,6 +69,7 @@ struct ActiveOutputBundle {
     transcript_lines: usize,
     transcript_has_partial_line: bool,
     omitted_tail: bool,
+    omitted_reply_visible_tail: bool,
     omission_recorded: bool,
     pre_index_image_paths: Vec<String>,
     disclosed: bool,
@@ -102,16 +104,28 @@ struct OutputStoreLimits {
 
 #[derive(Clone)]
 enum ReplyItem {
-    WorkerText { text: String, stream: TextStream },
-    ServerText { text: String, stream: TextStream },
+    WorkerText {
+        text: String,
+        stream: TextStream,
+        visibility: ContentVisibility,
+    },
+    ServerText {
+        text: String,
+        stream: TextStream,
+    },
     Image(ReplyImage),
 }
 
 impl ReplyItem {
-    fn worker_text(text: impl Into<String>, stream: TextStream) -> Self {
+    fn worker_text_with_visibility(
+        text: impl Into<String>,
+        stream: TextStream,
+        visibility: ContentVisibility,
+    ) -> Self {
         Self::WorkerText {
             text: text.into(),
             stream,
+            visibility,
         }
     }
 
@@ -596,7 +610,7 @@ impl ResponseState {
                                 compact_output_bundle_items(&append.retained_items, &bundle)
                             } else {
                                 let retained_worker_text =
-                                    worker_text_from_items(&append.retained_items);
+                                    reply_visible_worker_text_from_items(&append.retained_items);
                                 compact_text_bundle_items(
                                     append.retained_items,
                                     &retained_worker_text,
@@ -982,6 +996,7 @@ impl OutputStore {
             transcript_lines: 0,
             transcript_has_partial_line: false,
             omitted_tail: false,
+            omitted_reply_visible_tail: false,
             omission_recorded: false,
             pre_index_image_paths: Vec::new(),
             disclosed: false,
@@ -1258,8 +1273,7 @@ impl OutputStoreLimits {
     fn from_env() -> Result<Self, WorkerError> {
         let max_bundle_count =
             parse_limit_env::<usize>(OUTPUT_BUNDLE_MAX_COUNT_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_COUNT)?;
-        let max_bundle_bytes =
-            parse_limit_env::<u64>(OUTPUT_BUNDLE_MAX_BYTES_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_BYTES)?;
+        let max_bundle_bytes = configured_output_bundle_max_bytes()?;
         let max_total_bytes = parse_limit_env::<u64>(
             OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV,
             DEFAULT_OUTPUT_BUNDLE_MAX_TOTAL_BYTES,
@@ -1290,38 +1304,60 @@ impl ActiveOutputBundle {
         let mut retained_items = Vec::with_capacity(items.len());
         let mut omitted_this_reply = false;
 
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
             if self.omitted_tail {
-                if let ReplyItem::ServerText { text, stream } = item {
-                    retained_items.push(ReplyItem::server_text(text.clone(), *stream));
+                match item {
+                    ReplyItem::WorkerText { visibility, .. }
+                        if visibility.is_reply_visible() && !self.omitted_reply_visible_tail =>
+                    {
+                        let future_reply_visible_reserve =
+                            reply_visible_bundle_reserve(&items[index + 1..]);
+                        self.append_worker_text_item(
+                            store,
+                            &mut retained_items,
+                            &mut omitted_this_reply,
+                            item,
+                            future_reply_visible_reserve,
+                        )?;
+                    }
+                    ReplyItem::ServerText { text, stream } => {
+                        retained_items.push(ReplyItem::server_text(text.clone(), *stream));
+                    }
+                    ReplyItem::Image(image) if !self.omitted_reply_visible_tail => {
+                        if let Some(retained_item) = self.append_image(store, image)? {
+                            retained_items.push(retained_item);
+                        } else {
+                            retained_items.push(ReplyItem::Image(image.clone()));
+                            omitted_this_reply = true;
+                            self.apply_omission(store, false)?;
+                        }
+                    }
+                    _ => {}
                 }
                 continue;
             }
 
             match item {
-                ReplyItem::WorkerText { text, stream } => {
-                    let append = self.append_worker_text(store, text, *stream)?;
-                    if let Some(retained_item) = append {
-                        let partial_worker_text = matches!(
-                            &retained_item,
-                            ReplyItem::WorkerText { text: retained, .. } if retained.len() < text.len()
-                        );
-                        retained_items.push(retained_item);
-                        if partial_worker_text {
-                            omitted_this_reply = true;
-                            self.apply_omission(store)?;
-                        }
+                ReplyItem::WorkerText { visibility, .. } => {
+                    let future_reply_visible_reserve = if visibility.is_reply_visible() {
+                        0
                     } else {
-                        omitted_this_reply = true;
-                        self.apply_omission(store)?;
-                    }
+                        reply_visible_bundle_reserve(&items[index + 1..])
+                    };
+                    self.append_worker_text_item(
+                        store,
+                        &mut retained_items,
+                        &mut omitted_this_reply,
+                        item,
+                        future_reply_visible_reserve,
+                    )?;
                 }
                 ReplyItem::ServerText { text, stream } => {
                     match self.append_server_text(store, text, *stream)? {
                         Some(retained_item) => retained_items.push(retained_item),
                         None => {
                             omitted_this_reply = true;
-                            self.apply_omission(store)?;
+                            self.apply_omission(store, false)?;
                             retained_items.push(ReplyItem::server_text(text.clone(), *stream));
                         }
                     }
@@ -1331,7 +1367,7 @@ impl ActiveOutputBundle {
                         retained_items.push(retained_item);
                     } else {
                         omitted_this_reply = true;
-                        self.apply_omission(store)?;
+                        self.apply_omission(store, true)?;
                     }
                 }
             }
@@ -1343,16 +1379,77 @@ impl ActiveOutputBundle {
         })
     }
 
+    fn append_worker_text_item(
+        &mut self,
+        store: &mut OutputStore,
+        retained_items: &mut Vec<ReplyItem>,
+        omitted_this_reply: &mut bool,
+        item: &ReplyItem,
+        reserved_capacity_after: usize,
+    ) -> Result<(), WorkerError> {
+        let ReplyItem::WorkerText {
+            text,
+            stream,
+            visibility,
+        } = item
+        else {
+            unreachable!("append_worker_text_item only accepts worker text");
+        };
+        let append = self.append_worker_text_with_visibility(
+            store,
+            text,
+            *stream,
+            *visibility,
+            reserved_capacity_after,
+        )?;
+        if let Some(retained_item) = append {
+            let partial_worker_text = matches!(
+                &retained_item,
+                ReplyItem::WorkerText { text: retained, .. } if retained.len() < text.len()
+            );
+            retained_items.push(retained_item);
+            if partial_worker_text {
+                *omitted_this_reply = true;
+                self.apply_omission(store, visibility.is_reply_visible())?;
+            }
+        } else {
+            *omitted_this_reply = true;
+            self.apply_omission(store, visibility.is_reply_visible())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn append_worker_text(
         &mut self,
         store: &mut OutputStore,
         text: &str,
         stream: TextStream,
     ) -> Result<Option<ReplyItem>, WorkerError> {
+        self.append_worker_text_with_visibility(
+            store,
+            text,
+            stream,
+            ContentVisibility::ReplyAndTranscript,
+            0,
+        )
+    }
+
+    fn append_worker_text_with_visibility(
+        &mut self,
+        store: &mut OutputStore,
+        text: &str,
+        stream: TextStream,
+        visibility: ContentVisibility,
+        reserved_capacity_after: usize,
+    ) -> Result<Option<ReplyItem>, WorkerError> {
         if text.is_empty() {
             return Ok(None);
         }
-        if self.has_images() && !self.has_events_log() {
+        if !self.has_events_log()
+            && (self.has_images()
+                || (self.omitted_tail && !self.omission_recorded && visibility.is_reply_visible()))
+        {
             self.materialize_events_log(store)?;
         }
         self.ensure_transcript(store)?;
@@ -1362,9 +1459,10 @@ impl ActiveOutputBundle {
         } else {
             usize::from(self.has_events_log()) * omission_event_line_len()
         };
+        let reserved_capacity_after = reserved_capacity_after.saturating_add(omission_reserve);
         let granted = store.prepare_append_capacity(
             self.id,
-            (text.len() + TEXT_ROW_OVERHEAD_BYTES + omission_reserve) as u64,
+            (text.len() + TEXT_ROW_OVERHEAD_BYTES + reserved_capacity_after) as u64,
         )? as usize;
         if granted == 0 {
             return Ok(None);
@@ -1384,9 +1482,9 @@ impl ActiveOutputBundle {
             let end_byte = start_byte.saturating_add(retained.len());
             let row = format!("T lines={start_line}-{end_line} bytes={start_byte}-{end_byte}\n");
             let reserve = if retained.len() < text.len() {
-                omission_reserve
+                reserved_capacity_after
             } else {
-                0
+                reserved_capacity_after.saturating_sub(omission_reserve)
             };
             if retained
                 .len()
@@ -1405,7 +1503,11 @@ impl ActiveOutputBundle {
                 self.transcript_bytes = self.transcript_bytes.saturating_add(retained.len());
                 self.transcript_lines = next_line_count;
                 self.transcript_has_partial_line = next_has_partial_line;
-                return Ok(Some(ReplyItem::worker_text(retained.to_string(), stream)));
+                return Ok(Some(ReplyItem::worker_text_with_visibility(
+                    retained.to_string(),
+                    stream,
+                    visibility,
+                )));
             }
             let allowed_text_bytes = granted.saturating_sub(row.len().saturating_add(reserve));
             let next = truncate_utf8_prefix(retained, allowed_text_bytes);
@@ -1544,8 +1646,13 @@ impl ActiveOutputBundle {
         Ok(Some(ReplyItem::Image(image.clone())))
     }
 
-    fn apply_omission(&mut self, store: &mut OutputStore) -> Result<(), WorkerError> {
+    fn apply_omission(
+        &mut self,
+        store: &mut OutputStore,
+        reply_visible: bool,
+    ) -> Result<(), WorkerError> {
         self.omitted_tail = true;
+        self.omitted_reply_visible_tail |= reply_visible;
         if self.omission_recorded || !self.has_events_log() {
             return Ok(());
         }
@@ -1708,6 +1815,10 @@ impl StagedTimeoutOutput {
     }
 }
 
+pub(crate) fn configured_output_bundle_max_bytes() -> Result<u64, WorkerError> {
+    parse_limit_env::<u64>(OUTPUT_BUNDLE_MAX_BYTES_ENV, DEFAULT_OUTPUT_BUNDLE_MAX_BYTES)
+}
+
 fn parse_limit_env<T>(name: &str, default: T) -> Result<T, WorkerError>
 where
     T: std::str::FromStr,
@@ -1766,12 +1877,14 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                 text,
                 origin,
                 stream,
+                visibility,
             } => {
-                let text = if matches!(origin, ContentOrigin::Worker) {
-                    normalize_error_prompt(text, is_error)
-                } else {
-                    text
-                };
+                let text =
+                    if matches!(origin, ContentOrigin::Worker) && visibility.is_reply_visible() {
+                        normalize_error_prompt(text, is_error)
+                    } else {
+                        text
+                    };
                 if text.is_empty() {
                     continue;
                 }
@@ -1783,7 +1896,7 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                         } else {
                             reply_worker_text.push_str(&text);
                         }
-                        ReplyItem::worker_text(text, stream)
+                        ReplyItem::worker_text_with_visibility(text, stream, visibility)
                     }
                     ContentOrigin::Server => ReplyItem::server_text(text, stream),
                 };
@@ -1864,15 +1977,50 @@ pub(crate) fn strip_text_stream_meta(result: &mut CallToolResult) {
 }
 
 fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
-    items
-        .into_iter()
-        .map(|item| match item {
-            ReplyItem::WorkerText { text, stream } | ReplyItem::ServerText { text, stream } => {
-                content_text(text, stream)
+    let mut out = Vec::new();
+    let mut pending_worker_text: Option<(String, TextStream)> = None;
+
+    for item in items {
+        match item {
+            ReplyItem::WorkerText {
+                text,
+                stream,
+                visibility,
+            } if visibility.is_reply_visible() => match &mut pending_worker_text {
+                Some((pending, pending_stream)) if *pending_stream == stream => {
+                    pending.push_str(&text);
+                }
+                Some(_) => {
+                    flush_pending_worker_text(&mut out, &mut pending_worker_text);
+                    pending_worker_text = Some((text, stream));
+                }
+                None => {
+                    pending_worker_text = Some((text, stream));
+                }
+            },
+            ReplyItem::WorkerText { .. } => {}
+            ReplyItem::ServerText { text, stream } => {
+                flush_pending_worker_text(&mut out, &mut pending_worker_text);
+                out.push(content_text(text, stream));
             }
-            ReplyItem::Image(image) => image_to_content(&image),
-        })
-        .collect()
+            ReplyItem::Image(image) => {
+                flush_pending_worker_text(&mut out, &mut pending_worker_text);
+                out.push(image_to_content(&image));
+            }
+        }
+    }
+
+    flush_pending_worker_text(&mut out, &mut pending_worker_text);
+    out
+}
+
+fn flush_pending_worker_text(
+    out: &mut Vec<Content>,
+    pending_worker_text: &mut Option<(String, TextStream)>,
+) {
+    if let Some((text, stream)) = pending_worker_text.take() {
+        out.push(content_text(text, stream));
+    }
 }
 
 fn image_to_content(image: &ReplyImage) -> Content {
@@ -1931,13 +2079,51 @@ fn worker_text_from_items(items: &[ReplyItem]) -> String {
     out
 }
 
+fn reply_visible_worker_text_from_items(items: &[ReplyItem]) -> String {
+    let mut out = String::new();
+    for item in items {
+        if let ReplyItem::WorkerText {
+            text, visibility, ..
+        } = item
+            && visibility.is_reply_visible()
+        {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+fn reply_visible_bundle_reserve(items: &[ReplyItem]) -> usize {
+    items.iter().fold(0usize, |reserve, item| match item {
+        ReplyItem::WorkerText {
+            text, visibility, ..
+        } if visibility.is_reply_visible() => reserve
+            .saturating_add(text.len())
+            .saturating_add(TEXT_ROW_OVERHEAD_BYTES),
+        ReplyItem::Image(image) => {
+            reserve.saturating_add(reply_visible_image_bundle_reserve(image))
+        }
+        ReplyItem::WorkerText { .. } | ReplyItem::ServerText { .. } => reserve,
+    })
+}
+
+fn reply_visible_image_bundle_reserve(image: &ReplyImage) -> usize {
+    image
+        .data
+        .len()
+        .saturating_mul(2)
+        .saturating_add(TEXT_ROW_OVERHEAD_BYTES)
+        .saturating_add(OUTPUT_BUNDLE_HEADER.len())
+        .saturating_add(omission_event_line_len())
+}
+
 fn compact_text_bundle_items(
     items: Vec<ReplyItem>,
-    worker_text: &str,
+    preview_worker_text: &str,
     bundle: &ActiveOutputBundle,
 ) -> Vec<Content> {
     let preview = build_preview(
-        worker_text,
+        preview_worker_text,
         Some(bundle.disclosure_path()),
         bundle.omitted_tail,
     );
@@ -1961,8 +2147,11 @@ fn compact_text_bundle_items(
     out
 }
 
-fn compact_text_without_bundle_items(items: Vec<ReplyItem>, worker_text: &str) -> Vec<Content> {
-    let preview = build_preview(worker_text, None, false);
+fn compact_text_without_bundle_items(
+    items: Vec<ReplyItem>,
+    preview_worker_text: &str,
+) -> Vec<Content> {
+    let preview = build_preview(preview_worker_text, None, false);
     let mut out = Vec::new();
     let mut worker_inserted = false;
     for item in items {
@@ -1978,6 +2167,24 @@ fn compact_text_without_bundle_items(items: Vec<ReplyItem>, worker_text: &str) -
         }
     }
     out
+}
+
+fn compact_omitted_bundle_items(
+    retained_items: Vec<ReplyItem>,
+    preview_worker_text: &str,
+    bundle: &ActiveOutputBundle,
+) -> Vec<Content> {
+    if bundle.next_image_number > 0 {
+        return compact_output_bundle_items(&retained_items, bundle);
+    }
+    if count_images(&retained_items) >= IMAGE_OUTPUT_BUNDLE_THRESHOLD {
+        let mut out = compact_output_without_bundle_items(&retained_items);
+        if bundle.omitted_tail {
+            out.push(Content::text(build_output_bundle_notice(bundle, 0)));
+        }
+        return out;
+    }
+    compact_text_bundle_items(retained_items, preview_worker_text, bundle)
 }
 
 fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle) -> Vec<Content> {
@@ -2130,23 +2337,25 @@ fn render_active_bundle_contents(
     let append = active.append_items(output_store, bundle_items)?;
     let retained_image_count = count_images(&append.retained_items);
     let retained_worker_text = worker_text_from_items(&append.retained_items);
+    let retained_reply_worker_text = reply_visible_worker_text_from_items(&append.retained_items);
     let has_incremental_content = !append.retained_items.is_empty();
     let has_worker_or_image_incremental_content =
         retained_image_count > 0 || !retained_worker_text.is_empty();
     let image_bundle_still_needed = active.next_image_number > 0
         && should_use_output_bundle(active.history_image_count, spill_worker_text_chars);
+    let retained_images_need_inline_cap = active.omitted_tail
+        && active.next_image_number == 0
+        && retained_image_count >= IMAGE_OUTPUT_BUNDLE_THRESHOLD;
 
     if append.omitted_this_reply {
         active.disclosed = true;
-        if active.next_image_number > 0 {
-            Ok(compact_output_bundle_items(&append.retained_items, active))
-        } else {
-            Ok(compact_text_bundle_items(
-                append.retained_items.clone(),
-                &retained_worker_text,
-                active,
-            ))
-        }
+        Ok(compact_omitted_bundle_items(
+            append.retained_items,
+            &retained_reply_worker_text,
+            active,
+        ))
+    } else if retained_images_need_inline_cap {
+        Ok(compact_output_without_bundle_items(&append.retained_items))
     } else if retained_image_count > 0 && image_bundle_still_needed {
         active.disclosed = true;
         Ok(compact_output_bundle_items(bundle_items, active))
@@ -2154,7 +2363,7 @@ fn render_active_bundle_contents(
         active.disclosed = true;
         Ok(compact_text_bundle_items(
             append.retained_items.clone(),
-            &retained_worker_text,
+            &retained_reply_worker_text,
             active,
         ))
     } else if active.was_disclosed()
@@ -2186,7 +2395,8 @@ fn compact_items_without_output_bundle(
         return compact_output_without_bundle_items(bundle_items);
     }
     if text_should_spill(worker_text.chars().count()) {
-        return compact_text_without_bundle_items(inline_items.to_vec(), worker_text);
+        let preview_worker_text = reply_visible_worker_text_from_items(inline_items);
+        return compact_text_without_bundle_items(inline_items.to_vec(), &preview_worker_text);
     }
     materialize_items(inline_items.to_vec())
 }
@@ -2229,7 +2439,6 @@ fn render_reply_items(
             output_store,
             reply_bundle_items,
             reply_inline_items,
-            reply_worker_text,
             false,
             protected_bundle_id,
         );
@@ -2239,7 +2448,6 @@ fn render_reply_items(
             output_store,
             reply_bundle_items,
             reply_inline_items,
-            reply_worker_text,
             true,
             protected_bundle_id,
         );
@@ -2251,7 +2459,6 @@ fn compact_reply_items_with_new_bundle(
     output_store: &mut OutputStore,
     reply_bundle_items: &[ReplyItem],
     reply_inline_items: &[ReplyItem],
-    reply_worker_text: &str,
     text_only: bool,
     protected_bundle_id: Option<u64>,
 ) -> Vec<Content> {
@@ -2259,10 +2466,17 @@ fn compact_reply_items_with_new_bundle(
         Ok(mut bundle) => match bundle.append_items(output_store, reply_bundle_items) {
             Ok(append) => {
                 if text_only {
-                    let retained_worker_text = worker_text_from_items(&append.retained_items);
+                    let retained_worker_text =
+                        reply_visible_worker_text_from_items(&append.retained_items);
                     compact_text_bundle_items(append.retained_items, &retained_worker_text, &bundle)
                 } else if append.omitted_this_reply {
-                    compact_output_bundle_items(&append.retained_items, &bundle)
+                    let retained_worker_text =
+                        reply_visible_worker_text_from_items(&append.retained_items);
+                    compact_omitted_bundle_items(
+                        append.retained_items,
+                        &retained_worker_text,
+                        &bundle,
+                    )
                 } else {
                     compact_output_bundle_items(reply_bundle_items, &bundle)
                 }
@@ -2275,9 +2489,11 @@ fn compact_reply_items_with_new_bundle(
                     );
                 }
                 if text_only {
+                    let preview_worker_text =
+                        reply_visible_worker_text_from_items(reply_inline_items);
                     compact_text_without_bundle_items(
                         reply_inline_items.to_vec(),
-                        reply_worker_text,
+                        &preview_worker_text,
                     )
                 } else {
                     compact_output_without_bundle_items(reply_inline_items)
@@ -2287,7 +2503,8 @@ fn compact_reply_items_with_new_bundle(
         Err(err) => {
             eprintln!("dropping output-bundle setup after output-bundle error: {err}");
             if text_only {
-                compact_text_without_bundle_items(reply_inline_items.to_vec(), reply_worker_text)
+                let preview_worker_text = reply_visible_worker_text_from_items(reply_inline_items);
+                compact_text_without_bundle_items(reply_inline_items.to_vec(), &preview_worker_text)
             } else {
                 compact_output_without_bundle_items(reply_inline_items)
             }
@@ -2439,7 +2656,12 @@ fn collect_prefix_text_after(items: &[ReplyItem], index: Option<usize>, budget: 
 
 fn item_text(item: &ReplyItem) -> Option<&str> {
     match item {
-        ReplyItem::WorkerText { text, .. } | ReplyItem::ServerText { text, .. } => Some(text),
+        ReplyItem::WorkerText {
+            text, visibility, ..
+        } if visibility.is_reply_visible() => Some(text),
+        ReplyItem::WorkerText { .. } => None,
+        ReplyItem::ServerText { text, .. } if text == OUTPUT_TRUNCATION_NOTICE => None,
+        ReplyItem::ServerText { text, .. } => Some(text),
         ReplyItem::Image(_) => None,
     }
 }
@@ -2519,8 +2741,8 @@ fn image_extension(mime_type: &str) -> &str {
 }
 
 fn build_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
-    if omitted_tail && text.chars().count() <= INLINE_TEXT_BUDGET {
-        return build_short_preview(text, path);
+    if text.chars().count() <= INLINE_TEXT_BUDGET {
+        return build_short_preview(text, path, omitted_tail);
     }
     if let Some(preview) = build_line_preview(text, path, omitted_tail) {
         return preview;
@@ -2609,15 +2831,21 @@ fn build_char_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> St
     format!("{head}\n{marker}\n{tail}")
 }
 
-fn build_short_preview(text: &str, path: Option<&Path>) -> String {
+fn build_short_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
     let mut out = String::new();
     out.push_str(text);
     if !text.is_empty() && !text.ends_with('\n') {
         out.push('\n');
     }
+    let omitted = if omitted_tail {
+        "; later content omitted"
+    } else {
+        ""
+    };
     out.push_str(&format!(
-        "...[{}; later content omitted]...",
-        preview_storage_clause(path)
+        "...[{}{}]...",
+        preview_storage_clause(path),
+        omitted
     ));
     out
 }
@@ -2731,6 +2959,17 @@ mod tests {
             .collect()
     }
 
+    fn result_text_chunks(result: &rmcp::model::CallToolResult) -> Vec<&str> {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match &item.raw {
+                RawContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn result_images(result: &rmcp::model::CallToolResult) -> Vec<Vec<u8>> {
         result
             .content
@@ -2795,6 +3034,75 @@ mod tests {
     fn compact_search_cards_do_not_trigger_error_prompt_normalization() {
         let text = "[pager] search for `Error` @10\n[match] Error: boom\n".to_string();
         assert_eq!(normalize_error_prompt(text.clone(), true), text);
+    }
+
+    #[test]
+    fn standalone_terminal_mode_toggles_are_preserved_from_worker_content() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h"),
+                    WorkerContent::worker_stdout("2\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        assert_eq!(result_text(&result), "\u{1b}[?9001h\u{1b}[?1004h2\n");
+    }
+
+    #[test]
+    fn adjacent_visible_worker_text_materializes_as_one_content_item() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("[1] 42\n"),
+                    WorkerContent::worker_stdout("> "),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        assert_eq!(result_text_chunks(&result), vec!["[1] 42\n> "]);
+    }
+
+    #[test]
+    fn standalone_terminal_mode_toggles_are_preserved_in_output_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let visible = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let toggles = "\u{1b}[?9001h\u{1b}[?1004h";
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(toggles),
+                    WorkerContent::worker_stdout(visible.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected transcript path, got: {text:?}"));
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+        assert_eq!(transcript, format!("{toggles}{visible}"));
+        assert!(
+            text.contains("\u{1b}[?9001h") && text.contains("\u{1b}[?1004h"),
+            "expected terminal mode toggles in inline preview: {text:?}"
+        );
     }
 
     #[test]
@@ -4729,6 +5037,65 @@ mod tests {
     }
 
     #[test]
+    fn transcript_only_omission_caps_later_images_without_image_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.limits.max_bundle_bytes = 1;
+
+        let oversized_transcript_only = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let initial = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout_transcript_only(
+                    oversized_transcript_only,
+                )],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let initial_text = result_text(&initial);
+        assert!(
+            initial_text.contains("later content omitted"),
+            "expected transcript-only quota omission to be disclosed, got: {initial_text:?}"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected omitted timeout bundle to stay active"
+        );
+
+        let later_image_count = super::IMAGE_OUTPUT_BUNDLE_THRESHOLD + 3;
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                (0..later_image_count)
+                    .map(|index| WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                        mime_type: "image/png".to_string(),
+                        id: format!("later-{index}"),
+                        is_new: true,
+                    })
+                    .collect(),
+                Some(WorkerErrorCode::Timeout),
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+        assert!(
+            text.contains("output bundle unavailable"),
+            "expected compact image fallback notice, got: {text:?}"
+        );
+        assert!(
+            !images.is_empty() && images.len() <= 2,
+            "expected later images after transcript-only omission to stay capped, got {} images",
+            images.len()
+        );
+    }
+
+    #[test]
     fn worker_error_clears_active_timeout_bundle() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let bundle = state
@@ -4974,7 +5341,7 @@ mod tests {
             .expect("bundle metadata should exist");
 
         bundle
-            .apply_omission(&mut store)
+            .apply_omission(&mut store, true)
             .expect("omission should degrade to inline state");
 
         let events_after =

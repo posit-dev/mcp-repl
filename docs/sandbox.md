@@ -16,6 +16,15 @@ That metadata is the source of truth for the tool call that is about to run. If
 it is missing or malformed, `mcp-repl` fails closed with `--sandbox inherit
 requested but no client sandbox state was provided`.
 
+Current Codex builds send this metadata as a `permissionProfile` plus a
+`sandboxCwd` file URI. On macOS, `mcp-repl` consumes the managed filesystem
+profile directly: root reads, project-root writes, explicit writable paths,
+read-only carveouts, deny roots, deny globs, `:minimal`, `:tmpdir`, and
+`:slash_tmp` are rendered into the worker's Seatbelt profile. Simple profiles
+may still be logged as the older `read-only`, `workspace-write`,
+`external-sandbox`, or `danger-full-access` shapes for compatibility with the
+existing CLI surface.
+
 `--debug-repl` is the one local-only exception. Because there is no MCP client
 metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
 bootstraps one local inherited snapshot from the current default sandbox state
@@ -97,11 +106,27 @@ For `workspace-write`, writable roots include:
 If you also need R data/config roots, add them explicitly with repeatable
 `--add-writable-root` entries.
 
+For Codex `permissionProfile` metadata, writable and readable roots come from
+the profile entries. `mcp-repl` still adds the server-owned per-session temp
+directory as a writable root so the R and Python workers can start.
+When a profile requests `:minimal`, mcp-repl appends restricted
+read-only platform defaults instead of putting those broader system reads in
+the always-on base policy. The local copy also includes R and Python framework
+runtime roots needed by the embedded backends. Debug builds embed harp's R
+module assets so startup does not require a read carve-out for Cargo's source
+checkout. The always-on base policy keeps non-filesystem runtime allowances
+such as Python multiprocessing and the PyTorch/libomp OpenMP registration
+shared-memory carve-out.
+
 Within writable roots, these subpaths are forced read-only when present:
 
 - `.git`
 - `.codex`
 - `.agents`
+
+Deny entries from inherited metadata are enforced as read denials and unlink
+denials. Glob deny patterns use the supported git glob subset and are resolved
+against `sandboxCwd` when relative.
 
 Proxy-aware network behavior when `network_access: true`:
 
@@ -189,7 +214,11 @@ Optional `bwrap` stage:
   fixed proxy ports fail closed with an actionable error.
 - `read-only` and `workspace-write` use a two-stage Windows sandbox model:
   - the parent prepares and reuses stable filesystem ACL state for the effective sandbox policy,
-  - the internal Windows wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.
+  - the internal Windows sandbox wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.
+- Unsandboxed Windows ConPTY launches attach the worker process directly to the
+  pseudoconsole. Sandboxed ConPTY launches create the pseudoconsole inside the
+  Windows sandbox wrapper so the restricted worker, not an outer process, owns
+  the terminal endpoint.
 - Worker spawn refreshes prepared workspace ACL coverage before launch.
 - The per-session temp directory stays launch-scoped and is not shared through the stable workspace SID; the same configured path may be reused across respawns, but it is reset before each fresh worker launch.
 - `danger-full-access` and `external-sandbox` run without built-in sandbox enforcement.

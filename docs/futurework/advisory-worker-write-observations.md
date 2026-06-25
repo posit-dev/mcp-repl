@@ -17,7 +17,7 @@ just "readline happened":
 - they know which stream is being written,
 - they know the exact byte slice being written,
 - they know the local callback order relative to other worker-side events such
-  as `readline_result` and `plot_image`.
+  as `input_line` and `output_image`.
 
 That information is incomplete, but it may still be useful.
 
@@ -62,8 +62,8 @@ If this is prototyped, keep it narrow:
 - byte length
 - small preview and/or checksum
 - worker-local monotonic sequence number
-- whether the write came from embedded runtime output, echoed input, or another
-  worker-owned path
+- whether the write came from embedded runtime output, submitted input metadata,
+  or another worker-owned path
 
 The event should be cheap to emit and easy to ignore when it is not helpful.
 

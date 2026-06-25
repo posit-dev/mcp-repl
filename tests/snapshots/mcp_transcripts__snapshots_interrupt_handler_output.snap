@@ -9,7 +9,7 @@ call:
   "tool": "r_repl",
   "arguments": {
     "input": "cat(\"INTERRUPT_READY\\n\")\nflush.console()\ntryCatch(\n  {\n    repeat Sys.sleep(0.5)\n  },\n  interrupt = function(e) cat(\"interrupt received\\n\")\n)\n",
-    "timeout_ms": 1000
+    "timeout_ms": 3000
   }
 }
 response:
@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> cat(\"INTERRUPT_READY\\n\")\nINTERRUPT_READY\n> flush.console()\n> tryCatch(\n+   {\n+     repeat Sys.sleep(0.5)\n+   },\n+   interrupt = function(e) cat(\"interrupt received\\n\")\n+ )"
+      "text": "INTERRUPT_READY\n"
     },
     {
       "type": "text",
@@ -43,11 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "interrupt received"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "interrupt received\n> "
     }
   ]
 }
@@ -67,11 +63,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "[1] 2\n> "
     }
   ]
 }

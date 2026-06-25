@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString};
 use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 
 use crate::ipc;
@@ -59,10 +59,14 @@ impl RSession {
         self.init.wait_ready()
     }
 
-    pub fn enqueue_input(&self, input: String) -> Result<(), String> {
+    pub fn begin_input(&self, input: String) -> Result<(), String> {
         self.wait_until_ready()?;
         let state = session_state();
         let mut guard = state.inner.lock().unwrap();
+        if guard.active_input {
+            return Err("input_batch arrived while input is active".to_string());
+        }
+        guard.active_input = true;
         queue_input(&mut guard.input_queue, &input);
         state.cvar.notify_all();
         Ok(())
@@ -116,28 +120,29 @@ impl SessionInit {
     }
 }
 
-pub fn request_shutdown() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    guard.shutdown = true;
-    state.cvar.notify_all();
-    true
-}
-
 pub(crate) fn clear_pending_input() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
     };
     let mut guard = state.inner.lock().unwrap();
     let had_pending = !guard.input_queue.is_empty();
-    let discarded = drain_input_queue(&mut guard.input_queue);
-    drop(guard);
-    if !discarded.is_empty() {
-        ipc::emit_readline_discard_bytes(discarded.as_bytes());
-    }
+    drain_input_queue(&mut guard.input_queue);
     had_pending
+}
+
+pub(crate) fn interrupt_pending_input() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    let had_pending = !guard.input_queue.is_empty();
+    drain_input_queue(&mut guard.input_queue);
+    let interrupted_waiting_read = guard.waiting_for_input;
+    if interrupted_waiting_read {
+        guard.read_interrupted = true;
+    }
+    state.cvar.notify_all();
+    had_pending || interrupted_waiting_read
 }
 
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
@@ -150,7 +155,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     let init_start = std::time::Instant::now();
-    let init_result = initialize_r();
+    let init_result = initialize_r(&init);
     if let Err(err) = init_result {
         init.mark_failed(err.clone());
         return Err(err);
@@ -159,8 +164,6 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
         "r-session: init complete ({} ms)",
         crate::diagnostics::elapsed_ms(init_start.elapsed())
     ));
-
-    init.mark_ready();
 
     unsafe {
         libr::run_Rmainloop();
@@ -175,29 +178,40 @@ struct SessionState {
 }
 
 struct SessionStateInner {
-    input_queue: VecDeque<String>,
+    active_input: bool,
+    input_queue: VecDeque<InputBatchLine>,
     plot_hashes: HashMap<String, u64>,
     last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
+    waiting_for_input: bool,
+    read_interrupted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputBatchLine {
+    text: String,
 }
 
 impl SessionState {
     fn new() -> Self {
         Self {
             inner: Mutex::new(SessionStateInner {
+                active_input: false,
                 input_queue: VecDeque::new(),
                 plot_hashes: HashMap::new(),
                 last_prompt: None,
                 shutdown: false,
                 session_end_emitted: false,
+                waiting_for_input: false,
+                read_interrupted: false,
             }),
             cvar: Condvar::new(),
         }
     }
 }
 
-fn initialize_r() -> Result<(), String> {
+fn initialize_r(init: &SessionInit) -> Result<(), String> {
     let start = std::time::Instant::now();
     prepare_r_home_env();
     let r_home = r_home_setup().map_err(|err| format!("failed to set up R_HOME: {err}"))?;
@@ -232,7 +246,7 @@ fn initialize_r() -> Result<(), String> {
         "--no-save".to_string(),
     ];
     let setup_start = std::time::Instant::now();
-    setup_r(&args)?;
+    setup_r(&args, init)?;
     crate::diagnostics::startup_log(format!(
         "r-session: setup_r {} ms",
         crate::diagnostics::elapsed_ms(setup_start.elapsed())
@@ -499,7 +513,7 @@ fn configure_r_tempdir() {
 }
 
 #[cfg(target_family = "unix")]
-fn setup_r(args: &[String]) -> Result<(), String> {
+fn setup_r(args: &[String], init: &SessionInit) -> Result<(), String> {
     unsafe {
         let (owned_args, mut c_args) = build_c_args_owned(args);
         let _ = R_MAIN_ARGS.set(owned_args);
@@ -516,6 +530,8 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         libr::set(ptr_R_Busy, Some(r_busy));
         libr::set(ptr_R_Suicide, Some(r_suicide));
 
+        init.mark_ready();
+        ipc::emit_worker_ready("r", true);
         libr::setup_Rmainloop();
     }
 
@@ -523,7 +539,7 @@ fn setup_r(args: &[String]) -> Result<(), String> {
 }
 
 #[cfg(target_family = "windows")]
-fn setup_r(args: &[String]) -> Result<(), String> {
+fn setup_r(args: &[String], init: &SessionInit) -> Result<(), String> {
     unsafe {
         libr::set(libr::R_SignalHandlers, 1);
 
@@ -573,6 +589,8 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         R_SetParams(params);
         libr::graphapp::GA_initapp(0, std::ptr::null_mut());
         readconsolecfg();
+        init.mark_ready();
+        ipc::emit_worker_ready("r", true);
         libr::setup_Rmainloop();
     }
 
@@ -602,7 +620,7 @@ fn session_state() -> &'static Arc<SessionState> {
         .expect("R session state was not initialized")
 }
 
-fn queue_input(queue: &mut VecDeque<String>, input: &str) {
+fn queue_input(queue: &mut VecDeque<InputBatchLine>, input: &str) {
     if input.is_empty() {
         return;
     }
@@ -614,28 +632,41 @@ fn queue_input(queue: &mut VecDeque<String>, input: &str) {
             lines.push("\n".to_string());
         }
     }
-    queue.extend(lines);
+    queue.extend(lines.into_iter().map(|text| InputBatchLine { text }));
 }
 
-fn drain_input_queue(queue: &mut VecDeque<String>) -> String {
+fn drain_input_queue(queue: &mut VecDeque<InputBatchLine>) -> String {
     let mut drained = String::new();
     while let Some(line) = queue.pop_front() {
-        drained.push_str(&line);
+        drained.push_str(&line.text);
     }
     drained
 }
 
-fn split_console_line(mut line: String, max: usize) -> (String, Option<String>) {
-    if line.len() <= max {
+fn wait_until_console_input_changes(
+    state: &SessionState,
+    mut guard: MutexGuard<'_, SessionStateInner>,
+) {
+    while guard.input_queue.is_empty() && !guard.shutdown && !guard.read_interrupted {
+        guard = state.cvar.wait(guard).unwrap();
+    }
+    guard.waiting_for_input = false;
+}
+
+fn split_console_line(
+    mut line: InputBatchLine,
+    max: usize,
+) -> (InputBatchLine, Option<InputBatchLine>) {
+    if line.text.len() <= max {
         return (line, None);
     }
     let mut split = max;
-    while split > 0 && !line.is_char_boundary(split) {
+    while split > 0 && !line.text.is_char_boundary(split) {
         split -= 1;
     }
     assert!(split > 0, "R console buffer is too small for UTF-8 input");
-    let tail = line.split_off(split);
-    (line, Some(tail))
+    let tail = line.text.split_off(split);
+    (line, Some(InputBatchLine { text: tail }))
 }
 
 fn emit_output_text(stream: TextStream, bytes: &[u8]) {
@@ -910,8 +941,9 @@ pub extern "C-unwind" fn r_read_console(
     prompt: *const c_char,
     buf: *mut c_uchar,
     buflen: c_int,
-    _add_history: c_int,
+    add_history: c_int,
 ) -> c_int {
+    let _ = add_history;
     if buflen <= 0 {
         return 0;
     }
@@ -930,13 +962,10 @@ pub extern "C-unwind" fn r_read_console(
         .map(|text| text.to_ascii_lowercase().contains("save workspace image"))
         .unwrap_or(false);
     let state = session_state();
-    ipc::emit_readline_start(prompt);
-    let emit_idle_start;
     {
         let mut guard = state.inner.lock().unwrap();
         guard.last_prompt = Some(prompt.to_string());
-        emit_idle_start = guard.input_queue.is_empty();
-        if emit_idle_start {
+        if guard.input_queue.is_empty() && !guard.active_input {
             guard.plot_hashes.clear();
         }
     }
@@ -981,6 +1010,16 @@ pub extern "C-unwind" fn r_read_console(
             return 0;
         }
 
+        if guard.read_interrupted {
+            guard.read_interrupted = false;
+            guard.waiting_for_input = false;
+            drop(guard);
+            unsafe {
+                libr::Rf_onintr();
+            }
+            return 0;
+        }
+
         if let Some(line) = guard.input_queue.pop_front() {
             let max = (buflen as usize).saturating_sub(1);
             let (line_text, tail) = split_console_line(line, max);
@@ -989,26 +1028,35 @@ pub extern "C-unwind" fn r_read_console(
             }
             drop(guard);
 
-            let head = line_text.as_bytes();
+            let head = line_text.text.as_bytes();
             if !buf.is_null() {
                 unsafe {
                     std::ptr::copy_nonoverlapping(head.as_ptr(), buf, head.len());
                     *buf.add(head.len()) = 0;
                 }
             }
-            ipc::emit_readline_input_bytes(line_text.as_bytes());
-            let mut echoed = String::with_capacity(prompt.len() + line_text.len());
-            echoed.push_str(prompt);
-            echoed.push_str(&line_text);
-            ipc::emit_readline_result(prompt, &line_text);
-            if !echoed.is_empty() {
-                emit_output_text(TextStream::Stdout, echoed.as_bytes());
-            }
+            ipc::emit_input_line(prompt, &line_text.text);
 
             return 1;
         }
 
-        guard = state.cvar.wait(guard).unwrap();
+        if guard.active_input {
+            guard.active_input = false;
+            guard.plot_hashes.clear();
+            guard.waiting_for_input = true;
+            drop(guard);
+            ipc::emit_input_wait(prompt);
+            let guard = state.inner.lock().unwrap();
+            wait_until_console_input_changes(state, guard);
+            continue;
+        }
+
+        let prompt = prompt.to_string();
+        guard.waiting_for_input = true;
+        drop(guard);
+        ipc::emit_input_wait(&prompt);
+        let guard = state.inner.lock().unwrap();
+        wait_until_console_input_changes(state, guard);
     }
 }
 
@@ -1018,30 +1066,82 @@ pub(crate) fn push_plot_image(
     mime_type: String,
     is_new: bool,
 ) -> Result<(), String> {
-    let state = session_state();
-    let mut guard = state
-        .inner
-        .lock()
-        .map_err(|_| "session state lock poisoned".to_string())?;
-
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     let hash = hasher.finish();
 
-    if guard.plot_hashes.get(&plot_id) == Some(&hash) {
-        return Ok(());
+    {
+        let state = session_state();
+        let mut guard = state
+            .inner
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_string())?;
+
+        if guard.plot_hashes.get(&plot_id) == Some(&hash) {
+            return Ok(());
+        }
+
+        guard.plot_hashes.insert(plot_id.clone(), hash);
     }
 
-    guard.plot_hashes.insert(plot_id.clone(), hash);
     let mime_type = if mime_type.trim().is_empty() {
         "image/png".to_string()
     } else {
         mime_type
     };
     let data = STANDARD.encode(bytes);
-    ipc::emit_plot_image(&mime_type, &data, !is_new, Some(&plot_id));
+    ipc::emit_output_image(&mime_type, &data, !is_new, Some(&plot_id));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod input_queue_tests {
+    use std::collections::VecDeque;
+
+    use super::{InputBatchLine, queue_input, split_console_line};
+
+    #[test]
+    fn queue_input_splits_input_into_console_lines() {
+        let mut queue = VecDeque::new();
+
+        queue_input(&mut queue, "alpha\nbeta");
+
+        let queued = queue.into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            vec![
+                InputBatchLine {
+                    text: "alpha\n".to_string(),
+                },
+                InputBatchLine {
+                    text: "beta\n".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn split_console_line_preserves_text_remainder() {
+        let line = InputBatchLine {
+            text: "abcdef\n".to_string(),
+        };
+
+        let (head, tail) = split_console_line(line, 3);
+
+        assert_eq!(
+            head,
+            InputBatchLine {
+                text: "abc".to_string(),
+            }
+        );
+        assert_eq!(
+            tail,
+            Some(InputBatchLine {
+                text: "def\n".to_string(),
+            })
+        );
+    }
 }
 
 #[cfg(target_family = "windows")]

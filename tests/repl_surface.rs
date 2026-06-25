@@ -218,9 +218,9 @@ async fn explicit_plot_emit_orders_r_owned_output_around_image() -> TestResult<(
     }
 
     let before_idx =
-        first_text_index_containing(&result, "before").ok_or("expected before text in reply")?;
+        first_text_index_containing(&result, "before\n").ok_or("expected before text in reply")?;
     let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
-    let after_idx = first_text_index_containing(&result, "after").ok_or("expected after text")?;
+    let after_idx = first_text_index_containing(&result, "after\n").ok_or("expected after text")?;
     assert!(
         before_idx < image_idx && image_idx < after_idx,
         "expected R-owned output to preserve order around image, got content order: {:?}",
@@ -257,26 +257,26 @@ async fn explicit_plot_emit_orders_r_owned_stderr_and_stdout_around_image() -> T
     }
 
     let stdout_before = text
-        .find("stdout-before")
+        .find("stdout-before\n")
         .ok_or("expected stdout-before text in reply")?;
     let stderr_before = text
-        .find("stderr-before")
+        .find("stderr: stderr-before")
         .ok_or("expected stderr-before text in reply")?;
     let stderr_after = text
-        .find("stderr-after")
+        .find("stderr: stderr-after")
         .ok_or("expected stderr-after text in reply")?;
     let stdout_after = text
-        .find("stdout-after")
+        .find("stdout-after\n")
         .ok_or("expected stdout-after text in reply")?;
     assert!(
         stdout_before < stderr_before && stderr_after < stdout_after,
         "expected stdout/stderr text order to match R callback order, got: {text:?}"
     );
 
-    let before_idx = first_text_index_containing(&result, "stderr-before")
+    let before_idx = first_text_index_containing(&result, "stderr: stderr-before")
         .ok_or("expected stderr-before text item in reply")?;
     let image_idx = first_image_index(&result).ok_or("expected plot image in reply")?;
-    let after_idx = first_text_index_containing(&result, "stderr-after")
+    let after_idx = first_text_index_containing(&result, "stderr: stderr-after")
         .ok_or("expected stderr-after text item in reply")?;
     assert!(
         before_idx < image_idx && image_idx < after_idx,
@@ -422,7 +422,7 @@ async fn files_child_stdout_prompt_text_remains_ordinary_output() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn files_child_stdout_matching_later_r_echo_remains_visible() -> TestResult<()> {
+async fn files_child_stdout_matching_later_input_line_remains_visible() -> TestResult<()> {
     let _guard = lock_test_mutex().await;
     let session = common::spawn_server_with_files().await?;
 
@@ -452,8 +452,8 @@ async fn files_child_stdout_matching_later_r_echo_remains_visible() -> TestResul
 
     let matching_lines = text.matches("> 1 + 1\n").count();
     assert_eq!(
-        matching_lines, 2,
-        "expected raw child text plus later matching R echo, got: {text:?}"
+        matching_lines, 1,
+        "expected raw child text without a generated echo, got: {text:?}"
     );
     let raw_child_line = text
         .find("> 1 + 1\n")
@@ -504,7 +504,7 @@ async fn files_keeps_plot_image_before_later_stdout() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
+async fn repl_tool_hides_ipc_env_vars_from_r_user_code() -> TestResult<()> {
     let _guard = lock_test_mutex().await;
     let session = common::spawn_server().await?;
 
@@ -512,7 +512,7 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
         .call_tool_raw(
             session.repl_tool_name(),
             json!({
-                "input": "cat(sprintf(\"%s %s\\n\", nzchar(Sys.getenv(\"MCP_REPL_IPC_READ_FD\")), nzchar(Sys.getenv(\"MCP_REPL_IPC_WRITE_FD\"))))\n",
+                "input": "vars <- c('MCP_REPL_IPC_READ_FD', 'MCP_REPL_IPC_WRITE_FD', 'MCP_REPL_IPC_PIPE_TO_WORKER', 'MCP_REPL_IPC_PIPE_FROM_WORKER')\ncat(paste(nzchar(Sys.getenv(vars)), collapse = ' '), '\\n')\n",
                 "timeout_ms": 10_000
             }),
         )
@@ -531,8 +531,8 @@ async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        text.contains("FALSE FALSE"),
-        "expected IPC fd env vars to be hidden from R user code, got: {text:?}"
+        text.contains("FALSE FALSE FALSE FALSE"),
+        "expected IPC env vars to be hidden from R user code, got: {text:?}"
     );
 
     Ok(())

@@ -1,6 +1,4 @@
-use crate::ipc::IpcEchoEvent;
-use crate::output_capture::{OutputBuffer, OutputEventKind, OutputTextSpan};
-use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
+use crate::output_capture::{OutputBuffer, OutputEventKind};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
 use crate::reply_presentation::append_protocol_warnings;
@@ -70,27 +68,34 @@ pub(crate) fn snapshot_page_with_images(
     }
 }
 
-fn snapshot_page_with_images_from_collapsed(
-    bytes: Vec<u8>,
-    events: Vec<(u64, OutputEventKind)>,
-    text_spans: Vec<OutputTextSpan>,
-    source_end: u64,
+pub(crate) fn snapshot_pending_timeout_page_with_images(
+    output: &OutputBuffer,
+    end_offset: u64,
     target_bytes: u64,
 ) -> SnapshotWithImages {
-    let buffer = pager::PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
-    let pager::SnapshotPage {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-        last_range_end_byte: _,
-    } = pager::take_snapshot_page_from_buffer(buffer, target_bytes);
-    SnapshotWithImages {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
+    let start_offset = output.current_offset().unwrap_or(end_offset);
+    let range = output.read_range(start_offset, end_offset);
+    if range.bytes.is_empty()
+        && !range.events.is_empty()
+        && range.events.iter().all(|event| {
+            matches!(
+                event.kind,
+                OutputEventKind::InputEcho { .. }
+                    | OutputEventKind::InputWait
+                    | OutputEventKind::RequestBoundary
+                    | OutputEventKind::SessionEnd
+            )
+        })
+    {
+        return SnapshotWithImages {
+            contents: Vec::new(),
+            pages_left: 0,
+            buffer: None,
+            last_range: None,
+        };
     }
+
+    snapshot_page_with_images(output, end_offset, target_bytes)
 }
 
 pub(crate) fn snapshot_after_completion(
@@ -98,33 +103,7 @@ pub(crate) fn snapshot_after_completion(
     start_offset: u64,
     end_offset: u64,
     target_bytes: u64,
-    echo_events: &[IpcEchoEvent],
-    prompt_variants: Option<&[String]>,
 ) -> CompletionSnapshot {
-    if !echo_events.is_empty() {
-        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let range = output.read_range(start_offset, end_offset);
-        output.advance_offset_to(end_offset);
-        let collapsed = collapse_echo_with_attribution(
-            range,
-            echo_events,
-            0,
-            prompt_variants.unwrap_or_default(),
-            EchoCollapseMode::CollapseForFinalReply,
-        );
-        let snapshot = snapshot_page_with_images_from_collapsed(
-            collapsed.bytes,
-            collapsed.events,
-            collapsed.text_spans,
-            end_offset,
-            target_bytes,
-        );
-        return CompletionSnapshot {
-            snapshot,
-            saw_stderr,
-        };
-    }
-
     let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
     let snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
     CompletionSnapshot {
@@ -137,34 +116,8 @@ pub(crate) fn take_range_from_ring_after_completion(
     output: &OutputBuffer,
     start_offset: u64,
     end_offset: u64,
-    echo_events: &[IpcEchoEvent],
-    prompt_variants: Option<&[String]>,
     protocol_warnings: &[String],
 ) -> FormattedPendingOutput {
-    if !echo_events.is_empty() {
-        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let range = output.read_range(start_offset, end_offset);
-        output.advance_offset_to(end_offset);
-        let collapsed = collapse_echo_with_attribution(
-            range,
-            echo_events,
-            0,
-            prompt_variants.unwrap_or_default(),
-            EchoCollapseMode::CollapseForFinalReply,
-        );
-        let mut contents = pager::contents_from_collapsed_output(
-            collapsed.bytes,
-            collapsed.events,
-            collapsed.text_spans,
-            end_offset,
-        );
-        append_protocol_warnings(&mut contents, protocol_warnings);
-        return FormattedPendingOutput {
-            contents,
-            saw_stderr,
-        };
-    }
-
     let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
     let mut contents = pager::take_range_from_ring(output, end_offset);
     append_protocol_warnings(&mut contents, protocol_warnings);
@@ -178,13 +131,13 @@ fn page_end_offset(
     start_offset: u64,
     end_offset: u64,
     pages_left: u64,
-    last_range_end_byte: Option<u64>,
+    last_range_end_offset: Option<u64>,
 ) -> u64 {
     if pages_left == 0 {
         return end_offset;
     }
-    if let Some(end_byte) = last_range_end_byte {
-        return start_offset.saturating_add(end_byte);
+    if let Some(end_offset) = last_range_end_offset {
+        return end_offset;
     }
     start_offset
 }

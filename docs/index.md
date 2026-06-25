@@ -11,11 +11,12 @@ checked-in execution plans without relying on stale notes.
 - `docs/testing.md`: public validation surface and snapshot workflow.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and wire tracing.
 - `docs/sandbox.md`: sandbox modes, writable roots, and Codex per-tool-call sandbox metadata.
-- `docs/worker_sideband_protocol.md`: server/worker IPC contract.
-- `docs/adr/0001-stdin-close-graceful-shutdown.md`: accepted decision that
-  graceful worker shutdown is requested only by closing worker stdin.
+- `docs/releasing.md`: release checklist and PyPI distribution policy.
+- `docs/worker_sideband_protocol.md`: IPC-queued server/worker protocol
+  contract.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
 - `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex `--sandbox inherit` from async updates to per-tool-call sandbox metadata.
+- `docs/plans/completed/unified-output-timeline-pipeline.md`: completed plan for consolidating normal replies, files overflow, and pager overflow onto one output timeline.
 
 ## Normative Docs
 
@@ -25,7 +26,8 @@ checked-in execution plans without relying on stale notes.
 - `docs/tool-descriptions/repl_tool_python.md`: Python `repl` behavior for the files-mode oversized-output path.
 - `docs/tool-descriptions/repl_tool_python_pager.md`: Python `repl` behavior for pager mode.
 - `docs/tool-descriptions/repl_reset_tool.md`: `repl_reset` behavior.
-- `docs/adr/`: accepted architecture decision records.
+- `docs/releasing.md`: release checklist, GitHub Release asset policy, and
+  PyPI wheel policy.
 - `README.md`: user-facing overview and installation guide. Treat it as product documentation, not the engineering source of truth.
 
 ## Exploratory Docs
@@ -42,17 +44,13 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
 - `docs/futurework/portable-plugin-skill-mcp-bundle.md`: futurework note on packaging a shared skill plus MCP server config as a portable Codex/Claude plugin.
 - `docs/futurework/project-local-mcp-repl-config.md`: deferred design note on loading project-local `mcp-repl-config.toml` files from `.agents`, `.codex`, or `.claude`.
-- `docs/futurework/pypi-distribution.md`: deferred note on publishing `mcp-repl` through Python packaging tools in addition to Cargo and GitHub binaries.
 - `docs/futurework/r-embedding-minimal-callbacks.md`: deferred note on reducing custom embedded-R callbacks while keeping readline integration.
 - `docs/futurework/r-graphics-device-for-incremental-plot-emission.md`: decision record for not currently replacing hook/replay plot capture with a custom graphics device.
-- `docs/futurework/r-worker-turn-boundary-simplification.md`: deferred note on moving the built-in R adapter behind the v3 `turn_start` and `idle` boundary.
-- `docs/futurework/server-backend-boundary.md`: deferred note on removing backend-specific execution semantics from server-side request handling.
+- `docs/futurework/server-backend-boundary.md`: deferred note on keeping backend-specific execution semantics out of opaque queued server-side request handling.
 - `docs/futurework/sidecar-viewer-observability.md`: deferred note on a local read-only sidecar viewer for transcripts, plots, and output bundles.
 - `docs/futurework/worker-session-tempdir-rotation.md`: deferred design note on rotating worker tempdir paths per launch so stale temp trees do not block respawn.
-- `docs/futurework/worker-pty-stdin-transport.md`: historical design note for the implemented Unix Python and custom-worker PTY launch path.
 - `docs/futurework/stronger-worker-child-containment.md`: deferred design note on tighter worker descendant containment, especially on Windows.
-- `docs/futurework/unified-output-timeline-pipeline.md`: deferred design note for converging pager and files mode onto one shared resolved timeline pipeline.
-- `docs/futurework/stdin-transport-single-owner.md`: deferred design for making worker stdin ownership explicit instead of relying on a Windows-only gate.
+- `docs/futurework/stdin-transport-single-owner.md`: historical and deferred design note for keeping managed input batches owned by the worker queue.
 - `docs/futurework/repl-interaction-rough-edges.md`: candidate UX polish items observed during live REPL use.
 
 ## Maintenance Rules

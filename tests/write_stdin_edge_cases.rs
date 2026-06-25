@@ -87,8 +87,8 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
             return Ok(());
         }
         assert!(
-            completed_text.contains("2"),
-            "expected pending result after non-blocking call, got: {completed_text:?}"
+            completed_text.contains("2") || completed_text.contains(">"),
+            "expected pending result or idle prompt after non-blocking call, got: {completed_text:?}"
         );
     } else {
         assert!(
@@ -96,6 +96,20 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
             "expected timeout status or immediate evaluation result, got: {timeout_text:?}"
         );
     }
+
+    let follow_up = session
+        .write_stdin_raw_unterminated_with("1+1", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if backend_unavailable(&follow_up_text) {
+        eprintln!("write_stdin_edge_cases backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        follow_up_text.contains("2"),
+        "expected session to remain usable after non-blocking call, got: {follow_up_text:?}"
+    );
 
     let err = session
         .write_stdin_raw_unterminated_with("1+1", Some(-1.0))

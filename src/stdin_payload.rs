@@ -11,14 +11,6 @@ pub(crate) enum TimeoutBundleReuse {
     FollowUpInput,
 }
 
-pub(crate) fn prepare_worker_stdin_payload(input: &str) -> Vec<u8> {
-    let mut payload = input.as_bytes().to_vec();
-    if !payload.is_empty() && !payload.ends_with(b"\n") {
-        payload.push(b'\n');
-    }
-    payload
-}
-
 pub(crate) fn split_write_stdin_control_prefix(
     input: &str,
 ) -> Option<(WriteStdinControlAction, &str)> {

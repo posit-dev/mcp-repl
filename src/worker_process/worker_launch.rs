@@ -84,7 +84,6 @@ impl WorkerManager {
             &self.sandbox_state,
             WorkerSpawnContext {
                 oversized_output: self.oversized_output,
-                pending_output_tape: self.pending_output_tape.clone(),
                 output_timeline: self.output_timeline.clone(),
                 guardrail: self.guardrail.clone(),
                 managed_network_proxy: self.managed_network_proxy.as_ref(),
@@ -312,7 +311,9 @@ mod tests {
     #[test]
     fn windows_network_identity_selection_scopes_offline_proxy_cases() {
         let read_only = crate::sandbox::SandboxState {
-            sandbox_policy: SandboxPolicy::ReadOnly,
+            sandbox_policy: SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
             ..Default::default()
         };
         assert!(
@@ -393,8 +394,8 @@ mod tests {
             "expected inherited sandbox state to disable bwrap after fallback"
         );
 
-        let snapshot = manager.pending_output_tape.drain_final_snapshot();
-        let text = contents_text(&snapshot.format_contents().contents);
+        let output = manager.pending_output_tape.drain_final_output();
+        let text = contents_text(&output.contents);
         assert!(
             text.contains("continuing without bwrap"),
             "expected fallback notice in visible output, got: {text:?}"
@@ -444,15 +445,49 @@ mod tests {
         );
         assert!(retry, "expected startup failure to disable bwrap");
 
+        let sandbox_cwd = std::env::temp_dir();
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": std::env::temp_dir(),
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
@@ -515,15 +550,49 @@ mod tests {
         );
         assert!(retry, "expected startup failure to disable bwrap");
 
+        let sandbox_cwd = std::env::temp_dir();
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": std::env::temp_dir(),
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))

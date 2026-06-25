@@ -19,11 +19,29 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "# Title\n> for (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11\nalpha line 12\nalpha line 13\nalpha line 14\nalpha line 15\nalpha line 16\nalpha line 17"
+      "text": "# Title\nalpha line 1\nalpha line 2\nalpha line 3\nalpha line 4\nalpha line 5\nalpha line 6\nalpha line 7\nalpha line 8\nalpha line 9\nalpha line 10\nalpha line 11\nalpha line 12\nalpha line 13\nalpha line 14\nalpha line 15\nalpha line 16\nalpha line 17\nalpha line 18\nalpha line 19\nalpha line 20\nalpha line 21\n"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 11.0%, @0..293/2656)"
+      "text": "[pager] elided output: @293..839\n"
+    },
+    {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
+    },
+    {
+      "type": "text",
+      "text": "[pager] elided output: @839..1610\n"
+    },
+    {
+      "type": "image",
+      "mime_type": "image/png",
+      "data_len": 0
+    },
+    {
+      "type": "text",
+      "text": "--More-- (Np, 12.0%, @0..293/2441)"
     }
   ]
 }
@@ -43,11 +61,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "#1 @293 Title\n  > alpha line 18"
+      "text": "#1 @293 Title\n  > alpha line 22\n"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 11.5%, @293..307/2656)"
+      "text": "--More-- (Np, 12.5%, @293..307/2441)"
     }
   ]
 }
@@ -67,15 +85,15 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @0..307"
+      "text": "[pager] elided output (already shown): @0..307\n"
     },
     {
       "type": "text",
-      "text": "alpha line 19\nalpha line 20\nalpha line 21\nalpha line 22\nalpha line 23\nalpha line 24\nalpha line 25\nalpha line 26\nalpha line 27\nalpha line 28\nalpha line 29\nalpha line 30\nalpha line 31\nalpha line 32\nalpha line 33\nalpha line 34\nalpha line 35\nalpha line 36\nalpha line 37\nalpha line 38\nalpha line 39"
+      "text": "alpha line 23\nalpha line 24\nalpha line 25\nalpha line 26\nalpha line 27\nalpha line 28\nalpha line 29\nalpha line 30\nalpha line 31\nalpha line 32\nalpha line 33\nalpha line 34\nalpha line 35\nalpha line 36\nalpha line 37\nalpha line 38\nalpha line 39\nalpha line 40\nalpha line 41\nalpha line 42\nalpha line 43\n"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 22.6%, @307..601/2656)"
+      "text": "--More-- (Np, 24.6%, @307..601/2441)"
     }
   ]
 }
@@ -95,11 +113,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "#1 @919 Title\n  > > for (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")"
+      "text": "#1 @839 Title\n  > beta line 1\n"
     },
     {
       "type": "text",
-      "text": "--More-- (Np, 36.6%, @919..974/2656)"
+      "text": "--More-- (Np, 34.8%, @839..851/2441)"
     }
   ]
 }

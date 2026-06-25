@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container.\n\n"
     }
   ]
 }
@@ -39,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container."
+      "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container.\n\n"
     }
   ]
 }
@@ -60,10 +60,6 @@ response:
     {
       "type": "text",
       "text": "<PYTHON HELP BANNER>"
-    },
-    {
-      "type": "text",
-      "text": "<<repl status: waiting for stdin>>"
     }
   ]
 }
@@ -84,10 +80,6 @@ response:
     {
       "type": "text",
       "text": "Help on built-in function len in module builtins:\n\nlen(obj, /)\n    Return the number of items in a container.\n\nhelp> "
-    },
-    {
-      "type": "text",
-      "text": "<<repl status: waiting for stdin>>"
     }
   ]
 }
@@ -107,7 +99,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt."
+      "text": "\nYou are now leaving help and returning to the Python interpreter.\nIf you want to ask for help on a particular object directly from the\ninterpreter, you can type \"help(object)\".  Executing \"help('string')\"\nhas the same effect as typing a particular string at the help> prompt.\n"
     }
   ]
 }
@@ -127,7 +119,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "2"
+      "text": "2\n"
     }
   ]
 }

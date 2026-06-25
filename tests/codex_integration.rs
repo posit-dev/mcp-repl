@@ -36,7 +36,7 @@ mod unix_impl {
     const WARMUP_MARKER: &str = "WARMUP_TEST";
     const CODEX_MODEL: &str = "gpt-5.3-codex-spark";
     const CODEX_BACKEND_ENV: &str = "MCP_REPL_CODEX_BACKEND";
-    const LIVE_TOOL_INPUT: &str = "cat(\"CODEX_LIVE_MCP_OK\\n\")\n";
+    const LIVE_TOOL_INPUT: &str = "cat(\"CODEX_LIVE_MCP_OK\")\n";
     const MOCK_TOOL_INPUT: &str = "cat(\"CODEX_MOCK_MCP_OK\\n\")\n";
     const LIVE_FINAL_MARKER: &str = "CODEX_LIVE_DONE";
     const INSTALL_SCRIPTED_TOOL_CALL_MARKER: &str = "INSTALL_SCRIPTED_TOOL_CALL";
@@ -139,11 +139,6 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(
-            &env.debug_dir,
-            codex_exec_expected_sandbox_log(),
-            Duration::from_secs(10),
-        )?;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -153,6 +148,11 @@ mod unix_impl {
             )
             .into());
         }
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
 
         render_wire_snapshot(&env.debug_dir, &env.workspace, &env.codex_home)
     }
@@ -296,11 +296,6 @@ mod unix_impl {
             .into());
         }
 
-        wait_for_log_contains(
-            &env.debug_dir,
-            codex_exec_expected_sandbox_log(),
-            Duration::from_secs(10),
-        )?;
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -310,6 +305,11 @@ mod unix_impl {
             )
             .into());
         }
+        wait_for_log_contains(
+            &env.debug_dir,
+            codex_exec_expected_sandbox_log(),
+            Duration::from_secs(10),
+        )?;
 
         render_exec_snapshot(mode, &stdout, &stderr, &env.workspace, &env.codex_home)
     }
@@ -380,7 +380,7 @@ mod unix_impl {
 
         let mcp_repl = resolve_mcp_repl_path()?;
         let env = create_isolated_live_codex_env(&mcp_repl, auth_json)?;
-        let prompt = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CODEX_LIVE_MCP_OK\\n\") Then answer with exactly CODEX_LIVE_DONE, with no punctuation or extra text.";
+        let prompt = "Call the MCP tool with server `r` and tool `repl` exactly once. Use this exact argument: {\"input\":\"cat(\\\"CODEX_LIVE_MCP_OK\\\")\\n\"}. Do not use shell or command execution. Do not inspect or list MCP resources. After the r.repl result, answer exactly CODEX_LIVE_DONE, with no punctuation or extra text.";
         let cmd = codex_exec_command(
             &env,
             None,
@@ -453,8 +453,12 @@ mod unix_impl {
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write before full access"
         ))?;
-        driver.wait_for_contains("WRITE_ERROR:", Duration::from_secs(20))?;
         driver.wait_for_contains("Tool call 1 completed", Duration::from_secs(20))?;
+        let outputs = mock_server.function_call_outputs().await;
+        assert!(
+            outputs.iter().any(|out| out.contains("WRITE_ERROR:")),
+            "expected pre-full-access tool call to fail outside workspace: {outputs:?}"
+        );
         wait_for_log_contains(&env.debug_dir, "workspace-write", Duration::from_secs(10))?;
 
         driver.send_line("/permissions")?;
@@ -468,8 +472,12 @@ mod unix_impl {
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write after full access"
         ))?;
-        driver.wait_for_contains("WRITE_OK", Duration::from_secs(20))?;
         driver.wait_for_contains("Tool call 2 completed", Duration::from_secs(20))?;
+        let outputs = mock_server.function_call_outputs().await;
+        assert!(
+            outputs.iter().any(|out| out.contains("WRITE_OK")),
+            "expected post-full-access tool call to succeed outside workspace: {outputs:?}"
+        );
         wait_for_log_contains(
             &env.debug_dir,
             "danger-full-access",
@@ -477,16 +485,6 @@ mod unix_impl {
         )?;
         wait_for_log_contains(&env.debug_dir, "tool-call-meta", Duration::from_secs(20))?;
         driver.kill()?;
-
-        let outputs = mock_server.function_call_outputs().await;
-        assert!(
-            outputs.iter().any(|out| out.contains("WRITE_ERROR:")),
-            "expected pre-full-access tool call to fail outside workspace: {outputs:?}"
-        );
-        assert!(
-            outputs.iter().any(|out| out.contains("WRITE_OK")),
-            "expected post-full-access tool call to succeed outside workspace: {outputs:?}"
-        );
         Ok(())
     }
 
@@ -1360,6 +1358,10 @@ animations = false
 steer = true
 remote_models = true
 responses_websockets = false
+shell_tool = false
+apps = false
+plugins = false
+tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
@@ -1390,6 +1392,10 @@ animations = false
 steer = true
 remote_models = true
 responses_websockets = false
+shell_tool = false
+apps = false
+plugins = false
+tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
@@ -2000,7 +2006,71 @@ tryCatch({
             ] {
                 normalized = normalized.replace(needle, replacement);
             }
+            normalized = normalized.replace("file://<WORKSPACE>", "<WORKSPACE>");
+            normalized = normalized.replace("file://<CODEX_HOME>", "<CODEX_HOME>");
             normalize_temp_paths(&normalize_codex_home_path(&normalized))
+        }
+
+        fn wire_permission_profile_to_sandbox_policy(profile: &Value) -> Option<Value> {
+            if profile.get("type").and_then(Value::as_str)? != "managed" {
+                return None;
+            }
+            let network_access = profile.get("network").and_then(Value::as_str) == Some("enabled");
+            let file_system = profile.get("file_system")?;
+            if file_system.get("type").and_then(Value::as_str)? != "restricted" {
+                return None;
+            }
+
+            let mut workspace_writable = false;
+            let mut tmpdir_writable = false;
+            let mut slash_tmp_writable = false;
+            let mut writable_roots = Vec::new();
+
+            for entry in file_system.get("entries")?.as_array()? {
+                if entry.get("access").and_then(Value::as_str)? != "write" {
+                    continue;
+                }
+                let path = entry.get("path")?;
+                match path.get("type")?.as_str()? {
+                    "path" => {
+                        let path = path.get("path").and_then(Value::as_str)?;
+                        if path == "<WORKSPACE>" {
+                            workspace_writable = true;
+                        } else {
+                            writable_roots.push(Value::String(path.to_string()));
+                        }
+                    }
+                    "special" => {
+                        let kind = path
+                            .get("value")
+                            .and_then(|value| value.get("kind"))
+                            .and_then(Value::as_str)?;
+                        match kind {
+                            "project_roots" => workspace_writable = true,
+                            "tmpdir" => tmpdir_writable = true,
+                            "slash_tmp" => slash_tmp_writable = true,
+                            _ => {}
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+
+            if !workspace_writable {
+                return None;
+            }
+
+            let mut policy = serde_json::json!({
+                "type": "workspace-write",
+                "network_access": network_access,
+                "exclude_tmpdir_env_var": !tmpdir_writable,
+                "exclude_slash_tmp": !slash_tmp_writable
+            });
+            if !writable_roots.is_empty() {
+                writable_roots.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+                policy["writable_roots"] = Value::Array(writable_roots);
+            }
+            Some(policy)
         }
 
         fn normalize_inner(
@@ -2018,6 +2088,13 @@ tryCatch({
                             continue;
                         }
                         if normalized_key == "permissionProfile" {
+                            path.push(normalized_key.clone());
+                            normalize_inner(&mut child, path, workspace, codex_home);
+                            path.pop();
+                            if let Some(policy) = wire_permission_profile_to_sandbox_policy(&child)
+                            {
+                                map.insert("sandboxPolicy".to_string(), policy);
+                            }
                             continue;
                         }
                         if normalized_key == "turn_started_at_unix_ms" {
@@ -2038,22 +2115,6 @@ tryCatch({
                         path.push(normalized_key.clone());
                         normalize_inner(&mut child, path, workspace, codex_home);
                         path.pop();
-                        if path_matches(path, &["sandboxPolicy"])
-                            && normalized_key == "writable_roots"
-                            && matches!(
-                                &child,
-                                Value::Array(items)
-                                    if items.iter().all(|item| {
-                                        matches!(
-                                            item.as_str(),
-                                            Some("<CODEX_HOME>/memories")
-                                                | Some("<CODEX_HOME>\\memories")
-                                        )
-                                    })
-                            )
-                        {
-                            continue;
-                        }
                         map.insert(normalized_key, child);
                     }
                     if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
@@ -2206,15 +2267,26 @@ tryCatch({
     }
 
     #[test]
-    fn normalize_wire_snapshot_drops_default_codex_memories_writable_root() {
+    fn normalize_wire_snapshot_drops_permission_profile() {
         let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
         let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
         let memories = codex_home.join("memories");
         let mut value = serde_json::json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [memories],
-                "network_access": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": memories
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             }
         });
 
@@ -2222,26 +2294,54 @@ tryCatch({
 
         assert_eq!(
             value,
-            serde_json::json!({
-                "sandboxPolicy": {
-                    "type": "workspace-write",
-                    "network_access": false
-                }
-            }),
-            "wire snapshots should not retain Codex's default memories writable root"
+            serde_json::json!({}),
+            "wire snapshots should not retain Codex's full permission profile"
         );
     }
 
     #[test]
-    fn normalize_wire_snapshot_drops_windows_default_codex_memories_writable_root() {
+    fn normalize_wire_snapshot_maps_permission_profile_to_sandbox_policy() {
         let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
         let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
         let mut value = serde_json::json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": ["<CODEX_HOME>\\memories"],
-                "network_access": false
-            }
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": format!("file://{}", workspace.display())
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": format!("file://{}", workspace.display())
         });
 
         normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
@@ -2251,10 +2351,13 @@ tryCatch({
             serde_json::json!({
                 "sandboxPolicy": {
                     "type": "workspace-write",
-                    "network_access": false
-                }
+                    "network_access": false,
+                    "exclude_tmpdir_env_var": false,
+                    "exclude_slash_tmp": false
+                },
+                "sandboxCwd": "<WORKSPACE>"
             }),
-            "wire snapshots should not retain Codex's default memories writable root with Windows separators"
+            "wire snapshots should keep the semantic sandbox policy stable across Codex metadata schema changes"
         );
     }
 
@@ -2798,8 +2901,9 @@ tryCatch({
         let call_id = format!("call-{ordinal}");
         state.pending_call_id = Some(call_id.clone());
         state.pending_call_ordinal = Some(ordinal);
-        let tool_call =
-            resolve_tool_call_spec(request, &state.tool_name).unwrap_or_else(|| MockToolCallSpec {
+        let tool_call = resolve_tool_call_spec(request, &state.tool_name)
+            .or_else(|| legacy_tool_call_spec(&state.tool_name))
+            .unwrap_or_else(|| MockToolCallSpec {
                 name: state.tool_name.clone(),
                 namespace: None,
             });
@@ -2866,6 +2970,14 @@ tryCatch({
         let name_start = split + 2;
         (split > 0 && name_start < legacy_tool_name.len())
             .then(|| (&legacy_tool_name[..split], &legacy_tool_name[name_start..]))
+    }
+
+    fn legacy_tool_call_spec(legacy_tool_name: &str) -> Option<MockToolCallSpec> {
+        let (namespace, name) = split_legacy_tool_name(legacy_tool_name)?;
+        Some(MockToolCallSpec {
+            name: name.to_string(),
+            namespace: Some(namespace.to_string()),
+        })
     }
 
     fn message_item(text: &str) -> Value {

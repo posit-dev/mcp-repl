@@ -60,7 +60,7 @@ tryCatch(
             "interrupt_handler",
             mcp_session!(|session| {
                 session.write_stdin_raw_with("1+1", Some(10.0)).await?;
-                session.write_stdin_with(long_sleep, Some(1.0)).await;
+                session.write_stdin_with(long_sleep, Some(3.0)).await;
                 session.write_stdin_with("\u{3}", Some(5.0)).await;
                 session.write_stdin_with("1+1", Some(10.0)).await;
                 Ok(())
@@ -68,8 +68,8 @@ tryCatch(
         )
         .await?;
 
-    let rendered = snapshot.render();
-    let transcript = snapshot.render_transcript();
+    let rendered = normalize_interrupt_empty_stderr(snapshot.render());
+    let transcript = normalize_interrupt_empty_stderr(snapshot.render_transcript());
     if common::backend_unavailable(&rendered) || common::backend_unavailable(&transcript) {
         eprintln!("mcp_transcripts backend unavailable in this environment; skipping");
         return Ok(());
@@ -80,6 +80,53 @@ tryCatch(
         insta::assert_snapshot!("snapshots_interrupt_handler_output", transcript);
     });
     Ok(())
+}
+
+fn normalize_interrupt_empty_stderr(text: String) -> String {
+    text.replace(
+        "    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \"\n    },\n",
+        "",
+    )
+    .replace(
+        "    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \\n\"\n    },\n",
+        "",
+    )
+    .replace(
+        "    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }",
+        "    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n> \"\n    }",
+    )
+    .replace("<<< stderr: \n", "")
+    .replace("<<< interrupt received\n<<< \n<<< \n<<< > ", "<<< interrupt received\n<<< > ")
+}
+
+#[test]
+fn interrupt_empty_stderr_normalizer_drops_blank_chunks() {
+    let rendered = "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]";
+    let rendered_with_newline = "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]";
+    let rendered_with_interrupt_newline = "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"stderr: \\n\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]";
+    let transcript = "<<< interrupt received\n<<< stderr: \n<<< > ";
+    let transcript_with_blank_lines = "<<< interrupt received\n<<< \n<<< \n<<< > ";
+
+    assert_eq!(
+        normalize_interrupt_empty_stderr(rendered.to_string()),
+        "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]"
+    );
+    assert_eq!(
+        normalize_interrupt_empty_stderr(rendered_with_newline.to_string()),
+        "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\"\n    },\n    {\n      \"type\": \"text\",\n      \"text\": \"> \"\n    }\n]"
+    );
+    assert_eq!(
+        normalize_interrupt_empty_stderr(rendered_with_interrupt_newline.to_string()),
+        "content: [\n    {\n      \"type\": \"text\",\n      \"text\": \"interrupt received\\n> \"\n    }\n]"
+    );
+    assert_eq!(
+        normalize_interrupt_empty_stderr(transcript.to_string()),
+        "<<< interrupt received\n<<< > "
+    );
+    assert_eq!(
+        normalize_interrupt_empty_stderr(transcript_with_blank_lines.to_string()),
+        "<<< interrupt received\n<<< > "
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

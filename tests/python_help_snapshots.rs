@@ -39,27 +39,8 @@ fn normalize_python_help_banner(text: String) -> String {
         .lines()
         .map(str::trim_end)
         .filter(|line| !matches!(*line, "<<< >>>" | "<<< ..."))
-        .filter(|line| !is_transcript_echo_line(line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn is_transcript_echo_line(line: &str) -> bool {
-    matches!(
-        line,
-        "<<< help(len)"
-            | "<<< >>> help(len)"
-            | "<<< import pydoc; pydoc.help(len)"
-            | "<<< >>> import pydoc; pydoc.help(len)"
-            | "<<< help()"
-            | "<<< >>> help()"
-            | "<<< len"
-            | "<<< >>> len"
-            | "<<< q"
-            | "<<< >>> q"
-            | "<<< 1+1"
-            | "<<< >>> 1+1"
-    )
 }
 
 fn normalize_python_help_intro(text: String) -> String {
@@ -70,7 +51,7 @@ fn normalize_python_help_intro(text: String) -> String {
     for line in text.lines() {
         let trimmed_line = line.trim_end();
         if pending_blank_transcript_line {
-            if line.starts_with("<<< Welcome to Python <VERSION>'s help utility!") {
+            if is_transcript_help_intro_line(line) {
                 out.push("<<< <PYTHON HELP BANNER>".to_string());
                 pending_blank_transcript_line = false;
                 skipping_transcript_intro = true;
@@ -107,7 +88,7 @@ fn normalize_python_help_intro(text: String) -> String {
             continue;
         }
 
-        if line.starts_with("<<< Welcome to Python <VERSION>'s help utility!") {
+        if is_transcript_help_intro_line(line) {
             out.push("<<< <PYTHON HELP BANNER>".to_string());
             skipping_transcript_intro = true;
             continue;
@@ -123,10 +104,34 @@ fn normalize_python_help_intro(text: String) -> String {
     out.join("\n")
 }
 
+fn is_transcript_help_intro_line(line: &str) -> bool {
+    line.starts_with("<<< Welcome to Python <VERSION>'s help utility!")
+        || line.starts_with("<<< >>> Welcome to Python <VERSION>'s help utility!")
+}
+
 #[test]
 fn normalizes_help_banner_after_whitespace_only_transcript_line() {
     let transcript = normalize_python_help_banner(
         ">>> help()\n<<< \n<<< Welcome to Python 3.12's help utility!\n<<< help>".to_string(),
+    );
+
+    assert_eq!(
+        transcript,
+        ">>> help()\n<<< <PYTHON HELP BANNER>\n<<< help>"
+    );
+}
+
+#[test]
+fn normalizes_prefixed_transcript_help_banner_with_short_quit_text() {
+    let transcript = normalize_python_help_banner(
+        r#">>> help()
+<<< >>> Welcome to Python 3.12's help utility! If this is your first time using
+<<< Python, you should definitely check out the tutorial at
+<<< https://docs.python.org/3.12/tutorial/.
+<<< To quit this help utility and return to the interpreter,
+<<< enter "q" or "quit".
+<<< help>"#
+            .to_string(),
     );
 
     assert_eq!(

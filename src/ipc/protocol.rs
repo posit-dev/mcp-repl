@@ -2,26 +2,16 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::output_capture::OutputTextSource;
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 3;
+pub const WORKER_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerToWorkerIpcMessage {
-    TurnStart {
-        turn_id: u64,
-        input: String,
-    },
-    TurnInput {
-        turn_id: u64,
-        input: String,
-    },
-    Interrupt {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<u64>,
-    },
+    InputBatch { input: String },
+    Interrupt {},
+    Shutdown {},
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,57 +28,26 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default, skip_serializing_if = "is_false")]
         is_continuation: bool,
     },
-    ReadlineStart {
-        prompt: String,
-    },
-    ReadlineInputBytes {
-        data_b64: String,
-    },
-    ReadlineDiscardBytes {
-        data_b64: String,
-    },
-    ReadlineResult {
-        prompt: String,
-        line: String,
-    },
     InputLine {
-        turn_id: u64,
         prompt: String,
         text: String,
     },
-    PtyFeed {
-        turn_id: u64,
-        seq: u64,
-        data_b64: String,
-    },
-    StdinWait {
-        turn_id: u64,
+    InputWait {
         prompt: String,
     },
-    Idle {
-        turn_id: u64,
-        prompt: String,
-    },
-    PlotImage {
+    Ready {},
+    OutputImage {
         mime_type: String,
-        data: String,
+        data_b64: String,
         is_update: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
-    },
-    OutputImage {
-        image_id: String,
-        mime_type: String,
-        data_b64: String,
-        update: bool,
     },
     SessionEnd {
         #[serde(default)]
         reason: Option<String>,
         #[serde(default)]
-        message_b64: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        turn_id: Option<u64>,
+        message: Option<String>,
     },
 }
 
@@ -114,10 +73,9 @@ pub struct WorkerCapabilities {
 }
 
 #[derive(Debug, Clone)]
-pub struct IpcEchoEvent {
+pub struct IpcInputLineEvent {
     pub prompt: String,
     pub line: String,
-    pub source: OutputTextSource,
 }
 
 #[derive(Clone)]
@@ -128,14 +86,7 @@ pub struct IpcOutputText {
 }
 
 #[derive(Clone)]
-pub struct IpcPtyFeed {
-    pub turn_id: u64,
-    pub seq: u64,
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Clone)]
-pub struct IpcPlotImage {
+pub struct IpcOutputImage {
     pub id: String,
     pub mime_type: String,
     pub data: String,
@@ -147,14 +98,11 @@ pub struct IpcPlotImage {
 #[derive(Default, Clone)]
 pub struct IpcHandlers {
     pub on_output_text: Option<Arc<dyn Fn(IpcOutputText) + Send + Sync>>,
-    pub on_plot_image: Option<Arc<dyn Fn(IpcPlotImage) + Send + Sync>>,
-    pub on_readline_start: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    pub on_readline_result: Option<Arc<dyn Fn(IpcEchoEvent) + Send + Sync>>,
-    pub on_pty_feed: Option<IpcPtyFeedHandler>,
+    pub on_output_image: Option<Arc<dyn Fn(IpcOutputImage) + Send + Sync>>,
+    pub on_input_wait: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub on_input_line: Option<Arc<dyn Fn(IpcInputLineEvent) + Send + Sync>>,
     pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
-
-pub type IpcPtyFeedHandler = Arc<dyn Fn(IpcPtyFeed) -> Result<(), String> + Send + Sync>;
 
 pub(crate) fn worker_ready_message(
     worker_name: &str,
@@ -183,7 +131,6 @@ fn is_false(value: &bool) -> bool {
 mod tests {
     use super::{ServerToWorkerIpcMessage, WorkerToServerIpcMessage};
     use crate::worker_protocol::TextStream;
-    use base64::Engine as _;
     use serde_json::json;
 
     #[test]
@@ -196,34 +143,65 @@ mod tests {
         assert_eq!(protocol.version, super::WORKER_PROTOCOL_VERSION);
     }
     #[test]
-    fn plot_image_protocol_uses_update_flag_without_worker_id() {
+    fn output_image_protocol_uses_update_flag_without_worker_id() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "plot_image",
+            "type": "output_image",
             "mime_type": "image/png",
-            "data": "abc",
-            "is_update": true
+            "data_b64": "YWJj",
+            "is_update": true,
+            "source": "plot-1"
         }));
 
-        assert!(
-            parsed.is_ok(),
-            "plot_image should not require worker image id"
-        );
+        let Ok(WorkerToServerIpcMessage::OutputImage {
+            mime_type,
+            data_b64,
+            is_update,
+            source,
+        }) = parsed
+        else {
+            panic!("output_image should deserialize");
+        };
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(data_b64, "YWJj");
+        assert!(is_update);
+        assert_eq!(source.as_deref(), Some("plot-1"));
     }
     #[test]
-    fn plot_image_protocol_rejects_worker_id_and_is_new() {
+    fn output_image_protocol_rejects_old_worker_id_and_update_fields() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "plot_image",
-            "id": "plot-1",
+            "type": "output_image",
+            "image_id": "plot-1",
             "mime_type": "image/png",
-            "data": "abc",
-            "is_new": true,
-            "is_update": false
+            "data_b64": "YWJj",
+            "update": false
         }));
 
         assert!(
             parsed.is_err(),
-            "plot_image should reject old worker-owned image fields"
+            "output_image should reject old worker-owned image fields"
         );
+    }
+    #[test]
+    fn plot_image_is_not_protocol() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "plot_image",
+            "mime_type": "image/png",
+            "data": "abc",
+            "is_update": false
+        }));
+
+        assert!(parsed.is_err(), "plot_image should not deserialize");
+    }
+    #[test]
+    fn output_image_protocol_rejects_plain_data_payload() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "output_image",
+            "mime_type": "image/png",
+            "data": "abc",
+            "is_update": false
+        }));
+
+        assert!(parsed.is_err(), "output_image should require data_b64");
     }
     #[test]
     fn output_text_protocol_uses_stream_and_base64_payload() {
@@ -259,32 +237,26 @@ mod tests {
         assert!(parsed.is_err(), "output_text should require data_b64");
     }
     #[test]
-    fn readline_start_protocol_only_carries_prompt() {
-        let value = serde_json::to_value(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: "zod> ".to_string(),
-        })
-        .expect("serialize readline_start");
+    fn readline_start_is_not_protocol() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "readline_start",
+            "prompt": "zod> "
+        }));
 
-        assert_eq!(
-            value,
-            json!({
-                "type": "readline_start",
-                "prompt": "zod> "
-            })
-        );
+        assert!(parsed.is_err(), "readline_start should not deserialize");
     }
     #[test]
     fn plot_image_protocol_rejects_sequence_ack_handshake() {
         let worker_to_server = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "plot_image",
+            "type": "output_image",
             "mime_type": "image/png",
-            "data": "abc",
+            "data_b64": "YWJj",
             "is_update": false,
             "sequence": 1
         }));
         assert!(
             worker_to_server.is_err(),
-            "plot_image should not expose worker-side ack sequencing"
+            "output_image should not expose worker-side ack sequencing"
         );
 
         let server_to_worker = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
@@ -364,63 +336,64 @@ mod tests {
         );
     }
     #[test]
-    fn builtin_python_demand_feed_messages_are_directional() {
-        let feed = serde_json::to_value(WorkerToServerIpcMessage::PtyFeed {
-            turn_id: 7,
-            seq: 2,
-            data_b64: base64::engine::general_purpose::STANDARD.encode(b"answer\n"),
-        })
-        .expect("serialize pty_feed");
-        assert_eq!(
-            feed,
-            json!({
-                "type": "pty_feed",
-                "turn_id": 7,
-                "seq": 2,
-                "data_b64": "YW5zd2VyCg=="
-            })
-        );
-
+    fn input_wait_message_is_worker_to_server_only() {
         let wait = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "stdin_wait",
-            "turn_id": 7,
+            "type": "input_wait",
             "prompt": "debug> "
         }));
         assert!(
             matches!(
                 wait,
-                Ok(WorkerToServerIpcMessage::StdinWait {
-                    turn_id: 7,
+                Ok(WorkerToServerIpcMessage::InputWait {
                     ref prompt
                 }) if prompt == "debug> "
             ),
-            "stdin_wait should deserialize as a worker-to-server message"
+            "input_wait should deserialize as a worker-to-server message"
         );
 
-        let append = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
-            "type": "turn_input",
-            "turn_id": 7,
-            "input": "c\n"
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "input_wait",
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "input_wait should not deserialize as a server-to-worker message"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "input_wait",
+                "input_id": 7,
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "input_wait should reject input_id under v5"
+        );
+    }
+
+    #[test]
+    fn ready_message_is_worker_to_server_only() {
+        let ready = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "ready"
         }));
         assert!(
-            matches!(
-                append,
-                Ok(ServerToWorkerIpcMessage::TurnInput {
-                    turn_id: 7,
-                    ref input
-                }) if input == "c\n"
-            ),
-            "turn_input should deserialize as a server-to-worker message"
+            matches!(ready, Ok(WorkerToServerIpcMessage::Ready {})),
+            "ready should deserialize as a worker-to-server message"
         );
 
         assert!(
-            serde_json::from_value::<ServerToWorkerIpcMessage>(feed).is_err(),
-            "pty_feed should not deserialize as a server-to-worker message"
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "ready"
+            }))
+            .is_err(),
+            "ready should not deserialize as a server-to-worker message"
         );
+    }
+
+    #[test]
+    fn stale_turn_completion_messages_are_not_protocol() {
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
                 "type": "stdin_wait",
-                "turn_id": 7,
                 "prompt": "debug> "
             }))
             .is_err(),
@@ -428,12 +401,135 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "stdin_wait",
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "stdin_wait should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "idle",
+                "prompt": "debug> "
+            }))
+            .is_err(),
+            "idle should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
                 "type": "turn_input",
-                "turn_id": 7,
+                "input_id": 7,
                 "input": "c\n"
             }))
             .is_err(),
             "turn_input should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "turn_input",
+                "input_id": 7,
+                "input": "c\n"
+            }))
+            .is_err(),
+            "turn_input should not deserialize as a server-to-worker message"
+        );
+    }
+
+    #[test]
+    fn input_batch_is_server_to_worker_only() {
+        let batch = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "input_batch",
+            "input": "x <- 1\n"
+        }));
+        assert!(
+            matches!(
+                batch,
+                Ok(ServerToWorkerIpcMessage::InputBatch {
+                    ref input
+                }) if input == "x <- 1\n"
+            ),
+            "input_batch should deserialize as a server-to-worker message"
+        );
+
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "input_batch",
+                "input": "x <- 1\n"
+            }))
+            .is_err(),
+            "input_batch should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "input_batch",
+                "input_id": 7,
+                "input": "x <- 1\n"
+            }))
+            .is_err(),
+            "input_batch should reject input_id under v5"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "turn_start",
+                "turn_id": 7,
+                "input": "x <- 1\n"
+            }))
+            .is_err(),
+            "turn_start should not deserialize after v4 input_batch rename"
+        );
+    }
+
+    #[test]
+    fn shutdown_is_server_to_worker_lifecycle_control() {
+        let shutdown = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "shutdown"
+        }));
+        assert!(
+            matches!(shutdown, Ok(ServerToWorkerIpcMessage::Shutdown {})),
+            "shutdown should deserialize as a server-to-worker message"
+        );
+
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "shutdown"
+            }))
+            .is_err(),
+            "shutdown should not deserialize as a worker-to-server message"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "shutdown",
+                "input_id": 1
+            }))
+            .is_err(),
+            "shutdown should not carry input payload"
+        );
+    }
+
+    #[test]
+    fn interrupt_is_payload_free_server_to_worker_control() {
+        let interrupt = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "interrupt"
+        }));
+        assert!(
+            matches!(interrupt, Ok(ServerToWorkerIpcMessage::Interrupt {})),
+            "interrupt should deserialize without payload"
+        );
+
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "interrupt",
+                "input_id": 7
+            }))
+            .is_err(),
+            "interrupt should reject input_id under v5"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "interrupt"
+            }))
+            .is_err(),
+            "interrupt should not deserialize as a worker-to-server message"
         );
     }
 }

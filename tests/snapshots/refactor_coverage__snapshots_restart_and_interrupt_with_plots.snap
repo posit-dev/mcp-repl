@@ -49,11 +49,7 @@ response:
     },
     {
       "type": "text",
-      "text": "plots_done"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "plots_done\n> "
     }
   ]
 }
@@ -92,11 +88,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "[1] 2\n> "
     }
   ]
 }
@@ -136,7 +128,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "stderr: "
+      "text": "stderr: \n"
     },
     {
       "type": "text",
@@ -160,11 +152,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "[1] 2\n> "
     }
   ]
 }

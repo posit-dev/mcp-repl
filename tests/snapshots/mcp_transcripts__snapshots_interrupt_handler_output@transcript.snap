@@ -3,7 +3,7 @@ source: tests/mcp_transcripts.rs
 expression: transcript
 ---
 == session: interrupt_handler ==
-1) r_repl timeout_ms=1000
+1) r_repl timeout_ms=3000
 >>> cat("INTERRUPT_READY\n")
 >>> flush.console()
 >>> tryCatch(
@@ -13,12 +13,15 @@ expression: transcript
 >>>   interrupt = function(e) cat("interrupt received\n")
 >>> )
 <<< INTERRUPT_READY
+<<< 
 <<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 
 2) r_repl timeout_ms=5000
 >>> 
 <<< interrupt received
+<<< > 
 
 3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< >

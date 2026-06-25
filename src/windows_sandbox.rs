@@ -599,8 +599,9 @@ fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> S
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
     let stable_cwd = stable_sid_seed_path_buf(canonical_cwd.clone());
     let policy_seed = match policy {
-        SandboxPolicy::ReadOnly => serde_json::json!({
+        SandboxPolicy::ReadOnly { network_access } => serde_json::json!({
             "mode": "read-only",
+            "network_access": network_access,
         }),
         SandboxPolicy::WorkspaceWrite {
             writable_roots,
@@ -627,6 +628,10 @@ fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> S
                 "mode": "unsupported",
             })
         }
+        SandboxPolicy::Managed { .. } => serde_json::json!({
+            "mode": "managed-unsupported",
+            "policy": policy,
+        }),
     };
     let seed = format!(
         "mcp-repl-windows-sandbox-v2\0{}\0{}",
@@ -795,8 +800,10 @@ fn stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
 
 fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
     match policy {
-        SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite { .. } => Ok(()),
-        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+        SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. } => Ok(()),
+        SandboxPolicy::DangerFullAccess
+        | SandboxPolicy::ExternalSandbox { .. }
+        | SandboxPolicy::Managed { .. } => {
             Err("windows sandbox runner only supports read-only/workspace-write".to_string())
         }
     }
@@ -3856,6 +3863,22 @@ mod tests {
         }
     }
 
+    fn managed_policy() -> SandboxPolicy {
+        SandboxPolicy::Managed {
+            file_system: crate::sandbox::FileSystemSandboxPolicy {
+                kind: crate::sandbox::FileSystemSandboxKind::Restricted,
+                glob_scan_max_depth: None,
+                entries: vec![crate::sandbox::FileSystemSandboxEntry {
+                    path: crate::sandbox::FileSystemPath::Special {
+                        value: crate::sandbox::FileSystemSpecialPath::Root,
+                    },
+                    access: crate::sandbox::FileSystemAccessMode::Read,
+                }],
+            },
+            network_access: crate::sandbox::NetworkAccess::Restricted,
+        }
+    }
+
     fn prepared_launch_test_root() -> PathBuf {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -4329,7 +4352,9 @@ mod tests {
 
     #[test]
     fn applies_network_block_for_read_only() {
-        assert!(should_apply_network_block(&SandboxPolicy::ReadOnly));
+        assert!(should_apply_network_block(&SandboxPolicy::ReadOnly {
+            network_access: false,
+        }));
     }
 
     #[test]
@@ -4447,6 +4472,19 @@ mod tests {
         })
         .expect_err("external-sandbox should be rejected");
         assert!(err.contains("read-only/workspace-write"));
+    }
+
+    #[test]
+    fn rejects_managed_policy() {
+        let policy = managed_policy();
+        let err = validate_windows_policy(&policy).expect_err("managed should be rejected");
+        assert!(err.contains("read-only/workspace-write"));
+
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        let sid = stable_cap_sid_string(&policy, &cwd);
+        assert!(sid.starts_with("S-1-5-21-"));
     }
 
     #[test]
@@ -4568,7 +4606,9 @@ mod tests {
         let mut env_map = HashMap::new();
         env_map.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
         let paths = compute_allow_deny_paths(
-            &SandboxPolicy::ReadOnly,
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
             &command_cwd,
             &command_cwd,
             Some(&session_temp_dir),
@@ -4662,7 +4702,12 @@ mod tests {
             stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_a);
         let workspace_b =
             stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_b);
-        let readonly_a = stable_cap_sid_string(&SandboxPolicy::ReadOnly, &cwd_a);
+        let readonly_a = stable_cap_sid_string(
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            &cwd_a,
+        );
 
         assert_ne!(workspace_a, workspace_b);
         assert_ne!(workspace_a, readonly_a);

@@ -1,7 +1,9 @@
+import ast
+import __future__
 import base64
 import builtins
-import code
 import codecs
+import codeop
 import errno
 import hashlib
 import importlib.util
@@ -11,6 +13,7 @@ import os
 import pydoc
 import sys
 import threading
+import weakref
 
 import _io
 import _mcp_repl
@@ -45,8 +48,15 @@ _mcp_repl_windows_conpty = (
 _mcp_repl_ps1 = ">>> "
 _mcp_repl_ps2 = "... "
 _mcp_repl_c_stdio_tty = os.isatty(0) and os.isatty(1)
-_mcp_repl_interpreter = code.InteractiveInterpreter(globals())
-_mcp_repl_last_incomplete = False
+_mcp_repl_cell_compiler = codeop.Compile()
+_mcp_repl_input_streams = weakref.WeakSet()
+_mcp_repl_codeop_allow_incomplete_input = getattr(
+    codeop, "PyCF_ALLOW_INCOMPLETE_INPUT", 0
+)
+_mcp_repl_codeop_dont_imply_dedent = getattr(codeop, "PyCF_DONT_IMPLY_DEDENT", 0)
+_mcp_repl_future_features = tuple(
+    getattr(__future__, name) for name in __future__.all_feature_names
+)
 
 
 def _mcp_repl_readinto_type_name(target):
@@ -106,9 +116,107 @@ def _mcp_repl_capture_prompts():
         sys.ps2 = _mcp_repl_suppressed_ps2
 
 
-def _mcp_repl_runsource_b64(source_b64):
-    source = base64.b64decode(source_b64).decode("utf-8", "replace")
-    return _mcp_repl_interpreter.runsource(source, "<stdin>", "single")
+# Run a complete cell, displaying a final top-level expression like the REPL.
+def _mcp_repl_compile_complete(
+    source,
+    filename,
+    symbol,
+    _cell_compiler=_mcp_repl_cell_compiler,
+    _codeop_allow_incomplete_input=_mcp_repl_codeop_allow_incomplete_input,
+    _codeop_dont_imply_dedent=_mcp_repl_codeop_dont_imply_dedent,
+    _compile=compile,
+    _future_features=_mcp_repl_future_features,
+):
+    flags = _cell_compiler.flags
+    flags &= ~_codeop_allow_incomplete_input
+    flags &= ~_codeop_dont_imply_dedent
+    code = _compile(source, filename, symbol, flags, True)
+    for feature in _future_features:
+        if code.co_flags & feature.compiler_flag:
+            _cell_compiler.flags |= feature.compiler_flag
+    return code
+
+
+def _mcp_repl_run_cell(
+    source,
+    _ast_pycf_only_ast=ast.PyCF_ONLY_AST,
+    _ast_module=ast.Module,
+    _ast_expr=ast.Expr,
+    _ast_expression=ast.Expression,
+    _ast_fix_missing_locations=ast.fix_missing_locations,
+    _base_exception=BaseException,
+    _cell_compiler=_mcp_repl_cell_compiler,
+    _codeop_allow_incomplete_input=_mcp_repl_codeop_allow_incomplete_input,
+    _codeop_dont_imply_dedent=_mcp_repl_codeop_dont_imply_dedent,
+    _compile_complete=_mcp_repl_compile_complete,
+    _compile=compile,
+    _eval=eval,
+    _globals=globals,
+    _isinstance=isinstance,
+    _report_exception=None,
+    _sys=sys,
+    _system_exit=SystemExit,
+):
+    if _report_exception is None:
+        _report_exception = _mcp_repl_report_cell_exception
+    namespace = _globals()
+    compiler_flags = _cell_compiler.flags
+    try:
+        parse_flags = compiler_flags
+        parse_flags &= ~_codeop_allow_incomplete_input
+        parse_flags &= ~_codeop_dont_imply_dedent
+        module = _compile(
+            source,
+            "<mcp-repl>",
+            "exec",
+            parse_flags | _ast_pycf_only_ast,
+            True,
+        )
+        if module.body and _isinstance(module.body[-1], _ast_expr):
+            setup = _ast_module(body=module.body[:-1], type_ignores=module.type_ignores)
+            _ast_fix_missing_locations(setup)
+            setup_code = _compile_complete(setup, "<mcp-repl>", "exec")
+
+            expression = _ast_expression(module.body[-1].value)
+            _ast_fix_missing_locations(expression)
+            expression_code = _compile_complete(expression, "<mcp-repl>", "eval")
+            cell_code = (setup_code, expression_code)
+        else:
+            cell_code = _compile_complete(module, "<mcp-repl>", "exec")
+    except _base_exception as exc:
+        _cell_compiler.flags = compiler_flags
+        if _isinstance(exc, _system_exit):
+            _mcp_repl.request_exit()
+            return
+        _report_exception(exc)
+        return
+
+    try:
+        if _isinstance(cell_code, tuple):
+            setup_code, expression_code = cell_code
+            exec(setup_code, namespace, namespace)
+            value = _eval(expression_code, namespace, namespace)
+            _sys.displayhook(value)
+        else:
+            exec(cell_code, namespace, namespace)
+    except _base_exception as exc:
+        if _isinstance(exc, _system_exit):
+            _mcp_repl.request_exit()
+            return
+        _report_exception(exc)
+
+
+def _mcp_repl_report_cell_exception(exc, _sys=sys, _type=type):
+    tb = exc.__traceback__
+    helper_frame_names = ("_mcp_repl_run_cell", "_mcp_repl_compile_complete")
+    while tb is not None and tb.tb_frame.f_code.co_name in helper_frame_names:
+        tb = tb.tb_next
+    exc.__traceback__ = tb
+    _sys.last_exc = exc
+    _sys.last_type = _type(exc)
+    _sys.last_value = exc
+    _sys.last_traceback = tb
+    _sys.excepthook(_type(exc), exc, tb)
 
 
 def _input(prompt=""):
@@ -143,6 +251,7 @@ class McpInputStream:
         self._buffer = b""
         self._fileno = fileno
         self._closefd = closefd
+        _mcp_repl_input_streams.add(self)
         if encoding is not None:
             self.encoding = encoding
         if errors is not None:
@@ -347,6 +456,11 @@ class McpInputStream:
 
     def flush(self):
         pass
+
+
+def _mcp_repl_clear_stdin_buffers():
+    for stream in tuple(_mcp_repl_input_streams):
+        stream._buffer = b""
 
 
 class McpInputBuffer:
@@ -1097,22 +1211,26 @@ _mcp_repl.set_python_prompts(_mcp_repl_ps1, _mcp_repl_ps2)
 if _mcp_repl_c_stdio_tty:
     sys.ps1 = _mcp_repl_ps1
     sys.ps2 = _mcp_repl_ps2
+    builtins.open = _mcp_repl_open
+    io.open = _mcp_repl_open
+    io.FileIO = _McpReplFileIO
+    _io.open = _mcp_repl_open
+    _io.FileIO = _McpReplFileIO
+    os.fdopen = _mcp_repl_os_fdopen
     if os.name == "nt":
-        builtins.open = _mcp_repl_open
-        io.open = _mcp_repl_open
-        io.FileIO = _McpReplFileIO
-        _io.open = _mcp_repl_open
-        _io.FileIO = _McpReplFileIO
-        os.fdopen = _mcp_repl_os_fdopen
         os.dup = _mcp_repl_os_dup
         os.dup2 = _mcp_repl_os_dup2
         os.close = _mcp_repl_os_close
-        os.read = _mcp_repl_os_read
+    os.read = _mcp_repl_os_read
+    if _original_os_readv is not None:
+        os.readv = _mcp_repl_os_readv
+    if _mcp_repl_posix is not None:
+        _mcp_repl_posix.read = _mcp_repl_os_read
         if _original_os_readv is not None:
-            os.readv = _mcp_repl_os_readv
-        _mcp_repl_stdin = McpInputStream()
-        sys.stdin = _mcp_repl_stdin
-        sys.__stdin__ = _mcp_repl_stdin
+            _mcp_repl_posix.readv = _mcp_repl_os_readv
+    _mcp_repl_stdin = McpInputStream()
+    sys.stdin = _mcp_repl_stdin
+    sys.__stdin__ = _mcp_repl_stdin
 else:
     builtins.input = _input
     builtins.open = _mcp_repl_open

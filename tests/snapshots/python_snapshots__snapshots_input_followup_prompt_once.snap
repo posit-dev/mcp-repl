@@ -1,0 +1,45 @@
+---
+source: tests/python_snapshots.rs
+expression: rendered
+---
+== session: input_followup_prompt_once ==
+-- step 1 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "name = input(\"name: \")\nprint(\"hello\", name)\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "name: "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "Ada\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "hello Ada\n"
+    }
+  ]
+}

@@ -13,7 +13,9 @@ use crate::server::response::{
     ResponseState, TimeoutBundleReuse, text_stream_from_content, timeout_bundle_reuse_for_input,
 };
 use crate::worker_process::{WorkerError, WorkerManager, WriteStdinOptions};
-use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
+use crate::worker_protocol::{
+    ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
+};
 
 const DEFAULT_WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SAFETY_MARGIN: f64 = 1.05;
@@ -177,7 +179,7 @@ fn wait_for_initial_prompt(
         server_timeout,
         WriteStdinOptions::default(),
     )?;
-    while !reply_has_prompt(&last_reply) && Instant::now() < deadline {
+    while !reply_initializes_debug_repl(&last_reply) && Instant::now() < deadline {
         thread::sleep(INITIAL_PROMPT_POLL_INTERVAL);
         last_reply = worker.write_stdin(
             String::new(),
@@ -189,12 +191,31 @@ fn wait_for_initial_prompt(
     Ok(last_reply)
 }
 
+fn reply_initializes_debug_repl(reply: &WorkerReply) -> bool {
+    reply_has_prompt(reply) || reply_has_idle_status(reply)
+}
+
 fn reply_has_prompt(reply: &WorkerReply) -> bool {
     match reply {
         WorkerReply::Output { prompt, .. } => prompt
             .as_ref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
+    }
+}
+
+fn reply_has_idle_status(reply: &WorkerReply) -> bool {
+    match reply {
+        WorkerReply::Output { contents, .. } => contents.iter().any(|content| {
+            matches!(
+                content,
+                WorkerContent::ContentText {
+                    text,
+                    origin: ContentOrigin::Server,
+                    ..
+                } if text == "<<repl status: idle>>"
+            )
+        }),
     }
 }
 

@@ -20,7 +20,8 @@
 
 ## Follow-On Work
 
-- Broader oversized-output architecture follow-ons now live in `docs/futurework/per-turn-history-bundles.md` and `docs/futurework/unified-output-timeline-pipeline.md`.
+- Per-turn history bundles remain future work in `docs/futurework/per-turn-history-bundles.md`.
+- Timeline convergence is recorded in `docs/plans/completed/unified-output-timeline-pipeline.md`.
 
 ## Decision Log
 

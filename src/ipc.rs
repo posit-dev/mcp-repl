@@ -13,19 +13,16 @@ mod transport;
 mod worker_connection;
 
 pub use emit::{
-    emit_idle, emit_input_line, emit_output_text, emit_plot_image, emit_readline_discard_bytes,
-    emit_readline_input_bytes, emit_readline_result, emit_readline_start, emit_session_end,
-    emit_session_end_with_reason, emit_worker_ready, global_ipc, set_global_ipc,
+    emit_input_line, emit_input_wait, emit_output_image, emit_output_text, emit_ready,
+    emit_session_end, emit_session_end_with_reason, emit_worker_ready, global_ipc, set_global_ipc,
     worker_ipc_disabled_for_process,
 };
-#[cfg(target_family = "unix")]
-pub use emit::{emit_pty_feed, emit_stdin_wait};
 pub use protocol::{
-    IpcEchoEvent, IpcHandlers, IpcOutputText, IpcPlotImage, IpcPtyFeed, IpcPtyFeedHandler,
-    ServerToWorkerIpcMessage, WORKER_PROTOCOL_VERSION, WorkerCapabilities, WorkerIdentity,
-    WorkerProtocol, WorkerToServerIpcMessage,
+    IpcHandlers, IpcInputLineEvent, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
+    WORKER_PROTOCOL_VERSION, WorkerCapabilities, WorkerIdentity, WorkerProtocol,
+    WorkerToServerIpcMessage,
 };
-pub use server_connection::{IpcHandle, IpcWaitError, ServerIpcConnection};
+pub use server_connection::{IpcHandle, IpcInputReadiness, IpcWaitError, ServerIpcConnection};
 #[cfg(target_family = "windows")]
 pub use transport::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]

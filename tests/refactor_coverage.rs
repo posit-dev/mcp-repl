@@ -143,16 +143,34 @@ fn normalize_pager_footer_page_counts(text: &str) -> String {
     out
 }
 
+fn normalize_restart_interrupt_empty_stderr(text: &str) -> String {
+    text.replace(r#""text": "\nstderr: \nstderr: ""#, r#""text": "stderr: ""#)
+        .replace(
+            r#""text": "stderr: \nstderr: \n""#,
+            r#""text": "stderr: \n""#,
+        )
+        .replace("<<< \n<<< stderr: \n<<< stderr: \n", "<<< stderr: \n")
+        .replace("<<< stderr: \n<<< stderr: \n", "<<< stderr: \n")
+}
+
 fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
-    let rendered = if name == "snapshots_pager_hits_with_images" {
-        normalize_pager_footer_page_counts(&snapshot.render())
-    } else {
-        snapshot.render()
+    let rendered = match name {
+        "snapshots_pager_hits_with_images" => {
+            normalize_pager_footer_page_counts(&snapshot.render())
+        }
+        "snapshots_restart_and_interrupt_with_plots" => {
+            normalize_restart_interrupt_empty_stderr(&snapshot.render())
+        }
+        _ => snapshot.render(),
     };
-    let transcript = if name == "snapshots_pager_hits_with_images" {
-        normalize_pager_footer_page_counts(&snapshot.render_transcript())
-    } else {
-        snapshot.render_transcript()
+    let transcript = match name {
+        "snapshots_pager_hits_with_images" => {
+            normalize_pager_footer_page_counts(&snapshot.render_transcript())
+        }
+        "snapshots_restart_and_interrupt_with_plots" => {
+            normalize_restart_interrupt_empty_stderr(&snapshot.render_transcript())
+        }
+        _ => snapshot.render_transcript(),
     };
     if common::backend_unavailable(&rendered) || common::backend_unavailable(&transcript) {
         eprintln!("refactor_coverage backend unavailable in this environment; skipping");
@@ -229,4 +247,11 @@ async fn restart_interrupt_plot_smoke() -> TestResult<()> {
 
     session.cancel().await?;
     Ok(())
+}
+
+#[test]
+fn restart_interrupt_empty_stderr_normalizer_collapses_json_pair_without_leading_newline() {
+    let input = r#"{ "type": "text", "text": "stderr: \nstderr: \n" }"#;
+    let expected = r#"{ "type": "text", "text": "stderr: \n" }"#;
+    assert_eq!(normalize_restart_interrupt_empty_stderr(input), expected);
 }

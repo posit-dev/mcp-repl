@@ -17,6 +17,15 @@ impl WorkerManager {
         result
     }
 
+    pub(super) fn reset_after_session_end_preserving_detached_prefix_item_count(
+        &mut self,
+    ) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset_after_session_end();
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
     pub(super) fn reset_with_pager_preserving_detached_prefix_item_count(
         &mut self,
         preserve_pager: bool,
@@ -27,9 +36,18 @@ impl WorkerManager {
         result
     }
 
+    pub(super) fn reset_after_session_end_with_pager_preserving_detached_prefix_item_count(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        let detached_prefix_item_count = self.last_detached_prefix_item_count;
+        let result = self.reset_after_session_end_with_pager(preserve_pager);
+        self.last_detached_prefix_item_count = detached_prefix_item_count;
+        result
+    }
+
     pub(super) fn note_session_end(&mut self, include_notice: bool) {
         self.session_end_seen = true;
-        self.stdin_waiting = false;
         if let Some(process) = self.process.as_mut() {
             process.note_expected_exit();
             if include_notice {
@@ -57,11 +75,24 @@ impl WorkerManager {
                             .pending_output_tape
                             .append_stdout_status_line(message.as_bytes()),
                         OversizedOutputMode::Pager => {
-                            self.output_timeline.append_text(
-                                message.as_bytes(),
-                                false,
-                                ContentOrigin::Server,
-                            );
+                            self.output_timeline.flush_utf8_tails();
+                            if self.output_timeline.last_text_ends_with_newline() {
+                                self.output_timeline.append_text(
+                                    message.as_bytes(),
+                                    false,
+                                    ContentOrigin::Server,
+                                );
+                            } else {
+                                let mut status =
+                                    Vec::with_capacity(message.len().saturating_add(1));
+                                status.push(b'\n');
+                                status.extend_from_slice(message.as_bytes());
+                                self.output_timeline.append_text(
+                                    &status,
+                                    false,
+                                    ContentOrigin::Server,
+                                );
+                            }
                         }
                     }
                 }
@@ -72,9 +103,13 @@ impl WorkerManager {
     pub(super) fn maybe_reset_after_session_end(&mut self) {
         if self.session_end_seen {
             let result = match self.oversized_output {
-                OversizedOutputMode::Files => self.reset_preserving_detached_prefix_item_count(),
+                OversizedOutputMode::Files => {
+                    self.reset_after_session_end_preserving_detached_prefix_item_count()
+                }
                 OversizedOutputMode::Pager => self
-                    .reset_with_pager_preserving_detached_prefix_item_count(self.pager.is_active()),
+                    .reset_after_session_end_with_pager_preserving_detached_prefix_item_count(
+                        self.pager.is_active(),
+                    ),
             };
             if result.is_ok() {
                 self.note_respawn_during_write();
@@ -148,6 +183,41 @@ impl WorkerManager {
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
         });
         crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
+        Ok(())
+    }
+
+    pub(super) fn reset_after_session_end(&mut self) -> Result<(), WorkerError> {
+        self.reset_after_session_end_for_mode(false)
+    }
+
+    pub(super) fn reset_after_session_end_with_pager(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        self.reset_after_session_end_for_mode(preserve_pager)
+    }
+
+    fn reset_after_session_end_for_mode(
+        &mut self,
+        preserve_pager: bool,
+    ) -> Result<(), WorkerError> {
+        crate::event_log::log("worker_session_end_reset_begin", serde_json::json!({}));
+        if let Some(process) = self.process.take() {
+            let _ = process.finish_session_end_for_respawn();
+        }
+        self.require_inherited_sandbox_state()?;
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, preserve_pager),
+        }
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+        });
+        crate::event_log::log(
+            "worker_session_end_reset_end",
+            serde_json::json!({"status": "ok"}),
+        );
         Ok(())
     }
 
@@ -302,6 +372,13 @@ mod tests {
         let mut process = test_worker_process(successful_test_child());
         let status = process.wait_child_for_test().expect("wait test child");
         process.set_exit_status_for_test(status);
+        let _ = worker.send(WorkerToServerIpcMessage::InputWait {
+            prompt: ">>> ".to_string(),
+        });
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("server observes initial input_wait");
+        server.begin_input().expect("begin input");
         process.set_ipc_for_test(server);
         manager.process = Some(process);
         manager.pending_request = true;
@@ -309,15 +386,9 @@ mod tests {
         manager.pending_request_input = Some("quit()\n".to_string());
 
         let prompt = ">>> ".to_string();
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: prompt.clone(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+        let _ = worker.send(WorkerToServerIpcMessage::InputLine {
             prompt,
-            line: "quit()\n".to_string(),
-        });
-        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-            prompt: ">>> ".to_string(),
+            text: "quit()\n".to_string(),
         });
         drop(worker);
         manager.resolve_timeout_marker_with_wait(Duration::from_millis(200));

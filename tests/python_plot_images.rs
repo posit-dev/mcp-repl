@@ -393,6 +393,84 @@ fn python_plot_tests_enabled() -> bool {
     python_plotting_available()
 }
 
+fn fake_matplotlib_workspace() -> TestResult<tempfile::TempDir> {
+    let temp_dir = tempdir()?;
+    let package_dir = temp_dir.path().join("matplotlib");
+    fs::create_dir(&package_dir)?;
+    fs::write(
+        package_dir.join("__init__.py"),
+        r#"def use(*args, **kwargs):
+    return None
+"#,
+    )?;
+    fs::write(
+        package_dir.join("axes.py"),
+        r#"class Axes:
+    def __init__(self, figure):
+        self.figure = figure
+
+    def plot(self, *args, **kwargs):
+        self.figure._version += 1
+        return []
+"#,
+    )?;
+    fs::write(
+        package_dir.join("pyplot.py"),
+        r#"from matplotlib.axes import Axes
+
+rcParams = {}
+_figures = {}
+_current = None
+
+
+class Figure:
+    def __init__(self, number):
+        self.number = number
+        self.axes = Axes(self)
+        self._version = 0
+
+    def clf(self):
+        self._version += 1
+
+    def savefig(self, file, format=None):
+        file.write(f"fake-png-{self.number}-{self._version}".encode("ascii"))
+
+
+def figure(number=None):
+    global _current
+    if number is None:
+        number = max(_figures, default=0) + 1
+    if number not in _figures:
+        _figures[number] = Figure(number)
+    _current = _figures[number]
+    return _current
+
+
+def gcf():
+    if _current is None:
+        return figure(1)
+    return _current
+
+
+def get_fignums():
+    return sorted(_figures)
+
+
+def clf():
+    gcf().clf()
+
+
+def plot(*args, **kwargs):
+    return gcf().axes.plot(*args, **kwargs)
+
+
+def show(*args, **kwargs):
+    return None
+"#,
+    )?;
+    Ok(temp_dir)
+}
+
 async fn spawn_python_server_with_pager_page_chars(
     page_bytes: u64,
 ) -> TestResult<common::McpTestSession> {
@@ -527,6 +605,81 @@ plt.scatter([1, 2, 3], [3, 2, 1])"#,
         1,
         "expected prompt-time scatter plot to emit one image in the current response, got {images:?}; response text: {}",
         result_text(&result)
+    );
+    assert_eq!(images[0].mime_type, "image/png");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_interrupt_after_plot_creation_emits_plot() -> TestResult<()> {
+    if !common::python_available() {
+        eprintln!("python not available; skipping");
+        return Ok(());
+    }
+    let fake_matplotlib = fake_matplotlib_workspace()?;
+    let session = common::spawn_server_with_args_env(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--oversized-output".to_string(),
+            "files".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        vec![(
+            "PYTHONPATH".to_string(),
+            fake_matplotlib.path().display().to_string(),
+        )],
+    )
+    .await?;
+
+    let input = format!(
+        r#"{}
+import time
+plt.figure(301)
+plt.clf()
+plt.plot([1, 2, 3], [3, 1, 2])
+print("PLOT_READY", flush=True)
+time.sleep(30)"#,
+        python_plot_preamble()
+    );
+    let mut text = result_text(&session.write_stdin_raw_with(&input, Some(0.2)).await?);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !text.contains("PLOT_READY") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plot request did not report readiness before interrupt: {text:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        text = result_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
+    }
+
+    let mut interrupt_result = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut interrupt_text = result_text(&interrupt_result);
+    while common::is_busy_response(&interrupt_text) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plot interrupt did not finish: {interrupt_text:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        interrupt_result = session.write_stdin_raw_with("", Some(0.5)).await?;
+        interrupt_text = result_text(&interrupt_result);
+    }
+    session.cancel().await?;
+
+    assert!(
+        interrupt_text.contains("KeyboardInterrupt"),
+        "expected interrupt to complete with KeyboardInterrupt, got: {interrupt_text:?}"
+    );
+    let images = extract_images(&interrupt_result);
+    assert_eq!(
+        images.len(),
+        1,
+        "expected interrupted plot request to emit one image, got {images:?}; response text: {interrupt_text}"
     );
     assert_eq!(images[0].mime_type, "image/png");
 
@@ -740,6 +893,78 @@ print("late background plot scheduled")"#,
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_background_plot_before_new_idle_cell_does_not_emit() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+    let temp_dir = tempdir()?;
+    let done_path = temp_dir.path().join("background-plot-done");
+    let done_path = done_path
+        .to_str()
+        .ok_or("done path must be UTF-8")?
+        .to_string();
+    let done_path_literal = serde_json::to_string(&done_path)?;
+
+    let input = format!(
+        r#"{}
+import threading, time
+plt.figure(316)
+plt.clf()
+done_path = {done_path_literal}
+def _mcp_repl_late_idle_plot():
+    time.sleep(0.5)
+    plt.plot([1, 2, 3], [3, 1, 2])
+    with open(done_path, "w") as done_file:
+        done_file.write("done")
+
+threading.Thread(target=_mcp_repl_late_idle_plot, daemon=True).start()
+print("idle background plot scheduled")"#,
+        python_plot_preamble()
+    );
+    let schedule_result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    assert_ne!(
+        schedule_result.is_error,
+        Some(true),
+        "background plot setup reported an error: {}",
+        result_text(&schedule_result)
+    );
+    assert!(
+        result_text(&schedule_result).contains("idle background plot scheduled"),
+        "expected setup response before background plot, got: {}",
+        result_text(&schedule_result)
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !std::path::Path::new(&done_path).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background plot did not finish before the next idle cell"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let noop_result = session
+        .write_stdin_raw_with("print('NEW_IDLE_CELL_DONE')", Some(30.0))
+        .await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        noop_result.is_error,
+        Some(true),
+        "new idle cell reported an error: {}",
+        result_text(&noop_result)
+    );
+    assert!(
+        result_text(&noop_result).contains("NEW_IDLE_CELL_DONE"),
+        "expected new idle cell output, got: {}",
+        result_text(&noop_result)
+    );
+    assert_no_images(&noop_result, "background plot before new idle cell");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_background_plot_while_input_waits_does_not_emit() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
@@ -854,6 +1079,41 @@ async fn python_noop_after_plot_does_not_emit_update_notice() -> TestResult<()> 
         !noop_text.contains("[repl] image update from previous request"),
         "did not expect unchanged figure update notice in no-op response: {noop_text:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_image_only_files_mode_output_drains_once() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let session = common::spawn_python_server_with_files().await?;
+
+    let plot_input = format!(
+        "{}; plt.figure(191); plt.clf(); plt.plot([1, 2, 3]); plt.show()",
+        python_plot_preamble()
+    );
+    let plot_result = session
+        .write_stdin_raw_with(&plot_input, Some(30.0))
+        .await?;
+    let first_poll = session.write_stdin_raw_with("", Some(30.0)).await?;
+    let second_poll = session.write_stdin_raw_with("", Some(30.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        plot_result.is_error,
+        Some(true),
+        "plot reported an error: {}",
+        result_text(&plot_result)
+    );
+    assert_eq!(
+        extract_images(&plot_result).len(),
+        1,
+        "expected initial plot request to emit one image"
+    );
+    assert_no_images(&first_poll, "first empty poll after image-only output");
+    assert_no_images(&second_poll, "second empty poll after image-only output");
 
     Ok(())
 }

@@ -1,20 +1,12 @@
 use std::sync::atomic::Ordering;
 
 use super::WorkerManager;
-use super::backend_driver::output_echo_source_for_backend;
 use crate::completion_reply::{CompletionInfo, InputContext};
-use crate::ipc::IpcEchoEvent;
-use crate::output_capture::{OutputBuffer, reset_last_reply_marker_offset, reset_output_ring};
 use crate::output_snapshot::take_range_from_ring_after_completion;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::{self, Pager};
 use crate::pending_output_tape::FormattedPendingOutput;
-use crate::reply_presentation::{
-    build_input_transcript, echo_transcript_from_events, fallback_prompt_variants,
-    should_drop_echo_only_contents, should_trim_echo_prefix,
-    trim_echo_then_append_protocol_warnings, trim_leading_input_echo_from_contents,
-    trim_matching_echo_event_suffix_from_contents,
-};
+use crate::reply_presentation::append_protocol_warnings;
 use crate::worker_protocol::{ContentOrigin, WorkerContent};
 
 #[derive(Default)]
@@ -36,34 +28,20 @@ impl WorkerManager {
             prefix_is_error: detached_prefix.is_error || reply_prefix.is_error,
             start_offset: 0,
             prefix_bytes: 0,
-            input_echo: None,
-            input_transcript: None,
         }
     }
 
-    pub(super) fn prepare_input_context_pager(
-        &mut self,
-        text: &str,
-        echo_input: bool,
-    ) -> InputContext {
+    pub(super) fn prepare_input_context_pager(&mut self) -> InputContext {
         self.output.start_capture();
 
         let had_pending_output = self.output.has_pending_output();
-        let saw_background_output = self.output.pending_output_since_last_reply();
         let prompt_hint = self.current_prompt_hint();
         self.remember_prompt(prompt_hint.clone());
 
-        let mut input_echo = echo_input
-            .then(|| text.to_string())
-            .and_then(|value| pager::build_input_echo(&value));
-        let input_transcript = build_input_transcript(prompt_hint.as_deref(), text);
         let reply_prefix = self.take_current_prefix_pager(had_pending_output);
         let (detached_prefix, reply_prefix) = self.take_prefixes_for_next_request(reply_prefix);
 
         let start_offset = self.output.end_offset().unwrap_or(0);
-        if input_echo.is_none() && (echo_input || saw_background_output || had_pending_output) {
-            input_echo = pager::build_input_echo(text);
-        }
 
         InputContext {
             detached_prefix_contents: detached_prefix.contents,
@@ -71,8 +49,6 @@ impl WorkerManager {
             prefix_is_error: detached_prefix.is_error || reply_prefix.is_error,
             start_offset,
             prefix_bytes: detached_prefix.bytes.saturating_add(reply_prefix.bytes),
-            input_echo,
-            input_transcript,
         }
     }
 
@@ -125,11 +101,6 @@ impl WorkerManager {
 
     fn take_current_prefix_files(&mut self) -> PrefixCapture {
         let settled_completion = self.settled_pending_completion.take();
-        let fallback_input = settled_completion
-            .as_ref()
-            .map(|completion| self.take_input_fallback(completion))
-            .unwrap_or_default();
-        let fallback_input_transcript = fallback_input.transcript.clone();
         // A new accepted request seals the detached prefix. Flush any incomplete UTF-8 tail now
         // so it stays with the detached transcript instead of merging into fresh request output.
         let FormattedPendingOutput {
@@ -137,42 +108,7 @@ impl WorkerManager {
             saw_stderr,
         } = self.drain_sealed_formatted_output();
         if let Some(completion) = settled_completion.as_ref() {
-            let has_fallback_input_transcript = fallback_input_transcript.is_some();
-            let trim_enabled = if completion.echo_events.is_empty() {
-                has_fallback_input_transcript
-            } else {
-                should_trim_echo_prefix(&completion.echo_events)
-            };
-            let echo_transcript = echo_transcript_from_events(&completion.echo_events)
-                .or(fallback_input_transcript.clone());
-            trim_echo_then_append_protocol_warnings(
-                &mut contents,
-                echo_transcript.as_deref(),
-                trim_enabled,
-                if completion.echo_events.is_empty() {
-                    has_fallback_input_transcript
-                } else {
-                    should_drop_echo_only_contents(&completion.echo_events)
-                },
-                &completion.protocol_warnings,
-            );
-            if !trim_enabled {
-                let _ = trim_matching_echo_event_suffix_from_contents(
-                    &mut contents,
-                    &completion.echo_events,
-                );
-            }
-            if completion.echo_events.is_empty() && fallback_input_transcript.is_none() {
-                let prompt_variants = fallback_prompt_variants(
-                    completion.prompt.as_deref(),
-                    completion.prompt_variants.as_deref(),
-                );
-                let _ = trim_leading_input_echo_from_contents(
-                    &mut contents,
-                    fallback_input.raw_input.as_deref(),
-                    &prompt_variants,
-                );
-            }
+            append_protocol_warnings(&mut contents, &completion.protocol_warnings);
         }
         PrefixCapture {
             contents,
@@ -201,8 +137,6 @@ impl WorkerManager {
                     &self.output,
                     pending_start,
                     pending_end,
-                    &completion.echo_events,
-                    completion.prompt_variants.as_deref(),
                     &completion.protocol_warnings,
                 );
                 prefix_is_error = saw_stderr;
@@ -234,9 +168,7 @@ impl WorkerManager {
         let prompt = self.last_prompt.clone();
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: prompt.clone(),
-            stdin_wait_prompt: None,
             prompt_variants: prompt.clone().map(|prompt| vec![prompt]),
-            echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });
@@ -250,21 +182,9 @@ impl WorkerManager {
             return;
         }
 
-        let prompt = self.last_prompt.clone();
-        let prompt_variants = prompt.clone().map(|prompt| vec![prompt]);
-        let echo_events = match (prompt, self.pending_request_input.clone()) {
-            (Some(prompt), Some(line)) => vec![IpcEchoEvent {
-                prompt,
-                line,
-                source: output_echo_source_for_backend(self.backend),
-            }],
-            _ => Vec::new(),
-        };
         self.settled_pending_completion = Some(CompletionInfo {
             prompt: self.last_prompt.clone(),
-            stdin_wait_prompt: None,
-            prompt_variants,
-            echo_events,
+            prompt_variants: self.last_prompt.clone().map(|prompt| vec![prompt]),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });
@@ -283,7 +203,7 @@ impl WorkerManager {
         if !preserve_detached_output {
             self.pending_request_input = None;
         }
-        self.driver.clear_active_turn();
+        self.driver.clear_active_input();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -291,7 +211,6 @@ impl WorkerManager {
             self.last_detached_prefix_item_count = 0;
         }
         self.last_prompt = None;
-        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -305,9 +224,9 @@ impl WorkerManager {
             self.pending_output_tape.clear();
         }
         if !preserve_detached_output {
-            reset_output_ring();
-            reset_last_reply_marker_offset();
-            self.output = OutputBuffer::default();
+            self.output_timeline.clear();
+            self.output = self.output_timeline.buffer();
+            self.output.start_capture();
         }
         if !preserve_pager {
             self.pager = Pager::default();
@@ -315,7 +234,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.pending_request_input = None;
-        self.driver.clear_active_turn();
+        self.driver.clear_active_input();
         self.session_end_seen = false;
         if !preserve_detached_output {
             self.settled_pending_completion = None;
@@ -324,7 +243,6 @@ impl WorkerManager {
         }
         self.pager_prompt = None;
         self.last_prompt = None;
-        self.stdin_waiting = false;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -374,8 +292,9 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
             WorkerContent::ContentText {
                 text,
                 origin: ContentOrigin::Worker,
+                visibility,
                 ..
-            } => text.len() as u64,
+            } if visibility.is_reply_visible() => text.len() as u64,
             WorkerContent::ContentText { .. } | WorkerContent::ContentImage { .. } => 0,
         })
         .sum()
@@ -385,16 +304,12 @@ fn prefix_worker_text_bytes(contents: &[WorkerContent]) -> u64 {
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, ensure_output_ring, reset_last_reply_marker_offset,
-        reset_output_ring,
-    };
-    use crate::pending_output_tape::{PendingSidebandKind, PendingTextSource};
+    use crate::pending_output_tape::PendingSidebandKind;
     use crate::sandbox_cli::SandboxCliPlan;
-    use crate::worker_process::test_support::{contents_text, output_ring_test_guard};
+    use crate::worker_process::test_support::contents_text;
 
     #[test]
-    fn files_prepare_input_context_trims_echo_from_prompt_fallback_when_echo_events_missing() {
+    fn files_prepare_input_context_preserves_output_matching_input() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -407,9 +322,7 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
-            echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });
@@ -419,11 +332,11 @@ mod tests {
 
         assert!(
             text.contains("DETACHED_OK\n"),
-            "expected the settled files-mode output to survive trimming, got: {text:?}"
+            "expected the settled files-mode output to survive, got: {text:?}"
         );
         assert!(
-            !text.contains("import time; time.sleep(0.2)"),
-            "did not expect the Python prompt echo to leak into the next files-mode reply, got: {text:?}"
+            text.contains(">>> import time; time.sleep(0.2)"),
+            "expected worker output that matches submitted input to remain visible, got: {text:?}"
         );
         assert!(
             manager.settled_pending_completion.is_none(),
@@ -432,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn files_reset_preserving_detached_output_keeps_pending_request_input_for_trim() {
+    fn files_reset_preserving_detached_output_keeps_output_matching_input() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -445,9 +358,7 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
-            echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });
@@ -462,8 +373,8 @@ mod tests {
             "expected detached files-mode output to survive the preserved reset, got: {text:?}"
         );
         assert!(
-            !text.contains("import time; time.sleep(0.2)"),
-            "did not expect the preserved reset to leak the original Python input echo, got: {text:?}"
+            text.contains(">>> import time; time.sleep(0.2)"),
+            "expected preserved reset to keep worker output that matches submitted input, got: {text:?}"
         );
         assert!(
             manager.pending_request_input.is_none(),
@@ -472,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn files_respawned_pending_request_trims_echo_without_settled_completion() {
+    fn files_respawned_pending_request_preserves_output_matching_input() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -496,22 +407,17 @@ mod tests {
             "expected aborted pending output to survive the respawned reset, got: {text:?}"
         );
         assert!(
-            !text.contains("import time; time.sleep(0.2)"),
-            "did not expect the aborted request echo to leak across the respawn boundary, got: {text:?}"
+            text.contains(">>> import time; time.sleep(0.2)"),
+            "expected aborted request output matching input to survive the respawn boundary, got: {text:?}"
         );
         assert!(
             manager.pending_request_input.is_none(),
-            "expected the aborted request input fallback to be consumed once the detached prefix is prepared"
+            "expected the aborted request input record to be cleared once the detached prefix is prepared"
         );
     }
 
     #[test]
-    fn pager_respawned_pending_request_trims_echo_without_echo_events() {
-        let _guard = output_ring_test_guard();
-        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        reset_last_reply_marker_offset();
-
+    fn pager_respawned_pending_request_preserves_output_matching_input() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -522,16 +428,15 @@ mod tests {
         manager.last_prompt = Some(">>> ".to_string());
         manager.pending_request_input = Some("import time; time.sleep(0.2)\n".to_string());
         manager.output.start_capture();
-        manager.output_timeline.append_ipc_text_with_continuation(
+        manager.output_timeline.append_text(
             b">>> import time; time.sleep(0.2)\nDETACHED_OK\n",
             false,
             ContentOrigin::Worker,
-            false,
         );
 
         manager.reset_output_state_pager_preserving_detached_output(false);
 
-        let context = manager.prepare_input_context_pager("1+1", false);
+        let context = manager.prepare_input_context_pager();
         let text = contents_text(&context.detached_prefix_contents);
 
         assert!(
@@ -539,8 +444,8 @@ mod tests {
             "expected aborted pager output to survive the respawned reset, got: {text:?}"
         );
         assert!(
-            !text.contains("import time; time.sleep(0.2)"),
-            "did not expect the aborted pager echo to leak across the respawn boundary, got: {text:?}"
+            text.contains(">>> import time; time.sleep(0.2)"),
+            "expected aborted pager output matching input to survive the respawn boundary, got: {text:?}"
         );
     }
 
@@ -574,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn files_nonfinal_drain_preserves_echo_only_input() {
+    fn files_nonfinal_drain_preserves_prompt_shaped_runtime_output() {
         let manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),
@@ -590,20 +495,22 @@ mod tests {
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
-                echo_source: PendingTextSource::Ipc,
             });
 
         let formatted = manager.drain_formatted_output();
 
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected an in-flight files-mode drain to keep the echoed command visible"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+            ],
+            "expected an in-flight files-mode drain to keep generated echoes as transcript-only text"
         );
     }
 
     #[test]
-    fn files_nonfinal_drain_drops_leading_repl_echo_after_worker_output() {
+    fn files_nonfinal_drain_preserves_leading_repl_output_before_worker_output() {
         let manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),
@@ -613,13 +520,12 @@ mod tests {
 
         manager
             .pending_output_tape
-            .append_stdout_ipc_bytes(b"> Sys.sleep(5)\n");
+            .append_stdout_bytes(b"> Sys.sleep(5)\n");
         manager
             .pending_output_tape
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
-                echo_source: PendingTextSource::Ipc,
             });
         manager.pending_output_tape.append_stdout_bytes(b"start\n");
 
@@ -627,13 +533,17 @@ mod tests {
 
         assert_eq!(
             formatted.contents,
-            vec![WorkerContent::stdout("start\n")],
-            "expected worker output to hide the leading timed-out REPL echo again"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+                WorkerContent::stdout("start\n"),
+            ],
+            "expected worker output to preserve raw output and transcript-only generated echoes"
         );
     }
 
     #[test]
-    fn files_prepare_input_context_preserves_unsettled_echo_prefix() {
+    fn files_prepare_input_context_preserves_unsettled_prompt_shaped_prefix() {
         let mut manager = WorkerManager::new(
             Backend::R,
             SandboxCliPlan::default(),
@@ -649,15 +559,17 @@ mod tests {
             .append_sideband(PendingSidebandKind::ReadlineResult {
                 prompt: "> ".to_string(),
                 line: "Sys.sleep(5)\n".to_string(),
-                echo_source: PendingTextSource::Ipc,
             });
 
         let context = manager.prepare_input_context_files();
 
         assert_eq!(
             context.detached_prefix_contents,
-            vec![WorkerContent::stdout("> Sys.sleep(5)\n")],
-            "expected a sealed files-mode prefix without settled completion metadata to keep echoed input"
+            vec![
+                WorkerContent::stdout("> Sys.sleep(5)\n"),
+                WorkerContent::worker_stdout_transcript_only("> Sys.sleep(5)\n"),
+            ],
+            "expected a sealed files-mode prefix without settled completion metadata to keep generated echoes as transcript-only text"
         );
     }
 

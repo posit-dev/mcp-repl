@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
-use crate::completion_reply::{ReplyWithOffset, timeout_status_content};
-use crate::ipc::IpcWaitError;
+use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset, timeout_status_content};
+use crate::ipc::{IpcInputReadiness, IpcWaitError};
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -68,7 +68,7 @@ impl WorkerManager {
         Self::begin_interrupt(timeout);
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        self.interrupt_worker_if_running()?;
+        let interrupt_sent_at = self.interrupt_worker_if_running()?;
         let mode = self.resolve_interrupt_mode(mode);
 
         if interrupt_drains_existing_completion {
@@ -80,7 +80,7 @@ impl WorkerManager {
             );
         }
 
-        let prompt_wait = self.wait_for_interrupt_prompt(timeout)?;
+        let prompt_wait = self.wait_for_interrupt_prompt(timeout, interrupt_sent_at)?;
         let timed_out = prompt_wait.timed_out;
         let reply = self.build_interrupt_reply_for_mode(mode, prompt_wait, timeout);
         let session_end = self.session_end_seen;
@@ -129,15 +129,16 @@ impl WorkerManager {
         }
     }
 
-    fn interrupt_worker_if_running(&mut self) -> Result<(), WorkerError> {
+    fn interrupt_worker_if_running(&mut self) -> Result<Option<Instant>, WorkerError> {
         if !self.interrupt_target_running()? {
-            return Ok(());
+            return Ok(None);
         }
 
         let process = self
             .process
             .as_mut()
             .expect("worker process should be available");
+        let interrupt_sent_at = Instant::now();
         let interrupt_result = self.driver.interrupt(process);
         if let Err(err) = interrupt_result {
             self.reset()?;
@@ -149,7 +150,7 @@ impl WorkerManager {
             );
             return Err(err);
         }
-        Ok(())
+        Ok(Some(interrupt_sent_at))
     }
 
     fn drain_existing_completion_after_interrupt(
@@ -191,25 +192,38 @@ impl WorkerManager {
     fn wait_for_interrupt_prompt(
         &mut self,
         timeout: Duration,
+        interrupt_sent_at: Option<Instant>,
     ) -> Result<InterruptPromptWait, WorkerError> {
         let mut timed_out = false;
         let mut prompt: Option<String> = None;
         if let Some(process) = self.process.as_ref()
             && let Some(ipc) = process.ipc_connection()
         {
-            let result = ipc.wait_for_prompt(timeout);
-            match result {
-                Ok(value) => {
-                    prompt = Some(value);
+            if timeout.is_zero() {
+                timed_out = true;
+            } else {
+                let readiness = match interrupt_sent_at {
+                    Some(sent_at) => ipc.wait_for_input_wait_or_fresh_ready(timeout, sent_at),
+                    None => ipc.wait_for_input_readiness(timeout),
+                };
+                match readiness {
+                    Ok(IpcInputReadiness::InputWait(value)) => {
+                        prompt = Some(value);
+                    }
+                    Ok(IpcInputReadiness::Ready) => {
+                        prompt = None;
+                    }
+                    Err(IpcWaitError::Timeout) => {
+                        timed_out = true;
+                    }
+                    Err(IpcWaitError::SessionEnd) => {
+                        self.note_session_end(true);
+                    }
+                    Err(IpcWaitError::Disconnected) => {}
+                    Err(IpcWaitError::Protocol(message)) => {
+                        return Err(WorkerError::Protocol(message));
+                    }
                 }
-                Err(IpcWaitError::Timeout) => {
-                    timed_out = true;
-                }
-                Err(IpcWaitError::SessionEnd) => {
-                    self.note_session_end(true);
-                }
-                Err(IpcWaitError::Disconnected) => {}
-                Err(IpcWaitError::Protocol(message)) => return Err(WorkerError::Protocol(message)),
             }
         }
 
@@ -252,7 +266,12 @@ impl WorkerManager {
             prompt_wait.prompt
         };
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
+        let prompt_to_remember = if !session_end && !prompt_wait.timed_out {
+            normalize_prompt(raw_prompt)
+        } else {
+            raw_prompt
+        };
+        self.remember_prompt(prompt_to_remember);
         if !session_end && !prompt_wait.timed_out {
             reconcile_trailing_completion_prompt(
                 &mut contents,
@@ -269,7 +288,6 @@ impl WorkerManager {
                 prompt: (!session_end).then_some(()).and(resolved_prompt),
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -279,6 +297,9 @@ impl WorkerManager {
         timeout: Duration,
         page_bytes: u64,
     ) -> ReplyWithOffset {
+        if !prompt_wait.timed_out {
+            self.output_timeline.flush_utf8_tails();
+        }
         let start_offset = self.output.current_offset().unwrap_or(0);
         let mut end_offset = self.output.end_offset().unwrap_or(start_offset);
         if end_offset < start_offset {
@@ -315,9 +336,14 @@ impl WorkerManager {
             prompt_wait.prompt
         };
         let resolved_prompt = normalize_prompt(raw_prompt.clone());
-        self.remember_prompt(raw_prompt);
+        let prompt_to_remember = if !session_end && !prompt_wait.timed_out {
+            normalize_prompt(raw_prompt)
+        } else {
+            raw_prompt
+        };
+        self.remember_prompt(prompt_to_remember);
         if self.pager.is_active() && !session_end {
-            self.pager_prompt = resolved_prompt.clone();
+            self.pager_prompt = Some(PagerCompletionPrompt::from_prompt(resolved_prompt.clone()));
         }
         if !session_end && !prompt_wait.timed_out && !self.pager.is_active() {
             reconcile_trailing_completion_prompt(
@@ -337,7 +363,6 @@ impl WorkerManager {
                     .and(resolved_prompt),
                 prompt_variants: None,
             },
-            end_offset,
         }
     }
 }
@@ -352,7 +377,7 @@ mod tests {
     use crate::worker_process::test_support::contents_text;
 
     #[test]
-    fn interrupt_files_drains_settled_completion_without_leaking_echo() {
+    fn interrupt_files_drains_settled_completion_preserving_matching_output() {
         let mut manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -365,9 +390,7 @@ mod tests {
         manager.pending_request_input = Some("import time; time.sleep(0.07)\n".to_string());
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some(">>> ".to_string()),
-            stdin_wait_prompt: None,
             prompt_variants: Some(vec![">>> ".to_string()]),
-            echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });
@@ -382,8 +405,8 @@ mod tests {
             "expected the settled completion output to be preserved, got: {text:?}"
         );
         assert!(
-            !text.contains("import time; time.sleep(0.07)"),
-            "did not expect the settled completion echo to leak through interrupt handling, got: {text:?}"
+            text.contains(">>> import time; time.sleep(0.07)"),
+            "expected settled completion output matching submitted input to remain visible through interrupt handling, got: {text:?}"
         );
         assert!(
             text.contains(">>> "),

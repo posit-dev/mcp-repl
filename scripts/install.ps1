@@ -1,7 +1,7 @@
 function Install-McpRepl {
-    param(
-        [switch]$Dev
-    )
+    if ($args.Count -ne 0) {
+        throw "unexpected argument: $($args[0])"
+    }
 
     $Owner = "posit-dev"
     $Repo = "mcp-repl"
@@ -12,11 +12,7 @@ function Install-McpRepl {
     }
 
     $target = "x86_64-pc-windows-msvc"
-    if ($Dev) {
-        $url = "https://github.com/$Owner/$Repo/releases/download/dev/$App-$target.zip"
-    } else {
-        $url = "https://github.com/$Owner/$Repo/releases/latest/download/$App-$target.zip"
-    }
+    $url = "https://github.com/$Owner/$Repo/releases/latest/download/$App-$target.zip"
 
     $tmp = Join-Path $env:TEMP "$App-install"
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue

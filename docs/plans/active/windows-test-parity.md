@@ -45,10 +45,11 @@
 ## Open Questions
 
 - Whether optional reticulate help coverage should gain a Windows-specific server fix for hosts where reticulate initializes under `Rscript` but hangs inside the MCP R worker.
-- Whether the shared Windows suite server startup mutex is still necessary now that live test sessions pass under ordinary Cargo scheduling.
+- Whether the shared Windows suite server startup mutex can be deleted entirely. Current tests prove it is checkout-scoped, recovers after an abandoned owner, and does not block a second live session.
 
 ## Next Safe Slice
 
+- Audit the shared Windows suite server startup mutex for removal now that it no longer blocks concurrent live sessions.
 - Investigate the reticulate Windows MCP-worker initialization hang separately from test scheduling.
 
 ## Stop Conditions
