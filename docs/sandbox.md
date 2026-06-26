@@ -166,24 +166,29 @@ mcp-repl --sandbox workspace-write \
 
 ## Linux behavior
 
-Sandboxing is enforced by a Linux sandbox helper that applies seccomp + Landlock.
+Sandboxing is enforced by the internal Linux sandbox helper. The default path
+uses bubblewrap for the filesystem namespace and then applies seccomp in the
+sandboxed process. Legacy Landlock remains available as an explicit fallback,
+but it cannot enforce restricted-read managed profiles.
 
 - `workspace-write` always includes the per-session temp directory in writable roots.
-- `read-only` is translated to a minimal writable setup for the session temp directory only.
+- `read-only` and Codex managed `:minimal` profiles add only the server-owned
+  session temp directory as writable runtime state.
+- Linux consumes Codex managed filesystem metadata directly: restricted reads,
+  `:minimal`, project-root entries, `:tmpdir`, `:slash_tmp`, deny paths, deny
+  globs, and protected `.git`, `.codex`, and `.agents` metadata paths are
+  rendered into the bubblewrap mount plan.
 - default Linux worker setup disables network unless explicitly enabled.
 - managed domain allowlists are not enforced on Linux yet; configuring allowed
   or denied domains with enabled network access currently fails closed.
 - `mcp-repl` always uses its own internal Linux sandbox launcher; helper
   executable paths provided by an MCP client are ignored.
-- Codex sandbox metadata does not control `mcp-repl`'s optional internal
-  `bwrap` stage. That remains a local best-effort setting.
-
-Optional `bwrap` stage:
-
-- `MCP_REPL_USE_LINUX_BWRAP=1` enables a bubblewrap outer sandbox.
-- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
-- if `bwrap` is requested but worker startup dies before backend info arrives,
-  `mcp-repl` retries once without `bwrap` and continues.
+- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting when the host
+  container does not allow bubblewrap to mount it.
+- if the default bubblewrap path dies before worker readiness, `mcp-repl`
+  retries once with the legacy Landlock path for compatibility.
+- `MCP_REPL_USE_LINUX_BWRAP=0` disables the default bubblewrap path. Codex
+  `useLegacyLandlock` inherited metadata has the same effect for that tool call.
 
 ## Windows behavior (experimental)
 

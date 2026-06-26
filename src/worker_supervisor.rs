@@ -428,6 +428,8 @@ pub(crate) struct WorkerProcess {
     guardrail_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(target_family = "unix")]
     guardrail_thread_handle: Option<std::thread::Thread>,
+    #[cfg(target_os = "linux")]
+    linux_bwrap_sandboxed: bool,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -833,6 +835,9 @@ impl WorkerProcess {
         #[cfg(target_family = "unix")]
         let (guardrail_stop, guardrail_thread, guardrail_thread_handle) =
             start_memory_guardrail(child.id(), guardrail.clone());
+        #[cfg(target_os = "linux")]
+        let linux_bwrap_sandboxed = sandbox_state.use_linux_sandbox_bwrap
+            && sandbox_state.sandbox_policy.requires_sandbox();
 
         Ok(Self {
             child,
@@ -851,6 +856,8 @@ impl WorkerProcess {
             guardrail_thread: Some(guardrail_thread),
             #[cfg(target_family = "unix")]
             guardrail_thread_handle: Some(guardrail_thread_handle),
+            #[cfg(target_os = "linux")]
+            linux_bwrap_sandboxed,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -1140,9 +1147,13 @@ impl WorkerProcess {
     }
 
     pub(crate) fn send_interrupt(&mut self) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
+        #[cfg(all(target_family = "unix", not(target_os = "linux")))]
         {
             self.send_signal(libc::SIGINT)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.send_linux_interrupt()
         }
         #[cfg(target_family = "windows")]
         {
@@ -1204,6 +1215,34 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
+    fn send_linux_interrupt(&self) -> Result<(), WorkerError> {
+        if self.linux_bwrap_sandboxed && self.send_linux_bwrap_interrupt_descendants() {
+            return Ok(());
+        }
+        self.send_signal(libc::SIGINT)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_linux_bwrap_interrupt_descendants(&self) -> bool {
+        let root = Pid::from_u32(self.child.id());
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let mut sent = false;
+        for pid in collect_process_tree_pids(&system, root) {
+            if pid == root
+                || linux_pid_is_thread(pid)
+                || linux_pid_exe_basename(pid).is_some_and(|name| name == "bwrap")
+            {
+                continue;
+            }
+            let _ = raw_unix_kill(pid.as_u32() as i32, libc::SIGINT);
+            sent = true;
+        }
+        sent
+    }
+
+    #[cfg(target_family = "unix")]
     fn send_signal(&self, signal: i32) -> Result<(), WorkerError> {
         let pid = self.child.id() as i32;
         let result = raw_unix_kill(-pid, signal);
@@ -1233,16 +1272,19 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
-    fn send_signal_descendants_only(&self, signal: i32) {
+    fn send_signal_descendants_only(&self, signal: i32) -> bool {
         let root = Pid::from_u32(self.child.id());
         let mut system = System::new();
         system.refresh_processes(ProcessesToUpdate::All, true);
+        let mut sent = false;
         for pid in collect_process_tree_pids(&system, root) {
             if pid == root {
                 continue;
             }
             let _ = raw_unix_kill(pid.as_u32() as i32, signal);
+            sent = true;
         }
+        sent
     }
 
     pub(crate) fn note_expected_exit(&mut self) {
@@ -1533,6 +1575,8 @@ impl WorkerProcess {
             guardrail_thread: None,
             #[cfg(target_family = "unix")]
             guardrail_thread_handle: None,
+            #[cfg(target_os = "linux")]
+            linux_bwrap_sandboxed: false,
             #[cfg(target_os = "macos")]
             denial_logger: None,
         }
@@ -1734,6 +1778,31 @@ fn collect_process_tree_pids(system: &System, root: Pid) -> Vec<Pid> {
         }
     }
     pids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_is_thread(pid: Pid) -> bool {
+    let status_path = format!("/proc/{}/status", pid.as_u32());
+    let Ok(status) = std::fs::read_to_string(status_path) else {
+        return false;
+    };
+    for line in status.lines() {
+        let Some(raw_tgid) = line.strip_prefix("Tgid:") else {
+            continue;
+        };
+        let Ok(tgid) = raw_tgid.trim().parse::<u32>() else {
+            return false;
+        };
+        return tgid != pid.as_u32();
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_exe_basename(pid: Pid) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid.as_u32())).ok()?;
+    exe.file_name()
+        .map(|name| name.to_string_lossy().to_string())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

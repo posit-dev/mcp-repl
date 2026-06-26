@@ -157,7 +157,7 @@ fn managed_profile(entries: Vec<Value>, network: &str) -> Value {
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn managed_unrestricted_profile(network: &str) -> Value {
     json!({
         "type": "managed",
@@ -191,7 +191,7 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Value {
     let mut entries = vec![
         root_read_entry(),
@@ -212,7 +212,7 @@ fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Val
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
     let mut entries = vec![
         root_read_entry(),
@@ -233,7 +233,7 @@ fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_with_path_deny_and_child_write_meta(
     sandbox_cwd: &Path,
     denied_path: &Path,
@@ -265,7 +265,7 @@ fn workspace_write_with_path_deny_and_child_write_meta(
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -288,7 +288,7 @@ fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -347,7 +347,7 @@ fn read_only_with_unknown_special_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -402,7 +402,7 @@ fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn full_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_unrestricted_profile("restricted"),
@@ -411,7 +411,7 @@ fn full_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn root_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -2749,7 +2749,7 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_explicit_path_write_meta_blocks_missing_protected_metadata()
 -> TestResult<()> {
@@ -2834,7 +2834,7 @@ for (protected_name in c(".git", ".agents", ".codex")) {{
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_workspace_write_meta_blocks_missing_protected_metadata_alias()
 -> TestResult<()> {
@@ -2920,7 +2920,7 @@ tryCatch({{
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_glob_deny_meta_allows_write_but_blocks_read_and_unlink_in_cwd()
 -> TestResult<()> {
@@ -2964,14 +2964,28 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
         session.cancel().await?;
         return Ok(());
     }
-    assert!(
-        text.contains("WRITE_OK"),
-        "expected glob-denied file write in cwd to succeed, got: {text}"
-    );
-    assert!(
-        !text.contains("WRITE_ERROR:"),
-        "glob-denied file write in cwd unexpectedly failed: {text}"
-    );
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            text.contains("WRITE_OK"),
+            "expected glob-denied file write in cwd to succeed, got: {text}"
+        );
+        assert!(
+            !text.contains("WRITE_ERROR:"),
+            "glob-denied file write in cwd unexpectedly failed: {text}"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            text.contains("WRITE_ERROR:"),
+            "expected Linux bwrap glob-denied file write in cwd to fail, got: {text}"
+        );
+        assert!(
+            !text.contains("WRITE_OK"),
+            "Linux bwrap glob-denied file write unexpectedly succeeded: {text}"
+        );
+    }
     assert!(
         text.contains("READ_ERROR:"),
         "expected glob-denied file read in cwd to fail, got: {text}"
@@ -2981,15 +2995,22 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
         "glob-denied file read in cwd unexpectedly succeeded: {text}"
     );
     session.cancel().await?;
+    #[cfg(target_os = "macos")]
     assert_eq!(
         fs::read_to_string(&target)?,
         "allowed\n",
         "glob-denied file write should update contents while unlink remains denied"
     );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        fs::read_to_string(&target)?,
+        "original\n",
+        "Linux bwrap glob-denied file write should leave contents unchanged"
+    );
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_glob_deny_meta_blocks_canonical_tmp_read_and_unlink() -> TestResult<()> {
     let _guard = test_guard();
@@ -3052,7 +3073,7 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_directory_glob_deny_meta_blocks_child_read_and_unlink() -> TestResult<()> {
     let _guard = test_guard();
@@ -3107,7 +3128,7 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_blocks_write_read_and_unlink_in_cwd() -> TestResult<()> {
     let _guard = test_guard();
@@ -3172,7 +3193,7 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_blocks_missing_alias_path_creation() -> TestResult<()> {
     let _guard = test_guard();
@@ -3261,7 +3282,7 @@ tryCatch({{
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_preserves_more_specific_child_write() -> TestResult<()> {
     let _guard = test_guard();
@@ -3351,7 +3372,7 @@ tryCatch({{
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_preserves_alias_child_write() -> TestResult<()> {
     let _guard = test_guard();
@@ -3454,7 +3475,7 @@ tryCatch({{
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestResult<()> {
     let _guard = test_guard();
@@ -3485,7 +3506,7 @@ async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestR
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_minimal_meta_blocks_slash_tmp_write_without_slash_tmp_entry()
 -> TestResult<()> {
@@ -3543,7 +3564,7 @@ if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_workspace_write_meta_allows_explicit_slash_tmp_write() -> TestResult<()> {
     let _guard = test_guard();
@@ -3763,7 +3784,7 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
@@ -3790,7 +3811,7 @@ async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestRes
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_root_write_network_restricted_meta() -> TestResult<()> {
     let _guard = test_guard();
@@ -3913,7 +3934,7 @@ async fn sandbox_inherit_read_only_meta_blocks_write_in_cwd() -> TestResult<()> 
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_read_only_meta_blocks_ambient_temp_writes() -> TestResult<()> {
     let _guard = test_guard();
