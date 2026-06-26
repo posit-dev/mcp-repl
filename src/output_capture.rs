@@ -199,6 +199,10 @@ impl OutputTimeline {
         self.append_pending_locked(pending);
     }
 
+    pub(crate) fn has_unflushable_utf8_tail(&self) -> bool {
+        self.state.lock().unwrap().utf8_tails.has_unflushable_tail()
+    }
+
     fn append_event(&self, kind: OutputEventKind) {
         let mut guard = self.state.lock().unwrap();
         let pending = guard.utf8_tails.push_event(kind, self.ring.capacity_bytes);
@@ -404,6 +408,15 @@ impl OutputUtf8Tails {
         }
         self.entries.iter().skip(1).fold(0usize, |total, entry| {
             total.saturating_add(pending_entry_size_bytes(entry))
+        })
+    }
+
+    fn has_unflushable_tail(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                OutputPendingEntry::Text(entry) if !entry.sealed && !entry.is_flushable()
+            )
         })
     }
 }
@@ -1992,6 +2005,61 @@ mod tests {
                 WorkerContent::ContentImage { id, .. } if id == "plot-1"
             )),
             "expected the boundary image appended after the snapshot to survive"
+        );
+    }
+
+    #[test]
+    fn timeline_reports_unflushable_utf8_tail_until_raw_bytes_complete() {
+        let timeline = OutputTimeline::with_capacity(1024);
+        let output = timeline.buffer();
+        output.start_capture();
+
+        assert!(
+            !timeline.has_unflushable_utf8_tail(),
+            "fresh timeline should not report a pending UTF-8 tail"
+        );
+
+        timeline.append_text(&[0xC3], false, ContentOrigin::Worker);
+
+        assert!(
+            timeline.has_unflushable_utf8_tail(),
+            "split UTF-8 lead byte should stay visible to settle logic while held off-ring"
+        );
+        assert!(
+            !output.has_pending_output(),
+            "incomplete UTF-8 tail should not be materialized before it is completed or sealed"
+        );
+
+        timeline.append_input_wait();
+
+        assert!(
+            timeline.has_unflushable_utf8_tail(),
+            "input_wait markers should not seal an otherwise completable raw UTF-8 tail"
+        );
+
+        timeline.append_text(&[0xA9, b'\n'], false, ContentOrigin::Worker);
+
+        assert!(
+            !timeline.has_unflushable_utf8_tail(),
+            "completed UTF-8 sequence should clear the pending-tail state"
+        );
+
+        let formatted = output.drain_formatted(ProjectionMode::Bundle, true);
+        let text = formatted
+            .contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("é\n"),
+            "completed split UTF-8 bytes should render as text, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completed split UTF-8 bytes should not be escaped, got: {text:?}"
         );
     }
 
