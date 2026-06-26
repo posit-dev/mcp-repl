@@ -9,7 +9,7 @@
 <link href="mcp-repl-useR-lightning_files/libs/quarto-html/quarto-syntax-highlighting-dark-0a6b7249c26820e032cb0bd839ff02b1.css" rel="stylesheet" id="quarto-text-highlighting-styles"><meta charset="utf-8">
   <meta name="generator" content="quarto-1.9.38">
 
-  <title>Making R a First-Class Environment for LLMs</title>
+  <title>R Agents Need a Real Session</title>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, minimal-ui">
@@ -195,21 +195,147 @@
     <div class="slides">
 
 <section id="title-slide" class="quarto-title-block center">
-  <h1 class="title">Making R a First-Class Environment for LLMs</h1>
-  <p class="subtitle">mcp-repl: exposing interactive R through MCP</p>
+  <h1 class="title">R Agents Need a Real Session</h1>
+  <p class="subtitle">mcp-repl, MCP, and the limits of shell-only R access</p>
 
 <div class="quarto-title-authors">
 </div>
 
 </section>
-<section id="a-familiar-request" class="slide level2">
-<h2>A Familiar Request</h2>
+<section class="slide level2">
 
-<img alt="A chat interface where a user asks an agent to explore a
-dataset and build a first model. The agent responds by running several
-bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fig-align='center'" src="mcp-repl-useR-lightning-assets/chat-scenario.png" class="r-stretch"><aside class="notes">
+<style>
+.reveal h1,
+.reveal h2 {
+  text-transform: none;
+  letter-spacing: -0.035em;
+}
+
+.reveal p,
+.reveal li {
+  line-height: 1.25;
+}
+
+.reveal code {
+  border-radius: 0.22em;
+  padding: 0.02em 0.18em;
+}
+
+.reveal .lede {
+  font-size: 1.55em;
+  line-height: 1.18;
+  max-width: 1100px;
+}
+
+.reveal .quiet {
+  color: #c7d0dd;
+}
+
+.reveal .small {
+  font-size: 0.72em;
+  color: #c7d0dd;
+}
+
+.reveal .big-list li {
+  font-size: 1.22em;
+  margin: 0.45em 0;
+}
+
+.reveal .image-frame img {
+  width: 100%;
+  border-radius: 16px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+}
+
+.reveal .card-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.8em;
+  margin-top: 0.8em;
+}
+
+.reveal .card-grid.two {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.reveal .card {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.075);
+  padding: 0.75em 0.85em;
+  min-height: 145px;
+}
+
+.reveal .card h3 {
+  margin: 0 0 0.35em 0;
+  font-size: 0.9em;
+  letter-spacing: 0;
+}
+
+.reveal .card p,
+.reveal .card li {
+  font-size: 0.78em;
+}
+
+.reveal .flow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55em;
+  margin: 0.9em 0;
+  font-size: 1.05em;
+}
+
+.reveal .flow.compact {
+  flex-wrap: wrap;
+  gap: 0.35em;
+  font-size: 0.78em;
+}
+
+.reveal .flow.compact .node {
+  min-width: 120px;
+  padding: 0.55em 0.65em;
+}
+
+.reveal .flow.compact .arrow {
+  font-size: 1.1em;
+}
+
+.reveal .node {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.7em 0.9em;
+  min-width: 220px;
+  text-align: center;
+}
+
+.reveal .arrow {
+  color: #c7d0dd;
+  font-size: 1.4em;
+}
+
+.reveal .split-note {
+  margin-top: 0.6em;
+  font-size: 0.78em;
+  color: #c7d0dd;
+}
+
+.reveal .takeaway {
+  font-size: 1.55em;
+  line-height: 1.2;
+  max-width: 1200px;
+}
+</style>
+</section>
+<section id="the-request-is-ordinary" class="slide level2">
+<h2>The request is ordinary</h2>
+<div class="image-frame">
+<p><img alt="A chat interface where a user asks an agent to explore a dataset and build a first model. The agent responds by running several bash tool calls with Rscript and an edit_file tool call." src="mcp-repl-useR-lightning-assets/chat-scenario.png"></p>
+</div>
+<aside class="notes">
 <p>Timing: ~0:20.</p>
-<p>A user asks for ordinary R help: explore this dataset, make a first model, explain what you find. The chat looks persistent. The agent can remember the request and reason across turns. But underneath that chat, the first execution surface is often just a shell command. For R, that usually means <code>Rscript</code>.</p>
+<p>Start with a normal request: explore this dataset, build a first model, and explain what you find. The chat looks like one continuous workspace. The user can add constraints, ask follow-ups, and expect the agent to carry context forward. But below the chat, the agent still needs one very concrete thing: a way to run R.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -222,73 +348,24 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
           display:block!important;
       }</style></aside>
 </section>
-<section id="the-first-answer-is-batch" class="slide level2">
-<h2>The First Answer Is Batch</h2>
+<section id="for-r-the-first-tool-is-often-the-shell" class="slide level2">
+<h2>For R, the first tool is often the shell</h2>
 <div class="columns">
 <div class="column" style="width:58%;">
-<p><img src="mcp-repl-useR-lightning-assets/chat-rscript-e.png" alt="A chat interface where a user asks an agent to explore a dataset. The agent responds by running a bash tool call named bash with an inline Rscript command." style="width: 100%;"></p>
+<div class="image-frame">
+<p><img src="mcp-repl-useR-lightning-assets/chat-rscript-e.png" alt="A chat interface where a user asks an agent to explore a dataset. The agent responds by running a bash tool call named bash with an inline Rscript command."></p>
+</div>
 </div><div class="column" style="width:42%;">
-<p>The shortest path works.</p>
-<p>Ask R one question.</p>
-<p>Return one answer.</p>
-</div></div>
-<aside class="notes">
-<p>Timing: ~0:18.</p>
-<p>This is a reasonable starting point. An inline <code>Rscript -e</code> call is available almost everywhere. It is easy for the agent to generate and easy for the host to run. For a one-line calculation, it is enough. The problem is that real analysis does not stay one line for very long.</p>
-<style type="text/css">
-        span.MJX_Assistive_MathML {
-          position:absolute!important;
-          clip: rect(1px, 1px, 1px, 1px);
-          padding: 1px 0 0 0!important;
-          border: 0!important;
-          height: 1px!important;
-          width: 1px!important;
-          overflow: hidden!important;
-          display:block!important;
-      }</style></aside>
-</section>
-<section id="then-the-script-appears" class="slide level2">
-<h2>Then the Script Appears</h2>
-<div class="columns">
-<div class="column" style="width:58%;">
-<p><img src="mcp-repl-useR-lightning-assets/chat-heredoc-script.png" alt="A chat interface where the assistant uses a bash tool call named bash to write an R script with a heredoc, then runs it with Rscript." style="width: 100%;"></p>
-</div><div class="column" style="width:42%;">
-<p>The command gets longer.</p>
-<p>Quoting gets fragile.</p>
-<p>The agent starts writing files.</p>
-</div></div>
-<aside class="notes">
-<p>Timing: ~0:20.</p>
-<p>The next step is also predictable. The inline expression turns into a temporary script. The agent writes a file, runs <code>Rscript</code>, reads the output, edits the file, and runs it again. This is more stable than one huge shell string, but it is still batch execution wearing an interactive costume.</p>
-<style type="text/css">
-        span.MJX_Assistive_MathML {
-          position:absolute!important;
-          clip: rect(1px, 1px, 1px, 1px);
-          padding: 1px 0 0 0!important;
-          border: 0!important;
-          height: 1px!important;
-          width: 1px!important;
-          overflow: hidden!important;
-          display:block!important;
-      }</style></aside>
-</section>
-<section id="the-cold-start-loop" class="slide level2">
-<h2>The Cold-Start Loop</h2>
-<div class="columns">
-<div class="column" style="width:58%;">
-<p><img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant runs an Rscript file, edits it with an edit_file tool call, and runs it again." style="width: 100%;"></p>
-</div><div class="column" style="width:42%;">
-<p>Every attempt starts cold.</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb1-1"><a href=""></a>Run 1: load -&gt; inspect</span>
-<span id="cb1-2"><a href=""></a>Run 2: load -&gt; clean -&gt; plot</span>
-<span id="cb1-3"><a href=""></a>Run 3: load -&gt; clean -&gt; fit</span>
-<span id="cb1-4"><a href=""></a>Run 4: load -&gt; clean -&gt; debug</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>The conversation persists.</p>
-<p>The R session does not.</p>
+<div class="lede">
+<p><code>Rscript -e</code> is a good first move.</p>
+</div>
+<div class="quiet">
+<p>It answers one question, returns one result, and works almost everywhere.</p>
+</div>
 </div></div>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
-<p>The agent is adapting to the interface it has. But every run starts cold. It reloads data, rebuilds objects, replays setup, and leaves files behind as fake memory: intermediate CSVs, RDS files, generated plots, and notes for itself. That can work for small one-shot tasks. It is the wrong shape for exploratory analysis.</p>
+<p>There is nothing wrong with this as a starting point. A one-off <code>Rscript -e</code> call is portable and easy to generate. For a quick summary or a tiny calculation, it is exactly enough. The problem is not that the shell is bad. The problem is that exploratory analysis does not stay in this shape for long.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -301,34 +378,25 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
           display:block!important;
       }</style></aside>
 </section>
-<section id="r-is-rich-in-interactive-surfaces" class="slide level2">
-<h2>R Is Rich in Interactive Surfaces</h2>
+<section id="then-the-work-becomes-a-script" class="slide level2">
+<h2>Then the work becomes a script</h2>
 <div class="columns">
-<div class="column" style="width:33%;">
-<p>Debugger</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb2-1"><a href=""></a></span>
-<span id="cb2-2"><a href=""></a>browser()</span>
-<span id="cb2-3"><a href=""></a>Browse[1]&gt; str(x)</span>
-<span id="cb2-4"><a href=""></a>Browse[1]&gt; n</span>
-<span id="cb2-5"><a href=""></a>Browse[1]&gt; where</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-</div><div class="column" style="width:33%;">
-<p>Help</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb3-1"><a href=""></a>?lm</span>
-<span id="cb3-2"><a href=""></a>help("predict")</span>
-<span id="cb3-3"><a href=""></a>vignette("...")</span>
-<span id="cb3-4"><a href=""></a>RShowDoc()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-</div><div class="column" style="width:33%;">
-<p>Plots</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb4-1"><a href=""></a>plot(fit)</span>
-<span id="cb4-2"><a href=""></a>ggplot(df, aes(...))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-</div></div>
+<div class="column" style="width:58%;">
+<div class="image-frame">
+<p><img src="mcp-repl-useR-lightning-assets/chat-heredoc-script.png" alt="A chat interface where the assistant uses a bash tool call named bash to write an R script with a heredoc, then runs it with Rscript."></p>
+</div>
+</div><div class="column" style="width:42%;">
+<div class="big-list">
 <ul>
-<li>These are designed for repeated interactions with a persistent stateful R session.</li>
-<li>Many require <code>interactive()</code> return <code>TRUE</code>.</li>
+<li>The command grows.</li>
+<li>Quoting gets fragile.</li>
+<li>The agent needs somewhere to put the next thought.</li>
 </ul>
+</div>
+</div></div>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
-<p>The mismatch becomes obvious when the task stops being linear. R help, vignettes, pagers, plots, readline prompts, and the debugger all assume there is a live session on the other side. Batch execution can only approximate that by making more files and replaying more setup. For serious R work, command execution is not the primitive we need.</p>
+<p>The next move is also natural: write a temporary script, run it, read the output, edit it, and run it again. This is less brittle than one large shell string, but we have changed the workflow. The file has become a stand-in for the session we do not have.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -341,24 +409,26 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
           display:block!important;
       }</style></aside>
 </section>
-<section id="the-missing-primitive" class="slide level2">
-<h2>The Missing Primitive</h2>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb5-1"><a href=""></a>Agent</span>
-<span id="cb5-2"><a href=""></a>  |</span>
-<span id="cb5-3"><a href=""></a>  | repl</span>
-<span id="cb5-4"><a href=""></a>  v</span>
-<span id="cb5-5"><a href=""></a>Live R session</span>
-<span id="cb5-6"><a href=""></a></span>
-<span id="cb5-7"><a href=""></a>df &lt;- readRDS(...)</span>
-<span id="cb5-8"><a href=""></a>fit &lt;- lm(...)</span>
-<span id="cb5-9"><a href=""></a>plot(fit)</span>
-<span id="cb5-10"><a href=""></a>debugonce(fn)</span>
-<span id="cb5-11"><a href=""></a></span>
-<span id="cb5-12"><a href=""></a>state | help | plots | debugger | interrupt | reset</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Give the agent a real R session.</p>
+<section id="now-we-are-faking-memory-with-files" class="slide level2">
+<h2>Now we are faking memory with files</h2>
+<div class="columns">
+<div class="column" style="width:58%;">
+<div class="image-frame">
+<p><img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant runs an Rscript file, edits it with an edit_file tool call, and runs it again."></p>
+</div>
+</div><div class="column" style="width:42%;">
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb1-1"><a href=""></a>run 1: load -&gt; inspect</span>
+<span id="cb1-2"><a href=""></a>run 2: load -&gt; clean -&gt; plot</span>
+<span id="cb1-3"><a href=""></a>run 3: load -&gt; clean -&gt; fit</span>
+<span id="cb1-4"><a href=""></a>run 4: load -&gt; clean -&gt; debug</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="lede">
+<p>The chat remembers.</p>
+<p>R starts over.</p>
+</div>
+</div></div>
 <aside class="notes">
-<p>Timing: ~0:25.</p>
-<p>The missing primitive is not a smarter <code>Rscript</code> call. It is a persistent, interactive R session that the agent can own for the length of the task. The agent should be able to create an object in one call and inspect it in the next. It should be able to view plots, read help, step through <code>browser()</code>, interrupt bad work, and reset when it needs a clean slate.</p>
+<p>Timing: ~0:30.</p>
+<p>From the user’s point of view, the conversation is continuous. From R’s point of view, each attempt is a fresh process. The agent reloads the data, rebuilds objects, replays setup, and leaves behind temporary scripts, plots, RDS files, and notes for itself. That can be fine for a small task. It is a poor fit for exploratory work.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -371,18 +441,226 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
           display:block!important;
       }</style></aside>
 </section>
-<section id="mcp-repl" class="slide level2">
-<h2>mcp-repl</h2>
-<ul>
-<li>MCP server over stdio</li>
-<li>Tools: <code>repl</code> and <code>repl_reset</code></li>
-<li>Long-lived R or Python worker</li>
-<li>Text, images, prompts, and debugger interaction</li>
-<li>Private session for the agent</li>
-</ul>
+<section id="the-problem-is-the-shape" class="slide level2">
+<h2>The problem is the shape</h2>
+<div class="card-grid two">
+<div class="card">
+<h3>
+The chat has continuity
+</h3>
+<p>
+The request, plan, corrections, and intermediate reasoning are all still in view.
+</p>
+</div>
+<div class="card">
+<h3>
+The R process does not
+</h3>
+<p>
+Objects disappear after each run, so the agent rebuilds the world from files.
+</p>
+</div>
+</div>
+<div class="lede">
+<p>We are asking an interactive language to behave like a batch job.</p>
+</div>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
-<p><code>mcp-repl</code> is one implementation of that idea. The MCP surface is small: a <code>repl</code> tool for input and a <code>repl_reset</code> tool for starting over. The hard parts sit below that boundary: worker lifecycle, output capture, image capture, timeouts, interrupts, and response finalization. The user-visible property is continuity.</p>
+<p>This is the core mismatch. The agent is not failing because it is lazy or careless. It is adapting to the interface we gave it. If the only primitive is command execution, the agent will build a workflow out of command execution. But R users already know that the richest work in R is usually not a sequence of isolated batch jobs.</p>
+<style type="text/css">
+        span.MJX_Assistive_MathML {
+          position:absolute!important;
+          clip: rect(1px, 1px, 1px, 1px);
+          padding: 1px 0 0 0!important;
+          border: 0!important;
+          height: 1px!important;
+          width: 1px!important;
+          overflow: hidden!important;
+          display:block!important;
+      }</style></aside>
+</section>
+<section id="r-already-has-the-surfaces-agents-need" class="slide level2">
+<h2>R already has the surfaces agents need</h2>
+<div class="card-grid">
+<div class="card">
+<h3>
+State
+</h3>
+<p>
+<code>df</code>, <code>fit</code>, <code>res</code>
+</p>
+<p>
+<code>str()</code>, <code>ls()</code>, <code>glimpse()</code>
+</p>
+</div>
+<div class="card">
+<h3>
+Help
+</h3>
+<p>
+<code>?lm</code>
+</p>
+<p>
+<code>help(“predict”)</code>
+</p>
+<p>
+<code>vignette()</code>
+</p>
+</div>
+<div class="card">
+<h3>
+Graphics
+</h3>
+<p>
+<code>plot(fit)</code>
+</p>
+<p>
+<code>ggplot(df, aes(…))</code>
+</p>
+</div>
+<div class="card">
+<h3>
+Debugging
+</h3>
+<p>
+<code>browser()</code>
+</p>
+<p>
+<code>Browse[1]&gt; n</code>
+</p>
+<p>
+<code>where</code>
+</p>
+</div>
+</div>
+<div class="lede">
+<p>These are not just commands. They are a conversation with a live R session.</p>
+</div>
+<aside class="notes">
+<p>Timing: ~0:35.</p>
+<p>R has always had rich interactive surfaces: objects that stay in memory, help pages, vignettes, graphics devices, readline prompts, and the debugger. Many of these assume a live session. Some need <code>interactive()</code> to be true. Batch execution can approximate parts of this by writing more files and replaying more setup, but it is an approximation.</p>
+<style type="text/css">
+        span.MJX_Assistive_MathML {
+          position:absolute!important;
+          clip: rect(1px, 1px, 1px, 1px);
+          padding: 1px 0 0 0!important;
+          border: 0!important;
+          height: 1px!important;
+          width: 1px!important;
+          overflow: hidden!important;
+          display:block!important;
+      }</style></aside>
+</section>
+<section id="the-missing-primitive-is-a-repl" class="slide level2">
+<h2>The missing primitive is a REPL</h2>
+<div class="flow">
+<div class="node">
+Agent
+</div>
+<div class="arrow">
+↔︎
+</div>
+<div class="node">
+<code>repl(“…”)</code>
+</div>
+<div class="arrow">
+↔︎
+</div>
+<div class="node">
+Live R session
+</div>
+</div>
+<div class="card-grid">
+<div class="card">
+<h3>
+State persists
+</h3>
+<p>
+Create an object once. Inspect it later.
+</p>
+</div>
+<div class="card">
+<h3>
+Outputs return
+</h3>
+<p>
+Text, images, prompts, errors, and warnings come back through one channel.
+</p>
+</div>
+<div class="card">
+<h3>
+Debugging works
+</h3>
+<p>
+The agent can step, inspect, and recover inside the same session.
+</p>
+</div>
+<div class="card">
+<h3>
+Control is explicit
+</h3>
+<p>
+Interrupt when stuck. Reset when a clean slate is better.
+</p>
+</div>
+</div>
+<aside class="notes">
+<p>Timing: ~0:30.</p>
+<p>The missing primitive is not a smarter shell command. It is a persistent REPL: a live R session the agent can use for the length of the task. The agent should be able to create a model in one call, inspect it in the next, draw a plot, ask for help, step through <code>browser()</code>, interrupt a bad computation, and reset when needed.</p>
+<style type="text/css">
+        span.MJX_Assistive_MathML {
+          position:absolute!important;
+          clip: rect(1px, 1px, 1px, 1px);
+          padding: 1px 0 0 0!important;
+          border: 0!important;
+          height: 1px!important;
+          width: 1px!important;
+          overflow: hidden!important;
+          display:block!important;
+      }</style></aside>
+</section>
+<section id="mcp-repl-is-the-small-interface-around-that-idea" class="slide level2">
+<h2><code>mcp-repl</code> is the small interface around that idea</h2>
+<div class="card-grid">
+<div class="card">
+<h3>
+MCP server
+</h3>
+<p>
+Runs over stdio, so external agents can attach without a bespoke integration.
+</p>
+</div>
+<div class="card">
+<h3>
+<code>repl</code>
+</h3>
+<p>
+Send input to the live worker and collect the result.
+</p>
+</div>
+<div class="card">
+<h3>
+<code>repl_reset</code>
+</h3>
+<p>
+Discard session state and start clean.
+</p>
+</div>
+<div class="card">
+<h3>
+Worker runtime
+</h3>
+<p>
+Long-lived R or Python process with captured text, images, prompts, and debugger interaction.
+</p>
+</div>
+</div>
+<div class="lede">
+<p>The public surface is small. The important property is continuity.</p>
+</div>
+<aside class="notes">
+<p>Timing: ~0:30.</p>
+<p><code>mcp-repl</code> is one implementation of this interface. The MCP tool surface is intentionally small: send input to the REPL, or reset the session. Most of the work happens below that surface: worker lifecycle, output capture, image capture, timeouts, interrupts, prompts, and final response handling. The effect for the agent is simple: R remains there between turns.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -396,18 +674,22 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
       }</style></aside>
 </section>
 <section id="keep-the-session-in-a-box" class="slide level2">
-<h2>Keep the Session in a Box</h2>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb6-1"><a href=""></a>Agent-owned R session</span>
-<span id="cb6-2"><a href=""></a>  - private runtime state</span>
-<span id="cb6-3"><a href=""></a>  - explicit interrupt</span>
-<span id="cb6-4"><a href=""></a>  - explicit reset</span>
-<span id="cb6-5"><a href=""></a></span>
-<span id="cb6-6"><a href=""></a>Sandbox</span>
-<span id="cb6-7"><a href=""></a>  - workspace and temp writes only</span>
-<span id="cb6-8"><a href=""></a>  - network off unless configured</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<h2>Keep the session in a box</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb2-1"><a href=""></a>Agent-owned R session</span>
+<span id="cb2-2"><a href=""></a>  - private runtime state</span>
+<span id="cb2-3"><a href=""></a>  - explicit interrupt</span>
+<span id="cb2-4"><a href=""></a>  - explicit reset</span>
+<span id="cb2-5"><a href=""></a></span>
+<span id="cb2-6"><a href=""></a>Sandbox</span>
+<span id="cb2-7"><a href=""></a>  - workspace and temp writes only</span>
+<span id="cb2-8"><a href=""></a>  - network off unless configured</span>
+<span id="cb2-9"><a href=""></a>  - recovery path when the run goes wrong</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="lede">
+<p>Persistence is useful only if the boundary is clear.</p>
+</div>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
-<p>This is not a human and a model sharing one IDE session. It is built for agent work, so the live session needs a security boundary. The model can run code and keep state, but writes are constrained, network access is off unless configured, and recovery controls are explicit. The sandbox is part of what makes persistence acceptable.</p>
+<p>This is not the same as a human and a model sharing one IDE console. For agent work, the live session needs a boundary. The model can keep objects in memory, but writes are constrained, network access is off unless configured, and the host has explicit controls for interrupt and reset. The sandbox is part of what makes a persistent session acceptable.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -420,29 +702,93 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
           display:block!important;
       }</style></aside>
 </section>
-<section id="when-no-one-is-sitting-there" class="slide level2">
-<h2>When No One Is Sitting There</h2>
-<div class="columns">
-<div class="column" style="width:50%;">
-<p><strong>Unattended sessions</strong></p>
+<section id="this-matters-when-no-one-is-sitting-there" class="slide level2">
+<h2>This matters when no one is sitting there</h2>
+<div class="card-grid two">
+<div class="card">
+<h3>
+Unattended work
+</h3>
 <ul>
-<li>scheduled jobs</li>
-<li>fresh-data reconnaissance</li>
-<li>overnight failure analysis</li>
-<li>autonomous report drafts</li>
+<li>
+fresh-data reconnaissance
+</li>
+<li>
+scheduled checks
+</li>
+<li>
+overnight failure analysis
+</li>
+<li>
+first-draft reports
+</li>
 </ul>
-</div><div class="column" style="width:50%;">
-<p><strong>Workflow optimization</strong></p>
+</div>
+<div class="card">
+<h3>
+Workflow evaluation
+</h3>
 <ul>
-<li>evals on realistic R tasks</li>
-<li>prompt and policy sweeps</li>
-<li>regression tests for tool use</li>
-<li>LLM-powered pipeline tuning</li>
+<li>
+realistic R tasks
+</li>
+<li>
+debugger and help use
+</li>
+<li>
+recovery after errors
+</li>
+<li>
+regression tests for tool behavior
+</li>
 </ul>
-</div></div>
+</div>
+</div>
+<div class="lede">
+<p>A real session makes the real workflow observable.</p>
+</div>
 <aside class="notes">
 <p>Timing: ~0:35.</p>
-<p>This is the future-facing gap. The same primitive matters when there is not a human watching every turn: scheduled work, long-running investigations, agent evaluations, and optimization loops that tune prompts, tools, or analysis workflows. A human may review the result, but the session itself is owned by the agent while the work is happening.</p>
+<p>The same primitive matters beyond a live demo. A human may review the result, but the session itself can be owned by the agent while work is happening: scheduled checks, fresh-data reconnaissance, overnight analysis, or report drafting. It also gives us a better way to evaluate agents. We can test whether they can inspect state, use help, view plots, step through the debugger, and recover after mistakes.</p>
+<!--
+## Two useful shapes
+::: {.columns}
+::: {.column width="50%"}
+
+### `mcp-repl`: agent-owned
+
+<div class="flow compact">
+  <div class="node">Human review</div>
+  <div class="arrow">→</div>
+  <div class="node">Agent</div>
+  <div class="arrow">↔</div>
+  <div class="node">Private R session</div>
+</div>
+
+::: {.split-note}
+The human may start or review the work. The agent owns the live runtime.
+:::
+
+:::
+
+::: {.column width="50%"}
+
+### Posit Assistant: human in the loop
+
+<div class="flow compact">
+  <div class="node">Human</div>
+  <div class="arrow">↔</div>
+  <div class="node">Assistant</div>
+  <div class="arrow">↔</div>
+  <div class="node">IDE R session</div>
+</div>
+
+::: {.split-note}
+The human, assistant, and R session stay connected inside the IDE.
+:::
+
+:::
+::: -->
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -455,74 +801,12 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
           display:block!important;
       }</style></aside>
 </section>
-<section id="evaluate-the-real-workflow" class="slide level2">
-<h2>Evaluate the Real Workflow</h2>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb7-1"><a href=""></a>Task</span>
-<span id="cb7-2"><a href=""></a>Analyze this package failure and explain the likely bug.</span>
-<span id="cb7-3"><a href=""></a></span>
-<span id="cb7-4"><a href=""></a>Agent capabilities under test</span>
-<span id="cb7-5"><a href=""></a>  - load project state</span>
-<span id="cb7-6"><a href=""></a>  - inspect objects</span>
-<span id="cb7-7"><a href=""></a>  - read R help</span>
-<span id="cb7-8"><a href=""></a>  - view plots</span>
-<span id="cb7-9"><a href=""></a>  - step through browser()</span>
-<span id="cb7-10"><a href=""></a>  - recover after errors</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<aside class="notes">
-<p>Timing: ~0:30.</p>
-<p>If we want to evaluate agents on serious R work, we should not only ask whether they can emit syntactically valid code. We should ask whether they can use the surfaces R users actually depend on: object state, help, plots, debugger steps, and recovery after mistakes. A persistent REPL makes those behaviors observable and testable.</p>
-<style type="text/css">
-        span.MJX_Assistive_MathML {
-          position:absolute!important;
-          clip: rect(1px, 1px, 1px, 1px);
-          padding: 1px 0 0 0!important;
-          border: 0!important;
-          height: 1px!important;
-          width: 1px!important;
-          overflow: hidden!important;
-          display:block!important;
-      }</style></aside>
-</section>
-<section id="two-different-shapes" class="slide level2">
-<h2>Two Different Shapes</h2>
+<section id="two-useful-shapes" class="slide level2">
+<h2>Two useful shapes</h2>
 
 <img data-src="mcp-repl-useR-lightning_files/figure-revealjs/two-session-shapes-1.png" style="width:100.0%" class="r-stretch"><aside class="notes">
-<p>Timing: ~0:45.</p>
-<p>These are different shapes. With <code>mcp-repl</code>, a human may trigger or review work, but the agent owns the live connection to <code>mcp-repl</code>, and the session can also run unattended. There is no direct line from a human to that R session. It is private runtime owned by the agent. The IDE experience is different: the human, the assistant, and the R session are connected, so it is designed for interactive, agent-assisted data analysis.</p>
-<style type="text/css">
-        span.MJX_Assistive_MathML {
-          position:absolute!important;
-          clip: rect(1px, 1px, 1px, 1px);
-          padding: 1px 0 0 0!important;
-          border: 0!important;
-          height: 1px!important;
-          width: 1px!important;
-          overflow: hidden!important;
-          display:block!important;
-      }</style></aside>
-</section>
-<section id="posit-ai" class="slide level2">
-<h2>Posit AI</h2>
-<div class="columns">
-<div class="column" style="width:50%;">
-<p><strong>mcp-repl</strong></p>
-<ul>
-<li>open source</li>
-<li>agent-owned sessions</li>
-<li>works with external agents</li>
-<li>better than shell-only R access</li>
-</ul>
-</div><div class="column" style="width:50%;">
-<p><strong>Posit Assistant</strong></p>
-<ul>
-<li>built into the IDE experience</li>
-<li>human, agent, and R stay connected</li>
-<li>designed for interactive data analysis</li>
-<li>the richer human-in-the-loop path</li>
-</ul>
-</div></div>
-<aside class="notes">
-<p>Timing: ~0:25.</p>
-<p>The closing distinction is that <code>mcp-repl</code> is for agents. It is open source, and it helps external agents use R more effectively than raw shell commands. Posit AI is the product path for the integrated experience: the IDE has the assistant and the R session in the same human-in-the-loop environment.</p>
+<p>Timing: ~0:35.</p>
+<p>These are related, but they are not the same product shape. <code>mcp-repl</code> is agent-facing. It gives external agents a private R session that can run without a human directly attached to the console. Posit Assistant is the richer interactive path inside the IDE, where the human, the assistant, and the R session are all part of the same environment.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -537,13 +821,17 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
 </section>
 <section id="takeaway" class="slide level2">
 <h2>Takeaway</h2>
-<p>If an agent is going to work in R, it should get a live R session.</p>
-<p><code>mcp-repl</code> is the open source, agent-facing path: persistent, interactive, private, and sandboxed.</p>
-<p>For interactive work with a human in the loop, use Posit Assistant in the integrated IDE experience.</p>
-<p>https://github.com/posit-dev/mcp-repl</p>
+<div class="takeaway">
+<p>If an agent is going to work in R, it should get a live R session, not only a shell.</p>
+</div>
+<p><code>mcp-repl</code> is the open-source, agent-facing path: persistent, interactive, private, and sandboxed.</p>
+<p>For human-in-the-loop interactive analysis, the integrated IDE path is Posit Assistant.</p>
+<div class="small">
+<p><a href="https://github.com/posit-dev/mcp-repl" class="uri">https://github.com/posit-dev/mcp-repl</a></p>
+</div>
 <aside class="notes">
 <p>Timing: ~0:20.</p>
-<p>The takeaway is narrow: R support for agents should not stop at command execution. For agent-owned sessions, <code>mcp-repl</code> provides that interface over MCP. For human-in-the-loop interactive analysis, the better shape is the integrated Posit AI assistant experience in the IDE.</p>
+<p>The takeaway is narrow. R support for agents should not stop at command execution. For agent-owned sessions, <code>mcp-repl</code> gives R a persistent interactive surface over MCP. For interactive work with a human in the loop, Posit Assistant is the integrated IDE path.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -718,7 +1006,7 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
         previewLinks: false,
 
         // Transition style (none/fade/slide/convex/concave/zoom)
-        transition: 'none',
+        transition: 'fade',
 
         // Transition speed (default/fast/slow)
         transitionSpeed: 'default',
