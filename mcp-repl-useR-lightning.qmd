@@ -470,7 +470,14 @@ blue_fill <- "#17212b"
 green <- "#b8f5b0"
 green_fill <- "#1f251f"
 
-par(mar = c(0, 0, 0, 0), xaxs = "i", yaxs = "i", bg = bg, family = "sans")
+par(
+  mar = c(0, 0, 0, 0),
+  pty = "m",
+  xaxs = "i",
+  yaxs = "i",
+  bg = bg,
+  family = "sans"
+)
 plot.new()
 plot.window(xlim = c(0, 100), ylim = c(0, 60))
 rect(0, 0, 100, 60, col = bg, border = NA)
@@ -511,31 +518,60 @@ draw_person <- function(x, y, border) {
   text(x, y - 5.25, "Human", col = fg, cex = 0.8, font = 2)
 }
 
-draw_arrow <- function(x0, y0, x1, y1, col) {
+draw_arrow <- function(x0, y0, x1, y1, col, head_length, lwd) {
   arrows(
     x0,
     y0,
     x1,
     y1,
-    length = 0.11,
+    length = head_length,
     angle = 24,
     code = 3,
     col = col,
-    lwd = 2.8
+    lwd = lwd
   )
 }
 
-draw_arrow_between <- function(x0, y0, x1, y1, col, start_gap, end_gap) {
+draw_arrow_between <- function(
+  x0,
+  y0,
+  x1,
+  y1,
+  col,
+  start_gap,
+  end_gap,
+  shaft_length,
+  head_length,
+  lwd
+) {
   dx <- x1 - x0
   dy <- y1 - y0
-  distance <- sqrt(dx^2 + dy^2)
-  stopifnot(distance > 0)
+  data_distance <- sqrt(dx^2 + dy^2)
+  visual_distance <- sqrt((dx * x_unit)^2 + (dy * y_unit)^2)
+  stopifnot(
+    start_gap >= 0,
+    end_gap >= 0,
+    shaft_length > 0,
+    head_length > 0,
+    lwd > 0,
+    data_distance > 0,
+    visual_distance > 0
+  )
+  start_fraction <- start_gap / data_distance
+  end_fraction <- 1 - end_gap / data_distance
+  shaft_fraction <- shaft_length / visual_distance
+  trim_fraction <- (end_fraction - start_fraction - shaft_fraction) / 2
+  stopifnot(trim_fraction >= 0)
+  arrow_start <- start_fraction + trim_fraction
+  arrow_end <- end_fraction - trim_fraction
   draw_arrow(
-    x0 + start_gap * dx / distance,
-    y0 + start_gap * dy / distance,
-    x1 - end_gap * dx / distance,
-    y1 - end_gap * dy / distance,
-    col
+    x0 + arrow_start * dx,
+    y0 + arrow_start * dy,
+    x0 + arrow_end * dx,
+    y0 + arrow_end * dy,
+    col,
+    head_length,
+    lwd
   )
 }
 
@@ -558,6 +594,9 @@ box_edge_gap <- function(from, to, half_width, half_height) {
   distance * min(x_scale, y_scale)
 }
 
+agent_arrow <- list(shaft_length = 0.67, head_length = 0.10, lwd = 2.8)
+ide_arrow <- list(shaft_length = 1.00, head_length = 0.11, lwd = 2.8)
+
 rect(2, 7, 48, 53, border = panel, col = NA, lwd = 1.8)
 rect(52, 7, 98, 53, border = panel, col = NA, lwd = 1.8)
 
@@ -572,7 +611,10 @@ draw_arrow_between(
   agent_harness[2],
   blue,
   start_gap = circle_edge_gap(agent_human, agent_harness, person_radius),
-  end_gap = box_edge_gap(agent_harness, agent_human, 7, 4.5)
+  end_gap = box_edge_gap(agent_harness, agent_human, 7, 4.5),
+  shaft_length = agent_arrow$shaft_length,
+  head_length = agent_arrow$head_length,
+  lwd = agent_arrow$lwd
 )
 draw_arrow_between(
   agent_harness[1],
@@ -581,7 +623,10 @@ draw_arrow_between(
   agent_repl[2],
   blue,
   start_gap = box_edge_gap(agent_harness, agent_repl, 7, 4.5),
-  end_gap = box_edge_gap(agent_repl, agent_harness, 5, 6.2)
+  end_gap = box_edge_gap(agent_repl, agent_harness, 5, 6.2),
+  shaft_length = agent_arrow$shaft_length,
+  head_length = agent_arrow$head_length,
+  lwd = agent_arrow$lwd
 )
 draw_person(agent_human[1], agent_human[2], blue)
 draw_box(18, 26.5, 32, 35.5, "LLM harness", blue_fill, blue)
@@ -612,7 +657,10 @@ draw_arrow_between(
   triangle_right[2],
   green,
   start_gap = circle_edge_gap(triangle_left, triangle_right, person_radius),
-  end_gap = box_edge_gap(triangle_right, triangle_left, 8.2, 4.4)
+  end_gap = box_edge_gap(triangle_right, triangle_left, 8.2, 4.4),
+  shaft_length = ide_arrow$shaft_length,
+  head_length = ide_arrow$head_length,
+  lwd = ide_arrow$lwd
 )
 draw_arrow_between(
   triangle_right[1],
@@ -621,7 +669,10 @@ draw_arrow_between(
   triangle_bottom[2],
   green,
   start_gap = box_edge_gap(triangle_right, triangle_bottom, 8.2, 4.4),
-  end_gap = box_edge_gap(triangle_bottom, triangle_right, 8.8, 4.2)
+  end_gap = box_edge_gap(triangle_bottom, triangle_right, 8.8, 4.2),
+  shaft_length = ide_arrow$shaft_length,
+  head_length = ide_arrow$head_length,
+  lwd = ide_arrow$lwd
 )
 draw_arrow_between(
   triangle_bottom[1],
@@ -630,7 +681,10 @@ draw_arrow_between(
   triangle_left[2],
   green,
   start_gap = box_edge_gap(triangle_bottom, triangle_left, 8.8, 4.2),
-  end_gap = circle_edge_gap(triangle_left, triangle_bottom, person_radius)
+  end_gap = circle_edge_gap(triangle_left, triangle_bottom, person_radius),
+  shaft_length = ide_arrow$shaft_length,
+  head_length = ide_arrow$head_length,
+  lwd = ide_arrow$lwd
 )
 draw_person(triangle_left[1], triangle_left[2], green)
 draw_box(
