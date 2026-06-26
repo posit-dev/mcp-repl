@@ -915,6 +915,13 @@ fn env_var_truthy(key: &str) -> bool {
     })
 }
 
+fn env_var_truthy_if_set(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|value| {
+        let trimmed = value.trim();
+        trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+    })
+}
+
 #[allow(dead_code)]
 fn temp_roots_from_system(exclude_tmpdir_env_var: bool, exclude_slash_tmp: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -1235,11 +1242,11 @@ pub fn sandbox_state_update_from_codex_meta(
         sandbox_policy,
         sandbox_cwd: Some(sandbox_cwd),
         #[cfg(target_os = "linux")]
-        use_linux_sandbox_bwrap: Some(!use_legacy_landlock),
+        use_linux_sandbox_bwrap: use_legacy_landlock.then_some(false),
         #[cfg(not(target_os = "linux"))]
         use_linux_sandbox_bwrap: None,
         #[cfg(target_os = "linux")]
-        use_legacy_landlock: Some(use_legacy_landlock),
+        use_legacy_landlock: use_legacy_landlock.then_some(true),
         #[cfg(not(target_os = "linux"))]
         use_legacy_landlock: None,
     })
@@ -2278,7 +2285,9 @@ pub fn sandbox_state_defaults_with_environment() -> SandboxState {
         env_var_truthy(ALLOW_LOCAL_BINDING_ENV_KEY);
     #[cfg(target_os = "linux")]
     {
-        defaults.use_linux_sandbox_bwrap = env_var_truthy(LINUX_BWRAP_ENABLED_ENV);
+        if let Some(use_bwrap) = env_var_truthy_if_set(LINUX_BWRAP_ENABLED_ENV) {
+            defaults.use_linux_sandbox_bwrap = use_bwrap;
+        }
     }
     defaults
 }
@@ -5844,7 +5853,10 @@ mod tests {
         );
         assert_eq!(update.sandbox_cwd, Some(sandbox_cwd));
         #[cfg(target_os = "linux")]
-        assert_eq!(update.use_linux_sandbox_bwrap, Some(true));
+        assert!(
+            update.use_linux_sandbox_bwrap.is_none(),
+            "Codex useLegacyLandlock=false should not force mcp-repl's local bwrap setting on"
+        );
         #[cfg(not(target_os = "linux"))]
         assert!(update.use_linux_sandbox_bwrap.is_none());
     }
@@ -5869,6 +5881,35 @@ mod tests {
         assert_eq!(update.use_linux_sandbox_bwrap, Some(false));
         #[cfg(not(target_os = "linux"))]
         assert!(update.use_linux_sandbox_bwrap.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_sandbox_state_meta_does_not_override_local_bwrap_disablement() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox",
+        }))
+        .expect("codex sandbox metadata");
+        let mut state = SandboxState {
+            use_linux_sandbox_bwrap: false,
+            ..SandboxState::default()
+        };
+
+        state.apply_update(update);
+
+        assert!(
+            !state.use_linux_sandbox_bwrap,
+            "Codex metadata should preserve local bwrap disablement"
+        );
     }
 
     #[test]
@@ -6288,6 +6329,25 @@ mod tests {
     fn sandbox_state_defaults_with_environment_respects_linux_bwrap_env() {
         let _guard = linux_bwrap_env_lock();
         let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
+
+        unsafe {
+            std::env::remove_var(LINUX_BWRAP_ENABLED_ENV);
+        }
+        let defaults = sandbox_state_defaults_with_environment();
+        assert!(
+            defaults.use_linux_sandbox_bwrap,
+            "unset Linux bwrap env should preserve the Linux default"
+        );
+
+        unsafe {
+            std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "0");
+        }
+        let defaults = sandbox_state_defaults_with_environment();
+        assert!(
+            !defaults.use_linux_sandbox_bwrap,
+            "explicit false Linux bwrap env should disable bwrap"
+        );
+
         unsafe {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
         }

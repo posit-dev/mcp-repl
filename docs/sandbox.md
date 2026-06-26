@@ -188,7 +188,8 @@ but it cannot enforce restricted-read managed profiles.
 - if the default bubblewrap path dies before worker readiness, `mcp-repl`
   retries once with the legacy Landlock path for compatibility.
 - `MCP_REPL_USE_LINUX_BWRAP=0` disables the default bubblewrap path. Codex
-  `useLegacyLandlock` inherited metadata has the same effect for that tool call.
+  `useLegacyLandlock: true` inherited metadata has the same effect for that tool
+  call.
 
 ## Windows behavior (experimental)
 
