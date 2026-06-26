@@ -16,7 +16,7 @@ format:
 
 <img alt="A chat interface where a user asks an agent to explore a
 dataset and build a first model. The agent responds by running several
-bash tool calls with Rscript."
+bash tool calls with Rscript and an edit_file tool call."
 style="width: 100%; fig-align='center'"
 src="mcp-repl-useR-lightning-assets/chat-scenario.png"
 >
@@ -32,11 +32,15 @@ the first execution surface is often just a shell command. For R, that
 usually means `Rscript`.
 :::
 
+
+
 ## The First Answer Is Batch
 
 ::: {.columns}
 ::: {.column width="58%"}
-<img src="mcp-repl-useR-lightning-assets/chat-rscript-e.png" alt="A chat interface where a user asks an agent to explore a dataset. The agent responds by running a bash tool call named bash with an inline Rscript command." style="width: 100%;">
+<img src="mcp-repl-useR-lightning-assets/chat-rscript-e.png"
+alt="A chat interface where a user asks an agent to explore a dataset. The agent responds by running a bash tool call named bash with an inline Rscript command."
+style="width: 100%;">
 :::
 
 ::: {.column width="42%"}
@@ -56,6 +60,8 @@ available almost everywhere. It is easy for the agent to generate and
 easy for the host to run. For a one-line calculation, it is enough. The
 problem is that real analysis does not stay one line for very long.
 :::
+
+
 
 ## Then the Script Appears
 
@@ -83,11 +89,13 @@ huge shell string, but it is still batch execution wearing an
 interactive costume.
 :::
 
+
+
 ## The Cold-Start Loop
 
 ::: {.columns}
 ::: {.column width="58%"}
-<img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant repeatedly runs the same Rscript file through a bash tool call named bash." style="width: 100%;">
+<img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant runs an Rscript file, edits it with an edit_file tool call, and runs it again." style="width: 100%;">
 :::
 
 ::: {.column width="42%"}
@@ -116,12 +124,15 @@ and notes for itself. That can work for small one-shot tasks. It is the
 wrong shape for exploratory analysis.
 :::
 
-## R Is Interactive at the Edges
+
+
+## R Is Rich in Interactive Surfaces
 
 ::: {.columns}
 ::: {.column width="33%"}
-```text
 Debugger
+```text
+
 browser()
 Browse[1]> str(x)
 Browse[1]> n
@@ -130,17 +141,19 @@ Browse[1]> where
 :::
 
 ::: {.column width="33%"}
+
+Help
 ```text
-Help and pager
 ?lm
 help("predict")
 vignette("...")
+RShowDoc()
 ```
 :::
 
 ::: {.column width="33%"}
-```text
 Plots
+```text
 plot(fit)
 ggplot(df, aes(...))
 ```

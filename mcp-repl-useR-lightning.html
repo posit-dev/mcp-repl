@@ -207,7 +207,7 @@
 
 <img alt="A chat interface where a user asks an agent to explore a
 dataset and build a first model. The agent responds by running several
-bash tool calls with Rscript." style="width: 100%; fig-align='center'" src="mcp-repl-useR-lightning-assets/chat-scenario.png" class="r-stretch"><aside class="notes">
+bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fig-align='center'" src="mcp-repl-useR-lightning-assets/chat-scenario.png" class="r-stretch"><aside class="notes">
 <p>Timing: ~0:20.</p>
 <p>A user asks for ordinary R help: explore this dataset, make a first model, explain what you find. The chat looks persistent. The agent can remember the request and reason across turns. But underneath that chat, the first execution surface is often just a shell command. For R, that usually means <code>Rscript</code>.</p>
 <style type="text/css">
@@ -276,7 +276,7 @@ bash tool calls with Rscript." style="width: 100%; fig-align='center'" src="mcp-
 <h2>The Cold-Start Loop</h2>
 <div class="columns">
 <div class="column" style="width:58%;">
-<p><img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant repeatedly runs the same Rscript file through a bash tool call named bash." style="width: 100%;"></p>
+<p><img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant runs an Rscript file, edits it with an edit_file tool call, and runs it again." style="width: 100%;"></p>
 </div><div class="column" style="width:42%;">
 <p>Every attempt starts cold.</p>
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb1-1"><a href=""></a>Run 1: load -&gt; inspect</span>
@@ -301,22 +301,25 @@ bash tool calls with Rscript." style="width: 100%; fig-align='center'" src="mcp-
           display:block!important;
       }</style></aside>
 </section>
-<section id="r-is-interactive-at-the-edges" class="slide level2">
-<h2>R Is Interactive at the Edges</h2>
+<section id="r-is-rich-in-interactive-surfaces" class="slide level2">
+<h2>R Is Rich in Interactive Surfaces</h2>
 <div class="columns">
 <div class="column" style="width:33%;">
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb2-1"><a href=""></a>Debugger</span>
+<p>Debugger</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb2-1"><a href=""></a></span>
 <span id="cb2-2"><a href=""></a>browser()</span>
 <span id="cb2-3"><a href=""></a>Browse[1]&gt; str(x)</span>
 <span id="cb2-4"><a href=""></a>Browse[1]&gt; n</span>
 <span id="cb2-5"><a href=""></a>Browse[1]&gt; where</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </div><div class="column" style="width:33%;">
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb3-1"><a href=""></a>Help and pager</span>
-<span id="cb3-2"><a href=""></a>?lm</span>
-<span id="cb3-3"><a href=""></a>help("predict")</span>
-<span id="cb3-4"><a href=""></a>vignette("...")</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Help</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb3-1"><a href=""></a>?lm</span>
+<span id="cb3-2"><a href=""></a>help("predict")</span>
+<span id="cb3-3"><a href=""></a>vignette("...")</span>
+<span id="cb3-4"><a href=""></a>RShowDoc()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </div><div class="column" style="width:33%;">
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb4-1"><a href=""></a>Plots</span>
+<p>Plots</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb4-1"><a href=""></a></span>
 <span id="cb4-2"><a href=""></a>plot(fit)</span>
 <span id="cb4-3"><a href=""></a>ggplot(df, aes(...))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </div></div>

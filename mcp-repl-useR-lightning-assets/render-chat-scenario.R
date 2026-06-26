@@ -11,13 +11,19 @@ file_arg <- grep("^--file=", commandArgs(FALSE), value = TRUE)
 stopifnot(length(file_arg) == 1)
 asset_dir <- dirname(normalizePath(sub("^--file=", "", file_arg)))
 
-bash_call <- function(id, command) {
-  stopifnot(length(id) == 1, length(command) == 1)
+tool_call <- function(id, call) {
+  stopifnot(
+    length(id) == 1,
+    is.list(call),
+    length(call$name) == 1,
+    is.list(call$arguments),
+    length(call$intent) == 1
+  )
 
   request <- ContentToolRequest(
     id = id,
-    name = "bash",
-    arguments = list(command = command)
+    name = call$name,
+    arguments = call$arguments
   )
   card <- contents_shinychat(
     ContentToolResult(
@@ -25,14 +31,33 @@ bash_call <- function(id, command) {
       request = request
     )
   )
-  card$intent <- command
+  card$intent <- call$intent
   card$expanded <- TRUE
   card$show_request <- TRUE
   as.tags(card)
 }
 
+bash_command <- function(command) {
+  stopifnot(length(command) == 1)
+  list(name = "bash", arguments = list(command = command), intent = command)
+}
+
+edit_file_command <- function(path, instruction) {
+  stopifnot(length(path) == 1, length(instruction) == 1)
+  list(
+    name = "edit_file",
+    arguments = list(path = path, instruction = instruction),
+    intent = paste(path, instruction, sep = "\n")
+  )
+}
+
 render_chat <- function(filename, assistant_text, commands) {
-  stopifnot(length(filename) == 1, length(assistant_text) == 1, length(commands) >= 1)
+  stopifnot(
+    length(filename) == 1,
+    length(assistant_text) == 1,
+    is.list(commands),
+    length(commands) >= 1
+  )
 
   messages <- list(
     list(
@@ -46,7 +71,7 @@ render_chat <- function(filename, assistant_text, commands) {
         c(
           list(tags$p(assistant_text)),
           mapply(
-            function(id, command) bash_call(id, command),
+            function(id, call) tool_call(id, call),
             paste0("call_", seq_along(commands)),
             commands,
             SIMPLIFY = FALSE
@@ -75,8 +100,8 @@ render_chat <- function(filename, assistant_text, commands) {
         padding: 24px;
       }
       .chat-card {
-        width: 850px;
-        height: 610px;
+        width: 780px;
+        height: 640px;
         background: #f7f8fb;
         border: 1px solid #dce2ec;
         border-radius: 8px;
@@ -93,7 +118,7 @@ render_chat <- function(filename, assistant_text, commands) {
         --bs-primary-rgb: 49, 92, 246;
         --bs-code-color: #173a9d;
         --shiny-chat-user-message-bg: #315cf6;
-        height: 560px;
+        height: 590px;
         color: #172033;
       }
       .chat-card .shiny-chat-user-message {
@@ -131,7 +156,7 @@ render_chat <- function(filename, assistant_text, commands) {
           messages = messages,
           placeholder = "Ask about the R project...",
           width = "100%",
-          height = "560px",
+          height = "590px",
           fill = FALSE
         )
       )
@@ -143,8 +168,8 @@ render_chat <- function(filename, assistant_text, commands) {
   appshot(
     shinyApp(ui, server),
     file = file.path(asset_dir, filename),
-    vwidth = 960,
-    vheight = 700,
+    vwidth = 900,
+    vheight = 740,
     selector = ".chat-card",
     expand = 4,
     delay = 1
@@ -175,31 +200,38 @@ heredoc_command <- paste(
 render_chat(
   "chat-rscript-e.png",
   "I'll inspect the data first, so I'll send R a quick one-off command.",
-  inline_command
+  list(bash_command(inline_command))
 )
 
 render_chat(
   "chat-heredoc-script.png",
   "That inline command is getting long, so I'll write a temporary script.",
-  heredoc_command
+  list(bash_command(heredoc_command))
 )
 
 render_chat(
   "chat-rerun-loop.png",
   "Now I'll iterate: change the file, run it, inspect the result, repeat.",
-  c(
-    "Rscript /tmp/analysis.R",
-    "Rscript /tmp/analysis.R",
-    "Rscript /tmp/analysis.R"
+  list(
+    bash_command("Rscript /tmp/analysis.R"),
+    edit_file_command(
+      "/tmp/analysis.R",
+      "Add model diagnostics."
+    ),
+    bash_command("Rscript /tmp/analysis.R")
   )
 )
 
 render_chat(
   "chat-scenario.png",
   "I'll inspect the data, clean it up, and make a plot.",
-  c(
-    "Rscript -e \"...\"",
-    "Rscript /tmp/analysis.R",
-    "Rscript /tmp/analysis.R"
+  list(
+    bash_command("Rscript -e \"...\""),
+    bash_command("Rscript /tmp/analysis.R"),
+    edit_file_command(
+      "/tmp/analysis.R",
+      "Refine cleaning; add diagnostics."
+    ),
+    bash_command("Rscript /tmp/analysis.R")
   )
 )
