@@ -61,7 +61,7 @@ impl WorkerManager {
         } = if timed_out_elapsed.is_some() {
             self.drain_formatted_output()
         } else {
-            self.drain_final_formatted_output()
+            self.drain_completed_formatted_output(session_end)
         };
         let is_error = saw_stderr;
 
