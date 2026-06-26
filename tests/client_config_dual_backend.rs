@@ -327,6 +327,59 @@ command = "/usr/local/bin/notes"
 }
 
 #[test]
+fn install_codex_target_merges_inline_features_table() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    std::fs::write(
+        codex_home.join("config.toml"),
+        r#"features = { code_mode = false, use_linux_sandbox_bwrap = false }
+
+[mcp_servers.r]
+command = "/usr/local/bin/old-mcp-repl"
+"#,
+    )?;
+    let exe = resolve_exe()?;
+
+    assert_command_success(
+        Command::new(&exe)
+            .arg("install")
+            .arg("--client")
+            .arg("codex")
+            .arg("--interpreter")
+            .arg("r")
+            .env("CODEX_HOME", &codex_home),
+    )?;
+
+    let text = std::fs::read_to_string(codex_home.join("config.toml"))?;
+    let doc = text.parse::<DocumentMut>()?;
+    assert_eq!(
+        doc["features"]["code_mode"]["enabled"].as_bool(),
+        Some(false),
+        "expected existing inline features.code_mode boolean to move to enabled"
+    );
+    assert_eq!(
+        doc["features"]["use_linux_sandbox_bwrap"].as_bool(),
+        Some(false),
+        "expected unrelated inline features to remain"
+    );
+    let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
+        .as_array()
+        .expect("expected direct-only namespaces")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("expected direct-only namespace string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(direct_only, vec!["mcp__r".to_string()]);
+
+    Ok(())
+}
+
+#[test]
 fn install_codex_target_preserves_existing_direct_only_namespaces() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");

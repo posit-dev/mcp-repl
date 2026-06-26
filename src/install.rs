@@ -479,6 +479,16 @@ fn normalize_codex_code_mode_item(doc: &mut DocumentMut) -> Result<(), Box<dyn s
     if doc.get("features").is_none() {
         doc["features"] = Item::Table(Table::new());
     }
+    let inline_features = doc["features"].as_inline_table().map(|inline| {
+        let mut table = Table::new();
+        for (key, value) in inline.iter() {
+            table.insert(key, Item::Value(value.clone()));
+        }
+        table
+    });
+    if let Some(table) = inline_features {
+        doc["features"] = Item::Table(table);
+    }
     if !doc["features"].is_table() {
         return Err("`features` must be a TOML table".into());
     }
