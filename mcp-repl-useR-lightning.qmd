@@ -76,13 +76,43 @@ edit_file_command <- function(path, instruction) {
   )
 }
 
-render_chat <- function(filename, assistant_text, commands) {
+chat_tool <- function(call) {
+  stopifnot(is.list(call))
+  list(type = "tool", call = call)
+}
+
+chat_note <- function(text) {
+  stopifnot(length(text) == 1)
+  list(type = "note", text = text)
+}
+
+render_chat <- function(filename, assistant_text, steps) {
   stopifnot(
     length(filename) == 1,
     length(assistant_text) == 1,
-    is.list(commands),
-    length(commands) >= 1
+    is.list(steps),
+    length(steps) >= 1
   )
+
+  rendered_steps <- list()
+  tool_index <- 0
+  for (step in steps) {
+    stopifnot(is.list(step), length(step$type) == 1)
+    if (identical(step$type, "tool")) {
+      tool_index <- tool_index + 1
+      rendered_steps <- c(
+        rendered_steps,
+        list(tool_call(paste0("call_", tool_index), step$call))
+      )
+    } else if (identical(step$type, "note")) {
+      rendered_steps <- c(
+        rendered_steps,
+        list(div(class = "reasoning-note", tags$p(step$text)))
+      )
+    } else {
+      stop("unsupported chat step type: ", step$type)
+    }
+  }
 
   messages <- list(
     list(
@@ -95,12 +125,7 @@ render_chat <- function(filename, assistant_text, commands) {
         tagList,
         c(
           list(tags$p(assistant_text)),
-          mapply(
-            function(id, call) tool_call(id, call),
-            paste0("call_", seq_along(commands)),
-            commands,
-            SIMPLIFY = FALSE
-          )
+          rendered_steps
         )
       )
     )
@@ -172,6 +197,16 @@ render_chat <- function(filename, assistant_text, commands) {
         opacity: .9;
         white-space: pre-line;
       }
+      .chat-card .reasoning-note {
+        border-left: 3px solid #aab7cf;
+        color: #425069;
+        margin: .55rem 0;
+        padding: .05rem 0 .05rem .75rem;
+      }
+      .chat-card .reasoning-note p {
+        font-size: .9rem;
+        margin: 0;
+      }
     "
     )),
     div(
@@ -232,30 +267,34 @@ heredoc_command <- paste(
 render_chat(
   "chat-rscript-e.png",
   "I'll inspect the data first, so I'll send R a quick one-off command.",
-  list(bash_command(inline_command))
+  list(chat_tool(bash_command(inline_command)))
 )
 
 render_chat(
   "chat-heredoc-script.png",
-  "That inline command is getting long, so I'll write a temporary script.",
-  list(bash_command(heredoc_command))
+  "I'll inspect the data first, so I'll send R a quick one-off command.",
+  list(
+    chat_tool(bash_command(inline_command)),
+    chat_note("The result gives enough context to take the next step. This is turning into reusable setup, so I should move it into a script."),
+    chat_tool(bash_command(heredoc_command))
+  )
 )
 
 render_chat(
   "chat-rerun-loop.png",
   "Now I'll iterate: change the file, run it, inspect the result, repeat.",
   list(
-    bash_command("Rscript /tmp/analysis.R"),
-    edit_file_command(
+    chat_tool(bash_command("Rscript /tmp/analysis.R")),
+    chat_tool(edit_file_command(
       "/tmp/analysis.R",
       "Add model diagnostics."
-    ),
-    bash_command("Rscript /tmp/analysis.R")
+    )),
+    chat_tool(bash_command("Rscript /tmp/analysis.R"))
   )
 )
 ```
 
-## The first move starts simply
+## A simple request
 
 ::: {.columns}
 ::: {.column width="58%"}
@@ -291,16 +330,16 @@ look at the data.
 ::: {.columns}
 ::: {.column width="58%"}
 ::: {.image-frame}
-<img src="mcp-repl-useR-lightning-assets/chat-heredoc-script.png" alt="A chat interface where the assistant uses a bash tool call named bash to write an R script with a heredoc, then runs it with Rscript.">
+<img src="mcp-repl-useR-lightning-assets/chat-heredoc-script.png" alt="A chat interface where the assistant first uses an inline Rscript bash tool call, then shows a short reasoning summary, then uses another bash tool call to write and run a temporary R script.">
 :::
 :::
 
 ::: {.column width="42%"}
 
 ::: {.big-list}
-- The expression grows.
-- Setup needs to be reused.
-- The next thought needs somewhere to go.
+- First tool call.
+- Reasoning summary.
+- Next tool call.
 :::
 
 :::
@@ -309,11 +348,11 @@ look at the data.
 ::: notes
 Timing: ~0:25.
 
-But a typical analysis has more than one step. The next move is also
-natural: write a temporary script, run it, and read the output. This is
-less brittle than one large shell string, and it gives the agent
-somewhere to put setup, intermediate objects, and the next piece of the
-analysis.
+But a typical analysis has more than one step. This slide keeps the
+first move in view, then shows a high-level reasoning beat, then the
+next tool call. The exact conversation would have more detail, but these
+are the touchstones: the agent reads the result, decides the setup now
+needs somewhere to live, and writes a temporary script.
 :::
 
 ## Then iteration keeps that pattern

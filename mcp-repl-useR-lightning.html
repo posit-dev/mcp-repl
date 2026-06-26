@@ -197,14 +197,14 @@
 
 <section id="title-slide" class="quarto-title-block center">
   <h1 class="title">Agents Need a Real R Session</h1>
-  <p class="subtitle"><code>mcp-repl</code>, and the limits of shell-only R access</p>
+  <p class="subtitle">mcp-repl, and the limits of shell-only R access</p>
 
 <div class="quarto-title-authors">
 </div>
 
 </section>
-<section id="the-first-move-starts-simply" class="slide level2">
-<h2>The first move starts simply</h2>
+<section id="a-simple-request" class="slide level2">
+<h2>A simple request</h2>
 <div class="columns">
 <div class="column" style="width:58%;">
 <div class="image-frame">
@@ -238,20 +238,20 @@
 <div class="columns">
 <div class="column" style="width:58%;">
 <div class="image-frame">
-<p><img src="mcp-repl-useR-lightning-assets/chat-heredoc-script.png" alt="A chat interface where the assistant uses a bash tool call named bash to write an R script with a heredoc, then runs it with Rscript."></p>
+<p><img src="mcp-repl-useR-lightning-assets/chat-heredoc-script.png" alt="A chat interface where the assistant first uses an inline Rscript bash tool call, then shows a short reasoning summary, then uses another bash tool call to write and run a temporary R script."></p>
 </div>
 </div><div class="column" style="width:42%;">
 <div class="big-list">
 <ul>
-<li>The expression grows.</li>
-<li>Setup needs to be reused.</li>
-<li>The next thought needs somewhere to go.</li>
+<li>First tool call.</li>
+<li>Reasoning summary.</li>
+<li>Next tool call.</li>
 </ul>
 </div>
 </div></div>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
-<p>But a typical analysis has more than one step. The next move is also natural: write a temporary script, run it, and read the output. This is less brittle than one large shell string, and it gives the agent somewhere to put setup, intermediate objects, and the next piece of the analysis.</p>
+<p>But a typical analysis has more than one step. This slide keeps the first move in view, then shows a high-level reasoning beat, then the next tool call. The exact conversation would have more detail, but these are the touchstones: the agent reads the result, decides the setup now needs somewhere to live, and writes a temporary script.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
