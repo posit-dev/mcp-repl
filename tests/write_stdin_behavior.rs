@@ -240,7 +240,7 @@ async fn wait_until_empty_poll_discloses_transcript_path(
     session: &mut common::McpTestSession,
     timeout_secs: f64,
 ) -> TestResult<PathBuf> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_text = String::new();
     while Instant::now() < deadline {
         let reply = session.write_stdin_raw_with("", Some(timeout_secs)).await?;
@@ -1506,12 +1506,16 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
 async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
-    let tail_gate = tempdir()?;
-    let tail_gate_path = tail_gate.path().join("tail-ready");
-    let tail_gate_literal = serde_json::to_string(&tail_gate_path.to_string_lossy())?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("start-ready");
+    let mid_ready_path = temp.path().join("mid-ready");
+    let tail_gate_path = temp.path().join("tail-ready");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let mid_ready_literal = r_path_literal(&mid_ready_path)?;
+    let tail_gate_literal = r_path_literal(&tail_gate_path)?;
 
     let input = format!(
-        "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.1); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); while (!file.exists({tail_gate_literal})) Sys.sleep(0.05); cat('tail\\n')"
+        "big <- paste(rep('y', 120), collapse = ''); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('start\\n'); flush.console(); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); writeLines('ready', {mid_ready_literal}); while (!file.exists({tail_gate_literal})) Sys.sleep(0.01); cat('tail\\n')"
     );
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let first_text = result_text(&first);
@@ -1520,7 +1524,13 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial gated request to time out, got: {first_text:?}"
+    );
 
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&mid_ready_path, "mid output marker").await?;
     let transcript_path =
         wait_until_empty_poll_discloses_transcript_path(&mut session, 0.1).await?;
     let spilled_before_delete =
@@ -1703,8 +1713,15 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
 async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
+    let temp = workspace_tempdir()?;
+    let start_gate_path = temp.path().join("start-ready");
+    let mid_ready_path = temp.path().join("mid-ready");
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let mid_ready_literal = r_path_literal(&mid_ready_path)?;
 
-    let input = "big <- paste(rep('q', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.1); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(30); cat('tail\\n')";
+    let input = format!(
+        "big <- paste(rep('q', 120), collapse = ''); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('start\\n'); flush.console(); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); writeLines('ready', {mid_ready_literal}); Sys.sleep(30); cat('tail\\n')"
+    );
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -1712,7 +1729,13 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected the initial gated request to time out, got: {first_text:?}"
+    );
 
+    fs::write(&start_gate_path, b"ready")?;
+    wait_until_path_exists(&mid_ready_path, "mid output marker").await?;
     let transcript_path =
         wait_until_empty_poll_discloses_transcript_path(&mut session, 0.1).await?;
     let transcript_before = fs::read_to_string(&transcript_path)?;
