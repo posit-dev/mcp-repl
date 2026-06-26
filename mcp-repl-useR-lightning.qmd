@@ -527,30 +527,30 @@ text(
 )
 
 agent_open <- agent_arrow$shaft_length + 2 * agent_arrow$edge_gap
-agent_harness <- c(25, 31)
+agent_node <- c(25, 31)
 agent_human <- c(
-  agent_harness[1] - (agent_open / x_unit + person_radius + 7),
+  agent_node[1] - (agent_open / x_unit + person_radius + 7),
   31
 )
-agent_repl <- c(agent_harness[1] + agent_open / x_unit + 7 + 5, 31)
+agent_repl <- c(agent_node[1] + agent_open / x_unit + 7 + 5, 31)
 draw_arrow_between(
   agent_human,
-  agent_harness,
+  agent_node,
   blue_muted,
-  start_gap = circle_edge_gap(agent_human, agent_harness, person_radius),
-  end_gap = box_edge_gap(agent_harness, agent_human, 7, 4.5),
+  start_gap = circle_edge_gap(agent_human, agent_node, person_radius),
+  end_gap = box_edge_gap(agent_node, agent_human, 7, 4.5),
   arrow = optional_agent_arrow
 )
 draw_arrow_between(
-  agent_harness,
+  agent_node,
   agent_repl,
   blue,
-  start_gap = box_edge_gap(agent_harness, agent_repl, 7, 4.5),
-  end_gap = box_edge_gap(agent_repl, agent_harness, 5, 6.2),
+  start_gap = box_edge_gap(agent_node, agent_repl, 7, 4.5),
+  end_gap = box_edge_gap(agent_repl, agent_node, 5, 6.2),
   arrow = agent_arrow
 )
 draw_person(agent_human[1], agent_human[2], blue_muted)
-draw_box(18, 26.5, 32, 35.5, "LLM harness", blue_fill, blue)
+draw_box(18, 26.5, 32, 35.5, "Agent", blue_fill, blue)
 draw_mcp_repl_box(37, 24.8, 47, 37.2, blue_fill, blue)
 
 ide_open <- ide_arrow$shaft_length + 2 * ide_arrow$edge_gap
@@ -592,7 +592,7 @@ draw_box(
   triangle_right[2] - 4.4,
   triangle_right[1] + 8.2,
   triangle_right[2] + 4.4,
-  "LLM harness",
+  "Assistant",
   green_fill,
   green
 )
@@ -612,8 +612,8 @@ draw_box(
 Timing: ~0:45.
 
 These are different shapes. With `mcp-repl`, a human may trigger or
-review work, but the LLM harness owns the live connection to `mcp-repl`,
-and the session can also run unattended. There is no direct line from a
+review work, but the agent owns the live connection to `mcp-repl`, and
+the session can also run unattended. There is no direct line from a
 human to that R session. It is private runtime owned by the agent. The
 IDE experience is different: the human, the assistant, and the R session
 are connected, so it is designed for interactive, agent-assisted data
@@ -628,7 +628,7 @@ analysis.
 
 - open source
 - agent-owned sessions
-- works with external LLM harnesses
+- works with external agents
 - better than shell-only R access
 :::
 
@@ -646,7 +646,7 @@ analysis.
 Timing: ~0:25.
 
 The closing distinction is that `mcp-repl` is for agents. It is open
-source, and it helps external harnesses use R more effectively than raw
+source, and it helps external agents use R more effectively than raw
 shell commands. Posit AI is the product path for the integrated
 experience: the IDE has the assistant and the R session in the same
 human-in-the-loop environment.
