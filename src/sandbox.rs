@@ -915,6 +915,7 @@ fn env_var_truthy(key: &str) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn env_var_truthy_if_set(key: &str) -> Option<bool> {
     std::env::var(key).ok().map(|value| {
         let trimmed = value.trim();
