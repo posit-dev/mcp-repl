@@ -4124,7 +4124,7 @@ fn expand_linux_unreadable_globs(
     cwd: &Path,
     max_depth: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
-    if patterns.is_empty() || max_depth == Some(0) {
+    if patterns.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -4134,6 +4134,14 @@ fn expand_linux_unreadable_globs(
         if let Some((search_root, glob)) = split_linux_glob_pattern_for_search(pattern, cwd)
             && search_root.is_dir()
         {
+            if search_root == Path::new("/") && !matches!(max_depth, Some(depth) if depth > 0) {
+                return Err(format!(
+                    "unreadable glob pattern {pattern} is rooted at / and requires a positive glob_scan_max_depth"
+                ));
+            }
+            if max_depth == Some(0) {
+                continue;
+            }
             patterns_by_search_root
                 .entry(search_root)
                 .or_default()
@@ -4173,7 +4181,7 @@ fn split_linux_glob_pattern_for_search(pattern: &str, cwd: &Path) -> Option<(Pat
         .char_indices()
         .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']').then_some(index))?;
     let static_prefix = &pattern[..first_glob_index];
-    if static_prefix.is_empty() || static_prefix == "/" {
+    if static_prefix.is_empty() {
         return None;
     }
     let search_root_end = if static_prefix.ends_with('/') {
@@ -5523,6 +5531,41 @@ mod tests {
             "bwrap: Can't mount proc on /newroot/proc: Invalid argument"
         ));
         assert!(!is_proc_mount_failure("bwrap: unrelated failure"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_root_anchored_unreadable_globs_split_under_root() {
+        let cwd = Path::new("/tmp");
+
+        assert_eq!(
+            split_linux_glob_pattern_for_search("/*", cwd),
+            Some((PathBuf::from("/"), "*".to_string()))
+        );
+        assert_eq!(
+            split_linux_glob_pattern_for_search("/**/*.pem", cwd),
+            Some((PathBuf::from("/"), "**/*.pem".to_string()))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_root_anchored_unreadable_globs_without_bounded_scan_fail_closed() {
+        let patterns = vec!["/*".to_string()];
+        let err = expand_linux_unreadable_globs(&patterns, Path::new("/tmp"), None)
+            .expect_err("root-anchored glob without max depth should fail closed");
+        assert!(
+            err.contains("requires a positive glob_scan_max_depth"),
+            "unexpected error: {err}"
+        );
+
+        let patterns = vec!["/**/*.pem".to_string()];
+        let err = expand_linux_unreadable_globs(&patterns, Path::new("/tmp"), Some(0))
+            .expect_err("root-anchored glob with disabled scan should fail closed");
+        assert!(
+            err.contains("requires a positive glob_scan_max_depth"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
