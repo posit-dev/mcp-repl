@@ -294,6 +294,7 @@ REPL makes those behaviors observable and testable.
 ## Two Different Shapes
 
 ```{r}
+#| label: two-session-shapes
 #| echo: false
 #| fig-width: 13.5
 #| fig-height: 6
@@ -303,6 +304,7 @@ bg <- "#191919"
 fg <- "#f6f7fb"
 muted <- "#c8d3dc"
 panel <- "#2f3944"
+code_fill <- "#29323d"
 blue <- "#9ee7ff"
 blue_fill <- "#17212b"
 green <- "#b8f5b0"
@@ -327,6 +329,46 @@ person_radius <- 3.35
 draw_box <- function(x0, y0, x1, y1, label, fill, border, cex = 1.05) {
   rect(x0, y0, x1, y1, col = fill, border = border, lwd = 2.6)
   text((x0 + x1) / 2, (y0 + y1) / 2, label, col = fg, cex = cex, font = 2)
+}
+
+draw_code <- function(x, y, label, cex) {
+  stopifnot(is.character(label), length(label) == 1, cex > 0)
+  width <- strwidth(label, units = "user", cex = cex, font = 2, family = "mono")
+  height <- strheight(label, units = "user", cex = cex, font = 2, family = "mono")
+  rect(
+    x - width / 2 - 0.55,
+    y - height / 2 - 0.42,
+    x + width / 2 + 0.55,
+    y + height / 2 + 0.42,
+    col = code_fill,
+    border = NA
+  )
+  text(x, y, label, col = fg, cex = cex, font = 2, family = "mono")
+}
+
+draw_inline_code_label <- function(x, y, code, suffix, cex = 1.35) {
+  stopifnot(is.character(suffix), length(suffix) == 1)
+  code_width <- strwidth(code, units = "user", cex = cex, font = 2, family = "mono")
+  suffix_width <- strwidth(suffix, units = "user", cex = cex, font = 2)
+  code_outer_width <- code_width + 1.1
+  gap <- 0.12
+  left <- x - (code_outer_width + gap + suffix_width) / 2
+  draw_code(left + code_outer_width / 2, y, code, cex)
+  text(
+    left + code_outer_width + gap,
+    y,
+    suffix,
+    col = fg,
+    cex = cex,
+    font = 2,
+    adj = c(0, 0.5)
+  )
+}
+
+draw_mcp_repl_box <- function(x0, y0, x1, y1, fill, border, cex = 0.95) {
+  rect(x0, y0, x1, y1, col = fill, border = border, lwd = 2.6)
+  draw_code((x0 + x1) / 2, (y0 + y1) / 2 + 1.45, "mcp-repl", cex = cex)
+  text((x0 + x1) / 2, (y0 + y1) / 2 - 2.05, "R session", col = fg, cex = cex, font = 2)
 }
 
 draw_person <- function(x, y, border) {
@@ -432,14 +474,8 @@ ide_arrow <- list(
 )
 
 rect(c(2, 52), 7, c(48, 98), 53, border = panel, col = NA, lwd = 1.8)
-text(
-  c(25, 75),
-  49.5,
-  c("mcp-repl: agent-owned", "IDE assistant: human in the loop"),
-  col = fg,
-  cex = 1.35,
-  font = 2
-)
+draw_inline_code_label(25, 49.5, "mcp-repl", ": agent-owned")
+text(75, 49.5, "Posit Assistant: human in the loop", col = fg, cex = 1.35, font = 2)
 text(
   c(25, 75),
   c(13, 10.7),
@@ -476,7 +512,7 @@ draw_arrow_between(
 )
 draw_person(agent_human[1], agent_human[2], blue)
 draw_box(18, 26.5, 32, 35.5, "LLM harness", blue_fill, blue)
-draw_box(37, 24.8, 47, 37.2, "mcp-repl\nR session", blue_fill, blue, cex = 0.95)
+draw_mcp_repl_box(37, 24.8, 47, 37.2, blue_fill, blue)
 
 ide_open <- ide_arrow$shaft_length + 2 * ide_arrow$edge_gap
 triangle_top_y <- 41.5
@@ -557,7 +593,7 @@ agent-assisted data analysis.
 :::
 
 ::: {.column width="50%"}
-**IDE assistant**
+**Posit Assistant**
 
 - built into the IDE experience
 - human, agent, and R stay connected
@@ -583,8 +619,8 @@ If an agent is going to work in R, it should get a live R session.
 `mcp-repl` is the open source, agent-facing path: persistent,
 interactive, private, and sandboxed.
 
-For interactive work with a human in the loop, use the integrated IDE
-assistant experience.
+For interactive work with a human in the loop, use Posit Assistant in
+the integrated IDE experience.
 
 https://github.com/posit-dev/mcp-repl
 
