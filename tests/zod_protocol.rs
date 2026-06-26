@@ -1246,7 +1246,6 @@ async fn zod_files_completion_settles_split_utf8_tail_before_request_boundary() 
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
@@ -1257,7 +1256,7 @@ async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestRes
         .call_tool_raw(
             "repl",
             json!({
-                "input": "split-utf8-near-grace-then-more-after-completion",
+                "input": "split-utf8-then-more-after-completion",
                 "timeout_ms": 10_000
             }),
         )
@@ -1278,7 +1277,6 @@ async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestRes
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
@@ -1290,7 +1288,7 @@ async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestRe
         .call_tool_raw(
             "repl",
             json!({
-                "input": "split-utf8-near-grace-then-continuous-output-after-completion",
+                "input": "split-utf8-then-continuous-output-after-completion",
                 "timeout_ms": 10_000
             }),
         )

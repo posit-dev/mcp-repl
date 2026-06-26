@@ -14,11 +14,7 @@ const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
 const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
-const OUTPUT_READER_COMPLETION_STABLE: Duration = if cfg!(target_os = "macos") {
-    Duration::from_millis(80)
-} else {
-    Duration::from_millis(15)
-};
+const OUTPUT_READER_COMPLETION_STABLE: Duration = Duration::from_millis(80);
 const OUTPUT_READER_UTF8_TAIL_SETTLE_MAX: Duration = Duration::from_millis(900);
 const OUTPUT_READER_TIMEOUT_SETTLE_MAX: Duration = Duration::from_millis(900);
 
