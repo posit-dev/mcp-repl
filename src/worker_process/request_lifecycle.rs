@@ -19,6 +19,7 @@ const OUTPUT_READER_COMPLETION_STABLE: Duration = if cfg!(target_os = "macos") {
 } else {
     Duration::from_millis(15)
 };
+const OUTPUT_READER_UTF8_TAIL_SETTLE_MAX: Duration = Duration::from_millis(900);
 const OUTPUT_READER_TIMEOUT_SETTLE_MAX: Duration = Duration::from_millis(900);
 
 pub(super) struct RequestState {
@@ -212,11 +213,13 @@ impl WorkerManager {
 
     pub(super) fn settle_output_after_completion(&self, budget: Duration) {
         let total = budget.min(OUTPUT_READER_QUIESCE_GRACE);
-        if total.is_zero() {
+        let utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
+        if total.is_zero() && !utf8_tail_pending {
             return;
         }
         let stable_needed = OUTPUT_READER_COMPLETION_STABLE.min(total);
-        self.settle_output_until_stable(total, stable_needed);
+        let utf8_tail_total = OUTPUT_READER_UTF8_TAIL_SETTLE_MAX;
+        self.settle_output_until_stable(total, stable_needed, utf8_tail_total);
     }
 
     pub(super) fn wait_for_late_files_output_after_settled_completion(&self, budget: Duration) {
@@ -282,7 +285,12 @@ impl WorkerManager {
         )
     }
 
-    fn settle_output_until_stable(&self, total: Duration, stable_needed: Duration) {
+    fn settle_output_until_stable(
+        &self,
+        total: Duration,
+        stable_needed: Duration,
+        utf8_tail_total: Duration,
+    ) {
         if total.is_zero() {
             return;
         }
@@ -298,15 +306,21 @@ impl WorkerManager {
             OversizedOutputMode::Pager => self.output.current_progress_seq(),
         };
         let mut utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
+        let mut saw_utf8_tail_pending = utf8_tail_pending;
         let mut input_echo_ready = !requires_input_echo || self.pending_input_echoes_seen() > 0;
         let mut stable_for = Duration::from_millis(0);
-        while start.elapsed() < total {
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= total && (!saw_utf8_tail_pending || elapsed >= utf8_tail_total) {
+                return;
+            }
             thread::sleep(poll);
             let now = match self.oversized_output {
                 OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
                 OversizedOutputMode::Pager => self.output.current_progress_seq(),
             };
             let now_utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
+            saw_utf8_tail_pending |= now_utf8_tail_pending;
             if !input_echo_ready && self.pending_input_echoes_seen() > 0 {
                 input_echo_ready = true;
                 stable_for = Duration::from_millis(0);
@@ -487,6 +501,43 @@ mod tests {
         assert!(
             !text.contains("\\xC3") && !text.contains("\\xA9"),
             "completion settle should not seal split UTF-8 bytes when continuation arrives within the grace window, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn completion_settle_extends_quiesce_while_utf8_tail_is_pending() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(OUTPUT_READER_QUIESCE_GRACE + Duration::from_millis(80));
+            timeline.append_text(
+                &[0xA9, b'\n'],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(OUTPUT_READER_QUIESCE_GRACE);
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("é\n"),
+            "completion settle should extend past normal quiesce while UTF-8 tail is pending, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completion settle should not seal split UTF-8 bytes before the extended budget expires, got: {text:?}"
         );
     }
 }
