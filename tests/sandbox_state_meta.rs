@@ -212,6 +212,26 @@ fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Val
     codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
 }
 
+#[cfg(target_os = "linux")]
+fn symlink_workspace_write_minimal_read_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                special_entry("minimal", "read"),
+                special_entry("project_roots", "write"),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                protected_project_entry(".git"),
+                protected_project_entry(".agents"),
+                protected_project_entry(".codex"),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
     let mut entries = vec![
@@ -2772,6 +2792,50 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
         "workspace-write unexpectedly blocked write in cwd: {text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_symlinked_workspace_write_meta_allows_write_through_alias()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-symlink-workspace-write")?;
+    let real_workspace = scratch.path().join("real-workspace");
+    let symlink_workspace = scratch.path().join("linked-workspace");
+    fs::create_dir(&real_workspace)?;
+    std::os::unix::fs::symlink(&real_workspace, &symlink_workspace)?;
+
+    let target = symlink_workspace.join("allowed.txt");
+    let session = spawn_inherit_server(&symlink_workspace).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(symlink_workspace_write_minimal_read_meta(
+                &symlink_workspace,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected write through symlinked workspace root to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "symlinked workspace root unexpectedly blocked write: {text}"
+    );
+    session.cancel().await?;
+    assert!(
+        real_workspace.join("allowed.txt").exists(),
+        "write through symlinked root should create the target in the canonical workspace"
+    );
     Ok(())
 }
 

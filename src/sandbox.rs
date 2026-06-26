@@ -3543,9 +3543,21 @@ fn linux_bwrap_filesystem_args(
 
         let symlink_target = linux_canonical_target_if_symlinked_path(root);
         let mount_root = symlink_target.as_deref().unwrap_or(root);
+        if symlink_target.is_some() && !file_system_policy.has_full_disk_read_access() {
+            append_linux_mount_target_parent_dir_args(
+                &mut command.args,
+                mount_root,
+                Path::new("/"),
+            );
+        }
         command.args.push("--bind".to_string());
         command.args.push(linux_path_to_string(mount_root));
         command.args.push(linux_path_to_string(mount_root));
+        if symlink_target.is_some() {
+            command.args.push("--bind".to_string());
+            command.args.push(linux_path_to_string(mount_root));
+            command.args.push(linux_path_to_string(root));
+        }
 
         let mut read_only_subpaths = writable_root
             .read_only_subpaths
