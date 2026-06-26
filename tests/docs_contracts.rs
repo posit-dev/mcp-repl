@@ -381,12 +381,10 @@ fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
         "run: cargo test --quiet",
         "MCP_REPL_CODEX_BACKEND: mock",
         "Release CLI contract",
-        "Detect release CLI contract",
-        "release_cli_contract_available",
-        "steps.release_cli_contract_available.outputs.exists == 'true'",
         "MCP_REPL_RELEASE_BINARY: target/release/mcp-repl",
         "MCP_REPL_RELEASE_BINARY: target/release/mcp-repl.exe",
         "cargo test --test release_cli_contract --quiet",
+        "if: github.event_name == 'push' && github.ref_type == 'tag'",
         "if: github.event_name == 'push' && github.ref_type == 'tag' && needs.checks.result == 'success'",
         "if: needs.checks.result == 'success' && ((github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'workflow_dispatch')",
         "-F draft=false",
@@ -422,6 +420,10 @@ fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
         "steps.release_tag.outputs.latest",
         "manylinux: auto",
         "matrix.manylinux",
+        "Detect Python public API suite",
+        "python_public_api_suite_available",
+        "Detect release CLI contract",
+        "release_cli_contract_available",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -500,13 +502,19 @@ fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
         "tags that predate PyPI packaging",
         "current `pyproject.toml` packaging metadata only",
         "compiled source still comes from the immutable tag",
-        "Checks run from the tag's source tree",
-        "checks added after that tag run only when their test files exist",
+        "does not rerun historical validation checks",
+        "already passed when the tag was created",
+        "builds and smoke-tests the release binary and PyPI wheels",
         "does not create or update the GitHub release",
         "version already exists on PyPI",
     ] {
         assert_contains_wrapped_text(&docs, required, "docs/releasing.md");
     }
+
+    assert!(
+        !normalized_whitespace(&docs).contains("runs the normal release matrix"),
+        "manual PyPI backfill docs should not imply historical tags rerun the current validation matrix"
+    );
 }
 
 #[test]

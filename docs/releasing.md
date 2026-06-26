@@ -38,11 +38,12 @@ must be published before the next scheduled release tag.
 
 The manual dispatch checks out that tag, validates that the tag is final semver
 or PyPI-compatible prerelease semver, validates that it matches `Cargo.toml`,
-runs the normal release matrix, builds and smoke-tests the wheels, and then runs
-only `publish-pypi`. For tags that predate PyPI packaging, the dispatch overlays
-the current `pyproject.toml` packaging metadata only; the compiled source still
-comes from the immutable tag. Checks run from the tag's source tree, so checks
-added after that tag run only when their test files exist in the tag.
+builds and smoke-tests the release binary and PyPI wheels, and then runs only
+`publish-pypi`. It does not rerun historical validation checks; this path assumes
+that the checks required at the time already passed when the tag was created.
+For tags that predate PyPI packaging, the dispatch overlays the current
+`pyproject.toml` packaging metadata only; the compiled source still comes from
+the immutable tag.
 
 The manual dispatch does not create or update the GitHub release, move tags,
 publish a dev version, repair old GitHub Release assets, or upload an sdist. If
