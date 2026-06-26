@@ -236,6 +236,28 @@ async fn wait_until_busy_follow_up_discloses_transcript_path(
     )
 }
 
+async fn wait_until_empty_poll_discloses_transcript_path(
+    session: &mut common::McpTestSession,
+    timeout_secs: f64,
+) -> TestResult<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_text = String::new();
+    while Instant::now() < deadline {
+        let reply = session.write_stdin_raw_with("", Some(timeout_secs)).await?;
+        let text = result_text(&reply);
+        if let Some(path) = bundle_transcript_path(&text) {
+            return Ok(path);
+        }
+        if !text.contains("<<repl status: busy") {
+            return Err(format!("expected transcript path in poll reply, got: {text:?}").into());
+        }
+        last_text = text;
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    Err(format!("empty poll never disclosed a transcript path: {last_text:?}").into())
+}
+
 async fn retry_input_until_output_contains(
     session: &mut common::McpTestSession,
     input: &str,
@@ -262,22 +284,6 @@ const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
 const OVER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS + 200;
-
-fn test_timeout_secs(default_secs: f64, windows_secs: f64) -> f64 {
-    if cfg!(windows) {
-        windows_secs
-    } else {
-        default_secs
-    }
-}
-
-fn test_delay_ms(default_ms: u64, windows_ms: u64) -> Duration {
-    Duration::from_millis(if cfg!(windows) {
-        windows_ms
-    } else {
-        default_ms
-    })
-}
 
 fn output_bundle_temp_env_vars(path: &std::path::Path) -> Vec<(String, String)> {
     let value = path.display().to_string();
@@ -308,9 +314,8 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_behavior_session().await?;
 
-    let busy_sleep_secs = if cfg!(windows) { 2.0 } else { 0.75 };
     let _ = session
-        .write_stdin_raw_with(format!("Sys.sleep({busy_sleep_secs})"), Some(0.1))
+        .write_stdin_raw_with("Sys.sleep(2)", Some(0.1))
         .await?;
 
     let result = session.write_stdin_raw_with("1+1", Some(0.2)).await?;
@@ -1158,9 +1163,7 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
     let input = format!(
         "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); Sys.sleep(0.5); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n')"
     );
-    let first = session
-        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.05, 0.2)))
-        .await?;
+    let first = session.write_stdin_raw_with(&input, Some(0.2)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
@@ -1211,7 +1214,7 @@ async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold()
         "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); writeLines('done', {done_literal})"
     );
     let first = session
-        .write_stdin_raw_with(&first_input, Some(test_timeout_secs(0.05, 0.2)))
+        .write_stdin_raw_with(&first_input, Some(0.2))
         .await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
@@ -1518,20 +1521,8 @@ async fn timeout_spill_recreates_deleted_transcript_without_replaying_old_text()
         return Ok(());
     }
 
-    sleep(test_delay_ms(160, 260)).await;
-    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
-    let spilled_text = result_text(&spilled);
-    let transcript_path = match bundle_transcript_path(&spilled_text) {
-        Some(path) => path,
-        None if spilled_text.contains("<<repl status: busy") => {
-            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
-        None => {
-            panic!("expected transcript path in first oversized poll reply, got: {spilled_text:?}")
-        }
-    };
+    let transcript_path =
+        wait_until_empty_poll_discloses_transcript_path(&mut session, 0.1).await?;
     let spilled_before_delete =
         wait_until_file_contains_via_polls(&mut session, &transcript_path, "mid080").await?;
     assert!(
@@ -1711,7 +1702,7 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let session = spawn_behavior_session().await?;
+    let mut session = spawn_behavior_session().await?;
 
     let input = "big <- paste(rep('q', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.1); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(30); cat('tail\\n')";
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
@@ -1722,20 +1713,8 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
         return Ok(());
     }
 
-    sleep(test_delay_ms(160, 260)).await;
-    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
-    let spilled_text = result_text(&spilled);
-    let transcript_path = match bundle_transcript_path(&spilled_text) {
-        Some(path) => path,
-        None if spilled_text.contains("<<repl status: busy") => {
-            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
-        None => {
-            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
-        }
-    };
+    let transcript_path =
+        wait_until_empty_poll_discloses_transcript_path(&mut session, 0.1).await?;
     let transcript_before = fs::read_to_string(&transcript_path)?;
 
     let restart = session
@@ -1748,7 +1727,12 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
         return Ok(());
     }
 
-    sleep(Duration::from_millis(100)).await;
+    let follow_up = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected restarted worker to accept a follow-up before checking the old bundle, got: {follow_up_text:?}"
+    );
     let transcript_after = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;
@@ -1774,8 +1758,11 @@ async fn ctrl_c_follow_up_keeps_detached_tail_out_of_fresh_reply_bundle() -> Tes
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
+    let temp = workspace_tempdir()?;
+    let sleep_ready_path = temp.path().join("sleep-ready");
+    let sleep_ready_literal = r_path_literal(&sleep_ready_path)?;
     let input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); detached <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); tryCatch({{ Sys.sleep(30) }}, interrupt = function(e) {{ cat('DETACHED_START\\n'); cat(detached); cat('\\nDETACHED_END\\n'); flush.console() }})"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); detached <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); writeLines('ready', {sleep_ready_literal}); tryCatch({{ Sys.sleep(30) }}, interrupt = function(e) {{ cat('DETACHED_START\\n'); cat(detached); cat('\\nDETACHED_END\\n'); flush.console() }})"
     );
     let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
     let first_text = result_text(&first);
@@ -1789,7 +1776,7 @@ async fn ctrl_c_follow_up_keeps_detached_tail_out_of_fresh_reply_bundle() -> Tes
         "did not expect timeout bundle disclosure before the ctrl-c follow-up, got: {first_text:?}"
     );
 
-    sleep(test_delay_ms(160, 700)).await;
+    wait_until_path_exists(&sleep_ready_path, "interrupt sleep marker").await?;
     let follow_up = session
         .write_stdin_raw_with("\u{3}cat('NEW_TURN\\n')", Some(10.0))
         .await?;
@@ -1841,9 +1828,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> Test
     let input = format!(
         "gate <- {gate_literal}; big <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); while (!file.exists(gate)) Sys.sleep(0.05); cat('TAIL\\n')"
     );
-    let first = session
-        .write_stdin_raw_with(&input, Some(test_timeout_secs(1.0, 2.0)))
-        .await?;
+    let first = session.write_stdin_raw_with(&input, Some(2.0)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
@@ -1873,78 +1858,6 @@ async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> Test
     assert!(
         transcript.contains("TAIL"),
         "expected the disclosed timeout bundle to keep receiving later worker output after a busy follow-up, got: {transcript:?}"
-    );
-    assert!(
-        bundle_transcript_path(&final_text).is_none(),
-        "did not expect the settled poll to switch to a different transcript path, got: {final_text:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() -> TestResult<()> {
-    let _guard = lock_test_mutex();
-    let session = spawn_behavior_session().await?;
-
-    let tail_sleep_secs = if cfg!(windows) { 1.5 } else { 0.9 };
-    let input = format!(
-        "big <- paste(rep('i', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep({tail_sleep_secs}); cat('TAIL\\n')"
-    );
-    let first = session
-        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.05, 0.2)))
-        .await?;
-    let first_text = result_text(&first);
-    if backend_unavailable(&first_text) {
-        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
-    sleep(test_delay_ms(160, 700)).await;
-    let spilled = session
-        .write_stdin_raw_with("", Some(test_timeout_secs(0.1, 0.3)))
-        .await?;
-    let spilled_text = result_text(&spilled);
-    let transcript_path = match bundle_transcript_path(&spilled_text) {
-        Some(path) => path,
-        None if spilled_text.contains("<<repl status: busy") => {
-            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
-        None => {
-            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
-        }
-    };
-
-    sleep(test_delay_ms(180, 600)).await;
-    let busy_follow_up = session
-        .write_stdin_raw_with("1+1", Some(test_timeout_secs(0.05, 0.2)))
-        .await?;
-    let busy_text = result_text(&busy_follow_up);
-    if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<repl status: busy")
-    {
-        eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
-    let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
-    let final_text = result_text(&final_poll);
-    if final_text.contains("<<repl status: busy") {
-        eprintln!("write_stdin_behavior final poll remained busy; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    let transcript = fs::read_to_string(&transcript_path)?;
-
-    session.cancel().await?;
-
-    assert!(
-        transcript.contains("TAIL"),
-        "expected the disclosed timeout bundle to keep receiving later worker output after a silent busy follow-up, got: {transcript:?}"
     );
     assert!(
         bundle_transcript_path(&final_text).is_none(),
@@ -2083,7 +1996,7 @@ async fn pager_follow_up_after_resolved_timeout_skips_leading_detached_input_ech
 async fn pager_hidden_only_detached_echo_does_not_consume_follow_up_page_budget() -> TestResult<()>
 {
     let _guard = lock_test_mutex();
-    let session = spawn_pager_behavior_session(80).await?;
+    let mut session = spawn_pager_behavior_session(80).await?;
     let temp = workspace_tempdir()?;
     let start_gate_path = temp.path().join("hidden-prefix-start-ready");
     let done_path = temp.path().join("hidden-prefix-done");
@@ -2111,12 +2024,13 @@ async fn pager_hidden_only_detached_echo_does_not_consume_follow_up_page_budget(
 
     fs::write(&start_gate_path, b"ready")?;
     wait_until_path_exists(&done_path, "pager hidden-prefix output marker").await?;
-    sleep(Duration::from_millis(100)).await;
-
-    let follow_up = session
-        .write_stdin_raw_with("cat('FRESH_VISIBLE\\n')", Some(2.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = retry_input_until_output_contains(
+        &mut session,
+        "cat('FRESH_VISIBLE\\n')",
+        "FRESH_VISIBLE",
+        "pager hidden-prefix follow-up",
+    )
+    .await?;
 
     session.cancel().await?;
 

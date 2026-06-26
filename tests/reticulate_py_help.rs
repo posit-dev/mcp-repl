@@ -6,10 +6,8 @@ use std::process::Command;
 use std::time::Duration;
 
 const REPL_STARTUP_TIMEOUT_SECS: f64 = 30.0;
-const DEFAULT_RETICULATE_INIT_TIMEOUT_SECS: f64 = 30.0;
-const WINDOWS_RETICULATE_INIT_TIMEOUT_SECS: f64 = 30.0;
-const DEFAULT_PY_HELP_TIMEOUT_SECS: f64 = 5.0;
-const WINDOWS_PY_HELP_TIMEOUT_SECS: f64 = 30.0;
+const RETICULATE_INIT_TIMEOUT_SECS: f64 = 30.0;
+const PY_HELP_TIMEOUT_SECS: f64 = 5.0;
 const RETICULATE_READY_MARKER: &str = "[repl] reticulate python ready";
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -35,22 +33,6 @@ fn assert_not_busy(label: &str, text: &str) -> TestResult<()> {
         return Err(format!("{label} exceeded its timeout budget: {text:?}").into());
     }
     Ok(())
-}
-
-fn reticulate_init_timeout_secs() -> f64 {
-    if cfg!(windows) {
-        WINDOWS_RETICULATE_INIT_TIMEOUT_SECS
-    } else {
-        DEFAULT_RETICULATE_INIT_TIMEOUT_SECS
-    }
-}
-
-fn py_help_timeout_secs() -> f64 {
-    if cfg!(windows) {
-        WINDOWS_PY_HELP_TIMEOUT_SECS
-    } else {
-        DEFAULT_PY_HELP_TIMEOUT_SECS
-    }
 }
 
 fn reticulate_env_vars() -> Vec<(String, String)> {
@@ -125,7 +107,7 @@ async fn reticulate_py_help_is_rendered() -> TestResult<()> {
   }
 }
 "#,
-            Some(reticulate_init_timeout_secs()),
+            Some(RETICULATE_INIT_TIMEOUT_SECS),
         )
         .await?;
     let setup = match common::wait_until_not_busy(
@@ -160,7 +142,7 @@ async fn reticulate_py_help_is_rendered() -> TestResult<()> {
     let result = session
         .write_stdin_raw_with(
             "reticulate::py_help(.mcp_repl_reticulate_builtins$len); invisible(NULL)",
-            Some(py_help_timeout_secs()),
+            Some(PY_HELP_TIMEOUT_SECS),
         )
         .await?;
     let result = match common::wait_until_not_busy(
