@@ -217,7 +217,11 @@ impl WorkerManager {
         if total.is_zero() && !utf8_tail_pending {
             return;
         }
-        let stable_needed = OUTPUT_READER_COMPLETION_STABLE.min(total);
+        let stable_needed = if total.is_zero() && utf8_tail_pending {
+            OUTPUT_READER_COMPLETION_STABLE
+        } else {
+            OUTPUT_READER_COMPLETION_STABLE.min(total)
+        };
         let utf8_tail_total = OUTPUT_READER_UTF8_TAIL_SETTLE_MAX;
         self.settle_output_until_stable(total, stable_needed, utf8_tail_total);
     }
@@ -568,6 +572,49 @@ mod tests {
         assert!(
             text.contains("é\n"),
             "completion settle should use UTF-8 tail grace even with no regular budget, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completion settle should not seal split UTF-8 bytes when continuation arrives within the tail grace, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn completion_settle_keeps_stability_window_after_zero_budget_utf8_recovery() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            timeline.append_text(
+                &[0xA9],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+            thread::sleep(Duration::from_millis(10));
+            timeline.append_text(
+                b" after\n",
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(Duration::ZERO);
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("é after\n"),
+            "completion settle should keep a stability window after UTF-8 recovery, got: {text:?}"
         );
         assert!(
             !text.contains("\\xC3") && !text.contains("\\xA9"),
