@@ -977,6 +977,88 @@ async fn plot_size_option_changes_apply_to_next_managed_page() -> TestResult<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn plot_size_option_changes_wait_for_next_multi_panel_page() -> TestResult<()> {
+    let session = spawn_server_with_files().await?;
+
+    let input = r#"options(console.plot.width = 4, console.plot.height = 3, console.plot.asp = NULL, console.plot.units = "in", console.plot.dpi = 100); par(mfrow = c(1, 2)); plot(1:10); first <- dev.size("in"); options(console.plot.width = 6, console.plot.height = 2, console.plot.dpi = 100); plot(10:1); second <- dev.size("in"); cat(sprintf("mcp-repl-multipanel-size %.1f %.1f %.1f %.1f\n", first[[1]], first[[2]], second[[1]], second[[2]]))"#;
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "multi-panel size change plot reported an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("mcp-repl-multipanel-size 4.0 3.0 4.0 3.0"),
+        "expected changed console.plot options to wait for the next multi-panel page: {}",
+        result_text(&result)
+    );
+    let images = extract_images(&result);
+    assert_eq!(
+        images.len(),
+        1,
+        "expected multi-panel page to remain one emitted image"
+    );
+    let (width, height) =
+        png_dimensions(&images[0].bytes).expect("multi-panel plot did not return a valid png");
+    assert_eq!(
+        (width, height),
+        (400, 300),
+        "expected active multi-panel page to keep its original size"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plot_size_option_changes_preserve_par_on_reopened_managed_device() -> TestResult<()> {
+    let session = spawn_server_with_files().await?;
+
+    let input = r#"options(console.plot.width = 4, console.plot.height = 3, console.plot.asp = NULL, console.plot.units = "in", console.plot.dpi = 100); par(mfrow = c(1, 2), mar = c(2, 3, 4, 1)); plot(1:10); plot(10:1); options(console.plot.width = 6, console.plot.height = 2, console.plot.dpi = 100); plot(1:10); state <- c(par("mfrow"), par("mar"), par("mfg"), dev.size("in")); plot(10:1); cat(sprintf("mcp-repl-reopened-par mfrow=%d,%d mar=%.1f,%.1f,%.1f,%.1f mfg=%d,%d,%d,%d size=%.1f,%.1f\n", state[[1]], state[[2]], state[[3]], state[[4]], state[[5]], state[[6]], state[[7]], state[[8]], state[[9]], state[[10]], state[[11]], state[[12]]))"#;
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "reopened managed device par plot reported an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains(
+            "mcp-repl-reopened-par mfrow=1,2 mar=2.0,3.0,4.0,1.0 mfg=1,1,1,2 size=6.0,2.0"
+        ),
+        "expected reopened managed device to preserve par settings: {}",
+        result_text(&result)
+    );
+    let images = extract_images(&result);
+    assert_eq!(
+        images.len(),
+        2,
+        "expected one image before and one image after managed device resize"
+    );
+    let (width, height) = png_dimensions(&images[1].bytes)
+        .expect("resized multi-panel plot did not return a valid png");
+    assert_eq!(
+        (width, height),
+        (600, 200),
+        "expected reopened managed page to use updated size"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn plot_size_changes_do_not_resize_user_opened_device() -> TestResult<()> {
     let session = spawn_server_with_files().await?;
 

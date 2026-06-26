@@ -838,6 +838,7 @@ local({
     }
 
     old_dev <- grDevices::dev.cur()
+    old_par <- tryCatch(graphics::par(no.readonly = TRUE), error = function(e) NULL)
     st$managed_device <- NULL
     st$managed_path <- NULL
     st$managed_spec <- NULL
@@ -850,6 +851,9 @@ local({
     }
 
     .mcp_repl_plot_device()
+    if (is.list(old_par)) {
+      try(graphics::par(old_par), silent = TRUE)
+    }
     TRUE
   }
 
@@ -871,7 +875,7 @@ local({
       .mcp_repl_plot_process_changes(reason)
     }
 
-    reopened <- .mcp_repl_plot_reopen_managed_device_if_needed()
+    reopened <- is_new_page && .mcp_repl_plot_reopen_managed_device_if_needed()
 
     if (is_new_page || isTRUE(reopened)) {
       st$current_id <- .mcp_repl_new_plot_id()
