@@ -4477,15 +4477,39 @@ fn linux_apply_sandbox_policy_to_current_thread(
                     .to_string(),
             );
         }
-        let writable_roots = file_system_policy
-            .get_writable_roots_with_cwd(cwd, Some(session_temp_dir))
-            .into_iter()
-            .map(|root| root.root)
-            .collect();
+        let writable_roots =
+            linux_landlock_writable_root_paths(&file_system_policy, cwd, session_temp_dir)?;
         linux_install_filesystem_landlock_rules_on_current_thread(writable_roots)?;
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_writable_root_paths(
+    file_system_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+    session_temp_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let writable_roots =
+        file_system_policy.get_writable_roots_with_cwd(cwd, Some(session_temp_dir));
+    for writable_root in &writable_roots {
+        if matches!(
+            sandbox_path_relation(&writable_root.root, session_temp_dir),
+            Some(SandboxPathRelation::Same)
+        ) {
+            continue;
+        }
+        if !writable_root.read_only_subpaths.is_empty()
+            || !writable_root.protected_metadata_names.is_empty()
+        {
+            return Err(format!(
+                "read-only carveouts inside writable root {} are not supported by the legacy Linux Landlock filesystem backend",
+                writable_root.root.display()
+            ));
+        }
+    }
+    Ok(writable_roots.into_iter().map(|root| root.root).collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -5668,6 +5692,62 @@ mod tests {
             err.contains("cannot enforce sandbox deny-read glob"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_landlock_writable_roots_with_carveouts_fail_closed() {
+        let writable_root = PathBuf::from("/tmp/mcp-repl-landlock-writable");
+        let session_temp_dir = PathBuf::from("/tmp/mcp-repl-landlock-session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: writable_root.clone(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let err = linux_landlock_writable_root_paths(
+            &file_system_policy,
+            &writable_root,
+            &session_temp_dir,
+        )
+        .expect_err("legacy Landlock should reject writable roots with protected carveouts");
+
+        assert!(
+            err.contains("read-only carveouts inside writable root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&writable_root.display().to_string()),
+            "error should identify the widened writable root: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_landlock_allows_internal_session_temp_writable_root() {
+        let cwd = PathBuf::from("/tmp/mcp-repl-landlock-workspace");
+        let session_temp_dir = PathBuf::from("/tmp/mcp-repl-landlock-session");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            &session_temp_dir,
+        );
+
+        let writable_roots =
+            linux_landlock_writable_root_paths(&file_system_policy, &cwd, &session_temp_dir)
+                .expect("session temp writable root should not make legacy Landlock fail closed");
+
+        assert_eq!(writable_roots, vec![session_temp_dir]);
     }
 
     #[cfg(target_os = "linux")]

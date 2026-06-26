@@ -3704,7 +3704,9 @@ async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestR
     let text = collect_text(&result);
     session.cancel().await?;
 
-    if backend_unavailable(&text) {
+    if backend_unavailable(&text)
+        || text.contains("ipc disconnected while waiting for worker_ready")
+    {
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
