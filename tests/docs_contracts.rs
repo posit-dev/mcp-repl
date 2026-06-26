@@ -321,7 +321,7 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
 }
 
 #[test]
-fn release_workflow_defines_tag_only_publishing_contract() {
+fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
     let workflow = read(&repo_root().join(".github/workflows/release.yml"));
 
     for required in [
@@ -329,11 +329,20 @@ fn release_workflow_defines_tag_only_publishing_contract() {
         "tags:",
         "- 'v*.*.*'",
         "- '!v*\\+*'",
+        "workflow_dispatch:",
+        "pypi_backfill_tag:",
+        "Manual PyPI backfill tag",
         "publish-release:",
         "publish-pypi:",
-        "github.ref_type == 'tag'",
+        "if: (github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'workflow_dispatch'",
+        "RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.pypi_backfill_tag || github.ref_name }}",
+        "ref: ${{ env.RELEASE_TAG }}",
         "fetch-depth: 0",
+        "Prepare manual PyPI backfill metadata",
+        "${GITHUB_SHA}:pyproject.toml",
+        "target tag does not contain pyproject.toml",
         "Validate release tag matches Cargo version",
+        "git rev-parse \"refs/tags/${RELEASE_TAG}\" >/dev/null",
         "^v[0-9]+(\\.[0-9]+){2}(-(a|b|rc)[0-9]+)?$",
         "Decide whether this tag should be latest",
         "id: latest_guard",
@@ -372,9 +381,14 @@ fn release_workflow_defines_tag_only_publishing_contract() {
         "run: cargo test --quiet",
         "MCP_REPL_CODEX_BACKEND: mock",
         "Release CLI contract",
+        "Detect release CLI contract",
+        "release_cli_contract_available",
+        "steps.release_cli_contract_available.outputs.exists == 'true'",
         "MCP_REPL_RELEASE_BINARY: target/release/mcp-repl",
         "MCP_REPL_RELEASE_BINARY: target/release/mcp-repl.exe",
         "cargo test --test release_cli_contract --quiet",
+        "if: github.event_name == 'push' && github.ref_type == 'tag' && needs.checks.result == 'success'",
+        "if: needs.checks.result == 'success' && ((github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'workflow_dispatch')",
         "-F draft=false",
         "-F prerelease=\"${prerelease_flag}\"",
         "--prerelease",
@@ -387,7 +401,6 @@ fn release_workflow_defines_tag_only_publishing_contract() {
     }
 
     for forbidden in [
-        "workflow_dispatch:",
         "release_tag:",
         "publish-dev:",
         "group: publish-dev",
@@ -480,7 +493,17 @@ fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
         "manylinux2014",
         "R is optional",
         "No rolling dev release",
-        "No backfill workflow",
+        "Manual PyPI Backfill",
+        "`pypi_backfill_tag`",
+        "existing immutable semver tag",
+        "before the next scheduled release tag",
+        "tags that predate PyPI packaging",
+        "current `pyproject.toml` packaging metadata only",
+        "compiled source still comes from the immutable tag",
+        "Checks run from the tag's source tree",
+        "checks added after that tag run only when their test files exist",
+        "does not create or update the GitHub release",
+        "version already exists on PyPI",
     ] {
         assert_contains_wrapped_text(&docs, required, "docs/releasing.md");
     }
