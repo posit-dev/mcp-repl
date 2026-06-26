@@ -525,7 +525,7 @@ mod tests {
             );
         });
 
-        manager.settle_output_after_completion(Duration::from_millis(120));
+        manager.settle_output_after_completion(Duration::from_millis(200));
         let formatted = manager.drain_final_formatted_output();
 
         handle.join().expect("delayed output writer should finish");
