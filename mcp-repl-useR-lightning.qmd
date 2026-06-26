@@ -13,17 +13,14 @@ format:
 
 ## A Familiar Request
 
-::: {.columns}
-::: {.column width="58%"}
-<img src="mcp-repl-useR-lightning-assets/chat-scenario.png" alt="A chat interface where a user asks an agent to explore a dataset and build a first model. The agent responds by running several bash tool calls with Rscript." style="width: 100%;">
-:::
 
-::: {.column width="42%"}
-R is interactive.
+<img alt="A chat interface where a user asks an agent to explore a
+dataset and build a first model. The agent responds by running several
+bash tool calls with Rscript."
+style="width: 100%; fig-align='center'"
+src="mcp-repl-useR-lightning-assets/chat-scenario.png"
+>
 
-Often, the first bridge is a shell.
-:::
-:::
 
 ::: notes
 Timing: ~0:20.

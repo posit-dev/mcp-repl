@@ -204,14 +204,10 @@
 </section>
 <section id="a-familiar-request" class="slide level2">
 <h2>A Familiar Request</h2>
-<div class="columns">
-<div class="column" style="width:58%;">
-<p><img src="mcp-repl-useR-lightning-assets/chat-scenario.png" alt="A chat interface where a user asks an agent to explore a dataset and build a first model. The agent responds by running several bash tool calls with Rscript." style="width: 100%;"></p>
-</div><div class="column" style="width:42%;">
-<p>R is interactive.</p>
-<p>Often, the first bridge is a shell.</p>
-</div></div>
-<aside class="notes">
+
+<img alt="A chat interface where a user asks an agent to explore a
+dataset and build a first model. The agent responds by running several
+bash tool calls with Rscript." style="width: 100%; fig-align='center'" src="mcp-repl-useR-lightning-assets/chat-scenario.png" class="r-stretch"><aside class="notes">
 <p>Timing: ~0:20.</p>
 <p>A user asks for ordinary R help: explore this dataset, make a first model, explain what you find. The chat looks persistent. The agent can remember the request and reason across turns. But underneath that chat, the first execution surface is often just a shell command. For R, that usually means <code>Rscript</code>.</p>
 <style type="text/css">
