@@ -110,14 +110,14 @@ If you also need R data/config roots, add them explicitly with repeatable
 For Codex `permissionProfile` metadata, writable and readable roots come from
 the profile entries. `mcp-repl` still adds the server-owned per-session temp
 directory as a writable root so the R and Python workers can start.
-When a profile requests `:minimal`, mcp-repl appends restricted
-read-only platform defaults instead of putting those broader system reads in
-the always-on base policy. The local copy also includes R and Python framework
-runtime roots needed by the embedded backends. Debug builds embed harp's R
-module assets so startup does not require a read carve-out for Cargo's source
-checkout. The always-on base policy keeps non-filesystem runtime allowances
-such as Python multiprocessing and the PyTorch/libomp OpenMP registration
-shared-memory carve-out.
+When a Linux profile does not grant full-disk reads, mcp-repl appends
+restricted read-only platform defaults instead of putting those broader system
+reads in the always-on base policy. The local copy also includes R and Python
+framework runtime roots needed by the embedded backends. Debug builds embed
+harp's R module assets so startup does not require a read carve-out for Cargo's
+source checkout. The always-on base policy keeps non-filesystem runtime
+allowances such as Python multiprocessing and the PyTorch/libomp OpenMP
+registration shared-memory carve-out.
 
 Within writable roots, these subpaths are forced read-only when present:
 

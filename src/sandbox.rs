@@ -392,7 +392,7 @@ impl FileSystemSandboxPolicy {
 
     #[cfg(target_os = "linux")]
     fn include_platform_defaults(&self) -> bool {
-        !self.has_full_disk_read_access() && self.has_minimal_read_entry()
+        !self.has_full_disk_read_access()
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -5949,7 +5949,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_bwrap_project_roots_read_omits_platform_defaults() {
+    fn linux_bwrap_project_roots_read_keeps_platform_defaults_readable() {
         let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
             .iter()
             .map(Path::new)
@@ -5988,10 +5988,10 @@ mod tests {
         let platform_root = linux_path_to_string(platform_root);
 
         assert!(
-            !command.args.windows(3).any(|args| args[0] == "--ro-bind"
+            command.args.windows(3).any(|args| args[0] == "--ro-bind"
                 && args[1] == platform_root
                 && args[2] == platform_root),
-            "project-roots read profile should not mount platform runtime roots: {:?}",
+            "project-roots read profile should mount platform runtime roots: {:?}",
             command.args
         );
     }
