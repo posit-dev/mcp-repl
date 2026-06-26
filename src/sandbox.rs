@@ -3374,6 +3374,9 @@ fn linux_bwrap_supports_proc_mount(
         eprintln!("codex-linux-sandbox: bwrap could not mount /proc; retrying with --no-proc");
         return false;
     }
+    if is_bwrap_proc_probe_quiet_retry_failure(stderr.as_ref()) {
+        return false;
+    }
     eprintln!(
         "codex-linux-sandbox: bwrap /proc probe failed; retrying with --no-proc: {}",
         stderr.trim()
@@ -4706,6 +4709,11 @@ fn is_proc_mount_failure(stderr: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn is_bwrap_proc_probe_quiet_retry_failure(stderr: &str) -> bool {
+    stderr.contains("Unable to mount source on destination: No such file or directory")
+}
+
+#[cfg(target_os = "linux")]
 fn linux_apply_sandbox_policy_to_current_thread(
     sandbox_policy: &SandboxPolicy,
     cwd: &Path,
@@ -5888,6 +5896,17 @@ mod tests {
             "bwrap: Can't mount proc on /newroot/proc: Invalid argument"
         ));
         assert!(!is_proc_mount_failure("bwrap: unrelated failure"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_proc_probe_quiet_retry_detects_old_bind_target_stderr() {
+        assert!(is_bwrap_proc_probe_quiet_retry_failure(
+            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-bm2Cuc on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to mount source on destination: No such file or directory"
+        ));
+        assert!(!is_bwrap_proc_probe_quiet_retry_failure(
+            "bwrap: unrelated failure"
+        ));
     }
 
     #[cfg(target_os = "linux")]
