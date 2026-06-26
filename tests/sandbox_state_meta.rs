@@ -771,6 +771,7 @@ fn busy_text(text: &str) -> bool {
 }
 
 enum RetryMode {
+    #[cfg(unix)]
     Plain,
     WithMeta(Value),
     RawUnterminatedWithMeta(Value),
@@ -791,6 +792,7 @@ where
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let last_text = loop {
         let reply = match &mode {
+            #[cfg(unix)]
             RetryMode::Plain => {
                 session
                     .write_stdin_raw_with(input.clone(), Some(timeout_secs))
