@@ -145,6 +145,19 @@ impl WorkerManager {
         self.pending_output_tape.drain_final_output()
     }
 
+    pub(super) fn drain_completed_formatted_output(
+        &self,
+        session_end: bool,
+    ) -> FormattedPendingOutput {
+        if session_end {
+            self.drain_final_formatted_output()
+        } else {
+            // Keep an incomplete raw UTF-8 tail open at input_wait; the next accepted
+            // request seals it before fresh output can merge across requests.
+            self.drain_formatted_output()
+        }
+    }
+
     pub(super) fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
         self.pending_output_tape.drain_sealed_output()
     }

@@ -297,6 +297,7 @@ fn run_command(
             prompt: "v5> ".to_string(),
         })?;
         append_control_log(control_log_path.as_deref(), "input_wait")?;
+        sleep_for(200, sideband_interrupted, false);
         io::stdout().write_all(&[0xA9, b'\n'])?;
         io::stdout().flush()?;
         return Ok(false);

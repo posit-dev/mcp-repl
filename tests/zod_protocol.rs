@@ -1111,7 +1111,7 @@ async fn zod_raw_split_utf8_survives_input_wait_marker() -> TestResult<()> {
     let first_text = result_text(&first);
 
     wait_for_log_contains(&control_log, "input_wait")?;
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(250));
 
     let completed = session
         .call_tool_raw(

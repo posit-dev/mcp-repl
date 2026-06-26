@@ -95,7 +95,7 @@ impl WorkerManager {
                 }
                 let mut contents = context.detached_prefix_contents;
                 contents.extend(context.reply_prefix_contents);
-                let formatted = self.drain_final_formatted_output();
+                let formatted = self.drain_completed_formatted_output(session_end);
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
                 let built = build_completed_reply(
