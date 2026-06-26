@@ -8,7 +8,7 @@ Behavior:
 - Session state (variables, loaded packages) persists across calls. Errors don't crash the session.
 - Uses the user's R installation and library paths.
 
-- Plots (ggplot2 and base R) are captured and returned as images. Adjust sizing with `options(console.plot.width, console.plot.height, console.plot.units, console.plot.dpi)`.
+- Plots (ggplot2 and base R) are captured and returned as images. Adjust the managed console plot device and exported PNG size with `options(console.plot.width, console.plot.height, console.plot.asp, console.plot.units, console.plot.dpi)`. `console.plot.asp` is height / width, matching the shape of knitr `fig.asp` and Quarto `fig-asp`; mcp-repl does not read knitr options or Quarto YAML. Explicit user-opened graphics devices remain user-controlled.
 - Empty `input` polls for more output from a timed-out request or for detached background output while idle.
 - If a request times out, keep polling with empty `input` until the remaining worker output is drained. New non-empty input is discarded while that timed-out request is still active.
 - Large output replies may stay inline when only slightly oversized. Larger overages may be written to a server-owned output bundle directory. The inline reply stays bounded and may show a preview plus the most relevant disclosed path inside that bundle.

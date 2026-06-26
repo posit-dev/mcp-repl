@@ -137,6 +137,7 @@ It should be treated as source material for:
 ### R plot controls
 
 - `options(console.plot.width = ..., console.plot.height = ...)`
+- `options(console.plot.asp = ...)` (height / width, used when height is unset)
 - `options(console.plot.units = "in" | "cm" | "mm" | "px")`
 - `options(console.plot.dpi = ...)` (alias: `console.plot.res`)
 

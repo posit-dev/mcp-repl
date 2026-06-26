@@ -845,6 +845,181 @@ async fn plots_respect_numeric_size_options() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn plot_size_options_set_live_device_geometry() -> TestResult<()> {
+    let session = spawn_server_with_files().await?;
+
+    let input = r#"options(console.plot.width = 13.5, console.plot.height = 6, console.plot.units = "in", console.plot.dpi = 150); plot.new(); size <- dev.size("in"); cat(sprintf("mcp-repl-live-size %.1f %.1f\n", size[[1]], size[[2]]))"#;
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "live device size plot reported an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("mcp-repl-live-size 13.5 6.0"),
+        "expected live device size to match console.plot options: {}",
+        result_text(&result)
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plot_size_options_use_aspect_ratio_when_height_unset() -> TestResult<()> {
+    let session = spawn_server_with_files().await?;
+
+    let input = r#"options(console.plot.width = 4, console.plot.height = NULL, console.plot.asp = 0.5, console.plot.units = "in", console.plot.dpi = 100); plot(1:10); size <- dev.size("in"); cat(sprintf("mcp-repl-asp-size %.1f %.1f\n", size[[1]], size[[2]]))"#;
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "aspect ratio plot reported an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("mcp-repl-asp-size 4.0 2.0"),
+        "expected live device height to come from console.plot.asp: {}",
+        result_text(&result)
+    );
+    let images = extract_images(&result);
+    assert!(
+        !images.is_empty(),
+        "expected aspect ratio plot to emit image content"
+    );
+    let (width, height) =
+        png_dimensions(&images[0].bytes).expect("aspect ratio plot did not return a valid png");
+    assert_eq!(
+        (width, height),
+        (400, 200),
+        "expected 4 inch width and 0.5 aspect at 100 dpi to render at 400x200"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plot_height_option_takes_precedence_over_aspect_ratio() -> TestResult<()> {
+    let session = spawn_server_with_files().await?;
+
+    let input = r#"options(console.plot.width = 4, console.plot.height = 3, console.plot.asp = 0.5, console.plot.units = "in", console.plot.dpi = 100); plot(1:10); size <- dev.size("in"); cat(sprintf("mcp-repl-height-precedence-size %.1f %.1f\n", size[[1]], size[[2]]))"#;
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "height precedence plot reported an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("mcp-repl-height-precedence-size 4.0 3.0"),
+        "expected console.plot.height to take precedence over console.plot.asp: {}",
+        result_text(&result)
+    );
+    let images = extract_images(&result);
+    assert!(
+        !images.is_empty(),
+        "expected height precedence plot to emit image content"
+    );
+    let (width, height) = png_dimensions(&images[0].bytes)
+        .expect("height precedence plot did not return a valid png");
+    assert_eq!(
+        (width, height),
+        (400, 300),
+        "expected explicit 4x3 inches at 100 dpi to render at 400x300"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plot_size_option_changes_apply_to_next_managed_page() -> TestResult<()> {
+    let session = spawn_server_with_files().await?;
+
+    let input = r#"options(console.plot.width = 4, console.plot.height = 3, console.plot.asp = NULL, console.plot.units = "in", console.plot.dpi = 100); plot(1:10); first <- dev.size("in"); options(console.plot.width = 6, console.plot.height = 2, console.plot.dpi = 100); plot(1:10); second <- dev.size("in"); cat(sprintf("mcp-repl-persistent-size %.1f %.1f %.1f %.1f\n", first[[1]], first[[2]], second[[1]], second[[2]]))"#;
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "persistent managed device plot reported an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("mcp-repl-persistent-size 4.0 3.0 6.0 2.0"),
+        "expected changed console.plot options to apply to the next managed page: {}",
+        result_text(&result)
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plot_size_changes_do_not_resize_user_opened_device() -> TestResult<()> {
+    let session = spawn_server_with_files().await?;
+
+    let setup_input = r#"options(console.plot.width = 4, console.plot.height = 3, console.plot.dpi = 100); plot(1:10); grDevices::dev.off()"#;
+    let setup_result = session
+        .write_stdin_raw_with(setup_input, Some(30.0))
+        .await?;
+    if any_backend_unavailable(&[&setup_result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        setup_result.is_error,
+        Some(true),
+        "managed device setup plot reported an error: {}",
+        result_text(&setup_result)
+    );
+
+    let input = r#"path <- tempfile(fileext = ".png"); options(console.plot.width = 6, console.plot.height = 2, console.plot.dpi = 100); grDevices::png(path, width = 5, height = 4, units = "in", res = 100); plot(1:10); size <- dev.size("in"); cat(sprintf("mcp-repl-user-device-size %.1f %.1f\n", size[[1]], size[[2]])); grDevices::dev.off(); unlink(path)"#;
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "user-opened device plot reported an error: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("mcp-repl-user-device-size 5.0 4.0"),
+        "expected changed console.plot options not to resize an explicit user device: {}",
+        result_text(&result)
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grid_plots_emit_images_and_updates() -> TestResult<()> {
     let session = spawn_server_with_files().await?;
     let mut steps = Vec::new();

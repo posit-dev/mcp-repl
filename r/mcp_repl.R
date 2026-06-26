@@ -518,6 +518,9 @@ local({
   .mcp_repl_plot_state$recordings <- new.env(parent = emptyenv())
   .mcp_repl_plot_state$in_render <- FALSE
   .mcp_repl_plot_state$initialized <- FALSE
+  .mcp_repl_plot_state$managed_device <- NULL
+  .mcp_repl_plot_state$managed_path <- NULL
+  .mcp_repl_plot_state$managed_spec <- NULL
   .mcp_repl_plot_default_dpi <- 96
   .mcp_repl_plot_default_width <- 800 / .mcp_repl_plot_default_dpi
   .mcp_repl_plot_default_height <- 600 / .mcp_repl_plot_default_dpi
@@ -545,19 +548,161 @@ local({
     NULL
   }
 
+  .mcp_repl_plot_positive_number <- function(value) {
+    if (
+      !is.numeric(value) ||
+        length(value) != 1L ||
+        !is.finite(value) ||
+        value <= 0
+    ) {
+      return(NULL)
+    }
+
+    as.numeric(value)
+  }
+
+  .mcp_repl_plot_spec <- function() {
+    units <- .mcp_repl_plot_units(
+      getOption("console.plot.units", .mcp_repl_plot_default_units)
+    )
+    if (is.null(units)) {
+      units <- .mcp_repl_plot_default_units
+    }
+
+    dpi <- .mcp_repl_plot_positive_number(getOption("console.plot.dpi"))
+    if (is.null(dpi)) {
+      dpi <- .mcp_repl_plot_positive_number(getOption("console.plot.res"))
+    }
+    if (is.null(dpi)) {
+      dpi <- .mcp_repl_plot_default_dpi
+    }
+
+    width <- .mcp_repl_plot_positive_number(getOption("console.plot.width"))
+    height <- .mcp_repl_plot_positive_number(getOption("console.plot.height"))
+    asp <- .mcp_repl_plot_positive_number(getOption("console.plot.asp"))
+
+    scale <- switch(
+      units,
+      "in" = 1,
+      "cm" = 1 / 2.54,
+      "mm" = 1 / 25.4,
+      "px" = NA_real_
+    )
+
+    if (is.na(scale)) {
+      if (is.null(width)) {
+        width_px <- round(.mcp_repl_plot_default_width * dpi)
+      } else {
+        width_px <- round(width)
+      }
+
+      if (is.null(height)) {
+        if (is.null(asp)) {
+          height_px <- round(.mcp_repl_plot_default_height * dpi)
+        } else {
+          height_px <- round(width_px * asp)
+        }
+      } else {
+        height_px <- round(height)
+      }
+    } else {
+      if (is.null(width)) {
+        width_px <- round(.mcp_repl_plot_default_width * dpi)
+      } else {
+        width_px <- round(width * scale * dpi)
+      }
+
+      if (is.null(height)) {
+        if (is.null(asp)) {
+          height_px <- round(.mcp_repl_plot_default_height * dpi)
+        } else {
+          height_px <- round(width_px * asp)
+        }
+      } else {
+        height_px <- round(height * scale * dpi)
+      }
+    }
+
+    if (!is.finite(width_px) || width_px <= 0) {
+      width_px <- round(.mcp_repl_plot_default_width * dpi)
+    }
+    if (!is.finite(height_px) || height_px <= 0) {
+      height_px <- round(.mcp_repl_plot_default_height * dpi)
+    }
+
+    list(
+      width = width_px,
+      height = height_px,
+      res = dpi,
+      key = paste(width_px, height_px, dpi, sep = ":")
+    )
+  }
+
+  .mcp_repl_plot_current_is_managed <- function() {
+    st <- .mcp_repl_plot_state
+    current <- grDevices::dev.cur()
+    path <- .mcp_repl_plot_device_path(current)
+
+    is.numeric(st$managed_device) &&
+      length(st$managed_device) == 1L &&
+      is.character(st$managed_path) &&
+      length(st$managed_path) == 1L &&
+      current > 1L &&
+      as.integer(current) == as.integer(st$managed_device) &&
+      identical(path, st$managed_path)
+  }
+
+  .mcp_repl_plot_device_path <- function(device) {
+    device <- as.integer(device)
+    devices <- get(".Devices", envir = baseenv())
+    if (!is.list(devices) || length(devices) < device) {
+      return(NULL)
+    }
+
+    path <- attr(devices[[device]], "filepath", exact = TRUE)
+    if (!is.character(path) || length(path) != 1L || !nzchar(path)) {
+      return(NULL)
+    }
+
+    path
+  }
+
+  .mcp_repl_plot_render_spec <- function() {
+    st <- .mcp_repl_plot_state
+    if (.mcp_repl_plot_current_is_managed() && is.list(st$managed_spec)) {
+      return(st$managed_spec)
+    }
+
+    .mcp_repl_plot_spec()
+  }
+
   .mcp_repl_plot_device <- function(...) {
+    st <- .mcp_repl_plot_state
+    spec <- .mcp_repl_plot_spec()
     path <- tempfile("mcp-repl-plot-", fileext = ".png")
     ok <- FALSE
     tryCatch({
-      grDevices::png(filename = path, ...)
+      grDevices::png(
+        filename = path,
+        width = spec$width,
+        height = spec$height,
+        res = spec$res
+      )
       ok <- TRUE
     }, error = function(e) NULL)
 
     if (!ok) {
       path <- tempfile("mcp-repl-plot-", fileext = ".pdf")
-      grDevices::pdf(file = path, ...)
+      grDevices::pdf(
+        file = path,
+        width = spec$width / spec$res,
+        height = spec$height / spec$res
+      )
     }
 
+    st$managed_device <- grDevices::dev.cur()
+    st$managed_path <- .mcp_repl_plot_device_path(st$managed_device)
+    st$managed_spec <- spec
     try(grDevices::dev.control(displaylist = "enable"), silent = TRUE)
     invisible(NULL)
   }
@@ -656,65 +801,13 @@ local({
 
     st$recordings[[id]] <- raw_recording
 
-    width <- getOption("console.plot.width")
-    if (is.null(width)) {
-      width <- .mcp_repl_plot_default_width
-    }
-
-    height <- getOption("console.plot.height")
-    if (is.null(height)) {
-      height <- .mcp_repl_plot_default_height
-    }
-
-    units <- .mcp_repl_plot_units(
-      getOption("console.plot.units", .mcp_repl_plot_default_units)
-    )
-    if (is.null(units)) {
-      units <- .mcp_repl_plot_default_units
-    }
-
-    dpi <- getOption("console.plot.dpi")
-    if (is.null(dpi)) {
-      dpi <- getOption("console.plot.res", .mcp_repl_plot_default_dpi)
-    }
-
-    if (!is.numeric(width) || !is.finite(width) || width <= 0) {
-      width <- .mcp_repl_plot_default_width
-    }
-    if (!is.numeric(height) || !is.finite(height) || height <= 0) {
-      height <- .mcp_repl_plot_default_height
-    }
-    if (!is.numeric(dpi) || !is.finite(dpi) || dpi <= 0) {
-      dpi <- .mcp_repl_plot_default_dpi
-    }
-
-    scale <- switch(
-      units,
-      "in" = 1,
-      "cm" = 1 / 2.54,
-      "mm" = 1 / 25.4,
-      "px" = NA_real_
-    )
-    if (is.na(scale)) {
-      width <- round(width)
-      height <- round(height)
-    } else {
-      width <- round(width * scale * dpi)
-      height <- round(height * scale * dpi)
-    }
-
-    if (!is.finite(width) || width <= 0) {
-      width <- round(.mcp_repl_plot_default_width * .mcp_repl_plot_default_dpi)
-    }
-    if (!is.finite(height) || height <= 0) {
-      height <- round(.mcp_repl_plot_default_height * .mcp_repl_plot_default_dpi)
-    }
+    spec <- .mcp_repl_plot_render_spec()
 
     png_raw <- .mcp_repl_plot_render_recording(
       recording,
-      width = width,
-      height = height,
-      res = dpi
+      width = spec$width,
+      height = spec$height,
+      res = spec$res
     )
     if (!is.raw(png_raw)) {
       return(invisible(NULL))
@@ -731,6 +824,33 @@ local({
 
   .mcp_repl_plot_flush <<- function(reason = "") {
     .mcp_repl_plot_process_changes(reason)
+  }
+
+  .mcp_repl_plot_reopen_managed_device_if_needed <- function() {
+    st <- .mcp_repl_plot_state
+    if (!.mcp_repl_plot_current_is_managed()) {
+      return(FALSE)
+    }
+
+    spec <- .mcp_repl_plot_spec()
+    if (is.list(st$managed_spec) && identical(spec$key, st$managed_spec$key)) {
+      return(FALSE)
+    }
+
+    old_dev <- grDevices::dev.cur()
+    st$managed_device <- NULL
+    st$managed_path <- NULL
+    st$managed_spec <- NULL
+    closed <- tryCatch({
+      grDevices::dev.off(which = old_dev)
+      TRUE
+    }, error = function(e) FALSE)
+    if (!closed) {
+      return(FALSE)
+    }
+
+    .mcp_repl_plot_device()
+    TRUE
   }
 
   .mcp_repl_plot_before_new_page <- function(reason = "") {
@@ -751,7 +871,9 @@ local({
       .mcp_repl_plot_process_changes(reason)
     }
 
-    if (is_new_page) {
+    reopened <- .mcp_repl_plot_reopen_managed_device_if_needed()
+
+    if (is_new_page || isTRUE(reopened)) {
       st$current_id <- .mcp_repl_new_plot_id()
       st$next_is_new <- TRUE
       st$page_open_seen <- TRUE
