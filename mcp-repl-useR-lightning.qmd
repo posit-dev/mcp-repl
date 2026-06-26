@@ -147,12 +147,14 @@ execute:
 ::: notes
 Timing: ~0:20.
 
-Start with a normal request: explore this dataset, build a first model,
-and explain what you find. The chat looks like one continuous workspace.
-The user can add constraints, ask follow-ups, and expect the agent to
-carry context forward. But below the chat, the agent still needs one
-very concrete thing: a way to run R.
+If you start up a typical agent today, like codex or claude code, or pi,
+and you give it a prompt to do some data related task like: "explore
+this dataset", you'll probably see something like this:
+
+- The model calls out to R via a shell tool.
 :::
+
+
 
 ## For R, the first tool is often the shell
 
@@ -283,33 +285,28 @@ is usually not a sequence of isolated batch jobs.
 
 ## R already has the surfaces agents need
 
-<div class="card-grid">
-<div class="card">
-<h3>State</h3>
-<p><code>df</code>, <code>fit</code>, <code>res</code></p>
-<p><code>str()</code>, <code>ls()</code>, <code>glimpse()</code></p>
-</div>
+```{r}
+#| label: r-surfaces-cards
+#| message: false
+r_surfaces <- list(
+  Help = c("?lm", 'help("predict")', "vignette()"),
+  Graphics = c("plot(fit)", "ggplot(df, aes(...))"),
+  Debugging = c("browser()", "Browse[1]> n", "where"),
+  EDA = c("df, fit, res", "str(), ls(), glimpse()")
+)
 
-<div class="card">
-<h3>Help</h3>
-<p><code>?lm</code></p>
-<p><code>help("predict")</code></p>
-<p><code>vignette()</code></p>
-</div>
+surface_card <- function(title, lines) {
+  shiny::tags$div(
+    class = "card",
+    shiny::tags$h3(title),
+    lapply(lines, \(line) shiny::tags$p(shiny::tags$code(line)))
+  )
+}
 
-<div class="card">
-<h3>Graphics</h3>
-<p><code>plot(fit)</code></p>
-<p><code>ggplot(df, aes(...))</code></p>
-</div>
+cards <- unname(Map(surface_card, names(r_surfaces), r_surfaces))
 
-<div class="card">
-<h3>Debugging</h3>
-<p><code>browser()</code></p>
-<p><code>Browse[1]&gt; n</code></p>
-<p><code>where</code></p>
-</div>
-</div>
+shiny::tags$div(class = "card-grid", cards)
+```
 
 ::: {.lede}
 These are not just commands. They are a conversation with a live R

@@ -335,7 +335,10 @@
 </div>
 <aside class="notes">
 <p>Timing: ~0:20.</p>
-<p>Start with a normal request: explore this dataset, build a first model, and explain what you find. The chat looks like one continuous workspace. The user can add constraints, ask follow-ups, and expect the agent to carry context forward. But below the chat, the agent still needs one very concrete thing: a way to run R.</p>
+<p>If you start up a typical agent today, like codex or claude code, or pi, and you give it a prompt to do some data related task like: “explore this dataset”, you’ll probably see something like this:</p>
+<ul>
+<li>The model calls out to R via a shell tool.</li>
+</ul>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -481,47 +484,32 @@ Objects disappear after each run, so the agent rebuilds the world from files.
 </section>
 <section id="r-already-has-the-surfaces-agents-need" class="slide level2">
 <h2>R already has the surfaces agents need</h2>
+<div class="cell">
+<div class="cell-output-display">
 <div class="card-grid">
 <div class="card">
-<h3>
-State
-</h3>
-<p>
-<code>df</code>, <code>fit</code>, <code>res</code>
-</p>
-<p>
-<code>str()</code>, <code>ls()</code>, <code>glimpse()</code>
-</p>
-</div>
-<div class="card">
-<h3>
-Help
-</h3>
+<h3>Help</h3>
 <p>
 <code>?lm</code>
 </p>
 <p>
-<code>help(“predict”)</code>
+<code>help("predict")</code>
 </p>
 <p>
 <code>vignette()</code>
 </p>
 </div>
 <div class="card">
-<h3>
-Graphics
-</h3>
+<h3>Graphics</h3>
 <p>
 <code>plot(fit)</code>
 </p>
 <p>
-<code>ggplot(df, aes(…))</code>
+<code>ggplot(df, aes(...))</code>
 </p>
 </div>
 <div class="card">
-<h3>
-Debugging
-</h3>
+<h3>Debugging</h3>
 <p>
 <code>browser()</code>
 </p>
@@ -531,6 +519,17 @@ Debugging
 <p>
 <code>where</code>
 </p>
+</div>
+<div class="card">
+<h3>EDA</h3>
+<p>
+<code>df, fit, res</code>
+</p>
+<p>
+<code>str(), ls(), glimpse()</code>
+</p>
+</div>
+</div>
 </div>
 </div>
 <div class="lede">
