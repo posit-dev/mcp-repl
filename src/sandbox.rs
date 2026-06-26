@@ -3459,7 +3459,7 @@ fn linux_bwrap_filesystem_args(
                 .get_readable_roots_with_cwd(cwd, Some(session_temp_dir))
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>();
-            if file_system_policy.has_minimal_read_entry() {
+            if !file_system_policy.has_full_disk_read_access() {
                 readable_roots.extend(
                     LINUX_PLATFORM_DEFAULT_READ_ROOTS
                         .iter()
@@ -4343,32 +4343,100 @@ fn linux_glob_files(
         }
         Err(err) => return Err(err.to_string()),
     };
-    if !output.status.success() {
+    let mut paths = if !output.status.success() {
         if output.status.code() == Some(1) && output.stderr.is_empty() {
-            return Ok(Vec::new());
+            Vec::new()
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "ripgrep unreadable glob scan failed for {}: {stderr}",
+                search_root.display()
+            ));
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ripgrep unreadable glob scan failed for {}: {stderr}",
-            search_root.display()
-        ));
-    }
+    } else {
+        output
+            .stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                let path = PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
+                if path.is_absolute() {
+                    path
+                } else {
+                    search_root.join(path)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
 
-    Ok(output
-        .stdout
-        .split(|byte| *byte == b'\0')
-        .filter(|path| !path.is_empty())
-        .map(|path| {
-            let path = PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
-            if path.is_absolute() {
-                path
-            } else {
-                search_root.join(path)
-            }
-        })
-        .collect())
+    paths.extend(linux_glob_directories_internal(
+        search_root,
+        globs,
+        max_depth,
+    )?);
+    Ok(paths)
 }
 
+#[cfg(target_os = "linux")]
+fn linux_glob_directories_internal(
+    search_root: &Path,
+    globs: &[String],
+    max_depth: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for glob in globs {
+        let glob = globset::GlobBuilder::new(glob)
+            .literal_separator(true)
+            .allow_unclosed_class(true)
+            .build()
+            .map_err(|err| {
+                format!(
+                    "unreadable glob pattern is invalid for {}: {err}",
+                    search_root.display()
+                )
+            })?;
+        builder.add(glob);
+    }
+    let glob_set = builder.build().map_err(|err| {
+        format!(
+            "unreadable glob matcher failed for {}: {err}",
+            search_root.display()
+        )
+    })?;
+    let mut paths = Vec::new();
+    collect_linux_glob_directories(search_root, search_root, &glob_set, max_depth, &mut paths)?;
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_glob_directories(
+    search_root: &Path,
+    dir: &Path,
+    glob_set: &globset::GlobSet,
+    remaining_depth: Option<usize>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|err| err.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|err| err.to_string())?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let relative = path.strip_prefix(search_root).unwrap_or(path.as_path());
+        if glob_set.is_match(relative) {
+            paths.push(path.clone());
+        }
+        let remaining_depth = match remaining_depth {
+            Some(0 | 1) => continue,
+            Some(depth) => Some(depth - 1),
+            None => None,
+        };
+        collect_linux_glob_directories(search_root, &path, glob_set, remaining_depth, paths)?;
+    }
+    Ok(())
+}
 #[cfg(target_os = "linux")]
 fn linux_glob_files_internal(
     search_root: &Path,
@@ -5802,6 +5870,33 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_glob_scanner_includes_matching_directories() {
+        let root = Builder::new()
+            .prefix("mcp-repl-deny-glob-rg-dir-")
+            .tempdir()
+            .expect("tempdir");
+        let denied_dir = root.path().join("secrets");
+        let denied_child = denied_dir.join("token.txt");
+        std::fs::create_dir_all(&denied_dir).expect("create denied dir");
+        std::fs::write(&denied_child, "secret").expect("write denied child");
+        std::fs::write(root.path().join("secrets.txt"), "secret").expect("write denied file");
+
+        let expanded = linux_glob_files(root.path(), &["secrets*".to_string()], None)
+            .expect("glob scan should succeed");
+
+        let denied_file = root.path().join("secrets.txt");
+        assert!(
+            expanded.iter().any(|path| path == &denied_dir),
+            "glob scan should include matching directories: {expanded:?}"
+        );
+        assert!(
+            expanded.iter().any(|path| path == &denied_file),
+            "glob scan should still include matching files: {expanded:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_bwrap_minimal_with_deny_keeps_platform_defaults_readable() {
         let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
             .iter()
@@ -5848,6 +5943,55 @@ mod tests {
                 && args[1] == platform_root
                 && args[2] == platform_root),
             "minimal deny profile should mount platform runtime roots: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_project_roots_read_keeps_platform_defaults_readable() {
+        let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
+            .iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+        else {
+            eprintln!("no Linux platform default roots exist; skipping");
+            return;
+        };
+        let root = Builder::new()
+            .prefix("mcp-repl-project-roots-read-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        std::fs::create_dir_all(&session_temp_dir).expect("create session temp dir");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let command = linux_bwrap_filesystem_args(
+            &file_system_policy,
+            root.path(),
+            session_temp_dir.as_path(),
+        )
+        .expect("project-roots read profile should build bwrap args");
+        let platform_root = linux_path_to_string(platform_root);
+
+        assert!(
+            command.args.windows(3).any(|args| args[0] == "--ro-bind"
+                && args[1] == platform_root
+                && args[2] == platform_root),
+            "project-roots read profile should mount platform runtime roots: {:?}",
             command.args
         );
     }
