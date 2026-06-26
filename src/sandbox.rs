@@ -387,8 +387,12 @@ impl FileSystemSandboxPolicy {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn include_platform_defaults(&self) -> bool {
-        !self.has_full_disk_read_access()
-            && matches!(self.kind, FileSystemSandboxKind::Restricted)
+        !self.has_full_disk_read_access() && self.has_minimal_read_entry()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn has_minimal_read_entry(&self) -> bool {
+        matches!(self.kind, FileSystemSandboxKind::Restricted)
             && self.entries.iter().any(|entry| {
                 entry.access.can_read()
                     && matches!(
@@ -3450,7 +3454,7 @@ fn linux_bwrap_filesystem_args(
                 .get_readable_roots_with_cwd(cwd, Some(session_temp_dir))
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>();
-            if file_system_policy.include_platform_defaults() {
+            if file_system_policy.has_minimal_read_entry() {
                 readable_roots.extend(
                     LINUX_PLATFORM_DEFAULT_READ_ROOTS
                         .iter()
@@ -5760,6 +5764,58 @@ mod tests {
             .expect("literal missing glob should expand to a concrete path");
 
         assert_eq!(expanded, vec![cwd.join("secret.env")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_minimal_with_deny_keeps_platform_defaults_readable() {
+        let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
+            .iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+        else {
+            eprintln!("no Linux platform default roots exist; skipping");
+            return;
+        };
+        let cwd = Path::new("/tmp/mcp-repl-minimal-deny-workspace");
+        let session_temp_dir = Path::new("/tmp/mcp-repl-minimal-deny-session");
+        let denied_path = cwd.join("secret.txt");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Minimal,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: denied_path },
+                access: FileSystemAccessMode::Deny,
+            },
+        ]);
+
+        let command = linux_bwrap_filesystem_args(&file_system_policy, cwd, session_temp_dir)
+            .expect("minimal deny profile should build bwrap args");
+        let platform_root = linux_path_to_string(platform_root);
+
+        assert!(
+            command.args.windows(3).any(|args| args[0] == "--ro-bind"
+                && args[1] == platform_root
+                && args[2] == platform_root),
+            "minimal deny profile should mount platform runtime roots: {:?}",
+            command.args
+        );
     }
 
     #[test]

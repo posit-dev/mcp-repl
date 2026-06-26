@@ -409,7 +409,7 @@ fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn minimal_read_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
     codex_sandbox_state_meta(
         managed_profile(
@@ -3872,6 +3872,55 @@ tryCatch({{
     assert!(
         !text.contains("PLATFORM_DEFAULT_READ_OK"),
         "path deny unexpectedly allowed platform-default read: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_path_deny_allows_worker_start() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let denied_child = temp.path().join("secret.txt");
+    fs::write(&denied_child, "secret")?;
+    let encoded_denied_child = encode_path(&denied_child)?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_denied_child}
+cat("WORKER_STARTED\n")
+tryCatch({{
+  readLines(target, warn = FALSE)
+  cat("DENIED_READ_OK\n")
+}}, error = function(e) {{
+  message("DENIED_READ_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(minimal_read_with_path_deny_meta(temp.path(), &denied_child)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("WORKER_STARTED"),
+        "expected minimal path-deny metadata to allow worker startup, got: {text}"
+    );
+    assert!(
+        text.contains("DENIED_READ_ERROR:"),
+        "expected path deny to block the denied file read, got: {text}"
+    );
+    assert!(
+        !text.contains("DENIED_READ_OK"),
+        "path deny unexpectedly allowed denied file read: {text}"
     );
     Ok(())
 }
