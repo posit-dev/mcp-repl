@@ -2959,6 +2959,82 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
         )
         .await?;
     let text = collect_text(&result);
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            text.contains("cannot enforce sandbox deny-read glob")
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject writable wildcard deny glob, got: {text}"
+        );
+        session.cancel().await?;
+        assert_eq!(
+            fs::read_to_string(&target)?,
+            "original\n",
+            "rejected Linux wildcard glob policy should leave contents unchanged"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if backend_unavailable(&text) {
+            eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        assert!(
+            text.contains("WRITE_OK"),
+            "expected glob-denied file write in cwd to succeed, got: {text}"
+        );
+        assert!(
+            !text.contains("WRITE_ERROR:"),
+            "glob-denied file write in cwd unexpectedly failed: {text}"
+        );
+        assert!(
+            text.contains("READ_ERROR:"),
+            "expected glob-denied file read in cwd to fail, got: {text}"
+        );
+        assert!(
+            !text.contains("READ_OK"),
+            "glob-denied file read in cwd unexpectedly succeeded: {text}"
+        );
+        session.cancel().await?;
+        assert_eq!(
+            fs::read_to_string(&target)?,
+            "allowed\n",
+            "glob-denied file write should update contents while unlink remains denied"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_literal_glob_deny_meta_blocks_future_create_in_cwd() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-literal-glob-deny-create")?;
+    let target = scratch.path().join("future.env");
+    let encoded_target = encode_path(&target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  writeLines("created", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "future.env",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
     if backend_unavailable(&text) {
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         session.cancel().await?;
@@ -2968,45 +3044,31 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
     {
         assert!(
             text.contains("WRITE_OK"),
-            "expected glob-denied file write in cwd to succeed, got: {text}"
+            "expected macOS literal glob-denied file write in cwd to succeed, got: {text}"
         );
         assert!(
-            !text.contains("WRITE_ERROR:"),
-            "glob-denied file write in cwd unexpectedly failed: {text}"
+            target.exists(),
+            "macOS literal glob-denied file write should create the target"
         );
+        session.cancel().await?;
     }
     #[cfg(target_os = "linux")]
     {
         assert!(
             text.contains("WRITE_ERROR:"),
-            "expected Linux bwrap glob-denied file write in cwd to fail, got: {text}"
+            "expected Linux bwrap literal glob-denied future create to fail, got: {text}"
         );
         assert!(
             !text.contains("WRITE_OK"),
-            "Linux bwrap glob-denied file write unexpectedly succeeded: {text}"
+            "Linux bwrap literal glob-denied future create unexpectedly succeeded: {text}"
+        );
+        session.cancel().await?;
+        assert!(
+            !target.exists(),
+            "Linux bwrap literal glob-denied future create should not create {}",
+            target.display()
         );
     }
-    assert!(
-        text.contains("READ_ERROR:"),
-        "expected glob-denied file read in cwd to fail, got: {text}"
-    );
-    assert!(
-        !text.contains("READ_OK"),
-        "glob-denied file read in cwd unexpectedly succeeded: {text}"
-    );
-    session.cancel().await?;
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        fs::read_to_string(&target)?,
-        "allowed\n",
-        "glob-denied file write should update contents while unlink remains denied"
-    );
-    #[cfg(target_os = "linux")]
-    assert_eq!(
-        fs::read_to_string(&target)?,
-        "original\n",
-        "Linux bwrap glob-denied file write should leave contents unchanged"
-    );
     Ok(())
 }
 
@@ -3052,24 +3114,40 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
         )
         .await?;
     let text = collect_text(&result);
-    if backend_unavailable(&text) {
-        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            text.contains("cannot enforce sandbox deny-read glob")
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject writable wildcard deny glob, got: {text}"
+        );
         session.cancel().await?;
-        return Ok(());
+        assert!(
+            target.exists(),
+            "rejected Linux wildcard glob policy should leave the target file in place"
+        );
     }
-    assert!(
-        text.contains("READ_ERROR:"),
-        "expected canonical glob-denied file read to fail, got: {text}"
-    );
-    assert!(
-        !text.contains("READ_OK"),
-        "canonical glob-denied file read unexpectedly succeeded: {text}"
-    );
-    session.cancel().await?;
-    assert!(
-        target.exists(),
-        "canonical glob-denied unlink should leave the target file in place"
-    );
+    #[cfg(target_os = "macos")]
+    {
+        if backend_unavailable(&text) {
+            eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        assert!(
+            text.contains("READ_ERROR:"),
+            "expected canonical glob-denied file read to fail, got: {text}"
+        );
+        assert!(
+            !text.contains("READ_OK"),
+            "canonical glob-denied file read unexpectedly succeeded: {text}"
+        );
+        session.cancel().await?;
+        assert!(
+            target.exists(),
+            "canonical glob-denied unlink should leave the target file in place"
+        );
+    }
     Ok(())
 }
 

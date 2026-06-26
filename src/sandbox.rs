@@ -3417,6 +3417,7 @@ fn linux_bwrap_filesystem_args(
             protected_metadata_names: Vec::new(),
         });
     }
+    validate_linux_unreadable_globs_for_future_writes(&unreadable_globs, cwd, &writable_roots)?;
 
     let mut unreadable_roots = file_system_policy
         .get_unreadable_roots_with_cwd(cwd, Some(session_temp_dir))
@@ -3612,6 +3613,38 @@ fn linux_path_to_string(path: &Path) -> String {
 #[cfg(target_os = "linux")]
 fn linux_path_depth(path: &Path) -> usize {
     path.components().count()
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_unreadable_globs_for_future_writes(
+    patterns: &[String],
+    cwd: &Path,
+    writable_roots: &[WritableRoot],
+) -> Result<(), String> {
+    for pattern in patterns {
+        if !linux_pattern_has_glob_metachar(pattern) {
+            continue;
+        }
+        let Some((search_root, _glob)) = split_linux_glob_pattern_for_search(pattern, cwd) else {
+            continue;
+        };
+        if writable_roots.iter().any(|writable_root| {
+            path_is_at_or_under_root(&writable_root.root, &search_root)
+                || path_is_at_or_under_root(&search_root, &writable_root.root)
+        }) {
+            return Err(format!(
+                "cannot enforce sandbox deny-read glob {pattern} for future paths under writable roots with the Linux bubblewrap backend"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pattern_has_glob_metachar(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
 }
 
 #[cfg(target_os = "linux")]
@@ -4146,9 +4179,7 @@ fn expand_linux_unreadable_globs(
                 .entry(search_root)
                 .or_default()
                 .push(glob);
-        } else if let Some(path) = resolve_candidate_path(Path::new(pattern), cwd)
-            && path.exists()
-        {
+        } else if let Some(path) = resolve_candidate_path(Path::new(pattern), cwd) {
             if let Some(target) = linux_canonical_target_if_symlinked_path(&path) {
                 expanded.insert(target);
             }
@@ -5566,6 +5597,41 @@ mod tests {
             err.contains("requires a positive glob_scan_max_depth"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unreadable_wildcard_globs_under_writable_roots_fail_closed() {
+        let writable_roots = vec![WritableRoot {
+            root: PathBuf::from("/tmp/mcp-repl-writable"),
+            read_only_subpaths: Vec::new(),
+            protected_metadata_names: Vec::new(),
+        }];
+        let patterns = vec!["/tmp/mcp-repl-writable/**/*.env".to_string()];
+
+        let err = validate_linux_unreadable_globs_for_future_writes(
+            &patterns,
+            Path::new("/tmp/mcp-repl-writable"),
+            &writable_roots,
+        )
+        .expect_err("writable wildcard glob should fail closed");
+
+        assert!(
+            err.contains("cannot enforce sandbox deny-read glob"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_literal_unreadable_globs_include_missing_future_path() {
+        let cwd = Path::new("/tmp/mcp-repl-literal-glob");
+        let patterns = vec!["secret.env".to_string()];
+
+        let expanded = expand_linux_unreadable_globs(&patterns, cwd, None)
+            .expect("literal missing glob should expand to a concrete path");
+
+        assert_eq!(expanded, vec![cwd.join("secret.env")]);
     }
 
     #[test]
