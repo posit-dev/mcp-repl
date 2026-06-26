@@ -300,7 +300,7 @@ REPL makes those behaviors observable and testable.
 ```{mermaid}
 %%{init: {"theme": "base", "themeVariables": {"background": "transparent", "fontSize": "22px", "primaryColor": "#17212b", "primaryTextColor": "#ffffff", "primaryBorderColor": "#9ee7ff", "lineColor": "#9ee7ff", "fontFamily": "system-ui, sans-serif"}}}%%
 flowchart LR
-  human((Human)) --- harness["LLM harness"] --- repl["mcp-repl"]
+  human((Human)) <--> harness["LLM harness"] <--> repl["mcp-repl"]
 
   classDef agentBox fill:#17212b,stroke:#9ee7ff,color:#ffffff,stroke-width:3px,font-size:22px;
   class human,harness,repl agentBox;
@@ -318,9 +318,9 @@ flowchart TB
   human((Human))
   harness["LLM harness"]
   repl["IDE R session"]
-  human --- harness
-  harness --- repl
-  human --- repl
+  human <--> harness
+  harness <--> repl
+  human <--> repl
 
   classDef ideBox fill:#1f251f,stroke:#b8f5b0,color:#ffffff,stroke-width:3px,font-size:22px;
   class human,harness,repl ideBox;
@@ -346,7 +346,7 @@ agent-assisted data analysis.
 ## Two Different Shapes (Graphviz)
 
 ```{dot}
-graph two_shapes {
+digraph two_shapes {
   graph [
     bgcolor="transparent"
     compound=true
@@ -371,6 +371,7 @@ graph two_shapes {
 
   edge [
     color="#9ee7ff"
+    dir=both
     penwidth=3
   ];
 
@@ -390,7 +391,7 @@ graph two_shapes {
     agent_harness [label="LLM harness"];
     agent_repl [label="mcp-repl\nagent-owned R session"];
 
-    agent_human -- agent_harness -- agent_repl;
+    agent_human -> agent_harness -> agent_repl;
   }
 
   subgraph cluster_ide {
@@ -405,7 +406,10 @@ graph two_shapes {
       color="#b8f5b0"
       fillcolor="#1f251f"
     ];
-    edge [color="#b8f5b0"];
+    edge [
+      color="#b8f5b0"
+      dir=both
+    ];
 
     ide_human [
       fillcolor="#111820"
@@ -415,12 +419,13 @@ graph two_shapes {
     ide_harness [label="LLM harness\nIDE assistant"];
     ide_repl [label="IDE R session\nshared context"];
 
-    ide_human -- ide_harness;
-    ide_harness -- ide_repl;
-    ide_human -- ide_repl;
+    ide_human -> ide_harness;
+    ide_harness -> ide_repl;
+    ide_human -> ide_repl;
   }
 
-  agent_repl -- ide_human [
+  agent_repl -> ide_human [
+    dir=none
     style=invis
     weight=8
   ];
@@ -470,6 +475,10 @@ plot.new()
 plot.window(xlim = c(0, 100), ylim = c(0, 60))
 rect(0, 0, 100, 60, col = bg, border = NA)
 
+x_unit <- par("pin")[1] / diff(par("usr")[1:2])
+y_unit <- par("pin")[2] / diff(par("usr")[3:4])
+person_radius <- 3.35
+
 draw_box <- function(x0, y0, x1, y1, label, fill, border, cex = 1.05) {
   rect(x0, y0, x1, y1, col = fill, border = border, lwd = 2.6)
   text((x0 + x1) / 2, (y0 + y1) / 2, label, col = fg, cex = cex, font = 2)
@@ -479,29 +488,104 @@ draw_person <- function(x, y, border) {
   symbols(
     x,
     y,
-    circles = 3.1,
+    circles = person_radius,
     inches = FALSE,
     add = TRUE,
     fg = border,
     bg = bg,
     lwd = 2.8
   )
-  text(x, y, "Human", col = fg, cex = 0.88, font = 2)
+  symbols(
+    x,
+    y + 1.15,
+    circles = 0.9,
+    inches = FALSE,
+    add = TRUE,
+    fg = border,
+    bg = bg,
+    lwd = 2.4
+  )
+  shoulder_x <- seq(-1.95, 1.95, length.out = 32)
+  shoulder_y <- -1.8 + 0.9 * sqrt(pmax(0, 1 - (shoulder_x / 1.95)^2))
+  lines(x + shoulder_x, y + shoulder_y, col = border, lwd = 2.4, lend = "round")
+  text(x, y - 5.25, "Human", col = fg, cex = 0.8, font = 2)
 }
 
-draw_line <- function(x0, y0, x1, y1, col) {
-  segments(x0, y0, x1, y1, col = col, lwd = 2.8)
+draw_arrow <- function(x0, y0, x1, y1, col) {
+  arrows(
+    x0,
+    y0,
+    x1,
+    y1,
+    length = 0.11,
+    angle = 24,
+    code = 3,
+    col = col,
+    lwd = 2.8
+  )
+}
+
+draw_arrow_between <- function(x0, y0, x1, y1, col, start_gap, end_gap) {
+  dx <- x1 - x0
+  dy <- y1 - y0
+  distance <- sqrt(dx^2 + dy^2)
+  stopifnot(distance > 0)
+  draw_arrow(
+    x0 + start_gap * dx / distance,
+    y0 + start_gap * dy / distance,
+    x1 - end_gap * dx / distance,
+    y1 - end_gap * dy / distance,
+    col
+  )
+}
+
+circle_edge_gap <- function(from, to, radius) {
+  dx <- to[1] - from[1]
+  dy <- to[2] - from[2]
+  data_distance <- sqrt(dx^2 + dy^2)
+  visual_distance <- sqrt((dx * x_unit)^2 + (dy * y_unit)^2)
+  stopifnot(visual_distance > 0)
+  data_distance * radius * x_unit / visual_distance
+}
+
+box_edge_gap <- function(from, to, half_width, half_height) {
+  dx <- to[1] - from[1]
+  dy <- to[2] - from[2]
+  distance <- sqrt(dx^2 + dy^2)
+  stopifnot(distance > 0)
+  x_scale <- if (dx == 0) Inf else half_width / abs(dx)
+  y_scale <- if (dy == 0) Inf else half_height / abs(dy)
+  distance * min(x_scale, y_scale)
 }
 
 rect(2, 7, 48, 53, border = panel, col = NA, lwd = 1.8)
 rect(52, 7, 98, 53, border = panel, col = NA, lwd = 1.8)
 
 text(25, 49.5, "mcp-repl: agent-owned", col = fg, cex = 1.35, font = 2)
-draw_person(9, 31, blue)
+agent_human <- c(9, 31)
+agent_harness <- c(25, 31)
+agent_repl <- c(42, 31)
+draw_arrow_between(
+  agent_human[1],
+  agent_human[2],
+  agent_harness[1],
+  agent_harness[2],
+  blue,
+  start_gap = circle_edge_gap(agent_human, agent_harness, person_radius),
+  end_gap = box_edge_gap(agent_harness, agent_human, 7, 4.5)
+)
+draw_arrow_between(
+  agent_harness[1],
+  agent_harness[2],
+  agent_repl[1],
+  agent_repl[2],
+  blue,
+  start_gap = box_edge_gap(agent_harness, agent_repl, 7, 4.5),
+  end_gap = box_edge_gap(agent_repl, agent_harness, 5, 6.2)
+)
+draw_person(agent_human[1], agent_human[2], blue)
 draw_box(18, 26.5, 32, 35.5, "LLM harness", blue_fill, blue)
 draw_box(37, 24.8, 47, 37.2, "mcp-repl\nR session", blue_fill, blue, cex = 0.95)
-draw_line(12.3, 31, 17.6, 31, blue)
-draw_line(32.4, 31, 36.6, 31, blue)
 text(25, 13, "No direct human access to the REPL.", col = muted, cex = 1.04)
 
 text(
@@ -512,15 +596,65 @@ text(
   cex = 1.35,
   font = 2
 )
-draw_person(62, 39, green)
-draw_box(76, 35.5, 92, 44.5, "LLM harness", green_fill, green)
-draw_box(70, 18.5, 88, 27.5, "IDE R session", green_fill, green)
-draw_line(65.2, 39, 75.5, 40, green)
-draw_line(84, 35.2, 79.5, 28, green)
-draw_line(63.8, 36.4, 70.2, 27.9, green)
+triangle_side <- 19.5
+triangle_top_y <- 41.5
+triangle_left <- c(63, triangle_top_y)
+triangle_right <- c(triangle_left[1] + triangle_side, triangle_top_y)
+triangle_bottom <- c(
+  mean(c(triangle_left[1], triangle_right[1])),
+  triangle_top_y - triangle_side * x_unit / y_unit * sqrt(3) / 2
+)
+
+draw_arrow_between(
+  triangle_left[1],
+  triangle_left[2],
+  triangle_right[1],
+  triangle_right[2],
+  green,
+  start_gap = circle_edge_gap(triangle_left, triangle_right, person_radius),
+  end_gap = box_edge_gap(triangle_right, triangle_left, 8.2, 4.4)
+)
+draw_arrow_between(
+  triangle_right[1],
+  triangle_right[2],
+  triangle_bottom[1],
+  triangle_bottom[2],
+  green,
+  start_gap = box_edge_gap(triangle_right, triangle_bottom, 8.2, 4.4),
+  end_gap = box_edge_gap(triangle_bottom, triangle_right, 8.8, 4.2)
+)
+draw_arrow_between(
+  triangle_bottom[1],
+  triangle_bottom[2],
+  triangle_left[1],
+  triangle_left[2],
+  green,
+  start_gap = box_edge_gap(triangle_bottom, triangle_left, 8.8, 4.2),
+  end_gap = circle_edge_gap(triangle_left, triangle_bottom, person_radius)
+)
+draw_person(triangle_left[1], triangle_left[2], green)
+draw_box(
+  triangle_right[1] - 8.2,
+  triangle_right[2] - 4.4,
+  triangle_right[1] + 8.2,
+  triangle_right[2] + 4.4,
+  "LLM harness",
+  green_fill,
+  green
+)
+draw_box(
+  triangle_bottom[1] - 8.8,
+  triangle_bottom[2] - 4.2,
+  triangle_bottom[1] + 8.8,
+  triangle_bottom[2] + 4.2,
+  "IDE R session",
+  green_fill,
+  green,
+  cex = 0.98
+)
 text(
   75,
-  13,
+  10.7,
   "Human, agent, and REPL remain connected.",
   col = muted,
   cex = 0.98
