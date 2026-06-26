@@ -188,11 +188,11 @@ impl WorkerManager {
         // drain any bytes already written by the worker before we snapshot the ring.
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
+        self.settle_output_after_completion(remaining);
         if result.is_ok() {
             self.pending_output_tape
                 .append_sideband(PendingSidebandKind::RequestBoundary);
         }
-        self.settle_output_after_completion(remaining);
         if result.is_ok()
             && let Some(message) = ipc.take_protocol_error()
         {
@@ -386,9 +386,9 @@ impl WorkerManager {
         match status {
             Ok(()) => {
                 let mut settled_completion = completion_info_from_ipc(&ipc, false);
+                self.settle_output_after_completion(Duration::from_millis(120));
                 self.pending_output_tape
                     .append_sideband(PendingSidebandKind::RequestBoundary);
-                self.settle_output_after_completion(Duration::from_millis(120));
                 let worker_exited = match self.process.as_mut() {
                     Some(process) => match process.is_running() {
                         Ok(running) => !running,
@@ -427,9 +427,9 @@ impl WorkerManager {
 
     pub(super) fn settle_pending_session_end(&mut self, ipc: &ServerIpcConnection) {
         let settled_completion = completion_info_from_ipc(ipc, true);
+        self.settle_output_after_completion(Duration::from_millis(120));
         self.pending_output_tape
             .append_sideband(PendingSidebandKind::RequestBoundary);
-        self.settle_output_after_completion(Duration::from_millis(120));
         self.note_session_end(true);
         self.clear_pending_request_state();
         self.settled_pending_completion = Some(settled_completion);

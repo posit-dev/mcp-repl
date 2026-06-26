@@ -1167,6 +1167,37 @@ async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_settles_split_utf8_tail_before_request_boundary() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é\n"),
+        "completion should combine delayed UTF-8 continuation bytes before the request boundary, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "completion should not seal split UTF-8 bytes when the continuation arrives during settle, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");

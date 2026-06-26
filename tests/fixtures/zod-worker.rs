@@ -116,6 +116,7 @@ fn run_worker(
         input_line_after_input_wait: false,
         session_end_after_input_wait: false,
         bad_output_after_input_wait: None,
+        ready_after_turn: false,
     };
     while let Ok(message) = rx.recv() {
         match message {
@@ -177,9 +178,15 @@ fn run_turn(
         state.previous_line_empty = command.is_empty();
     }
 
-    let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
-    writer.send(&WorkerToServer::InputWait { prompt })?;
-    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    if state.ready_after_turn {
+        state.ready_after_turn = false;
+        writer.send(&WorkerToServer::Ready {})?;
+        append_control_log(control_log_path.as_deref(), "ready")?;
+    } else {
+        let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
+        writer.send(&WorkerToServer::InputWait { prompt })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+    }
     emit_deferred_protocol_faults(writer, control_log_path, state)?;
     Ok(false)
 }
@@ -279,6 +286,19 @@ fn run_command(
         output_image(writer, control_log_path, b"img")?;
         sleep_for(200, sideband_interrupted, false);
         output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
+        return Ok(false);
+    }
+
+    if command == "split-utf8-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_image(writer, control_log_path, b"img")?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9, b'\n'], true);
+        });
         return Ok(false);
     }
 
@@ -557,6 +577,7 @@ struct CommandState {
     input_line_after_input_wait: bool,
     session_end_after_input_wait: bool,
     bad_output_after_input_wait: Option<Duration>,
+    ready_after_turn: bool,
 }
 
 fn start_control_reader(
