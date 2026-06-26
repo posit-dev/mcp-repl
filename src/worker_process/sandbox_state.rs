@@ -81,6 +81,7 @@ pub(super) fn managed_network_proxy_config_for_state(
 }
 
 impl WorkerManager {
+    #[cfg(debug_assertions)]
     pub fn bootstrap_local_inherited_sandbox_state(&mut self) -> Result<bool, WorkerError> {
         if !self.missing_inherited_sandbox_state() {
             return Ok(false);

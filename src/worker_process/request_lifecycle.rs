@@ -297,6 +297,7 @@ impl WorkerManager {
             OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
             OversizedOutputMode::Pager => self.output.current_progress_seq(),
         };
+        let mut utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
         let mut input_echo_ready = !requires_input_echo || self.pending_input_echoes_seen() > 0;
         let mut stable_for = Duration::from_millis(0);
         while start.elapsed() < total {
@@ -305,20 +306,26 @@ impl WorkerManager {
                 OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
                 OversizedOutputMode::Pager => self.output.current_progress_seq(),
             };
+            let now_utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
             if !input_echo_ready && self.pending_input_echoes_seen() > 0 {
                 input_echo_ready = true;
                 stable_for = Duration::from_millis(0);
                 last = now;
+                utf8_tail_pending = now_utf8_tail_pending;
                 continue;
             }
-            if now == last {
-                stable_for = stable_for.saturating_add(poll);
-                if input_echo_ready && stable_for >= stable_needed {
-                    return;
-                }
-            } else {
+            if now != last || now_utf8_tail_pending != utf8_tail_pending {
                 last = now;
+                utf8_tail_pending = now_utf8_tail_pending;
                 stable_for = Duration::from_millis(0);
+                continue;
+            }
+            if utf8_tail_pending {
+                continue;
+            }
+            stable_for = stable_for.saturating_add(poll);
+            if input_echo_ready && stable_for >= stable_needed {
+                return;
             }
         }
     }
@@ -426,5 +433,60 @@ impl WorkerManager {
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_protocol::WorkerContent;
+
+    fn contents_text(contents: &[WorkerContent]) -> String {
+        contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completion_settle_waits_for_incomplete_utf8_tail() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            timeline.append_text(
+                &[0xA9, b'\n'],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(Duration::from_millis(120));
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("é\n"),
+            "completion settle should wait for delayed UTF-8 continuation bytes, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completion settle should not seal split UTF-8 bytes when continuation arrives within the grace window, got: {text:?}"
+        );
     }
 }

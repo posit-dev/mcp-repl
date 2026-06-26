@@ -137,6 +137,19 @@ jobs:
         run: |
           .\target\release\mcp-repl.exe --help
 
+      - name: Release CLI contract
+        if: matrix.os != 'windows-2022'
+        env:
+          MCP_REPL_RELEASE_BINARY: target/release/mcp-repl
+        run: cargo test --test release_cli_contract --quiet
+
+      - name: Release CLI contract (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        env:
+          MCP_REPL_RELEASE_BINARY: target/release/mcp-repl.exe
+        run: cargo test --test release_cli_contract --quiet
+
       - name: Package release archive
         if: matrix.os != 'windows-2022'
         shell: bash
