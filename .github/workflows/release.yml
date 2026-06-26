@@ -78,6 +78,11 @@ jobs:
       - name: cargo build
         run: cargo build
 
+      - name: Windows sandbox setup
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: .\target\debug\mcp-repl.exe windows-sandbox setup
+
       - name: Python public API suite
         if: matrix.os != 'windows-2022'
         run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl

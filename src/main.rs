@@ -34,6 +34,8 @@ mod stdin_payload;
 mod windows_conpty;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
+#[cfg(target_os = "windows")]
+mod windows_sandbox_setup;
 mod worker;
 mod worker_process;
 mod worker_protocol;
@@ -50,6 +52,8 @@ use crate::sandbox_cli::{
 enum CliCommand {
     RunServer(CliOptions),
     Install(install::InstallOptions),
+    #[cfg(target_os = "windows")]
+    WindowsSandboxSetup(windows_sandbox_setup::WindowsSandboxSetupOptions),
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if sandbox::invoked_as_codex_windows_sandbox() {
         sandbox::run_windows_sandbox_main();
     }
+    #[cfg(target_os = "windows")]
+    if sandbox::invoked_as_codex_windows_sandbox_logon_offline() {
+        sandbox::run_windows_sandbox_logon_offline_main();
+    }
 
     if worker::is_worker_mode() {
         crate::diagnostics::startup_log("main: worker mode");
@@ -129,6 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         CliCommand::Install(options) => install::run(options),
+        #[cfg(target_os = "windows")]
+        CliCommand::WindowsSandboxSetup(options) => {
+            windows_sandbox_setup::run_setup(options).map_err(|err| err.into())
+        }
     }
 }
 
@@ -153,6 +165,21 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
     if parser.peek() == Some("install") {
         parser.next();
         return Ok(CliCommand::Install(parse_install_args(&mut parser)?));
+    }
+    #[cfg(target_os = "windows")]
+    if parser.peek() == Some("windows-sandbox") {
+        parser.next();
+        let subcommand = parser
+            .next()
+            .ok_or_else(|| "missing windows-sandbox subcommand (expected setup)".to_string())?;
+        if subcommand != "setup" {
+            return Err(format!("unknown windows-sandbox subcommand: {subcommand}").into());
+        }
+        let remaining = parser.args[parser.index..].to_vec();
+        return Ok(CliCommand::WindowsSandboxSetup(
+            windows_sandbox_setup::parse_setup_args(&remaining)
+                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+        ));
     }
 
     let mut sandbox_args = SandboxCliArgs::default();
@@ -509,6 +536,7 @@ fn print_usage() {
         "Usage:\n\
 mcp-repl [--debug-repl] [--interpreter <r|python>] [--oversized-output <files|pager>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--arg <value>]...\n\n\
+mcp-repl windows-sandbox setup [--http-proxy-port <port>] [--socks-proxy-port <port>]\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-dir: optional base directory for per-startup debug artifacts (env: MCP_REPL_DEBUG_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER)\n\
@@ -518,6 +546,7 @@ mcp-repl install [--client <codex|claude>]... [--interpreter <r|python>[,r|pytho
 --add-allowed-domain: append allowed domain pattern in argument order\n\
 --config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\
 install: update MCP config for codex (~/.codex/config.toml) and claude (~/.claude.json)\n\
+windows-sandbox setup: create/refresh the Windows offline sandbox account and firewall rules\n\
 install defaults to the full interpreter grid for each selected client (currently r + python)"
     );
 }

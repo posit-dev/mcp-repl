@@ -1719,7 +1719,7 @@ pub fn prepare_worker_command_with_managed_network(
     {
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
-        env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir);
+        env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir.clone());
         #[cfg(target_os = "windows")]
         {
             // Ensure Windows sandbox policy and runtime temp resolution both target the
@@ -1732,6 +1732,11 @@ pub fn prepare_worker_command_with_managed_network(
                 "TMP".to_string(),
                 state.session_temp_dir.to_string_lossy().to_string(),
             );
+            if managed_network_proxy.is_some() {
+                env.insert("HOME".to_string(), temp_dir.clone());
+                env.insert("R_USER".to_string(), temp_dir.clone());
+                env.insert("USERPROFILE".to_string(), temp_dir);
+            }
         }
     }
 
@@ -1854,9 +1859,19 @@ pub fn prepare_worker_command_with_managed_network(
     #[cfg(target_os = "windows")]
     {
         let command = build_command_vec(program, &args);
-        let sandbox_args =
-            create_windows_sandbox_command_args(command, &state.sandbox_policy, &state.sandbox_cwd)
-                .map_err(SandboxError::WindowsSandbox)?;
+        let use_offline_identity = managed_network_proxy.is_some();
+        if use_offline_identity {
+            crate::managed_network::ManagedNetworkProxy::route_local_targets_through_proxy(
+                &mut env,
+            );
+        }
+        let sandbox_args = create_windows_sandbox_command_args(
+            command,
+            &state.sandbox_policy,
+            &state.sandbox_cwd,
+            use_offline_identity,
+        )
+        .map_err(SandboxError::WindowsSandbox)?;
         let sandbox_program = std::env::current_exe().map_err(|err| {
             SandboxError::WindowsSandbox(format!("failed to resolve current executable: {err}"))
         })?;
@@ -1920,18 +1935,23 @@ fn create_windows_sandbox_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
+    use_offline_identity: bool,
 ) -> Result<Vec<String>, String> {
     let sandbox_policy_cwd = sandbox_policy_cwd.to_string_lossy().to_string();
     let sandbox_policy_json =
         serde_json::to_string(sandbox_policy).map_err(|err| err.to_string())?;
-    let mut windows_cmd: Vec<String> = vec![
+    let mut windows_cmd: Vec<String> = Vec::new();
+    if use_offline_identity {
+        windows_cmd.push("--windows-sandbox-logon-offline".to_string());
+    }
+    windows_cmd.extend([
         "--windows-sandbox".to_string(),
         "--sandbox-policy-cwd".to_string(),
         sandbox_policy_cwd,
         "--sandbox-policy".to_string(),
         sandbox_policy_json,
         "--".to_string(),
-    ];
+    ]);
     windows_cmd.extend(command);
     Ok(windows_cmd)
 }
@@ -3378,8 +3398,28 @@ pub fn invoked_as_codex_windows_sandbox() -> bool {
 }
 
 #[cfg(target_os = "windows")]
+pub fn invoked_as_codex_windows_sandbox_logon_offline() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--windows-sandbox-logon-offline"))
+}
+
+#[cfg(target_os = "windows")]
 pub fn run_windows_sandbox_main() -> ! {
     match windows_sandbox_main_impl() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_windows_sandbox_logon_offline_main() -> ! {
+    let child_args = std::env::args_os()
+        .skip(2)
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    match crate::windows_sandbox_setup::run_offline_logon_wrapper(child_args) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("{err}");
@@ -4208,6 +4248,101 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepare_worker_command_with_managed_proxy_uses_session_temp_home() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: false,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-offline-home-test-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = tmp.path().join("session");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("worker.exe"),
+            vec!["worker".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+        let session_temp = session_temp_dir.to_string_lossy().to_string();
+
+        assert_eq!(
+            prepared.env.get("HOME").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+        assert_eq!(
+            prepared.env.get("R_USER").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+        assert_eq!(
+            prepared.env.get("USERPROFILE").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepare_worker_command_with_managed_proxy_routes_local_targets_through_proxy() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: true,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-offline-proxy-test-")
+            .tempdir()
+            .expect("tempdir");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: tmp.path().join("session"),
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+        state.managed_network_policy.allow_local_binding = true;
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("worker.exe"),
+            vec!["worker".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+
+        assert_eq!(prepared.env.get("NO_PROXY").map(String::as_str), Some(""));
+        assert_eq!(prepared.env.get("no_proxy").map(String::as_str), Some(""));
+        assert_eq!(
+            prepared.env.get("npm_config_noproxy").map(String::as_str),
+            Some("")
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn proc_mount_failure_detects_expected_stderr() {
@@ -4296,6 +4431,43 @@ mod tests {
             Some("0"),
             "managed network marker must be explicitly disabled when no domain restrictions exist"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn read_only_windows_command_keeps_current_user_wrapper_without_managed_proxy() {
+        let session_temp_dir = std::env::temp_dir().join(format!(
+            "mcp-repl-session-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+
+        let prepared =
+            prepare_worker_command(Path::new("worker.exe"), vec!["worker".to_string()], &state)
+                .expect("read-only Windows worker command should prepare");
+
+        assert!(
+            prepared.args.contains(&"--windows-sandbox".to_string()),
+            "read-only Windows workers should still use the Windows sandbox wrapper"
+        );
+        assert!(
+            !prepared
+                .args
+                .contains(&"--windows-sandbox-logon-offline".to_string()),
+            "read-only without managed proxy should stay on the current-user launch path"
+        );
+
+        let _ = std::fs::remove_dir_all(session_temp_dir);
     }
 
     #[cfg(target_os = "windows")]

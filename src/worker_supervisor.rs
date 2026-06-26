@@ -315,6 +315,13 @@ impl WorkerSupervisor {
         // respawns and wipes/recreates it in place before launch.
         crate::sandbox::prepare_session_temp_dir(&sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = context.prepared_windows_launch.as_ref() {
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
+                prepared_windows_launch,
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(&worker_launch, backend, sandbox_state)
         });
@@ -707,6 +714,20 @@ impl WorkerProcess {
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
+        #[cfg(target_family = "windows")]
+        let mut ipc_server = {
+            if let Some(launch) = prepared_windows_launch.as_ref() {
+                let mut allowed_sids = vec![launch.capability_sid()];
+                if let Some(offline_sid) = launch.offline_user_sid() {
+                    allowed_sids.push(offline_sid);
+                }
+                IpcServer::bind_with_allowed_sids(&allowed_sids)
+            } else {
+                IpcServer::bind()
+            }
+        }
+        .map_err(WorkerError::Io)?;
+        #[cfg(not(target_family = "windows"))]
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(oversized_output, output_timeline.clone());
         #[cfg(target_os = "windows")]
@@ -1978,15 +1999,28 @@ fn windows_spawn_transport(
     if !matches!(stdin_transport, WorkerStdinTransport::Pty) {
         return stdin_transport;
     }
-    if prepared_args
-        .first()
-        .is_some_and(|arg| arg == "--windows-sandbox")
-    {
+    if windows_prepared_args_start_sandbox_wrapper(prepared_args) {
         command.env(crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV, "1");
         WorkerStdinTransport::Pipe
     } else {
         stdin_transport
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_prepared_args_start_sandbox_wrapper(prepared_args: &[String]) -> bool {
+    if prepared_args
+        .first()
+        .is_some_and(|arg| arg == "--windows-sandbox")
+    {
+        return true;
+    }
+    prepared_args
+        .first()
+        .is_some_and(|arg| arg == "--windows-sandbox-logon-offline")
+        && prepared_args
+            .get(1)
+            .is_some_and(|arg| arg == "--windows-sandbox")
 }
 
 #[cfg(target_family = "unix")]
@@ -2412,6 +2446,55 @@ mod tests {
     fn ring_bytes(output_ring: &OutputRing) -> Vec<u8> {
         let output_end = output_ring.end_offset();
         output_ring.read_range(0, output_end).bytes
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sandbox_pty_transport_uses_pipe_and_requests_conpty() {
+        let mut command = Command::new("worker.exe");
+        let prepared_args = vec![
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+        ];
+
+        let transport =
+            windows_spawn_transport(&mut command, &prepared_args, WorkerStdinTransport::Pty);
+
+        assert!(matches!(transport, WorkerStdinTransport::Pipe));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().to_string()),
+            Some("1".to_string())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_offline_sandbox_pty_transport_uses_pipe_and_requests_conpty() {
+        let mut command = Command::new("worker.exe");
+        let prepared_args = vec![
+            "--windows-sandbox-logon-offline".to_string(),
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+        ];
+
+        let transport =
+            windows_spawn_transport(&mut command, &prepared_args, WorkerStdinTransport::Pty);
+
+        assert!(matches!(transport, WorkerStdinTransport::Pipe));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().to_string()),
+            Some("1".to_string())
+        );
     }
 
     #[cfg(target_family = "unix")]

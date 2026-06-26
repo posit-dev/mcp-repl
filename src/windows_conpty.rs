@@ -95,9 +95,20 @@ pub fn attach_stdio_to_conpty_if_attached() -> Result<(), String> {
     if std::env::var_os(WINDOWS_CONPTY_ATTACHED_ENV).is_none() {
         return Ok(());
     }
-    rebind_crt_fd_to_conpty_device(0, "CONIN$", libc::O_RDONLY | libc::O_TEXT)?;
-    rebind_crt_fd_to_conpty_device(1, "CONOUT$", libc::O_WRONLY | libc::O_TEXT)?;
-    rebind_crt_fd_to_conpty_device(2, "CONOUT$", libc::O_WRONLY | libc::O_TEXT)?;
+    crate::diagnostics::startup_log("windows-conpty: attaching stdio");
+    rebind_crt_fd_to_conpty_device(0, "CONIN$", libc::O_RDONLY | libc::O_TEXT).map_err(|err| {
+        crate::diagnostics::startup_log(format!("windows-conpty: attach stdin failed: {err}"));
+        err
+    })?;
+    rebind_crt_fd_to_conpty_device(1, "CONOUT$", libc::O_WRONLY | libc::O_TEXT).map_err(|err| {
+        crate::diagnostics::startup_log(format!("windows-conpty: attach stdout failed: {err}"));
+        err
+    })?;
+    rebind_crt_fd_to_conpty_device(2, "CONOUT$", libc::O_WRONLY | libc::O_TEXT).map_err(|err| {
+        crate::diagnostics::startup_log(format!("windows-conpty: attach stderr failed: {err}"));
+        err
+    })?;
+    crate::diagnostics::startup_log("windows-conpty: attached stdio");
     Ok(())
 }
 

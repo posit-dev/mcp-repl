@@ -32,7 +32,7 @@ jobs:
             artifact_name: release-x86_64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust (stable)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -58,6 +58,11 @@ jobs:
 
       - name: cargo build
         run: cargo build
+
+      - name: Windows sandbox setup
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: .\target\debug\mcp-repl.exe windows-sandbox setup
 
       - name: Python public API suite
         if: matrix.os != 'windows-2022'

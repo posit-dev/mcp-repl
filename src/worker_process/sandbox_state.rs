@@ -44,6 +44,20 @@ pub(super) fn prepare_initial_sandbox_state(
 pub(super) fn managed_network_proxy_config_for_state(
     state: &SandboxState,
 ) -> Result<Option<ManagedProxyConfig>, WorkerError> {
+    #[cfg(target_os = "windows")]
+    if matches!(
+        state.sandbox_policy,
+        crate::sandbox::SandboxPolicy::WorkspaceWrite {
+            network_access: false,
+            ..
+        }
+    ) {
+        return Ok(Some(ManagedProxyConfig {
+            allowed_domains: Vec::new(),
+            denied_domains: Vec::new(),
+            allow_local_binding: state.managed_network_policy.allow_local_binding,
+        }));
+    }
     if !state.managed_network_policy.has_domain_restrictions() {
         return Ok(None);
     }
@@ -55,9 +69,10 @@ pub(super) fn managed_network_proxy_config_for_state(
             "managed network domain restrictions require built-in sandbox enforcement".to_string(),
         ));
     }
-    if !cfg!(target_os = "macos") {
+    if !(cfg!(target_os = "macos") || cfg!(target_os = "windows")) {
         return Err(WorkerError::Sandbox(
-            "managed network domain restrictions are currently supported only on macOS".to_string(),
+            "managed network domain restrictions are currently supported only on macOS and Windows"
+                .to_string(),
         ));
     }
     ManagedProxyConfig::from_policy(&state.managed_network_policy)

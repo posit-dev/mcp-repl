@@ -934,6 +934,7 @@ dependencies = [
  "toml_edit 0.25.5+spec-1.1.0",
  "url",
  "vt100",
+ "windows",
  "windows-sys 0.61.2",
 ]
 
