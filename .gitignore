@@ -13,3 +13,4 @@ mcp-repl-useR-lightning_files
 
 /.quarto/
 **/*.quarto_ipynb
+mcp-repl-useR-lightning_cache/

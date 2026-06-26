@@ -9,7 +9,7 @@
 <link href="mcp-repl-useR-lightning_files/libs/quarto-html/quarto-syntax-highlighting-dark-0a6b7249c26820e032cb0bd839ff02b1.css" rel="stylesheet" id="quarto-text-highlighting-styles"><meta charset="utf-8">
   <meta name="generator" content="quarto-1.9.38">
 
-  <title>R Agents Need a Real Session</title>
+  <title>Agents Need a Real R Session</title>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, minimal-ui">
@@ -98,6 +98,7 @@
     code span.wa { color: #dcc6e0; } /* Warning */
   </style>
   <link rel="stylesheet" href="mcp-repl-useR-lightning_files/libs/revealjs/dist/theme/quarto-4df01d85d5cf19cc6202400f4f043f84.css">
+  <link rel="stylesheet" href="mcp-repl-useR-lightning.css">
   <link href="mcp-repl-useR-lightning_files/libs/revealjs/plugin/quarto-line-highlight/line-highlight.css" rel="stylesheet">
   <link href="mcp-repl-useR-lightning_files/libs/revealjs/plugin/reveal-menu/menu.css" rel="stylesheet">
   <link href="mcp-repl-useR-lightning_files/libs/revealjs/plugin/reveal-menu/quarto-menu.css" rel="stylesheet">
@@ -195,138 +196,12 @@
     <div class="slides">
 
 <section id="title-slide" class="quarto-title-block center">
-  <h1 class="title">R Agents Need a Real Session</h1>
-  <p class="subtitle">mcp-repl, MCP, and the limits of shell-only R access</p>
+  <h1 class="title">Agents Need a Real R Session</h1>
+  <p class="subtitle"><code>mcp-repl</code>, and the limits of shell-only R access</p>
 
 <div class="quarto-title-authors">
 </div>
 
-</section>
-<section class="slide level2">
-
-<style>
-.reveal h1,
-.reveal h2 {
-  text-transform: none;
-  letter-spacing: -0.035em;
-}
-
-.reveal p,
-.reveal li {
-  line-height: 1.25;
-}
-
-.reveal code {
-  border-radius: 0.22em;
-  padding: 0.02em 0.18em;
-}
-
-.reveal .lede {
-  font-size: 1.55em;
-  line-height: 1.18;
-  max-width: 1100px;
-}
-
-.reveal .quiet {
-  color: #c7d0dd;
-}
-
-.reveal .small {
-  font-size: 0.72em;
-  color: #c7d0dd;
-}
-
-.reveal .big-list li {
-  font-size: 1.22em;
-  margin: 0.45em 0;
-}
-
-.reveal .image-frame img {
-  width: 100%;
-  border-radius: 16px;
-  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
-}
-
-.reveal .card-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 0.8em;
-  margin-top: 0.8em;
-}
-
-.reveal .card-grid.two {
-  grid-template-columns: repeat(2, 1fr);
-}
-
-.reveal .card {
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.075);
-  padding: 0.75em 0.85em;
-  min-height: 145px;
-}
-
-.reveal .card h3 {
-  margin: 0 0 0.35em 0;
-  font-size: 0.9em;
-  letter-spacing: 0;
-}
-
-.reveal .card p,
-.reveal .card li {
-  font-size: 0.78em;
-}
-
-.reveal .flow {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.55em;
-  margin: 0.9em 0;
-  font-size: 1.05em;
-}
-
-.reveal .flow.compact {
-  flex-wrap: wrap;
-  gap: 0.35em;
-  font-size: 0.78em;
-}
-
-.reveal .flow.compact .node {
-  min-width: 120px;
-  padding: 0.55em 0.65em;
-}
-
-.reveal .flow.compact .arrow {
-  font-size: 1.1em;
-}
-
-.reveal .node {
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.08);
-  padding: 0.7em 0.9em;
-  min-width: 220px;
-  text-align: center;
-}
-
-.reveal .arrow {
-  color: #c7d0dd;
-  font-size: 1.4em;
-}
-
-.reveal .split-note {
-  margin-top: 0.6em;
-  font-size: 0.78em;
-  color: #c7d0dd;
-}
-
-.reveal .takeaway {
-  font-size: 1.55em;
-  line-height: 1.2;
-  max-width: 1200px;
-}
-</style>
 </section>
 <section id="the-first-move-starts-simply" class="slide level2">
 <h2>The first move starts simply</h2>

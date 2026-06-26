@@ -1,0 +1,121 @@
+.reveal h1,
+.reveal h2 {
+  text-transform: none;
+  letter-spacing: -0.035em;
+}
+
+.reveal p,
+.reveal li {
+  line-height: 1.25;
+}
+
+.reveal code {
+  border-radius: 0.22em;
+  padding: 0.02em 0.18em;
+}
+
+.reveal .lede {
+  font-size: 1.55em;
+  line-height: 1.18;
+  max-width: 1100px;
+}
+
+.reveal .quiet {
+  color: #c7d0dd;
+}
+
+.reveal .small {
+  font-size: 0.72em;
+  color: #c7d0dd;
+}
+
+.reveal .big-list li {
+  font-size: 1.22em;
+  margin: 0.45em 0;
+}
+
+.reveal .image-frame img {
+  width: 100%;
+  border-radius: 16px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+}
+
+.reveal .card-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.8em;
+  margin-top: 0.8em;
+}
+
+.reveal .card-grid.two {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.reveal .card {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.075);
+  padding: 0.75em 0.85em;
+  min-height: 145px;
+}
+
+.reveal .card h3 {
+  margin: 0 0 0.35em 0;
+  font-size: 0.9em;
+  letter-spacing: 0;
+}
+
+.reveal .card p,
+.reveal .card li {
+  font-size: 0.78em;
+}
+
+.reveal .flow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55em;
+  margin: 0.9em 0;
+  font-size: 1.05em;
+}
+
+.reveal .flow.compact {
+  flex-wrap: wrap;
+  gap: 0.35em;
+  font-size: 0.78em;
+}
+
+.reveal .flow.compact .node {
+  min-width: 120px;
+  padding: 0.55em 0.65em;
+}
+
+.reveal .flow.compact .arrow {
+  font-size: 1.1em;
+}
+
+.reveal .node {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.7em 0.9em;
+  min-width: 220px;
+  text-align: center;
+}
+
+.reveal .arrow {
+  color: #c7d0dd;
+  font-size: 1.4em;
+}
+
+.reveal .split-note {
+  margin-top: 0.6em;
+  font-size: 0.78em;
+  color: #c7d0dd;
+}
+
+.reveal .takeaway {
+  font-size: 1.55em;
+  line-height: 1.2;
+  max-width: 1200px;
+}
