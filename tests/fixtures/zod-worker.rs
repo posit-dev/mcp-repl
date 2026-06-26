@@ -334,7 +334,7 @@ fn run_command(
         let writer = writer.clone();
         let control_log_path = control_log_path.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(820));
+            thread::sleep(Duration::from_millis(885));
             let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
             for _ in 0..150 {
                 thread::sleep(Duration::from_millis(10));
