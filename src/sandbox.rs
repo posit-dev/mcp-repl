@@ -3327,7 +3327,11 @@ fn linux_bwrap_supports_proc_mount(
         eprintln!("codex-linux-sandbox: bwrap could not mount /proc; retrying with --no-proc");
         return false;
     }
-    true
+    eprintln!(
+        "codex-linux-sandbox: bwrap /proc probe failed; retrying with --no-proc: {}",
+        stderr.trim()
+    );
+    false
 }
 
 #[cfg(target_os = "linux")]
