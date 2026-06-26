@@ -346,8 +346,8 @@ impl WorkerManager {
             let elapsed = start.elapsed();
             if elapsed >= total
                 && (!saw_utf8_tail_pending
-                    || (elapsed >= utf8_tail_total
-                        && (utf8_tail_pending || stable_for >= stable_needed)))
+                    || elapsed >= utf8_tail_total
+                    || (!utf8_tail_pending && stable_for >= stable_needed))
             {
                 return;
             }

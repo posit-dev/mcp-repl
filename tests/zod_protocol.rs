@@ -1278,6 +1278,40 @@ async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestRes
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let start = std::time::Instant::now();
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-near-grace-then-continuous-output-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let elapsed = start.elapsed();
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        elapsed < Duration::from_millis(1_600),
+        "completion should cap UTF-8 settle even when later output prevents stability; elapsed {elapsed:?}, got: {text:?}"
+    );
+    assert!(
+        text.contains("é"),
+        "completion should include UTF-8 recovery before the cap, got: {text:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;

@@ -320,10 +320,26 @@ fn run_command(
         let writer = writer.clone();
         let control_log_path = control_log_path.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(885));
+            thread::sleep(Duration::from_millis(800));
             let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
             thread::sleep(Duration::from_millis(30));
             let _ = output_text_with_continuation(&writer, &control_log_path, b" after\n", false);
+        });
+        return Ok(false);
+    }
+
+    if command == "split-utf8-near-grace-then-continuous-output-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(885));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
+            for _ in 0..150 {
+                thread::sleep(Duration::from_millis(10));
+                let _ = output_text_with_continuation(&writer, &control_log_path, b".", false);
+            }
         });
         return Ok(false);
     }
