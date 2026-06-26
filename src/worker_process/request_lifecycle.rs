@@ -188,7 +188,8 @@ impl WorkerManager {
         // drain any bytes already written by the worker before we snapshot the ring.
         let elapsed = start.elapsed();
         let remaining = timeout.saturating_sub(elapsed);
-        self.settle_output_after_completion(remaining);
+        let allow_utf8_tail_grace = !matches!(result, Err(WorkerError::Timeout(_)));
+        self.settle_output_after_completion_with_utf8_tail_grace(remaining, allow_utf8_tail_grace);
         if result.is_ok() {
             self.pending_output_tape
                 .append_sideband(PendingSidebandKind::RequestBoundary);
@@ -212,8 +213,17 @@ impl WorkerManager {
     }
 
     pub(super) fn settle_output_after_completion(&self, budget: Duration) {
+        self.settle_output_after_completion_with_utf8_tail_grace(budget, true);
+    }
+
+    fn settle_output_after_completion_with_utf8_tail_grace(
+        &self,
+        budget: Duration,
+        allow_utf8_tail_grace: bool,
+    ) {
         let total = budget.min(OUTPUT_READER_QUIESCE_GRACE);
-        let utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
+        let utf8_tail_pending =
+            allow_utf8_tail_grace && self.output_timeline.has_unflushable_utf8_tail();
         if total.is_zero() && !utf8_tail_pending {
             return;
         }
@@ -222,7 +232,11 @@ impl WorkerManager {
         } else {
             OUTPUT_READER_COMPLETION_STABLE.min(total)
         };
-        let utf8_tail_total = OUTPUT_READER_UTF8_TAIL_SETTLE_MAX;
+        let utf8_tail_total = if allow_utf8_tail_grace {
+            OUTPUT_READER_UTF8_TAIL_SETTLE_MAX
+        } else {
+            total
+        };
         self.settle_output_until_stable(total, stable_needed, utf8_tail_total);
     }
 

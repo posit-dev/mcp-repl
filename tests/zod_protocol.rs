@@ -909,13 +909,13 @@ async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        timeout_text.contains("é"),
-        "timeout drain should complete a delayed split UTF-8 tail before later output, got: {timeout_text:?}"
+        !timeout_text.contains("é"),
+        "timeout reply should not wait for the delayed UTF-8 tail grace, got: {timeout_text:?}"
     );
     assert_eq!(
         result_image_count(&timed_out),
         1,
-        "timeout drain should pass later complete events after completing a split UTF-8 tail"
+        "timeout reply should include the image emitted before the timeout"
     );
 
     let completed = session
@@ -932,8 +932,8 @@ async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
     session.cancel().await?;
 
     assert!(
-        !text.contains("\\xA9"),
-        "the continuation byte should not flush separately after timeout drain completed the split UTF-8 tail, got: {text:?}"
+        text.contains("\\xA9"),
+        "the delayed UTF-8 continuation should remain available on the follow-up poll, got: {text:?}"
     );
 
     Ok(())
@@ -969,6 +969,39 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
     assert!(
         timeout_text.contains("stderr: tail-visible\n"),
         "timeout drain should expose later stderr after an incomplete UTF-8 tail, got: {timeout_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_timeout_does_not_wait_for_utf8_tail_grace_after_expiry() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let started = std::time::Instant::now();
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-then-sleep",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    let timeout_text = result_text(&timed_out);
+
+    session.cancel().await?;
+
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the incomplete UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "timeout should not wait for the UTF-8 tail grace after expiry; elapsed {elapsed:?}"
     );
 
     Ok(())
@@ -1022,20 +1055,36 @@ async fn zod_pager_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
         .await?;
     let timeout_text = result_text(&timed_out);
 
-    session.cancel().await?;
-
     assert!(
         timeout_text.contains("<<repl status: busy"),
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        timeout_text.contains("é"),
-        "pager timeout should complete a delayed split UTF-8 tail before later output, got: {timeout_text:?}"
+        !timeout_text.contains("é"),
+        "pager timeout should not wait for the delayed UTF-8 tail grace, got: {timeout_text:?}"
     );
     assert_eq!(
         result_image_count(&timed_out),
         1,
-        "pager timeout should expose later complete events after completing a split UTF-8 tail"
+        "pager timeout should include the image emitted before the timeout"
+    );
+
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&completed);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xA9"),
+        "the delayed UTF-8 continuation should remain available on the pager follow-up poll, got: {text:?}"
     );
 
     Ok(())
