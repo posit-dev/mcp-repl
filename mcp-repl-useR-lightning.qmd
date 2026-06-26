@@ -356,65 +356,46 @@ draw_person <- function(x, y, border) {
   text(x, y - 5.25, "Human", col = fg, cex = 0.8, font = 2)
 }
 
-draw_arrow <- function(x0, y0, x1, y1, col, head_length, lwd) {
-  arrows(
-    x0,
-    y0,
-    x1,
-    y1,
-    length = head_length,
-    angle = 24,
-    code = 3,
-    col = col,
-    lwd = lwd
-  )
-}
-
-draw_arrow_between <- function(
-  x0,
-  y0,
-  x1,
-  y1,
-  col,
-  start_gap,
-  end_gap,
-  shaft_length,
-  edge_gap,
-  head_length,
-  lwd
-) {
-  dx <- x1 - x0
-  dy <- y1 - y0
+draw_arrow_between <- function(from, to, col, start_gap, end_gap, arrow) {
+  stopifnot(length(from) == 2, length(to) == 2)
+  dx <- to[1] - from[1]
+  dy <- to[2] - from[2]
   data_distance <- sqrt(dx^2 + dy^2)
   visual_distance <- sqrt((dx * x_unit)^2 + (dy * y_unit)^2)
   stopifnot(
     start_gap >= 0,
     end_gap >= 0,
-    shaft_length > 0,
-    edge_gap >= 0,
-    head_length > 0,
-    lwd > 0,
+    arrow$shaft_length > 0,
+    arrow$edge_gap >= 0,
+    arrow$head_length > 0,
+    arrow$lwd > 0,
     data_distance > 0,
     visual_distance > 0
   )
   start_fraction <- start_gap / data_distance
   end_fraction <- 1 - end_gap / data_distance
-  edge_gap_fraction <- edge_gap / visual_distance
+  edge_gap_fraction <- arrow$edge_gap / visual_distance
   arrow_start <- start_fraction + edge_gap_fraction
   arrow_end <- end_fraction - edge_gap_fraction
   actual_shaft_length <- visual_distance * (arrow_end - arrow_start)
   stopifnot(
     arrow_start < arrow_end,
-    isTRUE(all.equal(actual_shaft_length, shaft_length, tolerance = 1e-3))
+    isTRUE(all.equal(
+      actual_shaft_length,
+      arrow$shaft_length,
+      tolerance = 1e-3
+    ))
   )
-  draw_arrow(
-    x0 + arrow_start * dx,
-    y0 + arrow_start * dy,
-    x0 + arrow_end * dx,
-    y0 + arrow_end * dy,
-    col,
-    head_length,
-    lwd
+  arrows(
+    from[1] + arrow_start * dx,
+    from[2] + arrow_start * dy,
+    from[1] + arrow_end * dx,
+    from[2] + arrow_end * dy,
+    length = arrow$head_length,
+    angle = 24,
+    code = 3,
+    col = col,
+    lwd = arrow$lwd
   )
 }
 
@@ -450,10 +431,26 @@ ide_arrow <- list(
   lwd = 2.8
 )
 
-rect(2, 7, 48, 53, border = panel, col = NA, lwd = 1.8)
-rect(52, 7, 98, 53, border = panel, col = NA, lwd = 1.8)
+rect(c(2, 52), 7, c(48, 98), 53, border = panel, col = NA, lwd = 1.8)
+text(
+  c(25, 75),
+  49.5,
+  c("mcp-repl: agent-owned", "IDE assistant: human in the loop"),
+  col = fg,
+  cex = 1.35,
+  font = 2
+)
+text(
+  c(25, 75),
+  c(13, 10.7),
+  c(
+    "No direct human access to the REPL.",
+    "Human, agent, and REPL remain connected."
+  ),
+  col = muted,
+  cex = c(1.04, 0.98)
+)
 
-text(25, 49.5, "mcp-repl: agent-owned", col = fg, cex = 1.35, font = 2)
 agent_open <- agent_arrow$shaft_length + 2 * agent_arrow$edge_gap
 agent_harness <- c(25, 31)
 agent_human <- c(
@@ -462,44 +459,25 @@ agent_human <- c(
 )
 agent_repl <- c(agent_harness[1] + agent_open / x_unit + 7 + 5, 31)
 draw_arrow_between(
-  agent_human[1],
-  agent_human[2],
-  agent_harness[1],
-  agent_harness[2],
+  agent_human,
+  agent_harness,
   blue,
   start_gap = circle_edge_gap(agent_human, agent_harness, person_radius),
   end_gap = box_edge_gap(agent_harness, agent_human, 7, 4.5),
-  shaft_length = agent_arrow$shaft_length,
-  edge_gap = agent_arrow$edge_gap,
-  head_length = agent_arrow$head_length,
-  lwd = agent_arrow$lwd
+  arrow = agent_arrow
 )
 draw_arrow_between(
-  agent_harness[1],
-  agent_harness[2],
-  agent_repl[1],
-  agent_repl[2],
+  agent_harness,
+  agent_repl,
   blue,
   start_gap = box_edge_gap(agent_harness, agent_repl, 7, 4.5),
   end_gap = box_edge_gap(agent_repl, agent_harness, 5, 6.2),
-  shaft_length = agent_arrow$shaft_length,
-  edge_gap = agent_arrow$edge_gap,
-  head_length = agent_arrow$head_length,
-  lwd = agent_arrow$lwd
+  arrow = agent_arrow
 )
 draw_person(agent_human[1], agent_human[2], blue)
 draw_box(18, 26.5, 32, 35.5, "LLM harness", blue_fill, blue)
 draw_box(37, 24.8, 47, 37.2, "mcp-repl\nR session", blue_fill, blue, cex = 0.95)
-text(25, 13, "No direct human access to the REPL.", col = muted, cex = 1.04)
 
-text(
-  75,
-  49.5,
-  "IDE assistant: human in the loop",
-  col = fg,
-  cex = 1.35,
-  font = 2
-)
 ide_open <- ide_arrow$shaft_length + 2 * ide_arrow$edge_gap
 triangle_top_y <- 41.5
 triangle_left <- c(62, triangle_top_y)
@@ -510,43 +488,28 @@ triangle_right <- c(
 triangle_bottom <- c(71.70876, 22.78294)
 
 draw_arrow_between(
-  triangle_left[1],
-  triangle_left[2],
-  triangle_right[1],
-  triangle_right[2],
+  triangle_left,
+  triangle_right,
   green,
   start_gap = circle_edge_gap(triangle_left, triangle_right, person_radius),
   end_gap = box_edge_gap(triangle_right, triangle_left, 8.2, 4.4),
-  shaft_length = ide_arrow$shaft_length,
-  edge_gap = ide_arrow$edge_gap,
-  head_length = ide_arrow$head_length,
-  lwd = ide_arrow$lwd
+  arrow = ide_arrow
 )
 draw_arrow_between(
-  triangle_right[1],
-  triangle_right[2],
-  triangle_bottom[1],
-  triangle_bottom[2],
+  triangle_right,
+  triangle_bottom,
   green,
   start_gap = box_edge_gap(triangle_right, triangle_bottom, 8.2, 4.4),
   end_gap = box_edge_gap(triangle_bottom, triangle_right, 8.8, 4.2),
-  shaft_length = ide_arrow$shaft_length,
-  edge_gap = ide_arrow$edge_gap,
-  head_length = ide_arrow$head_length,
-  lwd = ide_arrow$lwd
+  arrow = ide_arrow
 )
 draw_arrow_between(
-  triangle_bottom[1],
-  triangle_bottom[2],
-  triangle_left[1],
-  triangle_left[2],
+  triangle_bottom,
+  triangle_left,
   green,
   start_gap = box_edge_gap(triangle_bottom, triangle_left, 8.8, 4.2),
   end_gap = circle_edge_gap(triangle_left, triangle_bottom, person_radius),
-  shaft_length = ide_arrow$shaft_length,
-  edge_gap = ide_arrow$edge_gap,
-  head_length = ide_arrow$head_length,
-  lwd = ide_arrow$lwd
+  arrow = ide_arrow
 )
 draw_person(triangle_left[1], triangle_left[2], green)
 draw_box(
@@ -566,13 +529,6 @@ draw_box(
   "IDE R session",
   green_fill,
   green,
-  cex = 0.98
-)
-text(
-  75,
-  10.7,
-  "Human, agent, and REPL remain connected.",
-  col = muted,
   cex = 0.98
 )
 ```
