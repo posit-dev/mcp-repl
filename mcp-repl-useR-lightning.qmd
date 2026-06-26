@@ -437,8 +437,18 @@ box_edge_gap <- function(from, to, half_width, half_height) {
   distance * min(x_scale, y_scale)
 }
 
-agent_arrow <- list(shaft_length = 0.60, edge_gap = 0.08, head_length = 0.10, lwd = 2.8)
-ide_arrow <- list(shaft_length = 1.00, edge_gap = 0.16, head_length = 0.11, lwd = 2.8)
+agent_arrow <- list(
+  shaft_length = 0.60,
+  edge_gap = 0.08,
+  head_length = 0.10,
+  lwd = 2.8
+)
+ide_arrow <- list(
+  shaft_length = 1.00,
+  edge_gap = 0.16,
+  head_length = 0.11,
+  lwd = 2.8
+)
 
 rect(2, 7, 48, 53, border = panel, col = NA, lwd = 1.8)
 rect(52, 7, 98, 53, border = panel, col = NA, lwd = 1.8)
@@ -446,7 +456,10 @@ rect(52, 7, 98, 53, border = panel, col = NA, lwd = 1.8)
 text(25, 49.5, "mcp-repl: agent-owned", col = fg, cex = 1.35, font = 2)
 agent_open <- agent_arrow$shaft_length + 2 * agent_arrow$edge_gap
 agent_harness <- c(25, 31)
-agent_human <- c(agent_harness[1] - (agent_open / x_unit + person_radius + 7), 31)
+agent_human <- c(
+  agent_harness[1] - (agent_open / x_unit + person_radius + 7),
+  31
+)
 agent_repl <- c(agent_harness[1] + agent_open / x_unit + 7 + 5, 31)
 draw_arrow_between(
   agent_human[1],
