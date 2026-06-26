@@ -396,20 +396,6 @@ impl FileSystemSandboxPolicy {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn has_minimal_read_entry(&self) -> bool {
-        matches!(self.kind, FileSystemSandboxKind::Restricted)
-            && self.entries.iter().any(|entry| {
-                entry.access.can_read()
-                    && matches!(
-                        &entry.path,
-                        FileSystemPath::Special {
-                            value: FileSystemSpecialPath::Minimal,
-                        }
-                    )
-            })
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn get_readable_roots_with_cwd(
         &self,
         cwd: &Path,
@@ -1246,6 +1232,9 @@ pub fn sandbox_state_update_from_codex_meta(
         }
     };
     let _ = parsed.codex_linux_sandbox_exe;
+    #[cfg(not(target_os = "linux"))]
+    let _ = parsed.use_legacy_landlock;
+    #[cfg(target_os = "linux")]
     let use_legacy_landlock = parsed.use_legacy_landlock;
 
     Ok(SandboxStateUpdate {
