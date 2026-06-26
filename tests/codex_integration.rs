@@ -1295,6 +1295,24 @@ mod unix_impl {
             has_sandbox_inherit,
             "expected installed Codex config to include `--sandbox inherit`"
         );
+        let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
+            .as_array()
+            .ok_or_else(|| {
+                "expected features.code_mode.direct_only_tool_namespaces array".to_string()
+            })?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| "expected direct-only namespace string".to_string())
+                    .map(ToString::to_string)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            direct_only,
+            vec!["mcp__r".to_string()],
+            "expected installed Codex config to expose the R MCP namespace directly"
+        );
         Ok(())
     }
 
