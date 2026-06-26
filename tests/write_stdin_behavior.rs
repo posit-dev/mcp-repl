@@ -1268,13 +1268,18 @@ async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold()
 async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
+    let temp = workspace_tempdir()?;
+    let entered_gate_path = temp.path().join("entered-gate");
+    let start_gate_path = temp.path().join("start-ready");
+    let tail_gate_path = temp.path().join("tail-ready");
+    let entered_gate_literal = r_path_literal(&entered_gate_path)?;
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let tail_gate_literal = r_path_literal(&tail_gate_path)?;
 
     let input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.1); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(0.6); cat('TAIL\\n')"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); writeLines('ready', {entered_gate_literal}); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); while (!file.exists({tail_gate_literal})) Sys.sleep(0.01); cat('TAIL\\n')"
     );
-    let first = session
-        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.005, 0.05)))
-        .await?;
+    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
@@ -1286,13 +1291,10 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
         "did not expect timeout bundle disclosure before the busy follow-up, got: {first_text:?}"
     );
 
-    sleep(test_delay_ms(160, 700)).await;
-    let Some(transcript_path) = wait_until_busy_follow_up_discloses_transcript_path(
-        &mut session,
-        "1+1",
-        test_timeout_secs(0.1, 0.3),
-    )
-    .await?
+    wait_until_path_exists(&entered_gate_path, "worker output gate").await?;
+    fs::write(&start_gate_path, b"ready")?;
+    let Some(transcript_path) =
+        wait_until_busy_follow_up_discloses_transcript_path(&mut session, "1+1", 0.3).await?
     else {
         eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
         session.cancel().await?;
@@ -1314,6 +1316,7 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
         "did not expect busy marker text inside the worker transcript, got: {spilled_text:?}"
     );
 
+    fs::write(&tail_gate_path, b"ready")?;
     let final_poll = session.write_stdin_raw_with("", Some(0.1)).await?;
     let final_poll = wait_until_not_busy(&mut session, final_poll).await?;
     let final_text = result_text(&final_poll);
@@ -1344,13 +1347,18 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
 {
     let _guard = lock_test_mutex();
     let mut session = spawn_pager_behavior_session(20_000).await?;
+    let temp = workspace_tempdir()?;
+    let entered_gate_path = temp.path().join("entered-gate");
+    let start_gate_path = temp.path().join("start-ready");
+    let tail_gate_path = temp.path().join("tail-ready");
+    let entered_gate_literal = r_path_literal(&entered_gate_path)?;
+    let start_gate_literal = r_path_literal(&start_gate_path)?;
+    let tail_gate_literal = r_path_literal(&tail_gate_path)?;
 
     let input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); Sys.sleep(0.1); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(0.6); cat('TAIL\\n')"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); writeLines('ready', {entered_gate_literal}); while (!file.exists({start_gate_literal})) Sys.sleep(0.01); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); while (!file.exists({tail_gate_literal})) Sys.sleep(0.01); cat('TAIL\\n')"
     );
-    let first = session
-        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.005, 0.05)))
-        .await?;
+    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
@@ -1362,13 +1370,10 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
         "did not expect timeout bundle disclosure before the pager busy follow-up, got: {first_text:?}"
     );
 
-    sleep(test_delay_ms(160, 700)).await;
-    let Some(transcript_path) = wait_until_busy_follow_up_discloses_transcript_path(
-        &mut session,
-        "1+1",
-        test_timeout_secs(0.1, 0.3),
-    )
-    .await?
+    wait_until_path_exists(&entered_gate_path, "pager worker output gate").await?;
+    fs::write(&start_gate_path, b"ready")?;
+    let Some(transcript_path) =
+        wait_until_busy_follow_up_discloses_transcript_path(&mut session, "1+1", 0.3).await?
     else {
         eprintln!(
             "write_stdin_behavior pager busy follow-up completed without a busy marker; skipping"
@@ -1392,6 +1397,7 @@ async fn pager_busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills(
         "did not expect pager busy marker text inside the worker transcript, got: {spilled_text:?}"
     );
 
+    fs::write(&tail_gate_path, b"ready")?;
     let final_poll = session.write_stdin_raw_with("", Some(0.1)).await?;
     let final_poll = wait_until_not_busy(&mut session, final_poll).await?;
     let final_text = result_text(&final_poll);

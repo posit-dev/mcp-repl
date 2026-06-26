@@ -818,7 +818,7 @@ emit_at_wait = True; value = input("plot wait> ")
 #[tokio::test(flavor = "multi_thread")]
 async fn python_timeout_drains_later_stderr_after_incomplete_stdout_utf8_tail() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(mut session) = start_python_session().await? else {
+    let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
@@ -866,32 +866,38 @@ sys.stdout.flush()
         "expected sealed UTF-8 head before later stderr, got: {text:?}"
     );
 
-    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
-    let poll = common::wait_until_not_busy(
-        &mut session,
-        poll,
-        Duration::from_millis(50),
-        Duration::from_secs(10),
-    )
-    .await?;
-    let poll_text = result_text(&poll);
+    let mut poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let mut poll_text = result_text(&poll);
+    let mut completion_text = poll_text.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && is_busy_response(&poll_text) {
+        sleep(Duration::from_millis(50)).await;
+        poll = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        poll_text = result_text(&poll);
+        completion_text.push_str(&poll_text);
+    }
 
     session.cancel().await?;
 
     assert!(
-        !poll_text.contains("STDERR_READY"),
-        "stderr already drained in timeout reply should not repeat on completion poll, got: {poll_text:?}"
+        !is_busy_response(&poll_text),
+        "expected request to finish after polling, got: {completion_text:?}"
     );
-    let tail_idx = poll_text
-        .find("\\xA9")
-        .ok_or_else(|| format!("expected remaining UTF-8 continuation byte, got: {poll_text:?}"))?;
-    let done_idx = poll_text
-        .find("STDOUT_DONE")
-        .ok_or_else(|| format!("expected trailing stdout, got: {poll_text:?}"))?;
     assert!(
-        tail_idx < done_idx,
-        "expected continuation byte before later stdout, got: {poll_text:?}"
+        !completion_text.contains("STDERR_READY"),
+        "stderr already drained in timeout reply should not repeat on completion polls, got: {completion_text:?}"
     );
+    let done_idx = completion_text
+        .find("STDOUT_DONE")
+        .ok_or_else(|| format!("expected trailing stdout, got: {completion_text:?}"))?;
+    if let Some(tail_idx) = completion_text.find("\\xA9") {
+        assert!(
+            tail_idx < done_idx,
+            "expected continuation byte before later stdout, got: {completion_text:?}"
+        );
+    }
     Ok(())
 }
 

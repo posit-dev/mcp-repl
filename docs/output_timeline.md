@@ -102,6 +102,13 @@ whether text is an echo.
 The intent is one true visible timeline per output surface, with completion used
 only as a later presentation step.
 
+Timeline markers such as `input_wait`, `request_boundary`, and `session_end`
+are ordering facts. Appending a marker must not by itself seal, escape, or drain
+an incomplete UTF-8 tail. UTF-8 tails are sealed only by explicit presentation
+policies: final drains, session/error/reset paths, new-request detached-prefix
+capture, or timeout drains that must expose already-buffered visible output
+behind an incomplete tail.
+
 Input sideband events are structural metadata. Echo generation, when a surface
 needs it, is driven by those facts rather than by parsing captured output:
 

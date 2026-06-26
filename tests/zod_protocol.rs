@@ -909,13 +909,13 @@ async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        timeout_text.contains("\\xC3"),
-        "timeout drain should flush an incomplete leading UTF-8 tail before later output, got: {timeout_text:?}"
+        !timeout_text.contains("é"),
+        "timeout reply should not wait for the delayed UTF-8 tail grace, got: {timeout_text:?}"
     );
     assert_eq!(
         result_image_count(&timed_out),
         1,
-        "timeout drain should pass later complete events after flushing an incomplete UTF-8 tail"
+        "timeout reply should include the image emitted before the timeout"
     );
 
     let completed = session
@@ -933,7 +933,7 @@ async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
 
     assert!(
         text.contains("\\xA9"),
-        "the later continuation byte should flush separately after the timeout drained the prefix, got: {text:?}"
+        "the delayed UTF-8 continuation should remain available on the follow-up poll, got: {text:?}"
     );
 
     Ok(())
@@ -969,6 +969,39 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
     assert!(
         timeout_text.contains("stderr: tail-visible\n"),
         "timeout drain should expose later stderr after an incomplete UTF-8 tail, got: {timeout_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_timeout_does_not_wait_for_utf8_tail_grace_after_expiry() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let started = std::time::Instant::now();
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-then-sleep",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    let timeout_text = result_text(&timed_out);
+
+    session.cancel().await?;
+
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the incomplete UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "timeout should not wait for the UTF-8 tail grace after expiry; elapsed {elapsed:?}"
     );
 
     Ok(())
@@ -1022,20 +1055,36 @@ async fn zod_pager_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
         .await?;
     let timeout_text = result_text(&timed_out);
 
-    session.cancel().await?;
-
     assert!(
         timeout_text.contains("<<repl status: busy"),
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        timeout_text.contains("\\xC3"),
-        "pager timeout should flush an incomplete leading UTF-8 tail before later output, got: {timeout_text:?}"
+        !timeout_text.contains("é"),
+        "pager timeout should not wait for the delayed UTF-8 tail grace, got: {timeout_text:?}"
     );
     assert_eq!(
         result_image_count(&timed_out),
         1,
-        "pager timeout should expose later complete events after flushing an incomplete UTF-8 tail"
+        "pager timeout should include the image emitted before the timeout"
+    );
+
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&completed);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xA9"),
+        "the delayed UTF-8 continuation should remain available on the pager follow-up poll, got: {text:?}"
     );
 
     Ok(())
@@ -1161,6 +1210,151 @@ async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResu
     assert!(
         text.contains("v5> output-matching-input-line\nVISIBLE\n"),
         "output_text that matches input_line metadata should remain visible in pager mode, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_settles_split_utf8_tail_before_request_boundary() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é\n"),
+        "completion should combine delayed UTF-8 continuation bytes before the request boundary, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "completion should not seal split UTF-8 bytes when the continuation arrives during settle, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-near-grace-then-more-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é after\n"),
+        "completion should keep settling after UTF-8 recovery near the grace deadline, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "completion should not seal split UTF-8 bytes when the continuation arrives during settle, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let start = std::time::Instant::now();
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-near-grace-then-continuous-output-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let elapsed = start.elapsed();
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        elapsed < Duration::from_millis(1_600),
+        "completion should cap UTF-8 settle even when later output prevents stability; elapsed {elapsed:?}, got: {text:?}"
+    );
+    assert!(
+        text.contains("é"),
+        "completion should include UTF-8 recovery before the cap, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stderr-utf8-then-late-stderr-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        !first_text.contains("\\xC3"),
+        "completed request should keep an incomplete UTF-8 tail detached, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+
+    session.cancel().await?;
+
+    assert!(
+        second_text.contains("stderr: \\xC3stderr: after\n"),
+        "request boundary should reset stderr rendering after sealing the prior UTF-8 tail, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("stderr: \\xC3after\n"),
+        "stderr rendering state leaked across the sealed UTF-8 tail, got: {second_text:?}"
     );
 
     Ok(())
