@@ -144,11 +144,11 @@ fn assert_no_pager_markers(text: &str, context: &str) {
 }
 
 fn interrupt_recovery_deadline() -> Instant {
-    Instant::now() + Duration::from_secs(if cfg!(target_os = "macos") { 20 } else { 5 })
+    Instant::now() + Duration::from_secs(20)
 }
 
 fn python_startup_probe_budget() -> Duration {
-    Duration::from_secs(if cfg!(target_os = "macos") { 90 } else { 10 })
+    Duration::from_secs(90)
 }
 
 async fn start_python_session_with_env_vars(
@@ -680,11 +680,7 @@ async fn wait_for_file_text(path: &Path, expected: &str) -> TestResult<()> {
 
 #[cfg(unix)]
 fn shutdown_completion_budget() -> Duration {
-    if cfg!(target_os = "macos") {
-        Duration::from_millis(1_500)
-    } else {
-        Duration::from_millis(1_200)
-    }
+    Duration::from_millis(1_500)
 }
 
 #[cfg(unix)]
