@@ -306,6 +306,7 @@ muted <- "#c8d3dc"
 panel <- "#2f3944"
 code_fill <- "#29323d"
 blue <- "#9ee7ff"
+blue_muted <- "#6c8795"
 blue_fill <- "#17212b"
 green <- "#b8f5b0"
 green_fill <- "#1f251f"
@@ -334,7 +335,13 @@ draw_box <- function(x0, y0, x1, y1, label, fill, border, cex = 1.05) {
 draw_code <- function(x, y, label, cex) {
   stopifnot(is.character(label), length(label) == 1, cex > 0)
   width <- strwidth(label, units = "user", cex = cex, font = 2, family = "mono")
-  height <- strheight(label, units = "user", cex = cex, font = 2, family = "mono")
+  height <- strheight(
+    label,
+    units = "user",
+    cex = cex,
+    font = 2,
+    family = "mono"
+  )
   rect(
     x - width / 2 - 0.55,
     y - height / 2 - 0.42,
@@ -348,7 +355,13 @@ draw_code <- function(x, y, label, cex) {
 
 draw_inline_code_label <- function(x, y, code, suffix, cex = 1.35) {
   stopifnot(is.character(suffix), length(suffix) == 1)
-  code_width <- strwidth(code, units = "user", cex = cex, font = 2, family = "mono")
+  code_width <- strwidth(
+    code,
+    units = "user",
+    cex = cex,
+    font = 2,
+    family = "mono"
+  )
   suffix_width <- strwidth(suffix, units = "user", cex = cex, font = 2)
   code_outer_width <- code_width + 1.1
   gap <- 0.12
@@ -368,7 +381,14 @@ draw_inline_code_label <- function(x, y, code, suffix, cex = 1.35) {
 draw_mcp_repl_box <- function(x0, y0, x1, y1, fill, border, cex = 0.95) {
   rect(x0, y0, x1, y1, col = fill, border = border, lwd = 2.6)
   draw_code((x0 + x1) / 2, (y0 + y1) / 2 + 1.45, "mcp-repl", cex = cex)
-  text((x0 + x1) / 2, (y0 + y1) / 2 - 2.05, "R session", col = fg, cex = cex, font = 2)
+  text(
+    (x0 + x1) / 2,
+    (y0 + y1) / 2 - 2.05,
+    "R session",
+    col = fg,
+    cex = cex,
+    font = 2
+  )
 }
 
 draw_person <- function(x, y, border) {
@@ -411,6 +431,8 @@ draw_arrow_between <- function(from, to, col, start_gap, end_gap, arrow) {
     arrow$edge_gap >= 0,
     arrow$head_length > 0,
     arrow$lwd > 0,
+    is.character(arrow$lty),
+    length(arrow$lty) == 1,
     data_distance > 0,
     visual_distance > 0
   )
@@ -437,7 +459,8 @@ draw_arrow_between <- function(from, to, col, start_gap, end_gap, arrow) {
     angle = 24,
     code = 3,
     col = col,
-    lwd = arrow$lwd
+    lwd = arrow$lwd,
+    lty = arrow$lty
   )
 }
 
@@ -464,27 +487,43 @@ agent_arrow <- list(
   shaft_length = 0.60,
   edge_gap = 0.08,
   head_length = 0.10,
-  lwd = 2.8
+  lwd = 2.8,
+  lty = "solid"
+)
+optional_agent_arrow <- list(
+  shaft_length = 0.60,
+  edge_gap = 0.08,
+  head_length = 0.10,
+  lwd = 2.4,
+  lty = "22"
 )
 ide_arrow <- list(
   shaft_length = 1.00,
   edge_gap = 0.16,
   head_length = 0.11,
-  lwd = 2.8
+  lwd = 2.8,
+  lty = "solid"
 )
 
 rect(c(2, 52), 7, c(48, 98), 53, border = panel, col = NA, lwd = 1.8)
 draw_inline_code_label(25, 49.5, "mcp-repl", ": agent-owned")
-text(75, 49.5, "Posit Assistant: human in the loop", col = fg, cex = 1.35, font = 2)
+text(
+  75,
+  49.5,
+  "Posit Assistant: human in the loop",
+  col = fg,
+  cex = 1.35,
+  font = 2
+)
 text(
   c(25, 75),
   c(13, 10.7),
   c(
-    "No direct human access to the REPL.",
+    "Human can trigger or review; session can run unattended.",
     "Human, agent, and REPL remain connected."
   ),
   col = muted,
-  cex = c(1.04, 0.98)
+  cex = c(0.91, 0.98)
 )
 
 agent_open <- agent_arrow$shaft_length + 2 * agent_arrow$edge_gap
@@ -497,10 +536,10 @@ agent_repl <- c(agent_harness[1] + agent_open / x_unit + 7 + 5, 31)
 draw_arrow_between(
   agent_human,
   agent_harness,
-  blue,
+  blue_muted,
   start_gap = circle_edge_gap(agent_human, agent_harness, person_radius),
   end_gap = box_edge_gap(agent_harness, agent_human, 7, 4.5),
-  arrow = agent_arrow
+  arrow = optional_agent_arrow
 )
 draw_arrow_between(
   agent_harness,
@@ -510,7 +549,7 @@ draw_arrow_between(
   end_gap = box_edge_gap(agent_repl, agent_harness, 5, 6.2),
   arrow = agent_arrow
 )
-draw_person(agent_human[1], agent_human[2], blue)
+draw_person(agent_human[1], agent_human[2], blue_muted)
 draw_box(18, 26.5, 32, 35.5, "LLM harness", blue_fill, blue)
 draw_mcp_repl_box(37, 24.8, 47, 37.2, blue_fill, blue)
 
@@ -572,12 +611,13 @@ draw_box(
 ::: notes
 Timing: ~0:45.
 
-These are different shapes. With `mcp-repl`, the human talks to an LLM
-harness, and the harness talks to `mcp-repl`. There is no direct line
-from the human to that R session. It is private runtime owned by the
-agent. The IDE experience is different: the human, the assistant, and
-the R session are connected, so it is designed for interactive,
-agent-assisted data analysis.
+These are different shapes. With `mcp-repl`, a human may trigger or
+review work, but the LLM harness owns the live connection to `mcp-repl`,
+and the session can also run unattended. There is no direct line from a
+human to that R session. It is private runtime owned by the agent. The
+IDE experience is different: the human, the assistant, and the R session
+are connected, so it is designed for interactive, agent-assisted data
+analysis.
 :::
 
 ## Posit AI
