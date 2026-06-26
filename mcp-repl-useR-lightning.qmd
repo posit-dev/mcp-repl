@@ -138,25 +138,7 @@ execute:
 }
 </style>
 
-## The request is ordinary
-
-::: {.image-frame}
-<img alt="A chat interface where a user asks an agent to explore a dataset and build a first model. The agent responds by running several bash tool calls with Rscript and an edit_file tool call." src="mcp-repl-useR-lightning-assets/chat-scenario.png">
-:::
-
-::: notes
-Timing: ~0:20.
-
-If you start up a typical agent today, like codex or claude code, or pi,
-and you give it a prompt to do some data related task like: "explore
-this dataset", you'll probably see something like this:
-
-- The model calls out to R via a shell tool.
-:::
-
-
-
-## For R, the first tool is often the shell
+## The first move starts simply
 
 ::: {.columns}
 ::: {.column width="58%"}
@@ -168,12 +150,11 @@ this dataset", you'll probably see something like this:
 ::: {.column width="42%"}
 
 ::: {.lede}
-`Rscript -e` is a good first move.
+`Rscript -e` is a reasonable first move.
 :::
 
 ::: {.quiet}
-It answers one question, returns one result, and works almost
-everywhere.
+One shell call, one immediate result.
 :::
 
 :::
@@ -182,14 +163,13 @@ everywhere.
 ::: notes
 Timing: ~0:25.
 
-There is nothing wrong with this as a starting point. A one-off
-`Rscript -e` call is portable and easy to generate. For a quick summary
-or a tiny calculation, it is exactly enough. The problem is not that the
-shell is bad. The problem is that exploratory analysis does not stay in
-this shape for long.
+Even for a larger prompt, this is a natural place to start. The model
+calls the shell tool and runs an inline expression with `Rscript -e`.
+That is portable, easy to generate, and often good enough for the first
+look at the data.
 :::
 
-## Then the work becomes a script
+## Then the request has another step
 
 ::: {.columns}
 ::: {.column width="58%"}
@@ -201,9 +181,9 @@ this shape for long.
 ::: {.column width="42%"}
 
 ::: {.big-list}
-- The command grows.
-- Quoting gets fragile.
-- The agent needs somewhere to put the next thought.
+- The expression grows.
+- Setup needs to be reused.
+- The next thought needs somewhere to go.
 :::
 
 :::
@@ -212,13 +192,14 @@ this shape for long.
 ::: notes
 Timing: ~0:25.
 
-The next move is also natural: write a temporary script, run it, read
-the output, edit it, and run it again. This is less brittle than one
-large shell string, but we have changed the workflow. The file has
-become a stand-in for the session we do not have.
+But a typical analysis has more than one step. The next move is also
+natural: write a temporary script, run it, and read the output. This is
+less brittle than one large shell string, and it gives the agent
+somewhere to put setup, intermediate objects, and the next piece of the
+analysis.
 :::
 
-## Now we are faking memory with files
+## Then iteration keeps that pattern
 
 ::: {.columns}
 ::: {.column width="58%"}
@@ -248,11 +229,11 @@ R starts over.
 ::: notes
 Timing: ~0:30.
 
-From the user's point of view, the conversation is continuous. From R's
-point of view, each attempt is a fresh process. The agent reloads the
-data, rebuilds objects, replays setup, and leaves behind temporary
-scripts, plots, RDS files, and notes for itself. That can be fine for a
-small task. It is a poor fit for exploratory work.
+As you ask the model to iterate, explore, and correct itself, it keeps
+going in the same direction: edit the file, run the file, inspect the
+output, edit the file again. From the user's point of view, the
+conversation is continuous. From R's point of view, each attempt is a
+fresh process. The pattern has started to expose the mismatch.
 :::
 
 ## The problem is the shape

@@ -328,31 +328,8 @@
 }
 </style>
 </section>
-<section id="the-request-is-ordinary" class="slide level2">
-<h2>The request is ordinary</h2>
-<div class="image-frame">
-<p><img alt="A chat interface where a user asks an agent to explore a dataset and build a first model. The agent responds by running several bash tool calls with Rscript and an edit_file tool call." src="mcp-repl-useR-lightning-assets/chat-scenario.png"></p>
-</div>
-<aside class="notes">
-<p>Timing: ~0:20.</p>
-<p>If you start up a typical agent today, like codex or claude code, or pi, and you give it a prompt to do some data related task like: “explore this dataset”, you’ll probably see something like this:</p>
-<ul>
-<li>The model calls out to R via a shell tool.</li>
-</ul>
-<style type="text/css">
-        span.MJX_Assistive_MathML {
-          position:absolute!important;
-          clip: rect(1px, 1px, 1px, 1px);
-          padding: 1px 0 0 0!important;
-          border: 0!important;
-          height: 1px!important;
-          width: 1px!important;
-          overflow: hidden!important;
-          display:block!important;
-      }</style></aside>
-</section>
-<section id="for-r-the-first-tool-is-often-the-shell" class="slide level2">
-<h2>For R, the first tool is often the shell</h2>
+<section id="the-first-move-starts-simply" class="slide level2">
+<h2>The first move starts simply</h2>
 <div class="columns">
 <div class="column" style="width:58%;">
 <div class="image-frame">
@@ -360,15 +337,15 @@
 </div>
 </div><div class="column" style="width:42%;">
 <div class="lede">
-<p><code>Rscript -e</code> is a good first move.</p>
+<p><code>Rscript -e</code> is a reasonable first move.</p>
 </div>
 <div class="quiet">
-<p>It answers one question, returns one result, and works almost everywhere.</p>
+<p>One shell call, one immediate result.</p>
 </div>
 </div></div>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
-<p>There is nothing wrong with this as a starting point. A one-off <code>Rscript -e</code> call is portable and easy to generate. For a quick summary or a tiny calculation, it is exactly enough. The problem is not that the shell is bad. The problem is that exploratory analysis does not stay in this shape for long.</p>
+<p>Even for a larger prompt, this is a natural place to start. The model calls the shell tool and runs an inline expression with <code>Rscript -e</code>. That is portable, easy to generate, and often good enough for the first look at the data.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -381,8 +358,8 @@
           display:block!important;
       }</style></aside>
 </section>
-<section id="then-the-work-becomes-a-script" class="slide level2">
-<h2>Then the work becomes a script</h2>
+<section id="then-the-request-has-another-step" class="slide level2">
+<h2>Then the request has another step</h2>
 <div class="columns">
 <div class="column" style="width:58%;">
 <div class="image-frame">
@@ -391,15 +368,15 @@
 </div><div class="column" style="width:42%;">
 <div class="big-list">
 <ul>
-<li>The command grows.</li>
-<li>Quoting gets fragile.</li>
-<li>The agent needs somewhere to put the next thought.</li>
+<li>The expression grows.</li>
+<li>Setup needs to be reused.</li>
+<li>The next thought needs somewhere to go.</li>
 </ul>
 </div>
 </div></div>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
-<p>The next move is also natural: write a temporary script, run it, read the output, edit it, and run it again. This is less brittle than one large shell string, but we have changed the workflow. The file has become a stand-in for the session we do not have.</p>
+<p>But a typical analysis has more than one step. The next move is also natural: write a temporary script, run it, and read the output. This is less brittle than one large shell string, and it gives the agent somewhere to put setup, intermediate objects, and the next piece of the analysis.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
@@ -412,8 +389,8 @@
           display:block!important;
       }</style></aside>
 </section>
-<section id="now-we-are-faking-memory-with-files" class="slide level2">
-<h2>Now we are faking memory with files</h2>
+<section id="then-iteration-keeps-that-pattern" class="slide level2">
+<h2>Then iteration keeps that pattern</h2>
 <div class="columns">
 <div class="column" style="width:58%;">
 <div class="image-frame">
@@ -431,7 +408,7 @@
 </div></div>
 <aside class="notes">
 <p>Timing: ~0:30.</p>
-<p>From the user’s point of view, the conversation is continuous. From R’s point of view, each attempt is a fresh process. The agent reloads the data, rebuilds objects, replays setup, and leaves behind temporary scripts, plots, RDS files, and notes for itself. That can be fine for a small task. It is a poor fit for exploratory work.</p>
+<p>As you ask the model to iterate, explore, and correct itself, it keeps going in the same direction: edit the file, run the file, inspect the output, edit the file again. From the user’s point of view, the conversation is continuous. From R’s point of view, each attempt is a fresh process. The pattern has started to expose the mismatch.</p>
 <style type="text/css">
         span.MJX_Assistive_MathML {
           position:absolute!important;
