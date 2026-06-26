@@ -909,13 +909,13 @@ async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        timeout_text.contains("\\xC3"),
-        "timeout drain should flush an incomplete leading UTF-8 tail before later output, got: {timeout_text:?}"
+        timeout_text.contains("é"),
+        "timeout drain should complete a delayed split UTF-8 tail before later output, got: {timeout_text:?}"
     );
     assert_eq!(
         result_image_count(&timed_out),
         1,
-        "timeout drain should pass later complete events after flushing an incomplete UTF-8 tail"
+        "timeout drain should pass later complete events after completing a split UTF-8 tail"
     );
 
     let completed = session
@@ -932,8 +932,8 @@ async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
     session.cancel().await?;
 
     assert!(
-        text.contains("\\xA9"),
-        "the later continuation byte should flush separately after the timeout drained the prefix, got: {text:?}"
+        !text.contains("\\xA9"),
+        "the continuation byte should not flush separately after timeout drain completed the split UTF-8 tail, got: {text:?}"
     );
 
     Ok(())
@@ -1029,13 +1029,13 @@ async fn zod_pager_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        timeout_text.contains("\\xC3"),
-        "pager timeout should flush an incomplete leading UTF-8 tail before later output, got: {timeout_text:?}"
+        timeout_text.contains("é"),
+        "pager timeout should complete a delayed split UTF-8 tail before later output, got: {timeout_text:?}"
     );
     assert_eq!(
         result_image_count(&timed_out),
         1,
-        "pager timeout should expose later complete events after flushing an incomplete UTF-8 tail"
+        "pager timeout should expose later complete events after completing a split UTF-8 tail"
     );
 
     Ok(())

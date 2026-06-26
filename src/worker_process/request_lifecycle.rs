@@ -291,9 +291,6 @@ impl WorkerManager {
         stable_needed: Duration,
         utf8_tail_total: Duration,
     ) {
-        if total.is_zero() {
-            return;
-        }
         let poll = Duration::from_millis(5);
         let start = Instant::now();
         let requires_input_echo = self
@@ -538,6 +535,43 @@ mod tests {
         assert!(
             !text.contains("\\xC3") && !text.contains("\\xA9"),
             "completion settle should not seal split UTF-8 bytes before the extended budget expires, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn completion_settle_uses_utf8_tail_grace_when_budget_is_zero() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            timeline.append_text(
+                &[0xA9, b'\n'],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(Duration::ZERO);
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("é\n"),
+            "completion settle should use UTF-8 tail grace even with no regular budget, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completion settle should not seal split UTF-8 bytes when continuation arrives within the tail grace, got: {text:?}"
         );
     }
 }
