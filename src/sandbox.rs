@@ -3459,7 +3459,7 @@ fn linux_bwrap_filesystem_args(
                 .get_readable_roots_with_cwd(cwd, Some(session_temp_dir))
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>();
-            if !file_system_policy.has_full_disk_read_access() {
+            if file_system_policy.include_platform_defaults() {
                 readable_roots.extend(
                     LINUX_PLATFORM_DEFAULT_READ_ROOTS
                         .iter()
@@ -5949,7 +5949,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_bwrap_project_roots_read_keeps_platform_defaults_readable() {
+    fn linux_bwrap_project_roots_read_omits_platform_defaults() {
         let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
             .iter()
             .map(Path::new)
@@ -5988,10 +5988,10 @@ mod tests {
         let platform_root = linux_path_to_string(platform_root);
 
         assert!(
-            command.args.windows(3).any(|args| args[0] == "--ro-bind"
+            !command.args.windows(3).any(|args| args[0] == "--ro-bind"
                 && args[1] == platform_root
                 && args[2] == platform_root),
-            "project-roots read profile should mount platform runtime roots: {:?}",
+            "project-roots read profile should not mount platform runtime roots: {:?}",
             command.args
         );
     }
