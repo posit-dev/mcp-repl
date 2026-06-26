@@ -1256,7 +1256,7 @@ pub fn sandbox_state_update_from_codex_meta(
         #[cfg(not(target_os = "linux"))]
         use_linux_sandbox_bwrap: None,
         #[cfg(target_os = "linux")]
-        use_legacy_landlock: use_legacy_landlock.then_some(true),
+        use_legacy_landlock: Some(use_legacy_landlock),
         #[cfg(not(target_os = "linux"))]
         use_legacy_landlock: None,
     })
@@ -6325,10 +6325,7 @@ mod tests {
         );
         assert_eq!(update.sandbox_cwd, Some(sandbox_cwd));
         #[cfg(target_os = "linux")]
-        assert!(
-            update.use_linux_sandbox_bwrap.is_none(),
-            "Codex useLegacyLandlock=false should not force mcp-repl's local bwrap setting on"
-        );
+        assert_eq!(update.use_legacy_landlock, Some(false));
         #[cfg(not(target_os = "linux"))]
         assert!(update.use_linux_sandbox_bwrap.is_none());
     }
@@ -6357,12 +6354,33 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn codex_sandbox_state_meta_does_not_override_local_bwrap_disablement() {
+    fn codex_sandbox_state_meta_non_legacy_restores_bwrap_after_legacy_landlock() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
         let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
             .expect("absolute sandbox cwd should convert to file URI")
             .to_string();
-        let update = sandbox_state_update_from_codex_meta(&json!({
+        let legacy_update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": true,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("legacy Codex sandbox metadata");
+        let mut state = SandboxState::default();
+
+        state.apply_update(legacy_update);
+
+        assert!(
+            !state.use_linux_sandbox_bwrap,
+            "legacy Landlock metadata should disable Linux bwrap"
+        );
+
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
+        let non_legacy_update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
                 "type": "disabled"
             },
@@ -6370,17 +6388,13 @@ mod tests {
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox",
         }))
-        .expect("codex sandbox metadata");
-        let mut state = SandboxState {
-            use_linux_sandbox_bwrap: false,
-            ..SandboxState::default()
-        };
+        .expect("non-legacy Codex sandbox metadata");
 
-        state.apply_update(update);
+        state.apply_update(non_legacy_update);
 
         assert!(
-            !state.use_linux_sandbox_bwrap,
-            "Codex metadata should preserve local bwrap disablement"
+            state.use_linux_sandbox_bwrap,
+            "non-legacy Codex metadata should restore Linux bwrap after legacy metadata"
         );
     }
 

@@ -844,6 +844,15 @@ fn worker_spawn_policy_types(events: &[Value]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn worker_spawn_linux_bwrap_flags(events: &[Value]) -> Vec<bool> {
+    events
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .filter_map(|entry| entry["payload"]["use_linux_sandbox_bwrap"].as_bool())
+        .collect()
+}
+
 #[cfg(unix)]
 fn read_only_meta_policy_type() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -4516,6 +4525,67 @@ async fn sandbox_inherit_restarts_worker_when_state_meta_changes() -> TestResult
         "expected sandbox state change to restart the worker session, got: {second_text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_non_legacy_meta_restores_bwrap_after_legacy_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let legacy_meta = codex_sandbox_state_meta(json!({"type": "disabled"}), temp.path(), true);
+
+    let first = session
+        .write_stdin_raw_with_meta(r#"cat("LEGACY_OK\n")"#, Some(10.0), Some(legacy_meta))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("LEGACY_OK"),
+        "expected legacy metadata call to run, got: {first_text}"
+    );
+
+    let second = session
+        .write_stdin_raw_with_meta(
+            r#"cat("NON_LEGACY_OK\n")"#,
+            Some(10.0),
+            Some(full_access_meta(temp.path())),
+        )
+        .await?;
+    let second_text = collect_text(&second);
+    session.cancel().await?;
+
+    if backend_unavailable(&second_text) {
+        eprintln!("sandbox_state_meta backend unavailable after bwrap restore; checking spawn log");
+    } else {
+        assert!(
+            second_text.contains("NON_LEGACY_OK"),
+            "expected non-legacy metadata call to run, got: {second_text}"
+        );
+    }
+
+    let flags = worker_spawn_linux_bwrap_flags(&latest_debug_events(&debug_dir)?);
+    assert!(
+        flags.first() == Some(&false),
+        "expected first legacy metadata spawn to disable bwrap, got: {flags:?}"
+    );
+    assert!(
+        flags.iter().skip(1).any(|use_bwrap| *use_bwrap),
+        "expected later non-legacy metadata spawn to restore bwrap, got: {flags:?}"
+    );
     Ok(())
 }
 
