@@ -385,7 +385,12 @@ impl FileSystemSandboxPolicy {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn include_platform_defaults(&self) -> bool {
+        !self.has_full_disk_read_access()
+    }
+
+    #[cfg(target_os = "linux")]
     fn include_platform_defaults(&self) -> bool {
         !self.has_full_disk_read_access() && self.has_minimal_read_entry()
     }
@@ -4409,7 +4414,9 @@ fn collect_linux_glob_files(
         let path = entry.path();
         let file_type = entry.file_type().map_err(|err| err.to_string())?;
         let relative = path.strip_prefix(search_root).unwrap_or(path.as_path());
-        if (file_type.is_file() || file_type.is_symlink()) && glob_set.is_match(relative) {
+        if (file_type.is_file() || file_type.is_symlink() || file_type.is_dir())
+            && glob_set.is_match(relative)
+        {
             paths.push(path.clone());
         }
         if !file_type.is_dir() {
@@ -5768,6 +5775,33 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_internal_glob_scanner_includes_matching_directories() {
+        let root = Builder::new()
+            .prefix("mcp-repl-deny-glob-dir-")
+            .tempdir()
+            .expect("tempdir");
+        let denied_dir = root.path().join("secrets");
+        let denied_child = denied_dir.join("token.txt");
+        std::fs::create_dir_all(&denied_dir).expect("create denied dir");
+        std::fs::write(&denied_child, "secret").expect("write denied child");
+        std::fs::write(root.path().join("secrets.txt"), "secret").expect("write denied file");
+
+        let expanded = linux_glob_files_internal(root.path(), &["secrets*".to_string()], None)
+            .expect("fallback glob scan should succeed");
+
+        let denied_file = root.path().join("secrets.txt");
+        assert!(
+            expanded.iter().any(|path| path == &denied_dir),
+            "fallback glob scan should include matching directories: {expanded:?}"
+        );
+        assert!(
+            expanded.iter().any(|path| path == &denied_file),
+            "fallback glob scan should still include matching files: {expanded:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_bwrap_minimal_with_deny_keeps_platform_defaults_readable() {
         let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
             .iter()
@@ -6478,6 +6512,60 @@ mod tests {
         assert!(
             !update.sandbox_policy.has_full_disk_read_access(),
             "deny-read carveout must not be flattened to full read access"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_project_read_includes_seatbelt_platform_defaults() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-project-read");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex project read metadata should parse");
+        let state = SandboxState {
+            sandbox_policy: update.sandbox_policy,
+            sandbox_cwd: update.sandbox_cwd.expect("sandbox cwd"),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("seatbelt command should prepare");
+        let policy = prepared
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .expect("seatbelt policy argument");
+
+        assert!(
+            policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
+            "expected restricted profile seatbelt policy to include platform defaults: {policy}"
         );
     }
 
