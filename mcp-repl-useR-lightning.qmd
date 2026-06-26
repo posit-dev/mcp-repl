@@ -160,7 +160,10 @@ ggplot(df, aes(...))
 :::
 :::
 
-These are interactive surfaces.
+
+- These are designed for repeated interactions with a persistent
+  stateful R session.
+- Many require `interactive()` return `TRUE`.
 
 ::: notes
 Timing: ~0:25.

@@ -319,11 +319,13 @@ bash tool calls with Rscript and an edit_file tool call." style="width: 100%; fi
 <span id="cb3-4"><a href=""></a>RShowDoc()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </div><div class="column" style="width:33%;">
 <p>Plots</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb4-1"><a href=""></a></span>
-<span id="cb4-2"><a href=""></a>plot(fit)</span>
-<span id="cb4-3"><a href=""></a>ggplot(df, aes(...))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb4-1"><a href=""></a>plot(fit)</span>
+<span id="cb4-2"><a href=""></a>ggplot(df, aes(...))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
 </div></div>
-<p>These are interactive surfaces.</p>
+<ul>
+<li>These are designed for repeated interactions with a persistent stateful R session.</li>
+<li>Many require <code>interactive()</code> return <code>TRUE</code>.</li>
+</ul>
 <aside class="notes">
 <p>Timing: ~0:25.</p>
 <p>The mismatch becomes obvious when the task stops being linear. R help, vignettes, pagers, plots, readline prompts, and the debugger all assume there is a live session on the other side. Batch execution can only approximate that by making more files and replaying more setup. For serious R work, command execution is not the primitive we need.</p>
