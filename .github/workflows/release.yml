@@ -76,6 +76,7 @@ jobs:
           cache-bin: false
 
       - name: Install nightly rustfmt
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: rustup toolchain install nightly --profile minimal --component rustfmt
 
       - name: Set up Python
@@ -99,30 +100,33 @@ jobs:
           fi
 
       - name: cargo check
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo check
 
       - name: cargo build
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo build
 
       - name: Windows sandbox setup
-        if: matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         run: .\target\debug\mcp-repl.exe windows-sandbox setup
 
       - name: Python public API suite
-        if: matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
         run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl
 
       - name: Python public API suite (windows)
-        if: matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe
 
       - name: cargo clippy
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Install Codex CLI
-        if: matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -133,7 +137,7 @@ jobs:
           codex --version
 
       - name: Install Codex CLI (windows)
-        if: matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           npm install -g @openai/codex
@@ -143,11 +147,13 @@ jobs:
           & (Join-Path $npmPrefix "codex.cmd") --version
 
       - name: cargo test
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           MCP_REPL_CODEX_BACKEND: mock
         run: cargo test --quiet -- --test-threads=5
 
       - name: cargo +nightly fmt
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo +nightly fmt --all -- --check
 
       - name: cargo build --release
@@ -163,32 +169,21 @@ jobs:
         run: |
           .\target\release\mcp-repl.exe --help
 
-      - name: Detect release CLI contract
-        id: release_cli_contract_available
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f tests/release_cli_contract.rs ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Release CLI contract
-        if: matrix.os != 'windows-2022' && steps.release_cli_contract_available.outputs.exists == 'true'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
         env:
           MCP_REPL_RELEASE_BINARY: target/release/mcp-repl
         run: cargo test --test release_cli_contract --quiet
 
       - name: Release CLI contract (windows)
-        if: matrix.os == 'windows-2022' && steps.release_cli_contract_available.outputs.exists == 'true'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         env:
           MCP_REPL_RELEASE_BINARY: target/release/mcp-repl.exe
         run: cargo test --test release_cli_contract --quiet
 
       - name: Package release archive
-        if: matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -199,7 +194,7 @@ jobs:
           tar -C dist -czf "dist/${{ matrix.asset_name }}" "mcp-repl-${{ matrix.target }}"
 
       - name: Package release archive (windows)
-        if: matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           $packageDir = "dist/mcp-repl-${{ matrix.target }}"
@@ -252,6 +247,7 @@ jobs:
           .\wheel-smoke\Scripts\mcp-repl.exe --help
 
       - name: Upload packaged artifact
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
