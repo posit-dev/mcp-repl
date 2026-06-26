@@ -22,9 +22,22 @@ const OUTPUT_READER_COMPLETION_STABLE: Duration = if cfg!(target_os = "macos") {
 const OUTPUT_READER_UTF8_TAIL_SETTLE_MAX: Duration = Duration::from_millis(900);
 const OUTPUT_READER_TIMEOUT_SETTLE_MAX: Duration = Duration::from_millis(900);
 
+#[derive(Clone, Copy)]
+enum RequestOutputOutcome {
+    Completed,
+    TimedOut,
+    Failed,
+}
+
 pub(super) struct RequestState {
     pub(super) timeout: Duration,
     pub(super) started_at: Instant,
+}
+
+impl RequestState {
+    pub(super) fn remaining_budget(&self) -> Duration {
+        (self.started_at + self.timeout).saturating_duration_since(Instant::now())
+    }
 }
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
@@ -147,6 +160,7 @@ impl WorkerManager {
             .ipc_connection()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         let start = Instant::now();
+        let deadline = start + timeout;
         let mut result = self.driver.wait_for_completion(timeout, ipc.clone());
         if matches!(
             &result,
@@ -184,16 +198,7 @@ impl WorkerManager {
                 );
             }
         }
-        // Best-effort: after IPC completion, give the output reader threads a brief window to
-        // drain any bytes already written by the worker before we snapshot the ring.
-        let elapsed = start.elapsed();
-        let remaining = timeout.saturating_sub(elapsed);
-        let allow_utf8_tail_grace = !matches!(result, Err(WorkerError::Timeout(_)));
-        self.settle_output_after_completion_with_utf8_tail_grace(remaining, allow_utf8_tail_grace);
-        if result.is_ok() {
-            self.pending_output_tape
-                .append_sideband(PendingSidebandKind::RequestBoundary);
-        }
+        self.finalize_output_after_completion_wait(&result, deadline);
         if result.is_ok()
             && let Some(message) = ipc.take_protocol_error()
         {
@@ -213,29 +218,39 @@ impl WorkerManager {
     }
 
     pub(super) fn settle_output_after_completion(&self, budget: Duration) {
-        self.settle_output_after_completion_with_utf8_tail_grace(budget, true);
+        self.settle_output_for_request_outcome(
+            RequestOutputOutcome::Completed,
+            Instant::now() + budget,
+        );
     }
 
-    fn settle_output_after_completion_with_utf8_tail_grace(
-        &self,
-        budget: Duration,
-        allow_utf8_tail_grace: bool,
+    fn finalize_output_after_completion_wait(
+        &mut self,
+        result: &Result<CompletionInfo, WorkerError>,
+        deadline: Instant,
     ) {
-        let total = budget.min(OUTPUT_READER_QUIESCE_GRACE);
-        let utf8_tail_pending =
-            allow_utf8_tail_grace && self.output_timeline.has_unflushable_utf8_tail();
-        if total.is_zero() && !utf8_tail_pending {
+        let outcome = match result {
+            Ok(_) => RequestOutputOutcome::Completed,
+            Err(WorkerError::Timeout(_)) => RequestOutputOutcome::TimedOut,
+            Err(_) => RequestOutputOutcome::Failed,
+        };
+        self.settle_output_for_request_outcome(outcome, deadline);
+        if result.is_ok() {
+            self.pending_output_tape
+                .append_sideband(PendingSidebandKind::RequestBoundary);
+        }
+    }
+
+    fn settle_output_for_request_outcome(&self, outcome: RequestOutputOutcome, deadline: Instant) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return;
         }
-        let stable_needed = if total.is_zero() && utf8_tail_pending {
-            OUTPUT_READER_COMPLETION_STABLE
-        } else {
-            OUTPUT_READER_COMPLETION_STABLE.min(total)
-        };
-        let utf8_tail_total = if allow_utf8_tail_grace {
-            OUTPUT_READER_UTF8_TAIL_SETTLE_MAX
-        } else {
-            total
+        let total = remaining.min(OUTPUT_READER_QUIESCE_GRACE);
+        let stable_needed = OUTPUT_READER_COMPLETION_STABLE.min(remaining);
+        let utf8_tail_total = match outcome {
+            RequestOutputOutcome::Completed => remaining.min(OUTPUT_READER_UTF8_TAIL_SETTLE_MAX),
+            RequestOutputOutcome::TimedOut | RequestOutputOutcome::Failed => total,
         };
         self.settle_output_until_stable(total, stable_needed, utf8_tail_total);
     }
@@ -264,8 +279,11 @@ impl WorkerManager {
         }
     }
 
-    pub(super) fn settle_output_after_timeout(&self) {
-        let total = OUTPUT_READER_TIMEOUT_SETTLE_MAX;
+    pub(super) fn settle_output_after_timeout(&self, budget: Duration) {
+        let total = budget.min(OUTPUT_READER_TIMEOUT_SETTLE_MAX);
+        if total.is_zero() {
+            return;
+        }
         let stable_needed = Duration::from_millis(40);
         let poll = Duration::from_millis(5);
         let start = Instant::now();
@@ -326,7 +344,11 @@ impl WorkerManager {
         let mut stable_for = Duration::from_millis(0);
         loop {
             let elapsed = start.elapsed();
-            if elapsed >= total && (!saw_utf8_tail_pending || elapsed >= utf8_tail_total) {
+            if elapsed >= total
+                && (!saw_utf8_tail_pending
+                    || (elapsed >= utf8_tail_total
+                        && (utf8_tail_pending || stable_for >= stable_needed)))
+            {
                 return;
             }
             thread::sleep(poll);
@@ -540,7 +562,7 @@ mod tests {
             );
         });
 
-        manager.settle_output_after_completion(OUTPUT_READER_QUIESCE_GRACE);
+        manager.settle_output_after_completion(OUTPUT_READER_UTF8_TAIL_SETTLE_MAX);
         let formatted = manager.drain_final_formatted_output();
 
         handle.join().expect("delayed output writer should finish");
@@ -557,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_settle_uses_utf8_tail_grace_when_budget_is_zero() {
+    fn completion_settle_does_not_wait_when_budget_is_zero() {
         let manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -584,17 +606,17 @@ mod tests {
 
         let text = contents_text(&formatted.contents);
         assert!(
-            text.contains("é\n"),
-            "completion settle should use UTF-8 tail grace even with no regular budget, got: {text:?}"
+            text.contains("\\xC3"),
+            "completion settle should respect a zero budget and leave sealing to final drain, got: {text:?}"
         );
         assert!(
-            !text.contains("\\xC3") && !text.contains("\\xA9"),
-            "completion settle should not seal split UTF-8 bytes when continuation arrives within the tail grace, got: {text:?}"
+            !text.contains("é"),
+            "completion settle should not wait for UTF-8 continuation bytes after a zero budget, got: {text:?}"
         );
     }
 
     #[test]
-    fn completion_settle_keeps_stability_window_after_zero_budget_utf8_recovery() {
+    fn completion_settle_keeps_stability_window_after_utf8_recovery() {
         let manager = WorkerManager::new(
             Backend::Python,
             SandboxCliPlan::default(),
@@ -620,7 +642,7 @@ mod tests {
             );
         });
 
-        manager.settle_output_after_completion(Duration::ZERO);
+        manager.settle_output_after_completion(Duration::from_millis(200));
         let formatted = manager.drain_final_formatted_output();
 
         handle.join().expect("delayed output writer should finish");

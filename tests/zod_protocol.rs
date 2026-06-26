@@ -1246,6 +1246,86 @@ async fn zod_files_completion_settles_split_utf8_tail_before_request_boundary() 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-near-grace-then-more-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é after\n"),
+        "completion should keep settling after UTF-8 recovery near the grace deadline, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "completion should not seal split UTF-8 bytes when the continuation arrives during settle, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stderr-utf8-then-late-stderr-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        !first_text.contains("\\xC3"),
+        "completed request should keep an incomplete UTF-8 tail detached, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+
+    session.cancel().await?;
+
+    assert!(
+        second_text.contains("stderr: \\xC3stderr: after\n"),
+        "request boundary should reset stderr rendering after sealing the prior UTF-8 tail, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("stderr: \\xC3after\n"),
+        "stderr rendering state leaked across the sealed UTF-8 tail, got: {second_text:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;

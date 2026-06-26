@@ -255,6 +255,18 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "partial-stderr-utf8-then-late-stderr-after-completion" {
+        output_stderr_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(950));
+            let _ = output_stderr_text(&writer, &control_log_path, b"after\n");
+        });
+        return Ok(false);
+    }
+
     if command == "partial-stdout-then-newline-stderr" {
         output_text(writer, control_log_path, b"partial")?;
         output_stderr_text(writer, control_log_path, b"\nerr\n")?;
@@ -298,6 +310,20 @@ fn run_command(
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(40));
             let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9, b'\n'], true);
+        });
+        return Ok(false);
+    }
+
+    if command == "split-utf8-near-grace-then-more-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(885));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
+            thread::sleep(Duration::from_millis(30));
+            let _ = output_text_with_continuation(&writer, &control_log_path, b" after\n", false);
         });
         return Ok(false);
     }
@@ -520,6 +546,16 @@ fn output_stderr_text(
 ) -> io::Result<()> {
     append_control_log(control_log_path.as_deref(), "output_text stderr")?;
     writer.output_text("stderr", bytes)
+}
+
+fn output_stderr_text_with_continuation(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    is_continuation: bool,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_text stderr")?;
+    writer.output_text_with_continuation("stderr", bytes, is_continuation)
 }
 
 fn output_image(

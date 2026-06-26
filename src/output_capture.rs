@@ -162,40 +162,30 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_input_wait(&self) {
-        let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
-        self.append_pending_locked(pending);
-        self.ring.append_marker_event(OutputEventKind::InputWait);
+        self.append_event(OutputEventKind::InputWait);
     }
 
     pub(crate) fn append_request_boundary(&self) {
-        let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
-        self.append_pending_locked(pending);
-        self.ring
-            .append_marker_event(OutputEventKind::RequestBoundary);
+        self.append_event(OutputEventKind::RequestBoundary);
     }
 
     pub(crate) fn append_session_end(&self) {
-        let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
-        self.append_pending_locked(pending);
-        self.ring.append_marker_event(OutputEventKind::SessionEnd);
+        self.append_event(OutputEventKind::SessionEnd);
     }
 
     pub(crate) fn last_text_ends_with_newline(&self) -> bool {
         self.ring.last_text_ends_with_newline()
     }
 
-    pub(crate) fn flush_utf8_tails(&self) {
+    pub(crate) fn seal_utf8_tails(&self) {
         let mut guard = self.state.lock().unwrap();
         let pending = guard.utf8_tails.drain();
         self.append_pending_locked(pending);
     }
 
-    pub(crate) fn flush_ready_utf8_tails(&self) {
+    pub(crate) fn seal_utf8_tails_blocking_visible_output(&self) {
         let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
+        let pending = guard.utf8_tails.drain_ready_after_visible_gaps();
         self.append_pending_locked(pending);
     }
 
@@ -242,6 +232,19 @@ struct OutputUtf8Tail {
 enum OutputPendingEntry {
     Text(OutputUtf8Tail),
     Event(OutputEventKind),
+}
+
+impl OutputPendingEntry {
+    fn is_marker_event(&self) -> bool {
+        matches!(
+            self,
+            OutputPendingEntry::Event(
+                OutputEventKind::InputWait
+                    | OutputEventKind::RequestBoundary
+                    | OutputEventKind::SessionEnd
+            )
+        )
+    }
 }
 
 #[derive(Default)]
@@ -353,15 +356,19 @@ impl OutputUtf8Tails {
     ) -> Vec<OutputPendingEntry> {
         let mut ready = self.drain_ready();
         if self.blocked_side_buffer_bytes() > side_buffer_capacity_bytes {
-            ready.extend(self.drain_ready_after_gaps());
+            ready.extend(self.drain_ready_after_visible_gaps());
         }
         ready
     }
 
-    fn drain_ready_after_gaps(&mut self) -> Vec<OutputPendingEntry> {
+    fn drain_ready_after_visible_gaps(&mut self) -> Vec<OutputPendingEntry> {
         let mut ready = Vec::new();
         while !self.entries.is_empty() {
-            let has_later_entries = self.entries.len() > 1;
+            let has_later_visible_entries = self
+                .entries
+                .iter()
+                .skip(1)
+                .any(|entry| !entry.is_marker_event());
             let OutputPendingEntry::Text(front) = &mut self.entries[0] else {
                 ready.push(self.entries.remove(0));
                 continue;
@@ -373,7 +380,7 @@ impl OutputUtf8Tails {
 
             let flushable_len = flushable_prefix_len(&front.bytes);
             if flushable_len == 0 {
-                if has_later_entries {
+                if has_later_visible_entries {
                     front.sealed = true;
                     ready.push(materialize_pending_entry(self.entries.remove(0)));
                     continue;
@@ -392,7 +399,7 @@ impl OutputUtf8Tails {
                 bytes,
                 sealed: true,
             }));
-            if !has_later_entries {
+            if !has_later_visible_entries {
                 break;
             }
         }

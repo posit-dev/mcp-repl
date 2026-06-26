@@ -75,7 +75,7 @@ impl WorkerManager {
                             .pending_output_tape
                             .append_stdout_status_line(message.as_bytes()),
                         OversizedOutputMode::Pager => {
-                            self.output_timeline.flush_utf8_tails();
+                            self.output_timeline.seal_utf8_tails();
                             if self.output_timeline.last_text_ends_with_newline() {
                                 self.output_timeline.append_text(
                                     message.as_bytes(),
