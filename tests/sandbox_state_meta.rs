@@ -288,6 +288,32 @@ fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn project_subpath_write_meta(sandbox_cwd: &Path, subpath: &str) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                root_read_entry(),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                json!({
+                    "path": {
+                        "type": "special",
+                        "value": {
+                            "kind": "project_roots",
+                            "subpath": subpath
+                        }
+                    },
+                    "access": "write"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
@@ -2746,6 +2772,51 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
         "workspace-write unexpectedly blocked write in cwd: {text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_project_subpath_write_meta_allows_missing_writable_root() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-project-subpath-missing-write")?;
+    let writable_subpath = "generated/output";
+    let writable_root = scratch.path().join(writable_subpath);
+    assert!(
+        !writable_root.exists(),
+        "test requires missing writable root: {}",
+        writable_root.display()
+    );
+    let target = writable_root.join("allowed.txt");
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(project_subpath_write_meta(scratch.path(), writable_subpath)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected missing project subpath writable root to allow writes, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "missing project subpath writable root unexpectedly blocked write: {text}"
+    );
+    session.cancel().await?;
+    assert!(
+        target.exists(),
+        "write under missing project subpath root should create {}",
+        target.display()
+    );
     Ok(())
 }
 

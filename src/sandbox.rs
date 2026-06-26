@@ -3405,7 +3405,6 @@ fn linux_bwrap_filesystem_args(
     let mut writable_roots = file_system_policy
         .get_writable_roots_with_cwd(cwd, Some(session_temp_dir))
         .into_iter()
-        .filter(|writable_root| writable_root.root.exists())
         .collect::<Vec<_>>();
     if writable_roots.is_empty()
         && file_system_policy.has_full_disk_write_access()
@@ -3495,6 +3494,7 @@ fn linux_bwrap_filesystem_args(
         preserved_files: Vec::new(),
         synthetic_mount_targets: Vec::new(),
     };
+    prepare_linux_missing_writable_roots(&mut command, &writable_roots)?;
 
     let mut allowed_write_paths = Vec::with_capacity(writable_roots.len() * 2);
     for writable_root in &writable_roots {
@@ -3728,6 +3728,42 @@ fn append_linux_mount_target_parent_dir_args(
         args.push("--dir".to_string());
         args.push(linux_path_to_string(&dir));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_missing_writable_roots(
+    command: &mut LinuxBwrapCommand,
+    writable_roots: &[WritableRoot],
+) -> Result<(), String> {
+    for writable_root in writable_roots {
+        let root = writable_root.root.as_path();
+        if root.exists() {
+            continue;
+        }
+        let Some(first_missing) = find_first_non_existent_component(root) else {
+            continue;
+        };
+        std::fs::create_dir_all(root).map_err(|err| {
+            format!(
+                "failed to create missing sandbox writable root {}: {err}",
+                root.display()
+            )
+        })?;
+
+        let mut created_dirs = root
+            .ancestors()
+            .take_while(|path| *path != first_missing)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        created_dirs.push(first_missing);
+        created_dirs.reverse();
+        command.synthetic_mount_targets.extend(
+            created_dirs
+                .into_iter()
+                .map(LinuxSyntheticMountTarget::EmptyDirectory),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
