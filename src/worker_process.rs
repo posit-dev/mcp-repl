@@ -10,10 +10,13 @@ use crate::output_capture::{
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::Pager;
 use crate::pending_output_tape::PendingOutputTape;
-use crate::sandbox::{SandboxState, SandboxStateUpdate};
+use crate::sandbox::SandboxState;
+#[cfg(any(debug_assertions, test))]
+use crate::sandbox::SandboxStateUpdate;
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::server::response::configured_output_bundle_max_bytes;
 pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
+#[cfg(any(debug_assertions, test))]
 use crate::worker_protocol::WorkerReply;
 use crate::worker_supervisor::{GuardrailEvent, GuardrailShared, WorkerProcess};
 
@@ -169,6 +172,7 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
+    #[cfg(any(debug_assertions, test))]
     pub fn new(
         backend: Backend,
         sandbox_plan: SandboxCliPlan,
@@ -353,6 +357,7 @@ impl WorkerManager {
         }
     }
 
+    #[cfg(any(debug_assertions, test))]
     pub fn interrupt(
         &mut self,
         timeout: Duration,

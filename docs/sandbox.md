@@ -25,10 +25,11 @@ may still be logged as the older `read-only`, `workspace-write`,
 `external-sandbox`, or `danger-full-access` shapes for compatibility with the
 existing CLI surface.
 
-`--debug-repl` is the one local-only exception. Because there is no MCP client
-metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
-bootstraps one local inherited snapshot from the current default sandbox state
-before the first worker spawn.
+Debug/dev builds have one local-only exception: `--debug-repl`. Because there
+is no MCP client metadata channel in that mode, `mcp-repl --debug-repl
+--sandbox inherit` bootstraps one local inherited snapshot from the current
+default sandbox state before the first worker spawn. Shipped release binaries
+do not include `--debug-repl`.
 
 For `repl`, inherited sandbox metadata controls the worker session that handles
 the call. When a non-empty tool call would use the worker and the effective

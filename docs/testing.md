@@ -142,7 +142,7 @@ When behavior is unclear:
 1. Reproduce through the public tool surface or an existing integration test.
 2. Inspect with `docs/debugging.md`:
    - `MCP_REPL_DEBUG_DIR`
-   - `--debug-repl`
+   - `--debug-repl` from a debug/dev build
    - the stdio trace proxy
 3. Add or update a public API test.
 4. Re-run the full verification set.

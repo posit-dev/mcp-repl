@@ -2027,6 +2027,7 @@ fn image_to_content(image: &ReplyImage) -> Content {
     content_image(image.data.clone(), image.mime_type.clone())
 }
 
+#[cfg(any(debug_assertions, test))]
 pub(crate) fn text_stream_from_content(content: &Content) -> Option<TextStream> {
     let RawContent::Text(text) = &content.raw else {
         return None;
@@ -2054,6 +2055,7 @@ fn text_stream_meta(stream: TextStream) -> Option<Meta> {
     Some(meta)
 }
 
+#[cfg(any(debug_assertions, test))]
 fn text_stream_from_meta(meta: &Meta) -> Option<TextStream> {
     match meta.get(TEXT_STREAM_META_KEY).and_then(Value::as_str) {
         Some("stderr") => Some(TextStream::Stderr),

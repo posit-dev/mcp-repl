@@ -1,6 +1,7 @@
 mod backend;
 mod completion_reply;
 mod debug_logs;
+#[cfg(debug_assertions)]
 mod debug_repl;
 mod diagnostics;
 mod event_log;
@@ -59,6 +60,7 @@ enum CliCommand {
 #[derive(Debug, Clone)]
 struct CliOptions {
     sandbox_plan: SandboxCliPlan,
+    #[cfg(debug_assertions)]
     debug_repl: bool,
     worker_launch: WorkerLaunch,
     debug_dir: Option<PathBuf>,
@@ -107,20 +109,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match parse_cli_args()? {
         CliCommand::RunServer(options) => {
+            #[cfg(debug_assertions)]
+            let debug_repl = options.debug_repl;
+            #[cfg(not(debug_assertions))]
+            let debug_repl = false;
             debug_logs::initialize(options.debug_dir.clone())?;
             event_log::initialize(
                 options.debug_dir.clone(),
                 event_log::StartupContext {
-                    mode: if options.debug_repl {
+                    mode: if debug_repl {
                         "debug_repl".to_string()
                     } else {
                         "server".to_string()
                     },
                     backend: options.worker_launch.label(),
-                    debug_repl: options.debug_repl,
+                    debug_repl,
                     sandbox_state: None,
                 },
             )?;
+            #[cfg(debug_assertions)]
             if options.debug_repl {
                 let WorkerLaunch::Builtin(backend) = options.worker_launch.clone() else {
                     return Err("--debug-repl requires --interpreter, not --worker-spec".into());
@@ -183,6 +190,7 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
     }
 
     let mut sandbox_args = SandboxCliArgs::default();
+    #[cfg(debug_assertions)]
     let mut debug_repl = false;
     let mut debug_dir = None;
     let mut backend = backend_from_env()?;
@@ -288,6 +296,7 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
                     .operations
                     .push(SandboxCliOperation::Config(parsed));
             }
+            #[cfg(debug_assertions)]
             "--debug-repl" => {
                 debug_repl = true;
             }
@@ -364,6 +373,7 @@ fn parse_cli_args_from(args: Vec<String>) -> Result<CliCommand, Box<dyn std::err
 
     Ok(CliCommand::RunServer(CliOptions {
         sandbox_plan: sandbox_args.plan,
+        #[cfg(debug_assertions)]
         debug_repl,
         worker_launch,
         debug_dir,
@@ -535,9 +545,9 @@ fn print_usage() {
     println!("{}", top_level_help());
 }
 
-#[cfg(not(target_os = "windows"))]
-fn top_level_help() -> &'static str {
-    "\
+fn top_level_help() -> String {
+    let mut help = String::from(
+        "\
 mcp-repl is an MCP server that exposes a long-lived R or Python REPL over
 stdio. After an MCP client starts the server, call the `repl` and `repl_reset`
 tools through that client to run code, keep session state, read help, and
@@ -545,86 +555,42 @@ return plots or other output.
 
 Agents should not launch this binary directly. It powers an MCP tool and
 should be started by the configured harness or MCP client. Run
-`mcp-repl install` to register it with supported clients, or use `--debug-repl`
-only for local server debugging.
+`mcp-repl install` to register it with supported clients.
+",
+    );
 
+    #[cfg(debug_assertions)]
+    help.push_str("Use `--debug-repl` only for local server debugging.\n");
+
+    help.push_str(
+        "\n\
 Usage:
   mcp-repl [OPTIONS]
   mcp-repl install [OPTIONS]
+",
+    );
 
+    #[cfg(target_os = "windows")]
+    help.push_str("  mcp-repl windows-sandbox setup [OPTIONS]\n");
+
+    help.push_str(
+        "\n\
 Commands:
   install
       Update MCP config for supported clients.
+",
+    );
 
-Options:
-  -h, --help
-      Show this help.
-
-  --interpreter <r|python>
-      Choose the REPL interpreter.
-      Default: r. Environment: MCP_REPL_INTERPRETER.
-
-  --debug-repl
-      Run an interactive debug REPL over stdio.
-
-  --debug-dir <path>
-      Write per-startup debug artifacts under this directory.
-      Environment: MCP_REPL_DEBUG_DIR.
-
-  --oversized-output <files|pager>
-      Choose oversized-output handling.
-      Default: pager. Use files to spill oversized replies to bundle files.
-
-  --sandbox <inherit|read-only|workspace-write|danger-full-access>
-      Choose the base worker sandbox mode.
-      `inherit` uses client tool-call metadata.
-
-  --add-writable-root <abs-path>
-      Append an absolute writable root in argument order.
-      Alias: --add-writeable-root.
-
-  --add-allowed-domain <domain>
-      Append an allowed managed-network domain pattern in argument order.
-
-  --config <key=value>
-      Apply an advanced ordered sandbox or network override.
-
-Install:
-  mcp-repl install [--client <codex|claude>]...
-                   [--interpreter <r|python>[,r|python]...]...
-                   [--arg <value>]...
-
-  If no interpreter is specified, install registers both R and Python for each
-  selected client.
-"
-}
-
-#[cfg(target_os = "windows")]
-fn top_level_help() -> &'static str {
-    "\
-mcp-repl is an MCP server that exposes a long-lived R or Python REPL over
-stdio. After an MCP client starts the server, call the `repl` and `repl_reset`
-tools through that client to run code, keep session state, read help, and
-return plots or other output.
-
-Agents should not launch this binary directly. It powers an MCP tool and
-should be started by the configured harness or MCP client. Run
-`mcp-repl install` to register it with supported clients, or use `--debug-repl`
-only for local server debugging.
-
-Usage:
-  mcp-repl [OPTIONS]
-  mcp-repl install [OPTIONS]
-  mcp-repl windows-sandbox setup [OPTIONS]
-
-Commands:
-  install
-      Update MCP config for supported clients.
-
-  windows-sandbox setup
+    #[cfg(target_os = "windows")]
+    help.push_str(
+        "\n  windows-sandbox setup
       Create or refresh the Windows offline sandbox account and firewall
       rules.
+",
+    );
 
+    help.push_str(
+        "\n\
 Options:
   -h, --help
       Show this help.
@@ -632,11 +598,18 @@ Options:
   --interpreter <r|python>
       Choose the REPL interpreter.
       Default: r. Environment: MCP_REPL_INTERPRETER.
+",
+    );
 
-  --debug-repl
+    #[cfg(debug_assertions)]
+    help.push_str(
+        "\n  --debug-repl
       Run an interactive debug REPL over stdio.
+",
+    );
 
-  --debug-dir <path>
+    help.push_str(
+        "\n  --debug-dir <path>
       Write per-startup debug artifacts under this directory.
       Environment: MCP_REPL_DEBUG_DIR.
 
@@ -665,11 +638,19 @@ Install:
 
   If no interpreter is specified, install registers both R and Python for each
   selected client.
+",
+    );
 
+    #[cfg(target_os = "windows")]
+    help.push_str(
+        "\n\
 Windows Sandbox:
   mcp-repl windows-sandbox setup [--http-proxy-port <port>]
                                 [--socks-proxy-port <port>]
-"
+",
+    );
+
+    help
 }
 
 fn print_install_usage() {
