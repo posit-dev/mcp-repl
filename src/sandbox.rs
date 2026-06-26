@@ -433,7 +433,17 @@ impl FileSystemSandboxPolicy {
         dedup_paths(writable_entries)
             .into_iter()
             .map(|root| {
-                let mut read_only_subpaths = compute_writable_root_exclusions(&root, cwd);
+                #[cfg(target_os = "linux")]
+                let protect_metadata =
+                    !is_linux_ambient_temp_writable_root(&root, session_temp_dir);
+                #[cfg(not(target_os = "linux"))]
+                let protect_metadata = true;
+
+                let mut read_only_subpaths = if protect_metadata {
+                    compute_writable_root_exclusions(&root, cwd)
+                } else {
+                    Vec::new()
+                };
                 read_only_subpaths.extend(
                     resolved_entries
                         .iter()
@@ -450,12 +460,16 @@ impl FileSystemSandboxPolicy {
                         }),
                 );
                 #[cfg(target_os = "linux")]
-                let protected_metadata_names = self.protected_metadata_names_for_writable_root(
-                    &root,
-                    &resolved_entries,
-                    cwd,
-                    session_temp_dir,
-                );
+                let protected_metadata_names = if protect_metadata {
+                    self.protected_metadata_names_for_writable_root(
+                        &root,
+                        &resolved_entries,
+                        cwd,
+                        session_temp_dir,
+                    )
+                } else {
+                    Vec::new()
+                };
                 WritableRoot {
                     root,
                     read_only_subpaths: dedup_paths(read_only_subpaths),
@@ -938,6 +952,22 @@ fn temp_roots_from_system(exclude_tmpdir_env_var: bool, exclude_slash_tmp: bool)
     }
 
     roots
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_ambient_temp_writable_root(root: &Path, session_temp_dir: Option<&Path>) -> bool {
+    let Some(root) = ensure_absolute(root.to_path_buf()) else {
+        return false;
+    };
+    if session_temp_dir
+        .and_then(|path| ensure_absolute(path.to_path_buf()))
+        .is_some_and(|session_temp_dir| session_temp_dir == root)
+    {
+        return false;
+    }
+    temp_roots_from_system(false, false)
+        .into_iter()
+        .any(|temp_root| temp_root == root)
 }
 
 #[cfg(target_os = "linux")]
@@ -3212,6 +3242,8 @@ fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<Stri
 struct LinuxBwrapCommand {
     args: Vec<String>,
     preserved_files: Vec<std::fs::File>,
+    empty_file_source_index: Option<usize>,
+    preserved_tempdirs: Vec<tempfile::TempDir>,
     synthetic_mount_targets: Vec<LinuxSyntheticMountTarget>,
 }
 
@@ -3246,16 +3278,31 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
         mount_proc,
         network_mode,
     )?;
-    make_linux_files_inheritable(&bwrap_command.preserved_files)?;
-    let synthetic_mount_targets = bwrap_command.synthetic_mount_targets.clone();
-    let mut full_command = Vec::with_capacity(1 + bwrap_command.args.len());
+    let LinuxBwrapCommand {
+        args,
+        preserved_files,
+        empty_file_source_index: _,
+        preserved_tempdirs,
+        synthetic_mount_targets,
+    } = bwrap_command;
+    make_linux_files_inheritable(&preserved_files)?;
+    let synthetic_mount_targets_for_cleanup = synthetic_mount_targets.clone();
+    let mut full_command = Vec::with_capacity(1 + args.len());
     full_command.push(bwrap_program.into_os_string());
-    full_command.extend(bwrap_command.args.into_iter().map(std::ffi::OsString::from));
-    if !synthetic_mount_targets.is_empty() {
-        linux_run_bwrap_child_with_synthetic_cleanup(full_command, synthetic_mount_targets)?;
+    full_command.extend(args.into_iter().map(std::ffi::OsString::from));
+    if !synthetic_mount_targets_for_cleanup.is_empty() || !preserved_tempdirs.is_empty() {
+        linux_run_bwrap_child_with_cleanup(
+            full_command,
+            synthetic_mount_targets_for_cleanup,
+            preserved_files,
+            preserved_tempdirs,
+        )?;
         return Ok(());
     }
-    linux_execvp(full_command)?;
+    let exec_result = linux_execvp(full_command);
+    drop(preserved_files);
+    drop(preserved_tempdirs);
+    exec_result?;
     Ok(())
 }
 
@@ -3359,16 +3406,13 @@ fn create_linux_bwrap_command_args(
         bwrap_args.push("--proc".to_string());
         bwrap_args.push("/proc".to_string());
     }
-    let command_index = bwrap_args.len();
     bwrap_args.push("--".to_string());
     bwrap_args.extend(command);
-    bwrap_args.splice(
-        command_index..command_index,
-        ["--argv0".to_string(), "codex-linux-sandbox".to_string()],
-    );
     Ok(LinuxBwrapCommand {
         args: bwrap_args,
         preserved_files: bwrap_command.preserved_files,
+        empty_file_source_index: bwrap_command.empty_file_source_index,
+        preserved_tempdirs: bwrap_command.preserved_tempdirs,
         synthetic_mount_targets: bwrap_command.synthetic_mount_targets,
     })
 }
@@ -3399,6 +3443,8 @@ fn linux_bwrap_filesystem_args(
         return Ok(LinuxBwrapCommand {
             args: vec!["--bind".to_string(), "/".to_string(), "/".to_string()],
             preserved_files: Vec::new(),
+            empty_file_source_index: None,
+            preserved_tempdirs: Vec::new(),
             synthetic_mount_targets: Vec::new(),
         });
     }
@@ -3492,6 +3538,8 @@ fn linux_bwrap_filesystem_args(
             args
         },
         preserved_files: Vec::new(),
+        empty_file_source_index: None,
+        preserved_tempdirs: Vec::new(),
         synthetic_mount_targets: Vec::new(),
     };
     prepare_linux_missing_writable_roots(&mut command, &writable_roots)?;
@@ -3791,35 +3839,62 @@ fn append_linux_read_only_subpath_args(
             symlink.display()
         ));
     }
-
     if !subpath.exists() {
         if let Some(first_missing) = find_first_non_existent_component(subpath)
             && is_within_allowed_write_paths(&first_missing, allowed_write_paths)
         {
-            append_linux_missing_read_only_subpath_args(command, &first_missing)?;
+            append_linux_missing_read_only_subpath_args(
+                command,
+                &first_missing,
+                allowed_write_paths,
+            )?;
         }
         return Ok(());
     }
 
     if is_within_allowed_write_paths(subpath, allowed_write_paths) {
-        command.args.push("--ro-bind".to_string());
-        command.args.push(linux_path_to_string(subpath));
-        command.args.push(linux_path_to_string(subpath));
+        if linux_protected_metadata_name(subpath).is_some()
+            && linux_path_is_empty_directory(subpath)
+        {
+            append_linux_empty_directory_ro_bind_args(command, subpath, allowed_write_paths)?;
+        } else {
+            command.args.push("--ro-bind".to_string());
+            command.args.push(linux_path_to_string(subpath));
+            command.args.push(linux_path_to_string(subpath));
+        }
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_protected_metadata_name(path: &Path) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| PROTECTED_METADATA_SUBPATHS.contains(name))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_is_empty_directory(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_dir() {
+        return false;
+    }
+    std::fs::read_dir(path)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_none()
 }
 
 #[cfg(target_os = "linux")]
 fn append_linux_missing_read_only_subpath_args(
     command: &mut LinuxBwrapCommand,
     path: &Path,
+    allowed_write_paths: &[PathBuf],
 ) -> Result<(), String> {
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| PROTECTED_METADATA_SUBPATHS.contains(&name))
-    {
-        append_linux_empty_directory_args(&mut command.args, path, "555");
+    if linux_protected_metadata_name(path).is_some() {
+        append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
         command
             .synthetic_mount_targets
             .push(LinuxSyntheticMountTarget::EmptyDirectory(
@@ -3832,13 +3907,111 @@ fn append_linux_missing_read_only_subpath_args(
 }
 
 #[cfg(target_os = "linux")]
-fn append_linux_empty_directory_args(args: &mut Vec<String>, path: &Path, perms: &str) {
-    args.push("--perms".to_string());
-    args.push(perms.to_string());
-    args.push("--tmpfs".to_string());
-    args.push(linux_path_to_string(path));
-    args.push("--remount-ro".to_string());
-    args.push(linux_path_to_string(path));
+fn append_linux_empty_directory_ro_bind_args(
+    command: &mut LinuxBwrapCommand,
+    path: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> Result<(), String> {
+    let source_dir = create_linux_empty_directory_bind_source(allowed_write_paths)?;
+    command.args.push("--dir".to_string());
+    command.args.push(linux_path_to_string(path));
+    command.args.push("--ro-bind".to_string());
+    command.args.push(linux_path_to_string(source_dir.path()));
+    command.args.push(linux_path_to_string(path));
+    command.preserved_tempdirs.push(source_dir);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_empty_directory_bind_source(
+    allowed_write_paths: &[PathBuf],
+) -> Result<tempfile::TempDir, String> {
+    let mut errors = Vec::new();
+    for parent in linux_empty_directory_bind_source_parents() {
+        let Some(parent) = ensure_absolute(parent) else {
+            continue;
+        };
+        if linux_path_is_within_allowed_write_paths_or_canonical(&parent, allowed_write_paths) {
+            errors.push(format!(
+                "{} is inside a sandbox writable root",
+                parent.display()
+            ));
+            continue;
+        }
+        if let Err(err) = std::fs::create_dir_all(&parent) {
+            errors.push(format!("{}: {err}", parent.display()));
+            continue;
+        }
+        let tempdir = match Builder::new()
+            .prefix("mcp-repl-bwrap-empty-dir-")
+            .tempdir_in(&parent)
+        {
+            Ok(tempdir) => tempdir,
+            Err(err) => {
+                errors.push(format!("{}: {err}", parent.display()));
+                continue;
+            }
+        };
+        if linux_path_is_within_allowed_write_paths_or_canonical(
+            tempdir.path(),
+            allowed_write_paths,
+        ) {
+            errors.push(format!(
+                "{} is inside a sandbox writable root",
+                tempdir.path().display()
+            ));
+            drop(tempdir);
+            continue;
+        }
+        return Ok(tempdir);
+    }
+
+    let detail = if errors.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", errors.join("; "))
+    };
+    Err(format!(
+        "failed to create host-only empty directory for Linux bubblewrap read-only bind source outside writable roots{detail}"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_empty_directory_bind_source_parents() -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        parents.push(
+            PathBuf::from(home)
+                .join(".cache")
+                .join("mcp-repl")
+                .join("bwrap"),
+        );
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !runtime_dir.is_empty()
+    {
+        parents.push(PathBuf::from(runtime_dir).join("mcp-repl-bwrap"));
+    }
+    parents.push(PathBuf::from("/var/tmp"));
+    parents.push(std::env::temp_dir());
+    parents.sort();
+    parents.dedup();
+    parents
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_is_within_allowed_write_paths_or_canonical(
+    path: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> bool {
+    if is_within_allowed_write_paths(path, allowed_write_paths) {
+        return true;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|canonical| is_within_allowed_write_paths(&canonical, allowed_write_paths))
 }
 
 #[cfg(target_os = "linux")]
@@ -3848,16 +4021,23 @@ fn append_linux_empty_file_bind_data_args(
     perms: Option<&str>,
     synthetic: bool,
 ) -> Result<(), String> {
-    if command.preserved_files.is_empty() {
+    let empty_file_source_index = if let Some(index) = command.empty_file_source_index {
+        index
+    } else {
         command
             .preserved_files
             .push(std::fs::File::open("/dev/null").map_err(|err| err.to_string())?);
-    }
+        let index = command.preserved_files.len() - 1;
+        command.empty_file_source_index = Some(index);
+        index
+    };
     if let Some(perms) = perms {
         command.args.push("--perms".to_string());
         command.args.push(perms.to_string());
     }
-    let fd = command.preserved_files[0].as_raw_fd().to_string();
+    let fd = command.preserved_files[empty_file_source_index]
+        .as_raw_fd()
+        .to_string();
     command.args.push("--ro-bind-data".to_string());
     command.args.push(fd);
     command.args.push(linux_path_to_string(path));
@@ -3886,9 +4066,11 @@ fn make_linux_files_inheritable(files: &[std::fs::File]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_run_bwrap_child_with_synthetic_cleanup(
+fn linux_run_bwrap_child_with_cleanup(
     command: Vec<std::ffi::OsString>,
     synthetic_mount_targets: Vec<LinuxSyntheticMountTarget>,
+    preserved_files: Vec<std::fs::File>,
+    preserved_tempdirs: Vec<tempfile::TempDir>,
 ) -> Result<(), String> {
     let setup_signal_mask = LinuxBwrapForwardedSignalMask::block()?;
     let pid = unsafe { libc::fork() };
@@ -3924,6 +4106,8 @@ fn linux_run_bwrap_child_with_synthetic_cleanup(
     let cleanup_result = cleanup_linux_synthetic_mount_targets(&synthetic_mount_targets);
     let restore_result = signal_forwarders.restore();
     let mask_restore_result = cleanup_signal_mask.restore();
+    drop(preserved_files);
+    drop(preserved_tempdirs);
     cleanup_result?;
     restore_result?;
     mask_restore_result?;
@@ -5983,6 +6167,275 @@ mod tests {
                 && args[1] == platform_root
                 && args[2] == platform_root),
             "project-roots read profile should mount platform runtime roots: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_protected_metadata_uses_namespace_dir_and_read_only_empty_bind() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-protected-metadata-")
+            .tempdir()
+            .expect("tempdir");
+        let codex_path = root.path().join(".codex");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: codex_path.clone(),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+        ]);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
+                .expect("missing protected metadata should build bwrap args");
+        let codex_text = linux_path_to_string(&codex_path);
+        let dir_index = command
+            .args
+            .windows(2)
+            .position(|args| args[0] == "--dir" && args[1] == codex_text)
+            .expect("missing protected metadata should create its mount target inside bwrap");
+        let bind_index = command
+            .args
+            .windows(3)
+            .position(|args| args[0] == "--ro-bind" && args[2] == codex_text)
+            .expect("missing protected metadata should use a read-only empty directory bind");
+        assert!(
+            dir_index < bind_index,
+            "protected metadata mount target must exist before the bind: {:?}",
+            command.args
+        );
+        let bind_args = command
+            .args
+            .windows(3)
+            .find(|args| args[0] == "--ro-bind" && args[2] == codex_text)
+            .expect("missing protected metadata should use a read-only empty directory bind");
+        let source_path = PathBuf::from(&bind_args[1]);
+
+        assert!(
+            !codex_path.exists(),
+            "missing protected metadata target should be created inside bwrap, not on the host"
+        );
+        assert!(
+            command
+                .preserved_tempdirs
+                .iter()
+                .any(|tempdir| tempdir.path() == source_path),
+            "directory bind should reference a preserved empty source directory"
+        );
+        assert!(
+            !command
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--remount-ro" && args[1] == codex_text),
+            "missing protected metadata should not require tmpfs remount-ro: {:?}",
+            command.args
+        );
+        let protected_target = LinuxSyntheticMountTarget::EmptyDirectory(codex_path.clone());
+        assert!(
+            command.synthetic_mount_targets.contains(&protected_target),
+            "missing protected metadata target should be cleaned up after bwrap exits: {:?}",
+            command.synthetic_mount_targets
+        );
+        assert!(
+            command
+                .preserved_tempdirs
+                .iter()
+                .all(|tempdir| !tempdir.path().starts_with(root.path())),
+            "empty bind sources must stay outside sandbox writable roots"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_empty_protected_metadata_uses_private_bind_source() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-empty-protected-metadata-")
+            .tempdir()
+            .expect("tempdir");
+        let codex_path = root.path().join(".codex");
+        std::fs::create_dir_all(&codex_path).expect("empty metadata dir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: codex_path.clone(),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+        ]);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
+                .expect("empty protected metadata should build bwrap args");
+        let codex_text = linux_path_to_string(&codex_path);
+        let bind_args = command
+            .args
+            .windows(3)
+            .find(|args| args[0] == "--ro-bind" && args[2] == codex_text)
+            .expect("empty protected metadata should use a read-only empty directory bind");
+        let source_path = PathBuf::from(&bind_args[1]);
+
+        assert_ne!(
+            source_path, codex_path,
+            "empty protected metadata must not use the transient target as its bind source"
+        );
+        assert!(
+            command
+                .preserved_tempdirs
+                .iter()
+                .any(|tempdir| tempdir.path() == source_path),
+            "directory bind should reference a preserved empty source directory"
+        );
+        assert!(
+            !command
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(codex_path)),
+            "existing empty protected metadata should not require host cleanup: {:?}",
+            command.synthetic_mount_targets
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_temp_roots_do_not_synthesize_global_metadata_dirs() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-temp-root-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("tempdir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::workspace_write(&[], false, false);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, &workspace, &session_temp_dir)
+                .expect("workspace-write profile should build bwrap args");
+        let temp_roots = temp_roots_from_system(false, false);
+        let global_metadata_paths = temp_roots
+            .iter()
+            .flat_map(|root| {
+                PROTECTED_METADATA_SUBPATHS
+                    .iter()
+                    .map(|name| root.join(name))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for metadata_path in global_metadata_paths {
+            let metadata_text = linux_path_to_string(&metadata_path);
+            assert!(
+                !command
+                    .args
+                    .windows(3)
+                    .any(|args| args[0] == "--ro-bind" && args[2] == metadata_text),
+                "ambient temp metadata should not become a synthetic bwrap bind target: {:?}",
+                command.args
+            );
+            assert!(
+                !command
+                    .synthetic_mount_targets
+                    .contains(&LinuxSyntheticMountTarget::EmptyDirectory(metadata_path)),
+                "ambient temp metadata should not be created and cleaned as a synthetic target"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_read_only_keeps_private_session_metadata_binds() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-read-only-session-")
+            .tempdir()
+            .expect("tempdir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            &session_temp_dir,
+        );
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, &workspace, &session_temp_dir)
+                .expect("read-only profile should build bwrap args");
+        let git_text = linux_path_to_string(&session_temp_dir.join(".git"));
+
+        assert!(
+            command
+                .args
+                .windows(3)
+                .any(|args| args[0] == "--ro-bind" && args[2] == git_text),
+            "read-only session temp metadata should use private synthetic binds: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_command_does_not_require_newer_argv0_option() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-argv0-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let command = create_linux_bwrap_command_args(
+            vec!["/bin/true".to_string()],
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+            false,
+            LinuxBwrapNetworkMode::FullAccess,
+        )
+        .expect("workspace-write profile should build bwrap args");
+
+        assert!(
+            !command.args.iter().any(|arg| arg == "--argv0"),
+            "bwrap args should work with Ubuntu 22.04 bubblewrap 0.6.1: {:?}",
             command.args
         );
     }
