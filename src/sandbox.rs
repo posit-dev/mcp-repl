@@ -1281,7 +1281,7 @@ pub fn sandbox_state_update_from_codex_meta(
         sandbox_policy,
         sandbox_cwd: Some(sandbox_cwd),
         #[cfg(target_os = "linux")]
-        use_linux_sandbox_bwrap: use_legacy_landlock.then_some(false),
+        use_linux_sandbox_bwrap: Some(!use_legacy_landlock),
         #[cfg(not(target_os = "linux"))]
         use_linux_sandbox_bwrap: None,
         #[cfg(target_os = "linux")]
@@ -6895,7 +6895,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(update.use_legacy_landlock, Some(false));
         #[cfg(target_os = "linux")]
-        assert!(update.use_linux_sandbox_bwrap.is_none());
+        assert_eq!(update.use_linux_sandbox_bwrap, Some(true));
         #[cfg(not(target_os = "linux"))]
         assert!(update.use_linux_sandbox_bwrap.is_none());
     }
@@ -6924,11 +6924,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn codex_sandbox_state_meta_non_legacy_preserves_disabled_linux_bwrap() {
+    fn codex_sandbox_state_meta_non_legacy_reenables_linux_bwrap_after_legacy() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
         let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
             .expect("absolute sandbox cwd should convert to file URI")
             .to_string();
+        let legacy_update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": true,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("legacy Codex sandbox metadata");
         let non_legacy_update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
                 "type": "disabled"
@@ -6939,15 +6948,21 @@ mod tests {
         }))
         .expect("non-legacy Codex sandbox metadata");
         let mut state = SandboxState {
-            use_linux_sandbox_bwrap: false,
+            use_linux_sandbox_bwrap: true,
             ..SandboxState::default()
         };
+
+        state.apply_update(legacy_update);
+        assert!(
+            !state.use_linux_sandbox_bwrap,
+            "legacy Codex metadata should disable Linux bwrap"
+        );
 
         state.apply_update(non_legacy_update);
 
         assert!(
-            !state.use_linux_sandbox_bwrap,
-            "non-legacy Codex metadata should not override an explicitly disabled Linux bwrap default"
+            state.use_linux_sandbox_bwrap,
+            "non-legacy Codex metadata should re-enable Linux bwrap after legacy metadata clears"
         );
     }
 
