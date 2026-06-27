@@ -3628,7 +3628,13 @@ fn linux_bwrap_filesystem_args(
         }
         read_only_subpaths.sort_by_key(|path| linux_path_depth(path));
         for subpath in read_only_subpaths {
-            append_linux_read_only_subpath_args(&mut command, &subpath, &allowed_write_paths)?;
+            let allow_missing_protected_metadata_synthesis = mount_root == session_temp_dir;
+            append_linux_read_only_subpath_args(
+                &mut command,
+                &subpath,
+                &allowed_write_paths,
+                allow_missing_protected_metadata_synthesis,
+            )?;
         }
 
         let mut nested_unreadable_roots = unreadable_roots
@@ -3834,6 +3840,7 @@ fn append_linux_read_only_subpath_args(
     command: &mut LinuxBwrapCommand,
     subpath: &Path,
     allowed_write_paths: &[PathBuf],
+    allow_missing_protected_metadata_synthesis: bool,
 ) -> Result<(), String> {
     if let Some(symlink) = first_writable_symlink_component_in_path(subpath, allowed_write_paths) {
         return Err(format!(
@@ -3850,6 +3857,7 @@ fn append_linux_read_only_subpath_args(
                 command,
                 &first_missing,
                 allowed_write_paths,
+                allow_missing_protected_metadata_synthesis,
             )?;
         }
         return Ok(());
@@ -3895,17 +3903,26 @@ fn append_linux_missing_read_only_subpath_args(
     command: &mut LinuxBwrapCommand,
     path: &Path,
     allowed_write_paths: &[PathBuf],
+    allow_missing_protected_metadata_synthesis: bool,
 ) -> Result<(), String> {
     if linux_protected_metadata_name(path).is_some() {
-        append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
-        command
-            .synthetic_mount_targets
-            .push(LinuxSyntheticMountTarget::EmptyDirectory(
-                path.to_path_buf(),
-            ));
-    } else {
-        append_linux_empty_file_bind_data_args(command, path, Some("000"), true)?;
+        if allow_missing_protected_metadata_synthesis {
+            append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
+            command
+                .synthetic_mount_targets
+                .push(LinuxSyntheticMountTarget::EmptyDirectory(
+                    path.to_path_buf(),
+                ));
+        }
+        return Ok(());
     }
+    if is_within_allowed_write_paths(path, allowed_write_paths) {
+        return Err(format!(
+            "cannot enforce sandbox read-only path {} because it does not exist under a writable root with the Linux bubblewrap backend",
+            path.display()
+        ));
+    }
+    append_linux_empty_file_bind_data_args(command, path, Some("000"), true)?;
     Ok(())
 }
 
@@ -4316,7 +4333,10 @@ fn append_linux_unreadable_root_args(
         if let Some(first_missing) = find_first_non_existent_component(unreadable_root)
             && is_within_allowed_write_paths(&first_missing, allowed_write_paths)
         {
-            append_linux_empty_file_bind_data_args(command, &first_missing, Some("000"), true)?;
+            return Err(format!(
+                "cannot enforce sandbox deny-read path {} because it does not exist under a writable root with the Linux bubblewrap backend",
+                first_missing.display()
+            ));
         }
         return Ok(());
     }
@@ -6238,7 +6258,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_bwrap_missing_protected_metadata_uses_namespace_dir_and_read_only_empty_bind() {
+    fn linux_bwrap_missing_protected_metadata_under_writable_root_is_not_synthesized() {
         let root = Builder::new()
             .prefix("mcp-repl-bwrap-protected-metadata-")
             .tempdir()
@@ -6270,59 +6290,88 @@ mod tests {
             linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
                 .expect("missing protected metadata should build bwrap args");
         let codex_text = linux_path_to_string(&codex_path);
-        let dir_index = command
-            .args
-            .windows(2)
-            .position(|args| args[0] == "--dir" && args[1] == codex_text)
-            .expect("missing protected metadata should create its mount target inside bwrap");
-        let bind_index = command
-            .args
-            .windows(3)
-            .position(|args| args[0] == "--ro-bind" && args[2] == codex_text)
-            .expect("missing protected metadata should use a read-only empty directory bind");
-        assert!(
-            dir_index < bind_index,
-            "protected metadata mount target must exist before the bind: {:?}",
-            command.args
-        );
-        let bind_args = command
-            .args
-            .windows(3)
-            .find(|args| args[0] == "--ro-bind" && args[2] == codex_text)
-            .expect("missing protected metadata should use a read-only empty directory bind");
-        let source_path = PathBuf::from(&bind_args[1]);
 
-        assert!(
-            !codex_path.exists(),
-            "missing protected metadata target should be created inside bwrap, not on the host"
-        );
-        assert!(
-            command
-                .preserved_tempdirs
-                .iter()
-                .any(|tempdir| tempdir.path() == source_path),
-            "directory bind should reference a preserved empty source directory"
-        );
         assert!(
             !command
                 .args
                 .windows(2)
-                .any(|args| args[0] == "--remount-ro" && args[1] == codex_text),
-            "missing protected metadata should not require tmpfs remount-ro: {:?}",
+                .any(|args| args[0] == "--dir" && args[1] == codex_text),
+            "missing protected metadata should not create a bwrap mount target: {:?}",
             command.args
         );
-        let protected_target = LinuxSyntheticMountTarget::EmptyDirectory(codex_path.clone());
         assert!(
-            command.synthetic_mount_targets.contains(&protected_target),
-            "missing protected metadata target should be cleaned up after bwrap exits: {:?}",
+            !command
+                .args
+                .windows(3)
+                .any(|args| args[0] == "--ro-bind" && args[2] == codex_text),
+            "missing protected metadata should not bind over a missing target: {:?}",
+            command.args
+        );
+        assert!(
+            !command
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(
+                    codex_path.clone()
+                )),
+            "missing protected metadata should not require host cleanup: {:?}",
             command.synthetic_mount_targets
         );
         assert!(
-            command
-                .preserved_tempdirs
-                .iter()
-                .all(|tempdir| !tempdir.path().starts_with(root.path())),
-            "empty bind sources must stay outside sandbox writable roots"
+            !codex_path.exists(),
+            "missing protected metadata target should not be created on the host"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_deny_path_under_writable_root_fails_closed() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-missing-deny-")
+            .tempdir()
+            .expect("tempdir");
+        for protected_name in PROTECTED_METADATA_SUBPATHS {
+            std::fs::create_dir(root.path().join(protected_name)).expect("metadata dir");
+        }
+        let denied_path = root.path().join("secret.txt");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: denied_path.clone(),
+                },
+                access: FileSystemAccessMode::Deny,
+            },
+        ]);
+
+        let err = match linux_bwrap_filesystem_args(
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+        ) {
+            Ok(_) => panic!("missing deny path under writable root should fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("cannot enforce sandbox deny-read path")
+                && err.contains("does not exist under a writable root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !denied_path.exists(),
+            "rejected missing deny target should not be created on the host"
         );
     }
 

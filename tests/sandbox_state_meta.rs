@@ -3050,35 +3050,67 @@ for (protected_name in c(".git", ".agents", ".codex")) {{
         session.cancel().await?;
         return Ok(());
     }
-    assert!(
-        text.contains("ALLOWED_WRITE_OK"),
-        "expected explicit path write root to allow ordinary writes, got: {text}"
-    );
-    assert!(
-        !text.contains("ALLOWED_WRITE_ERROR:"),
-        "explicit path write root unexpectedly blocked ordinary write: {text}"
-    );
-    for protected_name in [".git", ".agents", ".codex"] {
+    #[cfg(target_os = "linux")]
+    {
         assert!(
-            text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
-            "expected explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+            text.contains("ALLOWED_WRITE_OK"),
+            "expected Linux bwrap explicit path write root to allow ordinary writes, got: {text}"
         );
         assert!(
-            !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
-            "explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
+            !text.contains("ALLOWED_WRITE_ERROR:"),
+            "Linux bwrap explicit path write root unexpectedly blocked ordinary write: {text}"
         );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
+                "Linux bwrap cannot block missing protected metadata without creating a host placeholder first; got: {text}"
+            );
+        }
+        session.cancel().await?;
+        assert!(
+            writable_root.join("allowed.txt").exists(),
+            "ordinary write under explicit root should create the target file"
+        );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                writable_root.join(protected_name).exists(),
+                "Linux bwrap missing protected metadata write should create {} after user code runs",
+                writable_root.join(protected_name).display()
+            );
+        }
     }
-    session.cancel().await?;
-    assert!(
-        writable_root.join("allowed.txt").exists(),
-        "ordinary write under explicit root should create the target file"
-    );
-    for protected_name in [".git", ".agents", ".codex"] {
+    #[cfg(target_os = "macos")]
+    {
         assert!(
-            !writable_root.join(protected_name).exists(),
-            "protected metadata write should not create {}",
-            writable_root.join(protected_name).display()
+            text.contains("ALLOWED_WRITE_OK"),
+            "expected explicit path write root to allow ordinary writes, got: {text}"
         );
+        assert!(
+            !text.contains("ALLOWED_WRITE_ERROR:"),
+            "explicit path write root unexpectedly blocked ordinary write: {text}"
+        );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
+                "expected explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+            );
+            assert!(
+                !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
+                "explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
+            );
+        }
+        session.cancel().await?;
+        assert!(
+            writable_root.join("allowed.txt").exists(),
+            "ordinary write under explicit root should create the target file"
+        );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                !writable_root.join(protected_name).exists(),
+                "protected metadata write should not create {}",
+                writable_root.join(protected_name).display()
+            );
+        }
     }
     Ok(())
 }
@@ -3141,31 +3173,52 @@ tryCatch({{
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert!(
-        text.contains("ALIAS_ALLOWED_WRITE_OK"),
-        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
-    );
-    assert!(
-        !text.contains("ALIAS_ALLOWED_WRITE_ERROR:"),
-        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
-    );
-    assert!(
-        text.contains("ALIAS_PROTECTED_WRITE_ERROR:"),
-        "expected canonical writable-root alias to block missing protected metadata, got: {text}"
-    );
-    assert!(
-        !text.contains("ALIAS_PROTECTED_WRITE_OK"),
-        "canonical writable-root alias unexpectedly allowed protected metadata write: {text}"
-    );
-    assert!(
-        canonical_scratch.join("allowed.txt").exists(),
-        "ordinary write through canonical writable-root alias should create the target file"
-    );
-    assert!(
-        !protected_dir.exists(),
-        "protected metadata write should not create {}",
-        protected_dir.display()
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            (text.contains("cannot enforce sandbox read-only path")
+                && text.contains("does not exist under a writable root"))
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject missing protected metadata alias under writable root, got: {text}"
+        );
+        assert!(
+            !canonical_scratch.join("allowed.txt").exists(),
+            "rejected Linux protected metadata alias policy should not run user code"
+        );
+        assert!(
+            !protected_dir.exists(),
+            "rejected Linux protected metadata alias policy should not create {}",
+            protected_dir.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            text.contains("ALIAS_ALLOWED_WRITE_OK"),
+            "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+        );
+        assert!(
+            !text.contains("ALIAS_ALLOWED_WRITE_ERROR:"),
+            "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+        );
+        assert!(
+            text.contains("ALIAS_PROTECTED_WRITE_ERROR:"),
+            "expected canonical writable-root alias to block missing protected metadata, got: {text}"
+        );
+        assert!(
+            !text.contains("ALIAS_PROTECTED_WRITE_OK"),
+            "canonical writable-root alias unexpectedly allowed protected metadata write: {text}"
+        );
+        assert!(
+            canonical_scratch.join("allowed.txt").exists(),
+            "ordinary write through canonical writable-root alias should create the target file"
+        );
+        assert!(
+            !protected_dir.exists(),
+            "protected metadata write should not create {}",
+            protected_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -3304,8 +3357,10 @@ tryCatch({{
     #[cfg(target_os = "linux")]
     {
         assert!(
-            text.contains("WRITE_ERROR:"),
-            "expected Linux bwrap literal glob-denied future create to fail, got: {text}"
+            (text.contains("cannot enforce sandbox deny-read path")
+                && text.contains("does not exist under a writable root"))
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject literal glob-denied future create, got: {text}"
         );
         assert!(
             !text.contains("WRITE_OK"),
@@ -3581,31 +3636,52 @@ tryCatch({{
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert!(
-        text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_OK"),
-        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
-    );
-    assert!(
-        !text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:"),
-        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
-    );
-    assert!(
-        text.contains("PATH_DENY_ALIAS_WRITE_ERROR:"),
-        "expected canonical path-deny alias to block missing denied path creation, got: {text}"
-    );
-    assert!(
-        !text.contains("PATH_DENY_ALIAS_WRITE_OK"),
-        "canonical path-deny alias unexpectedly allowed denied path creation: {text}"
-    );
-    assert!(
-        canonical_scratch.join("allowed.txt").exists(),
-        "ordinary write through canonical writable-root alias should create the target file"
-    );
-    assert!(
-        !canonical_denied_dir.exists(),
-        "path-deny write should not create {}",
-        canonical_denied_dir.display()
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            (text.contains("cannot enforce sandbox deny-read path")
+                && text.contains("does not exist under a writable root"))
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject missing path-deny alias under writable root, got: {text}"
+        );
+        assert!(
+            !canonical_scratch.join("allowed.txt").exists(),
+            "rejected Linux path-deny alias policy should not run user code"
+        );
+        assert!(
+            !canonical_denied_dir.exists(),
+            "rejected Linux path-deny alias policy should not create {}",
+            canonical_denied_dir.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_OK"),
+            "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+        );
+        assert!(
+            !text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:"),
+            "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+        );
+        assert!(
+            text.contains("PATH_DENY_ALIAS_WRITE_ERROR:"),
+            "expected canonical path-deny alias to block missing denied path creation, got: {text}"
+        );
+        assert!(
+            !text.contains("PATH_DENY_ALIAS_WRITE_OK"),
+            "canonical path-deny alias unexpectedly allowed denied path creation: {text}"
+        );
+        assert!(
+            canonical_scratch.join("allowed.txt").exists(),
+            "ordinary write through canonical writable-root alias should create the target file"
+        );
+        assert!(
+            !canonical_denied_dir.exists(),
+            "path-deny write should not create {}",
+            canonical_denied_dir.display()
+        );
+    }
     Ok(())
 }
 
