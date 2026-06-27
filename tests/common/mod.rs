@@ -403,28 +403,9 @@ fn normalize_newlines(mut text: String) -> String {
     text
 }
 
-fn strip_trailing_prompt(text: &str) -> String {
-    if let Some(stripped) = text.strip_suffix("\n> ") {
-        return stripped.to_string();
-    }
-    if let Some(stripped) = text.strip_suffix("\n+ ") {
-        return stripped.to_string();
-    }
-    if let Some(stripped) = text.strip_suffix("\n>>> ") {
-        return stripped.to_string();
-    }
-    if let Some(stripped) = text.strip_suffix("\n... ") {
-        return stripped.to_string();
-    }
-    text.to_string()
-}
-
 fn normalize_text_snapshot(text: &str) -> String {
     let normalized = normalize_output_bundle_paths(&normalize_newlines(text.to_string()));
-    let mut stripped = strip_trailing_prompt(&normalized);
-    while stripped.ends_with('\n') {
-        stripped.pop();
-    }
+    let mut stripped = normalized;
     if let Some(rest) = stripped.strip_prefix("\nstderr:") {
         stripped = format!("stderr:{rest}");
     }
@@ -1030,7 +1011,7 @@ impl McpSnapshot {
                 out.push('\n');
             }
         }
-        out.trim_end().to_string()
+        trim_trailing_newlines(out)
     }
 
     pub fn render_transcript(&self) -> String {
@@ -1056,33 +1037,40 @@ impl McpSnapshot {
                     out.push_str(&format!("{}) {call_desc}\n", step_index + 1));
                 }
 
-                for line in input_lines {
+                for line in &input_lines {
                     out.push_str(&format!(">>> {line}\n"));
                 }
 
-                let response_lines = format_snapshot_response_lines(&response, &step.call.tool);
+                let response_lines =
+                    format_snapshot_response_lines(&response, &step.call.tool, &input_lines);
                 for line in response_lines {
                     out.push_str(&format!("<<< {line}\n"));
                 }
             }
         }
 
-        out.trim_end().to_string()
+        trim_trailing_newlines(out)
     }
+}
+
+fn trim_trailing_newlines(mut text: String) -> String {
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    text
 }
 
 fn normalize_snapshot_response(
     response: &SnapshotResponse,
-    call: &SnapshotCall,
+    _call: &SnapshotCall,
 ) -> SnapshotResponse {
     match response {
         SnapshotResponse::ToolResult(result) => {
-            let mut content = result
+            let content = result
                 .content
                 .iter()
                 .filter_map(normalize_snapshot_content)
                 .collect::<Vec<_>>();
-            maybe_drop_settled_prompt_echo(&mut content, call);
             SnapshotResponse::ToolResult(SnapshotCallToolResult {
                 is_error: result.is_error,
                 content,
@@ -1092,71 +1080,13 @@ fn normalize_snapshot_response(
     }
 }
 
-fn maybe_drop_settled_prompt_echo(content: &mut Vec<SnapshotContent>, call: &SnapshotCall) {
-    if !is_repl_tool_name(&call.tool) {
-        return;
-    }
-
-    let Some(Value::Object(args)) = &call.arguments else {
-        return;
-    };
-    let Some(Value::String(input)) = args.get("input") else {
-        return;
-    };
-    let mut input_lines = split_input_lines(input).into_iter();
-    let Some(input_line) = input_lines.next() else {
-        return;
-    };
-    if input_lines.next().is_some() {
-        return;
-    }
-
-    let has_prompt_only = content.iter().any(|item| match item {
-        SnapshotContent::Text { text } => prompt_only_snapshot_text(text),
-        _ => false,
-    });
-    let has_stderr = content.iter().any(|item| match item {
-        SnapshotContent::Text { text } => text.contains("stderr:"),
-        _ => false,
-    });
-    if !(has_prompt_only && has_stderr) {
-        return;
-    }
-
-    content.retain(|item| match item {
-        SnapshotContent::Text { text } => !prompt_echo_matches_input(text, &input_line),
-        _ => true,
-    });
-}
-
-fn prompt_only_snapshot_text(text: &str) -> bool {
-    text.lines().all(|line| {
-        if line.is_empty() {
-            return true;
-        }
-        strip_prompt_prefix(line)
-            .map(|rest| rest.trim().is_empty())
-            .unwrap_or(false)
-    })
-}
-
-fn prompt_echo_matches_input(text: &str, input_line: &str) -> bool {
-    let mut lines = text.lines();
-    let Some(line) = lines.next() else {
-        return false;
-    };
-    if lines.next().is_some() {
-        return false;
-    }
-    strip_prompt_prefix(line)
-        .map(|rest| rest == input_line)
-        .unwrap_or(false)
-}
-
 fn normalize_snapshot_content(content: &SnapshotContent) -> Option<SnapshotContent> {
     match content {
         SnapshotContent::Text { text } => {
             let text = normalize_snapshot_text(text);
+            if text.is_empty() {
+                return None;
+            }
             Some(SnapshotContent::Text { text })
         }
         SnapshotContent::Image {
@@ -1321,7 +1251,11 @@ fn format_arg_value(value: &Value) -> String {
     }
 }
 
-fn format_snapshot_response_lines(response: &SnapshotResponse, tool: &str) -> Vec<String> {
+fn format_snapshot_response_lines(
+    response: &SnapshotResponse,
+    _tool: &str,
+    _input_lines: &[String],
+) -> Vec<String> {
     match response {
         SnapshotResponse::ToolResult(result) => {
             let mut lines = Vec::new();
@@ -1329,9 +1263,6 @@ fn format_snapshot_response_lines(response: &SnapshotResponse, tool: &str) -> Ve
                 match content {
                     SnapshotContent::Text { text } => {
                         for line in split_text_lines(text) {
-                            if is_repl_tool_name(tool) && is_prompt_line(&line) {
-                                continue;
-                            }
                             lines.push(line);
                         }
                     }
@@ -1369,16 +1300,6 @@ fn format_service_error(err: &SnapshotServiceError) -> String {
 
 fn split_text_lines(text: &str) -> Vec<String> {
     text.split('\n').map(|line| line.to_string()).collect()
-}
-
-fn is_prompt_line(line: &str) -> bool {
-    if line.is_empty() {
-        return false;
-    }
-    if line.starts_with(' ') || line.starts_with('\t') {
-        return false;
-    }
-    strip_prompt_prefix(line).is_some()
 }
 
 fn is_stderr_line(line: &str) -> bool {
@@ -1677,4 +1598,35 @@ fn terminate_process_tree(pid: u32) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_rendering_preserves_prompt_only_text_items() {
+        let snapshot = McpSnapshot {
+            sessions: vec![(
+                "prompt".to_string(),
+                vec![SnapshotStep {
+                    call: SnapshotCall {
+                        tool: "r_repl".to_string(),
+                        arguments: Some(json!({"input": "x\n"})),
+                    },
+                    response: SnapshotResponse::ToolResult(SnapshotCallToolResult {
+                        is_error: Some(false),
+                        content: vec![SnapshotContent::Text {
+                            text: "> ".to_string(),
+                        }],
+                    }),
+                }],
+            )],
+        };
+
+        assert_eq!(
+            snapshot.render_transcript(),
+            "== session: prompt ==\n1) r_repl\n>>> x\n<<< > "
+        );
+    }
 }

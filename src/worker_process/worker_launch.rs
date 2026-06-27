@@ -84,7 +84,6 @@ impl WorkerManager {
             &self.sandbox_state,
             WorkerSpawnContext {
                 oversized_output: self.oversized_output,
-                pending_output_tape: self.pending_output_tape.clone(),
                 output_timeline: self.output_timeline.clone(),
                 guardrail: self.guardrail.clone(),
                 managed_network_proxy: self.managed_network_proxy.as_ref(),
@@ -186,10 +185,15 @@ impl WorkerManager {
         }
 
         let launch_matches = self.windows_sandbox_launch.as_ref().is_some_and(|launch| {
-            launch.matches(
+            let network_identity = windows_sandbox_network_identity_for_state(&self.sandbox_state);
+            let Ok(network_identity) = network_identity else {
+                return false;
+            };
+            launch.matches_with_network_identity(
                 &self.sandbox_state.sandbox_policy,
                 &self.sandbox_state.sandbox_cwd,
                 &self.sandbox_state.session_temp_dir,
+                &network_identity,
             )
         });
         if launch_matches {
@@ -208,10 +212,12 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_windows_sandbox_prepare_begin", || {
             worker_context_event_payload(&self.worker_launch, self.backend, &self.sandbox_state)
         });
-        let prepared = crate::windows_sandbox::prepare_sandbox_launch(
+        let network_identity = windows_sandbox_network_identity_for_state(&self.sandbox_state)?;
+        let prepared = crate::windows_sandbox::prepare_sandbox_launch_with_network_identity(
             &self.sandbox_state.sandbox_policy,
             &self.sandbox_state.sandbox_cwd,
             &self.sandbox_state.session_temp_dir,
+            network_identity,
         );
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -222,6 +228,10 @@ impl WorkerManager {
             serde_json::json!({
                 "status": "ok",
                 "capability_sid": prepared.capability_sid(),
+                "network_identity": match prepared.network_identity() {
+                    crate::windows_sandbox::WindowsSandboxNetworkIdentity::CurrentUser => "current-user",
+                    crate::windows_sandbox::WindowsSandboxNetworkIdentity::OfflineProxy(_) => "offline-proxy",
+                },
             }),
         );
         self.windows_sandbox_launch = Some(prepared);
@@ -230,13 +240,42 @@ impl WorkerManager {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_sandbox_network_identity_for_state(
+    state: &crate::sandbox::SandboxState,
+) -> Result<crate::windows_sandbox::WindowsSandboxNetworkIdentity, WorkerError> {
+    if !windows_sandbox_requires_offline_proxy_identity(state) {
+        return Ok(crate::windows_sandbox::WindowsSandboxNetworkIdentity::CurrentUser);
+    }
+    let setup = crate::windows_sandbox_setup::load_offline_setup().map_err(WorkerError::Sandbox)?;
+    Ok(crate::windows_sandbox::WindowsSandboxNetworkIdentity::OfflineProxy(setup))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_sandbox_requires_offline_proxy_identity(state: &crate::sandbox::SandboxState) -> bool {
+    if state.managed_network_policy.has_domain_restrictions() {
+        return true;
+    }
+    matches!(
+        state.sandbox_policy,
+        crate::sandbox::SandboxPolicy::WorkspaceWrite {
+            network_access: false,
+            ..
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(any(target_os = "linux", target_family = "windows"))]
     use crate::oversized_output::OversizedOutputMode;
+    #[cfg(target_family = "windows")]
+    use crate::sandbox::ManagedNetworkPolicy;
+    #[cfg(any(target_os = "linux", target_family = "windows"))]
+    use crate::sandbox::SandboxPolicy;
     #[cfg(target_os = "linux")]
-    use crate::sandbox::{SandboxPolicy, SandboxState, SandboxStateUpdate};
+    use crate::sandbox::{SandboxState, SandboxStateUpdate};
     #[cfg(any(target_os = "linux", target_family = "windows"))]
     use crate::sandbox_cli::SandboxCliPlan;
     #[cfg(target_os = "linux")]
@@ -245,6 +284,66 @@ mod tests {
     use crate::worker_process::test_support::contents_text;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    #[cfg(target_family = "windows")]
+    fn force_windows_full_network_workspace_write(manager: &mut WorkerManager) {
+        if let SandboxPolicy::WorkspaceWrite { network_access, .. } =
+            &mut manager.sandbox_state.sandbox_policy
+        {
+            *network_access = true;
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn windows_workspace_write_state(network_access: bool) -> crate::sandbox::SandboxState {
+        crate::sandbox::SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_network_identity_selection_scopes_offline_proxy_cases() {
+        let read_only = crate::sandbox::SandboxState {
+            sandbox_policy: SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            ..Default::default()
+        };
+        assert!(
+            !windows_sandbox_requires_offline_proxy_identity(&read_only),
+            "read-only should keep the current-user sandbox launch path"
+        );
+
+        let workspace_no_network = windows_workspace_write_state(false);
+        assert!(
+            windows_sandbox_requires_offline_proxy_identity(&workspace_no_network),
+            "workspace-write without full network should use the offline proxy identity"
+        );
+
+        let workspace_full_network = windows_workspace_write_state(true);
+        assert!(
+            !windows_sandbox_requires_offline_proxy_identity(&workspace_full_network),
+            "full-network workspace-write without domain rules should stay current-user"
+        );
+
+        let mut managed_domains = windows_workspace_write_state(true);
+        managed_domains.managed_network_policy = ManagedNetworkPolicy {
+            allowed_domains: vec!["example.com".to_string()],
+            denied_domains: Vec::new(),
+            allow_local_binding: false,
+        };
+        assert!(
+            windows_sandbox_requires_offline_proxy_identity(&managed_domains),
+            "managed domain rules should use the offline proxy identity"
+        );
+    }
 
     #[test]
     fn python_backend_prepares_windows_sandbox_launch() {
@@ -295,8 +394,8 @@ mod tests {
             "expected inherited sandbox state to disable bwrap after fallback"
         );
 
-        let snapshot = manager.pending_output_tape.drain_final_snapshot();
-        let text = contents_text(&snapshot.format_contents().contents);
+        let output = manager.pending_output_tape.drain_final_output();
+        let text = contents_text(&output.contents);
         assert!(
             text.contains("continuing without bwrap"),
             "expected fallback notice in visible output, got: {text:?}"
@@ -346,15 +445,49 @@ mod tests {
         );
         assert!(retry, "expected startup failure to disable bwrap");
 
+        let sandbox_cwd = std::env::temp_dir();
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": std::env::temp_dir(),
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
@@ -417,15 +550,49 @@ mod tests {
         );
         assert!(retry, "expected startup failure to disable bwrap");
 
+        let sandbox_cwd = std::env::temp_dir();
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": [],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": std::env::temp_dir(),
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox"
         }))
@@ -457,6 +624,7 @@ mod tests {
             OversizedOutputMode::Files,
         )
         .expect("worker manager");
+        force_windows_full_network_workspace_write(&mut manager);
         let result = manager.ensure_windows_sandbox_launch();
 
         crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
@@ -492,6 +660,7 @@ mod tests {
             OversizedOutputMode::Files,
         )
         .expect("worker manager");
+        force_windows_full_network_workspace_write(&mut manager);
         let result = manager.ensure_windows_sandbox_launch();
 
         crate::windows_sandbox::set_prepare_sandbox_launch_test_error(None);
@@ -523,6 +692,7 @@ mod tests {
             OversizedOutputMode::Files,
         )
         .expect("worker manager");
+        force_windows_full_network_workspace_write(&mut manager);
 
         let first = manager
             .ensure_windows_sandbox_launch()

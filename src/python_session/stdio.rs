@@ -12,12 +12,7 @@ use super::unix_stdin;
 pub(super) static PYTHON_STDIN_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 pub(super) static PYTHON_STDOUT_FILE: AtomicPtr<libc::FILE> = AtomicPtr::new(ptr::null_mut());
 
-pub(super) struct PythonRuntime {
-    #[cfg_attr(windows, allow(dead_code))]
-    pub(super) stdin: *mut libc::FILE,
-}
-
-pub(super) fn open_python_runtime() -> Result<PythonRuntime, String> {
+pub(super) fn open_python_runtime() -> Result<(), String> {
     #[cfg(target_family = "unix")]
     {
         open_python_runtime_with_pty_stdio()
@@ -30,12 +25,12 @@ pub(super) fn open_python_runtime() -> Result<PythonRuntime, String> {
         let stdout = open_stdio_file(1, c"w")?;
         PYTHON_STDIN_FILE.store(stdin, Ordering::SeqCst);
         PYTHON_STDOUT_FILE.store(stdout, Ordering::SeqCst);
-        Ok(PythonRuntime { stdin })
+        Ok(())
     }
 }
 
 #[cfg(target_family = "unix")]
-fn open_python_runtime_with_pty_stdio() -> Result<PythonRuntime, String> {
+fn open_python_runtime_with_pty_stdio() -> Result<(), String> {
     ensure_python_pty_stdio()?;
     set_fd_close_on_exec(libc::STDIN_FILENO)?;
 
@@ -47,7 +42,7 @@ fn open_python_runtime_with_pty_stdio() -> Result<PythonRuntime, String> {
     unix_stdin::set_runtime_stdin_fd(runtime_read_fd);
     PYTHON_STDIN_FILE.store(stdin, Ordering::SeqCst);
     PYTHON_STDOUT_FILE.store(stdout, Ordering::SeqCst);
-    Ok(PythonRuntime { stdin })
+    Ok(())
 }
 
 #[cfg(target_family = "unix")]

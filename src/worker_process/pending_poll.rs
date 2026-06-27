@@ -2,11 +2,12 @@ use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{
-    CompletionInfo, CompletionReplyMode, InputFallback, ReplyWithOffset, build_completed_reply,
+    CompletionInfo, CompletionReplyMode, ReplyWithOffset, build_completed_reply,
     build_timeout_reply, timeout_status_content,
 };
 use crate::output_snapshot::{
     SnapshotWithImages, snapshot_after_completion, snapshot_page_with_images,
+    snapshot_pending_timeout_page_with_images,
 };
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -50,11 +51,6 @@ impl WorkerManager {
             PendingPollState::NoCompletion => (CompletionInfo::empty(), false, false, None),
         };
 
-        let fallback_input = if timed_out_elapsed.is_none() && consumed_completion {
-            self.take_input_fallback(&completion)
-        } else {
-            InputFallback::default()
-        };
         if timed_out_elapsed.is_none() && consumed_completion {
             self.wait_for_late_files_output_after_settled_completion(timeout);
         }
@@ -65,23 +61,21 @@ impl WorkerManager {
         } = if timed_out_elapsed.is_some() {
             self.drain_formatted_output()
         } else {
-            self.drain_final_formatted_output()
+            self.drain_completed_formatted_output(session_end)
         };
         let is_error = saw_stderr;
 
         if let Some(elapsed) = timed_out_elapsed {
             contents.push(timeout_status_content(elapsed));
-            return Ok(build_timeout_reply(contents, is_error, 0));
+            return Ok(build_timeout_reply(contents, is_error));
         }
 
         let built = build_completed_reply(
             contents,
             is_error,
-            0,
             &completion,
             session_end,
             CompletionReplyMode::Files {
-                fallback_input,
                 idle_status_if_empty: true,
             },
             self.backend,
@@ -107,13 +101,6 @@ impl WorkerManager {
 
         let state = self.observe_pending_poll_state(timeout, poll_start)?;
         let observed_completion = !matches!(state, PendingPollState::NoCompletion);
-        if observed_completion {
-            end_offset = self.output.end_offset().unwrap_or(end_offset);
-        }
-        if end_offset < start_offset {
-            end_offset = start_offset;
-        }
-
         let (completion, session_end, timed_out_elapsed) = match state {
             PendingPollState::TimedOut { elapsed } => {
                 (CompletionInfo::empty(), false, Some(elapsed))
@@ -125,17 +112,30 @@ impl WorkerManager {
             } => (completion, session_end, None),
             PendingPollState::NoCompletion => (CompletionInfo::empty(), false, None),
         };
+        if timed_out_elapsed.is_some() {
+            self.output_timeline
+                .seal_utf8_tails_blocking_visible_output();
+        } else if observed_completion {
+            self.output_timeline.seal_utf8_tails();
+        }
+        if observed_completion {
+            end_offset = self.output.end_offset().unwrap_or(end_offset);
+        }
+        if end_offset < start_offset {
+            end_offset = start_offset;
+        }
 
         let (saw_stderr, snapshot) = if observed_completion && timed_out_elapsed.is_none() {
-            let completed = snapshot_after_completion(
-                &self.output,
-                start_offset,
-                end_offset,
-                page_bytes,
-                &completion.echo_events,
-                completion.prompt_variants.as_deref(),
-            );
+            let completed =
+                snapshot_after_completion(&self.output, start_offset, end_offset, page_bytes);
             (completed.saw_stderr, completed.snapshot)
+        } else if timed_out_elapsed.is_some() {
+            let saw_stderr = self
+                .output
+                .saw_stderr_in_range(start_offset.min(end_offset), end_offset);
+            let snapshot =
+                snapshot_pending_timeout_page_with_images(&self.output, end_offset, page_bytes);
+            (saw_stderr, snapshot)
         } else {
             let saw_stderr = self
                 .output
@@ -165,24 +165,22 @@ impl WorkerManager {
         );
 
         if timed_out_elapsed.is_some() {
-            return Ok(build_timeout_reply(contents, is_error, end_offset));
+            return Ok(build_timeout_reply(contents, is_error));
         }
 
         let built = build_completed_reply(
             contents,
             is_error,
-            end_offset,
             &completion,
             session_end,
             CompletionReplyMode::Pager {
                 pager_active: self.pager.is_active(),
-                fallback_input_transcript: None,
             },
             self.backend,
         );
         self.remember_prompt(built.prompt_to_remember.clone());
         if let Some(pager_prompt) = built.pager_prompt {
-            self.pager_prompt = pager_prompt;
+            self.pager_prompt = Some(pager_prompt);
         }
         Ok(built.reply)
     }
@@ -284,7 +282,6 @@ mod tests {
         manager.settled_pending_completion = Some(CompletionInfo {
             prompt: Some("> ".to_string()),
             prompt_variants: Some(vec!["> ".to_string()]),
-            echo_events: Vec::new(),
             protocol_warnings: Vec::new(),
             session_end_seen: false,
         });

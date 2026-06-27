@@ -1,8 +1,9 @@
 ---
 source: tests/server_smoke.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: default ==
 1) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< >

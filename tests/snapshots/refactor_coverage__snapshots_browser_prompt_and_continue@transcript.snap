@@ -1,15 +1,18 @@
 ---
 source: tests/refactor_coverage.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: browser_prompt ==
 1) r_repl timeout_ms=10000
 >>> browser()
 <<< Called from: top level 
+<<< Browse[1]> 
 
 2) r_repl timeout_ms=10000
 >>> c
+<<< > 
 
 3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
+<<< >

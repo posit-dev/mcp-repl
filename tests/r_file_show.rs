@@ -2,6 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use std::time::Duration;
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -30,15 +31,21 @@ fn backend_unavailable(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_show_returns_full_output_without_pager() -> TestResult<()> {
-    let session = common::spawn_server_with_files().await?;
-    let timeout_secs = if cfg!(windows) { 60.0 } else { 30.0 };
+    let mut session = common::spawn_server_with_files().await?;
 
     let result = session
         .write_stdin_raw_with(
             "line <- paste(rep(\"x\", 200), collapse = \"\"); tf <- tempfile(\"mcp-repl-file-show-\"); writeLines(sprintf(\"file_show_line%04d %s\", 1:200, line), tf); file.show(tf, delete.file = TRUE); invisible(NULL)",
-            Some(timeout_secs),
+            Some(30.0),
         )
         .await?;
+    let result = common::wait_until_not_busy(
+        &mut session,
+        result,
+        Duration::from_millis(100),
+        Duration::from_secs(60),
+    )
+    .await?;
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("r_file_show backend unavailable in this environment; skipping");

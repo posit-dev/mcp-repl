@@ -24,7 +24,25 @@ pub enum ContentOrigin {
     Server,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentVisibility {
+    #[default]
+    ReplyAndTranscript,
+    TranscriptOnly,
+}
+
+impl ContentVisibility {
+    fn is_default(value: &Self) -> bool {
+        matches!(value, Self::ReplyAndTranscript)
+    }
+
+    pub(crate) fn is_reply_visible(self) -> bool {
+        matches!(self, Self::ReplyAndTranscript)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerContent {
     ContentText {
@@ -32,6 +50,8 @@ pub enum WorkerContent {
         stream: TextStream,
         #[serde(default)]
         origin: ContentOrigin,
+        #[serde(default, skip_serializing_if = "ContentVisibility::is_default")]
+        visibility: ContentVisibility,
     },
     ContentImage {
         data: String,
@@ -84,6 +104,16 @@ impl WorkerContent {
             text: text.into(),
             stream: TextStream::Stdout,
             origin: ContentOrigin::Worker,
+            visibility: ContentVisibility::ReplyAndTranscript,
+        }
+    }
+
+    pub fn worker_stdout_transcript_only(text: impl Into<String>) -> Self {
+        WorkerContent::ContentText {
+            text: text.into(),
+            stream: TextStream::Stdout,
+            origin: ContentOrigin::Worker,
+            visibility: ContentVisibility::TranscriptOnly,
         }
     }
 
@@ -93,6 +123,7 @@ impl WorkerContent {
             text: text.into(),
             stream: TextStream::Stderr,
             origin: ContentOrigin::Worker,
+            visibility: ContentVisibility::ReplyAndTranscript,
         }
     }
 
@@ -101,6 +132,7 @@ impl WorkerContent {
             text: text.into(),
             stream: TextStream::Stdout,
             origin: ContentOrigin::Server,
+            visibility: ContentVisibility::ReplyAndTranscript,
         }
     }
 
@@ -109,6 +141,7 @@ impl WorkerContent {
             text: text.into(),
             stream: TextStream::Stderr,
             origin: ContentOrigin::Server,
+            visibility: ContentVisibility::ReplyAndTranscript,
         }
     }
 }

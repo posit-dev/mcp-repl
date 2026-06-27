@@ -1,0 +1,13 @@
+---
+source: tests/python_snapshots.rs
+expression: transcript
+---
+== session: multiline_cell_no_continuation_prompt ==
+1) py_repl timeout_ms=5000
+>>> for i in range(2):
+>>>     print("loop", i)
+>>> print("done")
+<<< loop 0
+<<< loop 1
+<<< done
+<<<

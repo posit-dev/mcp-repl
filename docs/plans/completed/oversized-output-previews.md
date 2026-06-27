@@ -29,7 +29,7 @@
 ## Follow-On Work
 
 - Per-turn history bundles remain future work in `docs/futurework/per-turn-history-bundles.md`.
-- Converging pager/files mode onto one shared resolved timeline remains future work in `docs/futurework/unified-output-timeline-pipeline.md`.
+- Timeline convergence is recorded in `docs/plans/completed/unified-output-timeline-pipeline.md`.
 - Interaction polish remains future work in `docs/futurework/repl-interaction-rough-edges.md`.
 
 ## Decision Log

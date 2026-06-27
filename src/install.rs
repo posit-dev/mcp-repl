@@ -14,6 +14,7 @@ const CODEX_TOOL_TIMEOUT_COMMENT: &str =
 const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy metadata sent by Codex on each tool call.\n# mcp-repl fails closed if the tool call omits or malforms that metadata.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
+const MCP_REPL_TOOL_NAMES: &[&str] = &["repl", "repl_reset"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -103,6 +104,7 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                     upsert_codex_mcp_server(&path, server_name, &command, &server_args)?;
                 }
                 println!("Updated codex MCP config: {}", path.display());
+                println!("Start a new Codex session to load the updated MCP tools.");
             }
             InstallTarget::Claude => {
                 let config_path = root.join(".claude.json");
@@ -408,6 +410,9 @@ fn upsert_codex_mcp_server(
 
     doc["mcp_servers"][server_name]["command"] = value(command);
     doc["mcp_servers"][server_name]["tool_timeout_sec"] = value(CODEX_TOOL_TIMEOUT_SECS);
+    doc["mcp_servers"][server_name]["enabled"] = value(true);
+    ensure_codex_mcp_server_tools_unfiltered(&mut doc, server_name)?;
+    upsert_codex_code_mode_direct_namespace(&mut doc, server_name)?;
 
     let mut toml_args = Array::default();
     for arg in args {
@@ -435,6 +440,167 @@ fn upsert_codex_mcp_server(
 
     atomic_write(config_path, &doc.to_string())?;
     Ok(())
+}
+
+fn ensure_codex_mcp_server_tools_unfiltered(
+    doc: &mut DocumentMut,
+    server_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    add_values_to_existing_toml_string_array(
+        &mut doc["mcp_servers"][server_name]["enabled_tools"],
+        MCP_REPL_TOOL_NAMES,
+        &format!("mcp_servers.{server_name}.enabled_tools"),
+    )?;
+    remove_values_from_existing_toml_string_array(
+        &mut doc["mcp_servers"][server_name]["disabled_tools"],
+        MCP_REPL_TOOL_NAMES,
+        &format!("mcp_servers.{server_name}.disabled_tools"),
+    )
+}
+
+fn upsert_codex_code_mode_direct_namespace(
+    doc: &mut DocumentMut,
+    server_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    normalize_codex_code_mode_item(doc)?;
+    let namespace = codex_namespace_for_server_name(server_name);
+    let item = &mut doc["features"]["code_mode"]["direct_only_tool_namespaces"];
+    let mut namespaces = if item.is_none() {
+        Vec::new()
+    } else {
+        toml_string_array_values(item, "features.code_mode.direct_only_tool_namespaces")?
+    };
+    push_missing_string(&mut namespaces, &namespace);
+    set_toml_string_array(item, &namespaces);
+    Ok(())
+}
+
+fn normalize_codex_code_mode_item(doc: &mut DocumentMut) -> Result<(), Box<dyn std::error::Error>> {
+    if doc.get("features").is_none() {
+        doc["features"] = Item::Table(Table::new());
+    }
+    let inline_features = doc["features"].as_inline_table().map(|inline| {
+        let mut table = Table::new();
+        for (key, value) in inline.iter() {
+            table.insert(key, Item::Value(value.clone()));
+        }
+        table
+    });
+    if let Some(table) = inline_features {
+        doc["features"] = Item::Table(table);
+    }
+    if !doc["features"].is_table() {
+        return Err("`features` must be a TOML table".into());
+    }
+
+    let code_mode_item = &mut doc["features"]["code_mode"];
+    if code_mode_item.is_none() {
+        *code_mode_item = Item::Table(Table::new());
+        return Ok(());
+    }
+    if code_mode_item.is_table() {
+        return Ok(());
+    }
+    if let Some(enabled) = code_mode_item.as_bool() {
+        let mut table = Table::new();
+        table.insert("enabled", value(enabled));
+        *code_mode_item = Item::Table(table);
+        return Ok(());
+    }
+
+    let Some(inline) = code_mode_item.as_inline_table() else {
+        return Err("`features.code_mode` must be a TOML boolean, table, or inline table".into());
+    };
+    let mut table = Table::new();
+    for (key, value) in inline.iter() {
+        table.insert(key, Item::Value(value.clone()));
+    }
+    *code_mode_item = Item::Table(table);
+    Ok(())
+}
+
+fn codex_namespace_for_server_name(server_name: &str) -> String {
+    format!("mcp__{}", sanitize_codex_tool_name(server_name))
+}
+
+fn sanitize_codex_tool_name(raw: &str) -> String {
+    let mut sanitized = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            sanitized.push(c);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn add_values_to_existing_toml_string_array(
+    item: &mut Item,
+    values: &[&str],
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if item.is_none() {
+        return Ok(());
+    }
+    let mut existing = toml_string_array_values(item, path)?;
+    for value in values {
+        push_missing_string(&mut existing, value);
+    }
+    set_toml_string_array(item, &existing);
+    Ok(())
+}
+
+fn remove_values_from_existing_toml_string_array(
+    item: &mut Item,
+    values: &[&str],
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if item.is_none() {
+        return Ok(());
+    }
+    let existing = toml_string_array_values(item, path)?;
+    let filtered = existing
+        .into_iter()
+        .filter(|existing| !values.contains(&existing.as_str()))
+        .collect::<Vec<_>>();
+    set_toml_string_array(item, &filtered);
+    Ok(())
+}
+
+fn toml_string_array_values(
+    item: &Item,
+    path: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let Some(array) = item.as_array() else {
+        return Err(format!("`{path}` must be a TOML string array").into());
+    };
+    let mut values = Vec::new();
+    for value in array.iter() {
+        let Some(value) = value.as_str() else {
+            return Err(format!("`{path}` must contain only strings").into());
+        };
+        push_missing_string(&mut values, value);
+    }
+    Ok(values)
+}
+
+fn set_toml_string_array(item: &mut Item, values: &[String]) {
+    let mut array = Array::default();
+    for value in values {
+        array.push(value.as_str());
+    }
+    *item = Item::Value(array.into());
+}
+
+fn push_missing_string(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
 }
 
 fn format_toml_array_multiline(array: &mut Array) {

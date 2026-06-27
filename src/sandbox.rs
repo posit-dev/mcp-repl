@@ -7,11 +7,16 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::Write;
 #[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicI32, Ordering};
 use url::Url;
 
 use serde::{Deserialize, Serialize};
@@ -26,10 +31,18 @@ pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_
 pub const R_SESSION_TMPDIR_ENV: &str = "MCP_REPL_R_SESSION_TMPDIR";
 #[cfg(target_os = "macos")]
 pub const SANDBOX_LOG_DENIALS_ENV: &str = "MCP_REPL_SANDBOX_LOG_DENIALS";
+const PROTECTED_METADATA_SUBPATHS: [&str; 3] = [".git", ".agents", ".codex"];
 #[cfg(target_os = "linux")]
 pub const LINUX_BWRAP_ENABLED_ENV: &str = "MCP_REPL_USE_LINUX_BWRAP";
 #[cfg(target_os = "linux")]
 pub const LINUX_BWRAP_NO_PROC_ENV: &str = "MCP_REPL_LINUX_BWRAP_NO_PROC";
+#[cfg(target_os = "linux")]
+static LINUX_BWRAP_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+#[cfg(target_os = "linux")]
+static LINUX_BWRAP_PENDING_FORWARDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+#[cfg(target_os = "linux")]
+const LINUX_BWRAP_FORWARDED_SIGNALS: &[libc::c_int] =
+    &[libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
 
 #[derive(Debug, Clone)]
 pub enum SandboxError {
@@ -99,7 +112,10 @@ pub enum SandboxPolicy {
     #[serde(rename = "danger-full-access")]
     DangerFullAccess,
     #[serde(rename = "read-only")]
-    ReadOnly,
+    ReadOnly {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        network_access: bool,
+    },
     #[serde(rename = "external-sandbox")]
     ExternalSandbox {
         #[serde(default)]
@@ -116,33 +132,589 @@ pub enum SandboxPolicy {
         #[serde(default)]
         exclude_slash_tmp: bool,
     },
+    #[serde(rename = "managed")]
+    Managed {
+        file_system: FileSystemSandboxPolicy,
+        #[serde(default)]
+        network_access: NetworkAccess,
+    },
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WritableRoot {
     pub root: PathBuf,
     pub read_only_subpaths: Vec<PathBuf>,
+    #[cfg(target_os = "linux")]
+    pub protected_metadata_names: Vec<String>,
 }
 
-impl SandboxPolicy {
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    pub fn has_full_disk_write_access(&self) -> bool {
-        match self {
-            SandboxPolicy::DangerFullAccess => true,
-            SandboxPolicy::ExternalSandbox { .. } => true,
-            SandboxPolicy::ReadOnly => false,
-            SandboxPolicy::WorkspaceWrite { .. } => false,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileSystemAccessMode {
+    Read,
+    Write,
+    #[serde(alias = "none")]
+    Deny,
+}
+
+impl FileSystemAccessMode {
+    pub(crate) fn can_read(self) -> bool {
+        !matches!(self, FileSystemAccessMode::Deny)
+    }
+
+    pub(crate) fn can_write(self) -> bool {
+        matches!(self, FileSystemAccessMode::Write)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileSystemSpecialPath {
+    Root,
+    Minimal,
+    #[serde(alias = "current_working_directory")]
+    ProjectRoots {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<PathBuf>,
+    },
+    Tmpdir,
+    SlashTmp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileSystemPath {
+    Path { path: PathBuf },
+    GlobPattern { pattern: String },
+    Special { value: FileSystemSpecialPath },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSystemSandboxEntry {
+    pub path: FileSystemPath,
+    pub access: FileSystemAccessMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileSystemSandboxKind {
+    #[default]
+    Restricted,
+    Unrestricted,
+    ExternalSandbox,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSystemSandboxPolicy {
+    pub kind: FileSystemSandboxKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob_scan_max_depth: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<FileSystemSandboxEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct ResolvedFileSystemEntry {
+    path: PathBuf,
+    access: FileSystemAccessMode,
+}
+
+impl Default for FileSystemSandboxPolicy {
+    fn default() -> Self {
+        Self::read_only()
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl FileSystemSandboxPolicy {
+    fn read_only() -> Self {
+        Self::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            access: FileSystemAccessMode::Read,
+        }])
+    }
+
+    fn unrestricted() -> Self {
+        Self {
+            kind: FileSystemSandboxKind::Unrestricted,
+            glob_scan_max_depth: None,
+            entries: Vec::new(),
+        }
+    }
+
+    fn external_sandbox() -> Self {
+        Self {
+            kind: FileSystemSandboxKind::ExternalSandbox,
+            glob_scan_max_depth: None,
+            entries: Vec::new(),
+        }
+    }
+
+    fn restricted(entries: Vec<FileSystemSandboxEntry>) -> Self {
+        Self {
+            kind: FileSystemSandboxKind::Restricted,
+            glob_scan_max_depth: None,
+            entries,
+        }
+    }
+
+    fn workspace_write(
+        writable_roots: &[PathBuf],
+        exclude_tmpdir_env_var: bool,
+        exclude_slash_tmp: bool,
+    ) -> Self {
+        let mut entries = vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ];
+        if !exclude_slash_tmp {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::SlashTmp,
+                },
+                access: FileSystemAccessMode::Write,
+            });
+        }
+        if !exclude_tmpdir_env_var {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                access: FileSystemAccessMode::Write,
+            });
+        }
+        entries.extend(
+            writable_roots
+                .iter()
+                .cloned()
+                .map(|path| FileSystemSandboxEntry {
+                    path: FileSystemPath::Path { path },
+                    access: FileSystemAccessMode::Write,
+                }),
+        );
+        for subpath in PROTECTED_METADATA_SUBPATHS {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots {
+                        subpath: Some(PathBuf::from(subpath)),
+                    },
+                },
+                access: FileSystemAccessMode::Read,
+            });
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            for root in writable_roots {
+                for subpath in compute_read_only_subpaths(root) {
+                    entries.push(FileSystemSandboxEntry {
+                        path: FileSystemPath::Path { path: subpath },
+                        access: FileSystemAccessMode::Read,
+                    });
+                }
+            }
+        }
+        Self::restricted(entries)
+    }
+
+    fn has_root_access(&self, predicate: impl Fn(FileSystemAccessMode) -> bool) -> bool {
+        matches!(self.kind, FileSystemSandboxKind::Restricted)
+            && self.entries.iter().any(|entry| {
+                matches!(
+                    &entry.path,
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    } if predicate(entry.access)
+                )
+            })
+    }
+
+    fn has_denied_read_restrictions(&self) -> bool {
+        matches!(self.kind, FileSystemSandboxKind::Restricted)
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.access == FileSystemAccessMode::Deny)
+    }
+
+    fn has_write_narrowing_entries(&self) -> bool {
+        matches!(self.kind, FileSystemSandboxKind::Restricted)
+            && self.entries.iter().any(|entry| {
+                if entry.access.can_write() {
+                    return false;
+                }
+                !matches!(
+                    &entry.path,
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::Root,
+                    } if entry.access == FileSystemAccessMode::Read
+                )
+            })
+    }
+
+    pub(crate) fn has_full_disk_read_access(&self) -> bool {
+        match self.kind {
+            FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => true,
+            FileSystemSandboxKind::Restricted => {
+                self.has_root_access(FileSystemAccessMode::can_read)
+                    && !self.has_denied_read_restrictions()
+            }
+        }
+    }
+
+    pub(crate) fn has_full_disk_write_access(&self) -> bool {
+        match self.kind {
+            FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => true,
+            FileSystemSandboxKind::Restricted => {
+                self.has_root_access(FileSystemAccessMode::can_write)
+                    && !self.has_write_narrowing_entries()
+            }
         }
     }
 
     #[cfg(target_os = "macos")]
+    fn include_platform_defaults(&self) -> bool {
+        !self.has_full_disk_read_access()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn include_platform_defaults(&self) -> bool {
+        !self.has_full_disk_read_access()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn get_readable_roots_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        if self.has_full_disk_read_access() {
+            return Vec::new();
+        }
+        let roots = self
+            .resolved_entries_with_cwd(cwd, session_temp_dir)
+            .into_iter()
+            .filter(|entry| entry.access.can_read())
+            .filter(|entry| self.can_read_path_with_cwd(&entry.path, cwd, session_temp_dir))
+            .map(|entry| entry.path)
+            .collect();
+        dedup_paths(roots)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn get_writable_roots_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<WritableRoot> {
+        if self.has_full_disk_write_access() {
+            return Vec::new();
+        }
+        let resolved_entries = self.resolved_entries_with_cwd(cwd, session_temp_dir);
+        let writable_entries = resolved_entries
+            .iter()
+            .filter(|entry| entry.access.can_write())
+            .filter(|entry| self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir))
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        dedup_paths(writable_entries)
+            .into_iter()
+            .map(|root| {
+                #[cfg(target_os = "linux")]
+                let protect_metadata =
+                    !is_linux_ambient_temp_writable_root(&root, session_temp_dir);
+                #[cfg(not(target_os = "linux"))]
+                let protect_metadata = true;
+
+                let mut read_only_subpaths = if protect_metadata {
+                    compute_writable_root_exclusions(&root, cwd)
+                } else {
+                    Vec::new()
+                };
+                read_only_subpaths.extend(
+                    resolved_entries
+                        .iter()
+                        .filter(|entry| !entry.access.can_write())
+                        .filter(|entry| {
+                            !self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir)
+                        })
+                        .filter_map(|entry| {
+                            if path_is_descendant_of_root(&entry.path, &root) {
+                                Some(entry.path.clone())
+                            } else {
+                                None
+                            }
+                        }),
+                );
+                #[cfg(target_os = "linux")]
+                let protected_metadata_names = if protect_metadata {
+                    self.protected_metadata_names_for_writable_root(
+                        &root,
+                        &resolved_entries,
+                        cwd,
+                        session_temp_dir,
+                    )
+                } else {
+                    Vec::new()
+                };
+                WritableRoot {
+                    root,
+                    read_only_subpaths: dedup_paths(read_only_subpaths),
+                    #[cfg(target_os = "linux")]
+                    protected_metadata_names,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn get_unreadable_roots_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
+            return Vec::new();
+        }
+        let root = filesystem_root_for_cwd(cwd);
+        dedup_paths(
+            self.resolved_entries_with_cwd(cwd, session_temp_dir)
+                .into_iter()
+                .filter(|entry| entry.access == FileSystemAccessMode::Deny)
+                .filter(|entry| !self.can_read_path_with_cwd(&entry.path, cwd, session_temp_dir))
+                .filter(|entry| Some(entry.path.as_path()) != root.as_deref())
+                .map(|entry| entry.path)
+                .collect(),
+        )
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn get_unreadable_globs_with_cwd(&self, cwd: &Path) -> Vec<String> {
+        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
+            return Vec::new();
+        }
+        let mut patterns = self
+            .entries
+            .iter()
+            .filter(|entry| entry.access == FileSystemAccessMode::Deny)
+            .filter_map(|entry| match &entry.path {
+                FileSystemPath::GlobPattern { pattern } => {
+                    Some(resolve_glob_pattern_against_cwd(pattern, cwd))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        patterns.sort();
+        patterns.dedup();
+        patterns
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn can_read_path_with_cwd(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> bool {
+        self.resolve_access_with_cwd(path, cwd, session_temp_dir)
+            .can_read()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn can_write_path_with_cwd(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> bool {
+        if !self
+            .resolve_access_with_cwd(path, cwd, session_temp_dir)
+            .can_write()
+        {
+            return false;
+        }
+        if self.has_full_disk_write_access() {
+            return true;
+        }
+        !self.is_metadata_write_denied(path, cwd, session_temp_dir)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn resolve_access_with_cwd(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> FileSystemAccessMode {
+        match self.kind {
+            FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => {
+                return FileSystemAccessMode::Write;
+            }
+            FileSystemSandboxKind::Restricted => {}
+        }
+        let Some(path) = resolve_candidate_path(path, cwd) else {
+            return FileSystemAccessMode::Deny;
+        };
+        self.resolved_entries_with_cwd(cwd, session_temp_dir)
+            .into_iter()
+            .filter(|entry| path_is_at_or_under_root(&path, &entry.path))
+            .max_by_key(|entry| (sandbox_path_specificity(&entry.path), entry.access))
+            .map(|entry| entry.access)
+            .unwrap_or(FileSystemAccessMode::Deny)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn resolved_entries_with_cwd(
+        &self,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<ResolvedFileSystemEntry> {
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                resolve_entry_path(&entry.path, cwd, session_temp_dir).map(|path| {
+                    ResolvedFileSystemEntry {
+                        path,
+                        access: entry.access,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn is_metadata_write_denied(
+        &self,
+        path: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> bool {
+        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
+            return false;
+        }
+        let Some(target) = resolve_candidate_path(path, cwd) else {
+            return true;
+        };
+        let Some(protected_metadata_path) =
+            self.metadata_child_of_writable_root(target.as_path(), cwd, session_temp_dir)
+        else {
+            return false;
+        };
+        !self.has_explicit_write_entry_for_metadata_path(
+            &protected_metadata_path,
+            target.as_path(),
+            cwd,
+            session_temp_dir,
+        )
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn metadata_child_of_writable_root(
+        &self,
+        target: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Option<PathBuf> {
+        self.resolved_entries_with_cwd(cwd, session_temp_dir)
+            .iter()
+            .filter(|entry| entry.access.can_write())
+            .filter_map(|entry| {
+                let relative_path = target.strip_prefix(&entry.path).ok()?;
+                let first_component = relative_path.components().next()?;
+                let metadata_name = first_component.as_os_str().to_str()?;
+                PROTECTED_METADATA_SUBPATHS
+                    .contains(&metadata_name)
+                    .then(|| entry.path.join(metadata_name))
+            })
+            .next()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn has_explicit_write_entry_for_metadata_path(
+        &self,
+        protected_metadata_path: &Path,
+        target: &Path,
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> bool {
+        self.resolved_entries_with_cwd(cwd, session_temp_dir)
+            .iter()
+            .any(|entry| {
+                entry.access.can_write()
+                    && target.starts_with(&entry.path)
+                    && entry.path.starts_with(protected_metadata_path)
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn protected_metadata_names_for_writable_root(
+        &self,
+        root: &Path,
+        resolved_entries: &[ResolvedFileSystemEntry],
+        cwd: &Path,
+        session_temp_dir: Option<&Path>,
+    ) -> Vec<String> {
+        let raw_writable_roots = resolved_entries
+            .iter()
+            .filter(|entry| entry.access.can_write())
+            .filter(|entry| self.can_write_path_with_cwd(&entry.path, cwd, session_temp_dir))
+            .filter(|entry| sandbox_path_relation(&entry.path, root).is_some())
+            .map(|entry| entry.path.as_path())
+            .collect::<Vec<_>>();
+        PROTECTED_METADATA_SUBPATHS
+            .iter()
+            .filter_map(|metadata_name| {
+                let mut metadata_paths = vec![root.join(metadata_name)];
+                metadata_paths.extend(
+                    raw_writable_roots
+                        .iter()
+                        .map(|raw_root| raw_root.join(metadata_name)),
+                );
+                metadata_paths
+                    .iter()
+                    .all(|metadata_path| {
+                        !self.can_write_path_with_cwd(metadata_path, cwd, session_temp_dir)
+                    })
+                    .then(|| (*metadata_name).to_string())
+            })
+            .collect()
+    }
+}
+
+impl SandboxPolicy {
+    #[allow(dead_code)]
+    pub fn has_full_disk_write_access(&self) -> bool {
+        match self {
+            SandboxPolicy::DangerFullAccess => true,
+            SandboxPolicy::ExternalSandbox { .. } => true,
+            SandboxPolicy::ReadOnly { .. } => false,
+            SandboxPolicy::WorkspaceWrite { .. } => false,
+            SandboxPolicy::Managed { file_system, .. } => file_system.has_full_disk_write_access(),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[allow(dead_code)]
     pub fn has_full_disk_read_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { .. } => true,
-            SandboxPolicy::ReadOnly => true,
+            SandboxPolicy::ReadOnly { .. } => true,
             SandboxPolicy::WorkspaceWrite { .. } => true,
+            SandboxPolicy::Managed { file_system, .. } => file_system.has_full_disk_read_access(),
         }
     }
 
@@ -150,31 +722,37 @@ impl SandboxPolicy {
         match self {
             SandboxPolicy::DangerFullAccess => true,
             SandboxPolicy::ExternalSandbox { network_access } => network_access.is_enabled(),
-            SandboxPolicy::ReadOnly => false,
+            SandboxPolicy::ReadOnly { network_access } => *network_access,
             SandboxPolicy::WorkspaceWrite { network_access, .. } => *network_access,
+            SandboxPolicy::Managed { network_access, .. } => network_access.is_enabled(),
         }
     }
 
     pub fn requires_sandbox(&self) -> bool {
-        !matches!(
-            self,
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
-        )
+        match self {
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => false,
+            SandboxPolicy::Managed {
+                file_system,
+                network_access,
+            } => !file_system.has_full_disk_write_access() || !network_access.is_enabled(),
+            SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. } => true,
+        }
     }
 
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     pub fn get_writable_roots_with_cwd(
         &self,
         cwd: &Path,
         session_temp_dir: Option<&Path>,
     ) -> Vec<WritableRoot> {
         match self {
-            SandboxPolicy::ReadOnly => {
+            SandboxPolicy::ReadOnly { .. } => {
                 let roots = temp_writable_roots(false, false, session_temp_dir);
                 roots
                     .into_iter()
                     .map(|root| WritableRoot {
-                        read_only_subpaths: compute_read_only_subpaths(&root),
+                        read_only_subpaths: compute_macos_writable_root_exclusions(&root),
                         root,
                     })
                     .collect()
@@ -209,19 +787,134 @@ impl SandboxPolicy {
                 roots
                     .into_iter()
                     .map(|root| WritableRoot {
-                        read_only_subpaths: compute_read_only_subpaths(&root),
+                        read_only_subpaths: compute_macos_writable_root_exclusions(&root),
                         root,
                     })
                     .collect()
+            }
+            SandboxPolicy::Managed { file_system, .. } => {
+                file_system.get_writable_roots_with_cwd(cwd, session_temp_dir)
             }
             _ => Vec::new(),
         }
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn file_system_policy_from_legacy(policy: &SandboxPolicy) -> FileSystemSandboxPolicy {
+    match policy {
+        SandboxPolicy::DangerFullAccess => FileSystemSandboxPolicy::unrestricted(),
+        SandboxPolicy::ExternalSandbox { .. } => FileSystemSandboxPolicy::external_sandbox(),
+        SandboxPolicy::ReadOnly { .. } => FileSystemSandboxPolicy::read_only(),
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+            ..
+        } => FileSystemSandboxPolicy::workspace_write(
+            writable_roots,
+            *exclude_tmpdir_env_var,
+            *exclude_slash_tmp,
+        ),
+        SandboxPolicy::Managed { file_system, .. } => file_system.clone(),
+    }
+}
+
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::with_capacity(paths.len());
+    let mut seen = std::collections::HashSet::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            deduped.push(path);
+        }
+    }
+    deduped
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn filesystem_root_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    let cwd = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        return None;
+    };
+    cwd.ancestors().last().map(Path::to_path_buf)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_candidate_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else if cwd.is_absolute() {
+        Some(cwd.join(path))
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_entry_path(
+    path: &FileSystemPath,
+    cwd: &Path,
+    session_temp_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    match path {
+        FileSystemPath::Path { path } => Some(path.clone()),
+        FileSystemPath::GlobPattern { .. } => None,
+        FileSystemPath::Special { value } => {
+            resolve_file_system_special_path(value, cwd, session_temp_dir)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_file_system_special_path(
+    value: &FileSystemSpecialPath,
+    cwd: &Path,
+    session_temp_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    match value {
+        FileSystemSpecialPath::Root => filesystem_root_for_cwd(cwd),
+        FileSystemSpecialPath::Minimal => None,
+        FileSystemSpecialPath::ProjectRoots { subpath } => {
+            let cwd = ensure_absolute(cwd.to_path_buf())?;
+            match subpath {
+                Some(subpath) if subpath.is_absolute() => Some(subpath.clone()),
+                Some(subpath) => Some(cwd.join(subpath)),
+                None => Some(cwd),
+            }
+        }
+        FileSystemSpecialPath::Tmpdir => session_temp_dir
+            .and_then(|path| ensure_absolute(path.to_path_buf()))
+            .or_else(|| {
+                let tmpdir = std::env::var_os("TMPDIR")?;
+                if tmpdir.is_empty() {
+                    None
+                } else {
+                    ensure_absolute(PathBuf::from(tmpdir))
+                }
+            }),
+        FileSystemSpecialPath::SlashTmp => {
+            let slash_tmp = PathBuf::from("/tmp");
+            slash_tmp.is_dir().then_some(slash_tmp)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_glob_pattern_against_cwd(pattern: &str, cwd: &Path) -> String {
+    let path = Path::new(pattern);
+    if path.is_absolute() {
+        pattern.to_string()
+    } else {
+        cwd.join(path).to_string_lossy().into_owned()
+    }
 }
 
 fn env_var_truthy(key: &str) -> bool {
@@ -231,7 +924,15 @@ fn env_var_truthy(key: &str) -> bool {
     })
 }
 
-#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[cfg(target_os = "linux")]
+fn env_var_truthy_if_set(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|value| {
+        let trimmed = value.trim();
+        trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+    })
+}
+
+#[allow(dead_code)]
 fn temp_roots_from_system(exclude_tmpdir_env_var: bool, exclude_slash_tmp: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -254,6 +955,22 @@ fn temp_roots_from_system(exclude_tmpdir_env_var: bool, exclude_slash_tmp: bool)
 }
 
 #[cfg(target_os = "linux")]
+fn is_linux_ambient_temp_writable_root(root: &Path, session_temp_dir: Option<&Path>) -> bool {
+    let Some(root) = ensure_absolute(root.to_path_buf()) else {
+        return false;
+    };
+    if session_temp_dir
+        .and_then(|path| ensure_absolute(path.to_path_buf()))
+        .is_some_and(|session_temp_dir| session_temp_dir == root)
+    {
+        return false;
+    }
+    temp_roots_from_system(false, false)
+        .into_iter()
+        .any(|temp_root| temp_root == root)
+}
+
+#[cfg(target_os = "linux")]
 pub fn invoked_as_codex_linux_sandbox() -> bool {
     std::env::args_os()
         .next()
@@ -267,6 +984,7 @@ pub fn invoked_as_codex_linux_sandbox() -> bool {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn temp_writable_roots(
     exclude_tmpdir_env_var: bool,
     exclude_slash_tmp: bool,
@@ -283,7 +1001,7 @@ fn temp_writable_roots(
     roots
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn compute_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
     let mut subpaths = Vec::new();
 
@@ -311,32 +1029,39 @@ fn compute_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
     subpaths
 }
 
-#[cfg(target_os = "linux")]
-fn compute_linux_read_only_subpaths(root: &Path) -> Vec<PathBuf> {
-    let mut subpaths = Vec::new();
-
-    let dot_git = root.join(".git");
-    if dot_git.is_dir() || dot_git.is_file() {
-        if dot_git.is_file()
-            && let Some(gitdir) = resolve_gitdir_from_file(&dot_git)
-            && !subpaths.iter().any(|path| path == &gitdir)
-        {
-            subpaths.push(gitdir);
+#[cfg(target_os = "macos")]
+fn compute_macos_writable_root_exclusions(root: &Path) -> Vec<PathBuf> {
+    let mut subpaths = compute_read_only_subpaths(root);
+    for subpath in PROTECTED_METADATA_SUBPATHS {
+        let protected_path = root.join(subpath);
+        if !subpaths.iter().any(|path| path == &protected_path) {
+            subpaths.push(protected_path);
         }
-        subpaths.push(dot_git);
     }
-
-    let dot_codex = root.join(".codex");
-    if dot_codex.is_dir() {
-        subpaths.push(dot_codex);
-    }
-
-    let dot_agents = root.join(".agents");
-    if dot_agents.is_dir() {
-        subpaths.push(dot_agents);
-    }
-
     subpaths
+}
+
+#[cfg(target_os = "linux")]
+fn compute_linux_writable_root_exclusions(root: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut subpaths = compute_read_only_subpaths(root);
+    let codex_path = root.join(".codex");
+    if path_is_at_or_under_root(cwd, root) && !subpaths.iter().any(|path| path == &codex_path) {
+        subpaths.push(codex_path);
+    }
+    subpaths
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn compute_writable_root_exclusions(root: &Path, cwd: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = cwd;
+        compute_macos_writable_root_exclusions(root)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        compute_linux_writable_root_exclusions(root, cwd)
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -435,35 +1160,164 @@ pub struct SandboxStateUpdate {
     pub use_legacy_landlock: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexSandboxStateMeta {
-    pub sandbox_policy: SandboxPolicy,
+struct CodexSandboxStateMeta {
     #[serde(default)]
-    pub codex_linux_sandbox_exe: Option<PathBuf>,
-    pub sandbox_cwd: PathBuf,
+    sandbox_policy: Option<SandboxPolicy>,
     #[serde(default)]
-    pub use_legacy_landlock: bool,
+    permission_profile: Option<CodexPermissionProfile>,
+    #[serde(default)]
+    codex_linux_sandbox_exe: Option<serde_json::Value>,
+    sandbox_cwd: String,
+    #[serde(default)]
+    use_legacy_landlock: bool,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexPermissionProfile {
+    Managed {
+        file_system: CodexManagedFileSystemPermissions,
+        network: NetworkAccess,
+    },
+    Disabled,
+    External {
+        network: NetworkAccess,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexManagedFileSystemPermissions {
+    Restricted {
+        #[serde(default)]
+        entries: Vec<CodexFileSystemSandboxEntry>,
+        #[serde(default)]
+        glob_scan_max_depth: Option<usize>,
+    },
+    Unrestricted,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodexFileSystemSandboxEntry {
+    path: CodexFileSystemPath,
+    access: CodexFileSystemAccessMode,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CodexFileSystemAccessMode {
+    Read,
+    Write,
+    #[serde(alias = "none")]
+    Deny,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexFileSystemPath {
+    Path { path: String },
+    GlobPattern { pattern: String },
+    Special { value: CodexFileSystemSpecialPath },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CodexFileSystemSpecialPath {
+    Root,
+    Minimal,
+    ProjectRoots {
+        #[serde(default)]
+        subpath: Option<PathBuf>,
+    },
+    Tmpdir,
+    SlashTmp,
+    Unknown {
+        #[serde(rename = "path")]
+        _path: String,
+        #[serde(default, rename = "subpath")]
+        _subpath: Option<PathBuf>,
+    },
+}
+
+const CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR: &str =
+    "Codex permissionProfile full write access with restricted network access is not supported";
 
 pub fn sandbox_state_update_from_codex_meta(
     meta: &serde_json::Value,
 ) -> Result<SandboxStateUpdate, String> {
-    if let Some(field) = codex_unsupported_sandbox_policy_field(meta) {
-        return Err(format!(
-            "Codex sandbox metadata with {field} is not supported"
-        ));
-    }
     let parsed = serde_json::from_value::<CodexSandboxStateMeta>(meta.clone())
         .map_err(|err| format!("failed to parse Codex sandbox state metadata: {err}"))?;
+    let sandbox_cwd = parse_codex_path_uri(&parsed.sandbox_cwd, "sandboxCwd")?;
 
-    if !parsed.sandbox_cwd.is_absolute() {
+    let sandbox_policy = match (parsed.sandbox_policy, parsed.permission_profile) {
+        (Some(policy), _) => validate_codex_sandbox_policy(policy)?,
+        (None, Some(permission_profile)) => {
+            sandbox_policy_from_codex_permission_profile(permission_profile, &sandbox_cwd)?
+        }
+        (None, None) => {
+            return Err("failed to parse Codex sandbox state metadata: missing field `sandboxPolicy` or `permissionProfile`"
+                .to_string());
+        }
+    };
+    let _ = parsed.codex_linux_sandbox_exe;
+    #[cfg(not(target_os = "linux"))]
+    let _ = parsed.use_legacy_landlock;
+    #[cfg(target_os = "linux")]
+    let use_legacy_landlock = parsed.use_legacy_landlock;
+
+    Ok(SandboxStateUpdate {
+        sandbox_policy,
+        sandbox_cwd: Some(sandbox_cwd),
+        #[cfg(target_os = "linux")]
+        use_linux_sandbox_bwrap: use_legacy_landlock.then_some(false),
+        #[cfg(not(target_os = "linux"))]
+        use_linux_sandbox_bwrap: None,
+        #[cfg(target_os = "linux")]
+        use_legacy_landlock: Some(use_legacy_landlock),
+        #[cfg(not(target_os = "linux"))]
+        use_legacy_landlock: None,
+    })
+}
+
+fn parse_codex_path_uri(value: &str, field: &str) -> Result<PathBuf, String> {
+    let path = if value.starts_with("file:") {
+        let url = Url::parse(value)
+            .map_err(|err| format!("Codex sandbox metadata has invalid {field}: {err}"))?;
+        if url.scheme() != "file" {
+            return Err(format!(
+                "Codex sandbox metadata requires {field} to be a file URI, got: {value}"
+            ));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(format!(
+                "Codex sandbox metadata {field} file URI has unsupported metadata: {value}"
+            ));
+        }
+        url.to_file_path().map_err(|_| {
+            format!("Codex sandbox metadata requires local file URI {field}, got: {value}")
+        })?
+    } else {
+        PathBuf::from(value)
+    };
+
+    if !path.is_absolute() {
         return Err(format!(
-            "Codex sandbox metadata requires an absolute sandboxCwd, got: {}",
-            parsed.sandbox_cwd.display()
+            "Codex sandbox metadata requires an absolute {field}, got: {}",
+            path.display()
         ));
     }
-    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &parsed.sandbox_policy
+    Ok(path)
+}
+
+fn validate_codex_sandbox_policy(policy: SandboxPolicy) -> Result<SandboxPolicy, String> {
+    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &policy
         && let Some(root) = writable_roots.iter().find(|root| !root.is_absolute())
     {
         return Err(format!(
@@ -471,31 +1325,434 @@ pub fn sandbox_state_update_from_codex_meta(
             root.display()
         ));
     }
+    Ok(policy)
+}
 
-    Ok(SandboxStateUpdate {
-        sandbox_policy: parsed.sandbox_policy,
-        sandbox_cwd: Some(parsed.sandbox_cwd),
-        // Codex reports how its own Linux helper is configured, but mcp-repl's
-        // optional bwrap stage is a separate local best-effort knob.
-        use_linux_sandbox_bwrap: None,
-        use_legacy_landlock: None,
+fn sandbox_policy_from_codex_permission_profile(
+    permission_profile: CodexPermissionProfile,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    match permission_profile {
+        CodexPermissionProfile::Disabled => Ok(SandboxPolicy::DangerFullAccess),
+        CodexPermissionProfile::External { network } => Ok(SandboxPolicy::ExternalSandbox {
+            network_access: network,
+        }),
+        CodexPermissionProfile::Managed {
+            file_system,
+            network,
+        } => sandbox_policy_from_codex_managed_profile(file_system, network, sandbox_cwd),
+    }
+}
+
+fn sandbox_policy_from_codex_managed_profile(
+    file_system: CodexManagedFileSystemPermissions,
+    network: NetworkAccess,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    let network_access = network.is_enabled();
+    match file_system {
+        CodexManagedFileSystemPermissions::Unrestricted => {
+            if network_access {
+                Ok(SandboxPolicy::DangerFullAccess)
+            } else {
+                Ok(SandboxPolicy::Managed {
+                    file_system: FileSystemSandboxPolicy::unrestricted(),
+                    network_access: network,
+                })
+            }
+        }
+        CodexManagedFileSystemPermissions::Restricted {
+            entries,
+            glob_scan_max_depth,
+        } => sandbox_policy_from_codex_restricted_entries(
+            entries,
+            glob_scan_max_depth,
+            network,
+            network_access,
+            sandbox_cwd,
+        ),
+    }
+}
+
+#[derive(Debug, Default)]
+struct RestrictedProfileProjection {
+    root_read: bool,
+    root_write: bool,
+    workspace_root_writable: bool,
+    writable_roots: Vec<PathBuf>,
+    tmpdir_writable: bool,
+    slash_tmp_writable: bool,
+    read_entries: Vec<CodexFileSystemPath>,
+}
+
+fn sandbox_policy_from_codex_restricted_entries(
+    entries: Vec<CodexFileSystemSandboxEntry>,
+    glob_scan_max_depth: Option<usize>,
+    network: NetworkAccess,
+    network_access: bool,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    let file_system =
+        file_system_policy_from_codex_restricted_entries(&entries, glob_scan_max_depth)?;
+    if let Ok(policy) =
+        legacy_sandbox_policy_from_codex_restricted_entries(entries, network_access, sandbox_cwd)
+    {
+        if cfg!(target_os = "macos") && matches!(policy, SandboxPolicy::ReadOnly { .. }) {
+            return Ok(SandboxPolicy::Managed {
+                file_system,
+                network_access: network,
+            });
+        }
+        return Ok(policy);
+    }
+    Ok(SandboxPolicy::Managed {
+        file_system,
+        network_access: network,
     })
 }
 
-fn codex_unsupported_sandbox_policy_field(meta: &serde_json::Value) -> Option<String> {
-    let policy = meta
-        .get("sandboxPolicy")
-        .and_then(serde_json::Value::as_object)?;
-    match policy.get("type").and_then(serde_json::Value::as_str) {
-        Some("workspace-write") if policy.contains_key("read_only_access") => {
-            Some("sandboxPolicy.read_only_access".to_string())
+fn file_system_policy_from_codex_restricted_entries(
+    entries: &[CodexFileSystemSandboxEntry],
+    glob_scan_max_depth: Option<usize>,
+) -> Result<FileSystemSandboxPolicy, String> {
+    let mut runtime_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(path) = file_system_path_from_codex(&entry.path)? else {
+            continue;
+        };
+        match (&path, &entry.access) {
+            (FileSystemPath::GlobPattern { .. }, CodexFileSystemAccessMode::Deny) => {}
+            (FileSystemPath::GlobPattern { .. }, _) => {
+                return Err(
+                    "Codex permissionProfile.file_system glob pattern entries only support deny access"
+                        .to_string(),
+                );
+            }
+            (
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Minimal,
+                },
+                CodexFileSystemAccessMode::Write,
+            ) => {
+                return Err(
+                    "Codex permissionProfile.file_system minimal write access is not supported"
+                        .to_string(),
+                );
+            }
+            _ => {}
         }
-        Some("read-only") => policy
-            .keys()
-            .find(|key| key.as_str() != "type")
-            .map(|key| format!("sandboxPolicy.{key}")),
-        _ => None,
+        runtime_entries.push(FileSystemSandboxEntry {
+            path,
+            access: match entry.access {
+                CodexFileSystemAccessMode::Read => FileSystemAccessMode::Read,
+                CodexFileSystemAccessMode::Write => FileSystemAccessMode::Write,
+                CodexFileSystemAccessMode::Deny => FileSystemAccessMode::Deny,
+            },
+        });
     }
+
+    if !runtime_entries.iter().any(|entry| entry.access.can_read()) {
+        return Err(
+            "Codex permissionProfile.file_system restricted policy requires at least one readable entry"
+                .to_string(),
+        );
+    }
+
+    Ok(FileSystemSandboxPolicy {
+        kind: FileSystemSandboxKind::Restricted,
+        glob_scan_max_depth,
+        entries: runtime_entries,
+    })
+}
+
+fn file_system_path_from_codex(
+    path: &CodexFileSystemPath,
+) -> Result<Option<FileSystemPath>, String> {
+    match path {
+        CodexFileSystemPath::Path { path } => Ok(Some(FileSystemPath::Path {
+            path: parse_codex_path_uri(path, "permissionProfile.file_system.entries.path")?,
+        })),
+        CodexFileSystemPath::GlobPattern { pattern } => Ok(Some(FileSystemPath::GlobPattern {
+            pattern: pattern.clone(),
+        })),
+        CodexFileSystemPath::Special { value } => match value {
+            CodexFileSystemSpecialPath::Root => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            })),
+            CodexFileSystemSpecialPath::Minimal => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            })),
+            CodexFileSystemSpecialPath::ProjectRoots { subpath } => {
+                Ok(Some(FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots {
+                        subpath: subpath.clone(),
+                    },
+                }))
+            }
+            CodexFileSystemSpecialPath::Tmpdir => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::Tmpdir,
+            })),
+            CodexFileSystemSpecialPath::SlashTmp => Ok(Some(FileSystemPath::Special {
+                value: FileSystemSpecialPath::SlashTmp,
+            })),
+            CodexFileSystemSpecialPath::Unknown { .. } => Ok(None),
+        },
+    }
+}
+
+fn legacy_sandbox_policy_from_codex_restricted_entries(
+    entries: Vec<CodexFileSystemSandboxEntry>,
+    network_access: bool,
+    sandbox_cwd: &Path,
+) -> Result<SandboxPolicy, String> {
+    let mut projection = RestrictedProfileProjection::default();
+
+    for entry in entries {
+        if codex_path_is_unknown_special(&entry.path) {
+            continue;
+        }
+        match entry.access {
+            CodexFileSystemAccessMode::Deny => {
+                return Err(
+                    "Codex permissionProfile.file_system deny entries are not supported"
+                        .to_string(),
+                );
+            }
+            CodexFileSystemAccessMode::Read => {
+                if matches!(
+                    &entry.path,
+                    CodexFileSystemPath::Special {
+                        value: CodexFileSystemSpecialPath::Root
+                    }
+                ) {
+                    projection.root_read = true;
+                }
+                projection.read_entries.push(entry.path);
+            }
+            CodexFileSystemAccessMode::Write => {
+                project_codex_write_entry(entry.path, sandbox_cwd, &mut projection)?
+            }
+        }
+    }
+
+    if projection.root_write {
+        validate_root_write_projection(&projection)?;
+        if !network_access {
+            return Err(CODEX_FULL_WRITE_RESTRICTED_NETWORK_ERROR.to_string());
+        }
+        return Ok(SandboxPolicy::DangerFullAccess);
+    }
+
+    projection.writable_roots.sort();
+    projection.writable_roots.dedup();
+
+    if projection.workspace_root_writable {
+        validate_workspace_write_read_entries(&projection, sandbox_cwd)?;
+        return Ok(SandboxPolicy::WorkspaceWrite {
+            writable_roots: projection.writable_roots,
+            network_access,
+            exclude_tmpdir_env_var: !projection.tmpdir_writable,
+            exclude_slash_tmp: !projection.slash_tmp_writable,
+        });
+    }
+
+    if !projection.writable_roots.is_empty()
+        || projection.tmpdir_writable
+        || projection.slash_tmp_writable
+    {
+        return Err(
+            "Codex permissionProfile requests writes outside the workspace root, which mcp-repl cannot represent"
+                .to_string(),
+        );
+    }
+
+    if !projection.root_read {
+        return Err(
+            "Codex permissionProfile read-only policy without root read access is not supported"
+                .to_string(),
+        );
+    }
+
+    Ok(SandboxPolicy::ReadOnly { network_access })
+}
+
+fn codex_path_is_unknown_special(path: &CodexFileSystemPath) -> bool {
+    matches!(
+        path,
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::Unknown { .. }
+        }
+    )
+}
+
+fn project_codex_write_entry(
+    path: CodexFileSystemPath,
+    sandbox_cwd: &Path,
+    projection: &mut RestrictedProfileProjection,
+) -> Result<(), String> {
+    match path {
+        CodexFileSystemPath::Path { path } => {
+            let path = parse_codex_path_uri(&path, "permissionProfile.file_system.entries.path")?;
+            if path == sandbox_cwd {
+                projection.workspace_root_writable = true;
+            } else {
+                projection.writable_roots.push(path);
+            }
+        }
+        CodexFileSystemPath::Special { value } => match value {
+            CodexFileSystemSpecialPath::Root => {
+                projection.root_write = true;
+            }
+            CodexFileSystemSpecialPath::ProjectRoots { subpath: None } => {
+                projection.workspace_root_writable = true;
+            }
+            CodexFileSystemSpecialPath::ProjectRoots {
+                subpath: Some(subpath),
+            } => {
+                projection
+                    .writable_roots
+                    .push(resolve_codex_project_root_subpath(sandbox_cwd, &subpath));
+            }
+            CodexFileSystemSpecialPath::Tmpdir => {
+                projection.tmpdir_writable = true;
+            }
+            CodexFileSystemSpecialPath::SlashTmp => {
+                projection.slash_tmp_writable = true;
+            }
+            CodexFileSystemSpecialPath::Minimal => {
+                return Err(
+                    "Codex permissionProfile.file_system minimal write access is not supported"
+                        .to_string(),
+                );
+            }
+            CodexFileSystemSpecialPath::Unknown { .. } => {}
+        },
+        CodexFileSystemPath::GlobPattern { pattern } => {
+            let _ = pattern;
+            return Err(
+                "Codex permissionProfile.file_system glob pattern writes are not supported"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_codex_project_root_subpath(sandbox_cwd: &Path, subpath: &Path) -> PathBuf {
+    if subpath.is_absolute() {
+        subpath.to_path_buf()
+    } else {
+        sandbox_cwd.join(subpath)
+    }
+}
+
+fn validate_root_write_projection(projection: &RestrictedProfileProjection) -> Result<(), String> {
+    for read_entry in &projection.read_entries {
+        if !matches!(
+            read_entry,
+            CodexFileSystemPath::Special {
+                value: CodexFileSystemSpecialPath::Root
+            }
+        ) {
+            return Err(
+                "Codex permissionProfile root write policy with read carveouts is not supported"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_workspace_write_read_entries(
+    projection: &RestrictedProfileProjection,
+    sandbox_cwd: &Path,
+) -> Result<(), String> {
+    for read_entry in &projection.read_entries {
+        if workspace_write_read_entry_is_representable(
+            read_entry,
+            sandbox_cwd,
+            &projection.writable_roots,
+            projection.root_read,
+        )? {
+            continue;
+        }
+        return Err(
+            "Codex permissionProfile.file_system read entry cannot be represented by mcp-repl workspace-write"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn workspace_write_read_entry_is_representable(
+    read_entry: &CodexFileSystemPath,
+    sandbox_cwd: &Path,
+    writable_roots: &[PathBuf],
+    root_read: bool,
+) -> Result<bool, String> {
+    match read_entry {
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::Root,
+        } => Ok(true),
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::ProjectRoots { subpath },
+        } => Ok(subpath
+            .as_ref()
+            .is_some_and(|subpath| is_protected_metadata_subpath(subpath))),
+        CodexFileSystemPath::Special {
+            value:
+                CodexFileSystemSpecialPath::Tmpdir
+                | CodexFileSystemSpecialPath::SlashTmp
+                | CodexFileSystemSpecialPath::Minimal,
+        } => Ok(root_read),
+        CodexFileSystemPath::Special {
+            value: CodexFileSystemSpecialPath::Unknown { .. },
+        } => Ok(true),
+        CodexFileSystemPath::Path { path } => {
+            let path = parse_codex_path_uri(path, "permissionProfile.file_system.entries.path")?;
+            if is_protected_metadata_path_under_roots(&path, sandbox_cwd, writable_roots) {
+                return Ok(true);
+            }
+            Ok(root_read && !is_under_any_root(&path, sandbox_cwd, writable_roots))
+        }
+        CodexFileSystemPath::GlobPattern { pattern } => {
+            let _ = pattern;
+            Ok(false)
+        }
+    }
+}
+
+fn is_protected_metadata_path_under_roots(
+    path: &Path,
+    sandbox_cwd: &Path,
+    writable_roots: &[PathBuf],
+) -> bool {
+    is_protected_metadata_path_under_root(path, sandbox_cwd)
+        || writable_roots
+            .iter()
+            .any(|root| is_protected_metadata_path_under_root(path, root))
+}
+
+fn is_protected_metadata_path_under_root(path: &Path, root: &Path) -> bool {
+    let Ok(suffix) = path.strip_prefix(root) else {
+        return false;
+    };
+    is_protected_metadata_subpath(suffix)
+}
+
+fn is_under_any_root(path: &Path, sandbox_cwd: &Path, writable_roots: &[PathBuf]) -> bool {
+    path.starts_with(sandbox_cwd) || writable_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn is_protected_metadata_subpath(path: &Path) -> bool {
+    let mut components = path.components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    matches!(
+        first.as_os_str().to_str(),
+        Some(name) if PROTECTED_METADATA_SUBPATHS.contains(&name)
+    )
 }
 
 impl SandboxState {
@@ -507,8 +1764,6 @@ impl SandboxState {
         }
         if let Some(use_bwrap) = update.use_linux_sandbox_bwrap {
             next.use_linux_sandbox_bwrap = use_bwrap;
-        } else if let Some(use_legacy_landlock) = update.use_legacy_landlock {
-            next.use_linux_sandbox_bwrap = !use_legacy_landlock;
         }
         let changed = next != *self;
         *self = next;
@@ -528,7 +1783,7 @@ impl Default for SandboxState {
                 exclude_slash_tmp: false,
             },
             sandbox_cwd,
-            use_linux_sandbox_bwrap: false,
+            use_linux_sandbox_bwrap: cfg!(target_os = "linux"),
             managed_network_policy: ManagedNetworkPolicy::default(),
             session_temp_dir,
         }
@@ -650,7 +1905,7 @@ pub fn prepare_worker_command_with_managed_network(
     {
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
-        env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir);
+        env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir.clone());
         #[cfg(target_os = "windows")]
         {
             // Ensure Windows sandbox policy and runtime temp resolution both target the
@@ -663,6 +1918,16 @@ pub fn prepare_worker_command_with_managed_network(
                 "TMP".to_string(),
                 state.session_temp_dir.to_string_lossy().to_string(),
             );
+            if managed_network_proxy.is_some() {
+                env.insert("HOME".to_string(), temp_dir.clone());
+                env.insert("R_USER".to_string(), temp_dir.clone());
+                env.insert("USERPROFILE".to_string(), temp_dir);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !state.sandbox_policy.has_full_disk_read_access() {
+            env.insert("HOME".to_string(), temp_dir.clone());
+            env.insert("R_USER".to_string(), temp_dir);
         }
     }
 
@@ -728,42 +1993,13 @@ pub fn prepare_worker_command_with_managed_network(
 
     #[cfg(target_os = "linux")]
     {
-        let mut policy = state.sandbox_policy.clone();
-        let mut policy_cwd = state.sandbox_cwd.clone();
-        match &mut policy {
-            SandboxPolicy::ReadOnly => {
-                let temp_root = state.session_temp_dir.clone();
-                policy = SandboxPolicy::WorkspaceWrite {
-                    writable_roots: vec![temp_root.clone()],
-                    network_access: false,
-                    exclude_tmpdir_env_var: true,
-                    exclude_slash_tmp: true,
-                };
-                policy_cwd = temp_root;
-            }
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots,
-                exclude_tmpdir_env_var,
-                exclude_slash_tmp,
-                network_access: _,
-            } => {
-                if !writable_roots
-                    .iter()
-                    .any(|root| root == &state.session_temp_dir)
-                {
-                    writable_roots.push(state.session_temp_dir.clone());
-                }
-                *exclude_tmpdir_env_var = true;
-                *exclude_slash_tmp = true;
-            }
-            _ => {}
-        }
-        let policy = sanitize_linux_sandbox_policy(&policy);
+        let policy = sanitize_linux_sandbox_policy(&state.sandbox_policy);
         let command = build_command_vec(program, &args);
         let sandbox_args = create_linux_sandbox_command_args(
             command,
             &policy,
-            &policy_cwd,
+            &state.sandbox_cwd,
+            &state.session_temp_dir,
             state.use_linux_sandbox_bwrap,
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
         );
@@ -780,9 +2016,19 @@ pub fn prepare_worker_command_with_managed_network(
     #[cfg(target_os = "windows")]
     {
         let command = build_command_vec(program, &args);
-        let sandbox_args =
-            create_windows_sandbox_command_args(command, &state.sandbox_policy, &state.sandbox_cwd)
-                .map_err(SandboxError::WindowsSandbox)?;
+        let use_offline_identity = managed_network_proxy.is_some();
+        if use_offline_identity {
+            crate::managed_network::ManagedNetworkProxy::route_local_targets_through_proxy(
+                &mut env,
+            );
+        }
+        let sandbox_args = create_windows_sandbox_command_args(
+            command,
+            &state.sandbox_policy,
+            &state.sandbox_cwd,
+            use_offline_identity,
+        )
+        .map_err(SandboxError::WindowsSandbox)?;
         let sandbox_program = std::env::current_exe().map_err(|err| {
             SandboxError::WindowsSandbox(format!("failed to resolve current executable: {err}"))
         })?;
@@ -817,16 +2063,20 @@ fn create_linux_sandbox_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
     use_bwrap_sandbox: bool,
     no_proc: bool,
 ) -> Vec<String> {
     let sandbox_policy_cwd = sandbox_policy_cwd.to_string_lossy().to_string();
+    let session_temp_dir = session_temp_dir.to_string_lossy().to_string();
     let sanitized_policy = sanitize_linux_sandbox_policy(sandbox_policy);
     let sandbox_policy_json =
         serde_json::to_string(&sanitized_policy).expect("failed to serialize Linux sandbox policy");
     let mut linux_cmd: Vec<String> = vec![
         "--sandbox-policy-cwd".to_string(),
         sandbox_policy_cwd,
+        "--session-temp-dir".to_string(),
+        session_temp_dir,
         "--sandbox-policy".to_string(),
         sandbox_policy_json,
     ];
@@ -846,18 +2096,23 @@ fn create_windows_sandbox_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
+    use_offline_identity: bool,
 ) -> Result<Vec<String>, String> {
     let sandbox_policy_cwd = sandbox_policy_cwd.to_string_lossy().to_string();
     let sandbox_policy_json =
         serde_json::to_string(sandbox_policy).map_err(|err| err.to_string())?;
-    let mut windows_cmd: Vec<String> = vec![
+    let mut windows_cmd: Vec<String> = Vec::new();
+    if use_offline_identity {
+        windows_cmd.push("--windows-sandbox-logon-offline".to_string());
+    }
+    windows_cmd.extend([
         "--windows-sandbox".to_string(),
         "--sandbox-policy-cwd".to_string(),
         sandbox_policy_cwd,
         "--sandbox-policy".to_string(),
         sandbox_policy_json,
         "--".to_string(),
-    ];
+    ]);
     windows_cmd.extend(command);
     Ok(windows_cmd)
 }
@@ -885,8 +2140,65 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
         SandboxPolicy::ExternalSandbox { network_access } => SandboxPolicy::ExternalSandbox {
             network_access: *network_access,
         },
+        SandboxPolicy::Managed {
+            file_system,
+            network_access,
+        } => SandboxPolicy::Managed {
+            file_system: file_system.clone(),
+            network_access: *network_access,
+        },
         SandboxPolicy::DangerFullAccess => SandboxPolicy::DangerFullAccess,
-        SandboxPolicy::ReadOnly => SandboxPolicy::ReadOnly,
+        SandboxPolicy::ReadOnly { network_access } => SandboxPolicy::ReadOnly {
+            network_access: *network_access,
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_effective_file_system_policy(
+    policy: &SandboxPolicy,
+    session_temp_dir: &Path,
+) -> FileSystemSandboxPolicy {
+    let mut file_system = file_system_policy_from_legacy(policy);
+    if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+        && !file_system.has_full_disk_write_access()
+        && let Some(session_temp_dir) = ensure_absolute(session_temp_dir.to_path_buf())
+    {
+        let temp_entry = FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: session_temp_dir,
+            },
+            access: FileSystemAccessMode::Write,
+        };
+        if !file_system.entries.contains(&temp_entry) {
+            file_system.entries.push(temp_entry);
+        }
+    }
+    if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+        && !file_system.has_full_disk_read_access()
+        && let Ok(current_exe) = std::env::current_exe()
+        && let Some(current_exe) = ensure_absolute(current_exe)
+    {
+        push_linux_implementation_read_entry(&mut file_system, current_exe);
+    }
+    if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+        && !file_system.has_full_disk_read_access()
+        && let Some(r_home) = embedded_r_home()
+        && let Some(r_home) = ensure_absolute(r_home.clone())
+    {
+        push_linux_implementation_read_entry(&mut file_system, r_home);
+    }
+    file_system
+}
+
+#[cfg(target_os = "linux")]
+fn push_linux_implementation_read_entry(file_system: &mut FileSystemSandboxPolicy, path: PathBuf) {
+    let entry = FileSystemSandboxEntry {
+        path: FileSystemPath::Path { path },
+        access: FileSystemAccessMode::Read,
+    };
+    if !file_system.entries.contains(&entry) {
+        file_system.entries.push(entry);
     }
 }
 
@@ -980,6 +2292,9 @@ const MACOS_SEATBELT_BASE_POLICY: &str = include_str!("sandbox/seatbelt_base_pol
 #[cfg(target_os = "macos")]
 const MACOS_SEATBELT_NETWORK_POLICY: &str = include_str!("sandbox/seatbelt_network_policy.sbpl");
 #[cfg(target_os = "macos")]
+const MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS: &str =
+    include_str!("sandbox/restricted_read_only_platform_defaults.sbpl");
+#[cfg(target_os = "macos")]
 const PROXY_URL_ENV_KEYS: [&str; 6] = [
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -997,7 +2312,9 @@ pub fn sandbox_state_defaults_with_environment() -> SandboxState {
         env_var_truthy(ALLOW_LOCAL_BINDING_ENV_KEY);
     #[cfg(target_os = "linux")]
     {
-        defaults.use_linux_sandbox_bwrap = env_var_truthy(LINUX_BWRAP_ENABLED_ENV);
+        if let Some(use_bwrap) = env_var_truthy_if_set(LINUX_BWRAP_ENABLED_ENV) {
+            defaults.use_linux_sandbox_bwrap = use_bwrap;
+        }
     }
     defaults
 }
@@ -1140,6 +2457,409 @@ fn sandbox_network_env_snapshot() -> HashMap<String, String> {
 }
 
 #[cfg(target_os = "macos")]
+struct SeatbeltAccessRoot {
+    root: PathBuf,
+    excluded_subpaths: Vec<PathBuf>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sandbox_path_variants(path: &Path) -> Vec<PathBuf> {
+    let mut variants = Vec::new();
+    push_unique_path(&mut variants, path.to_path_buf());
+    if let Ok(canonical) = path.canonicalize() {
+        push_unique_path(&mut variants, canonical);
+    }
+    if let Some(canonical) = canonicalize_from_existing_parent(path) {
+        push_unique_path(&mut variants, canonical);
+    }
+    variants
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxPathRelation {
+    Same,
+    Descendant,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sandbox_path_relation(path: &Path, root: &Path) -> Option<SandboxPathRelation> {
+    let path_variants = sandbox_path_variants(path);
+    let root_variants = sandbox_path_variants(root);
+    let mut descendant = false;
+    for path_variant in &path_variants {
+        for root_variant in &root_variants {
+            if path_variant == root_variant {
+                return Some(SandboxPathRelation::Same);
+            }
+            if path_variant.starts_with(root_variant) {
+                descendant = true;
+            }
+        }
+    }
+    descendant.then_some(SandboxPathRelation::Descendant)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn path_is_at_or_under_root(path: &Path, root: &Path) -> bool {
+    sandbox_path_relation(path, root).is_some()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn path_is_descendant_of_root(path: &Path, root: &Path) -> bool {
+    matches!(
+        sandbox_path_relation(path, root),
+        Some(SandboxPathRelation::Descendant)
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sandbox_path_specificity(path: &Path) -> usize {
+    sandbox_path_variants(path)
+        .iter()
+        .map(|path| path.components().count())
+        .max()
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_paths(paths: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| path_is_descendant_of_root(path, root))
+        .cloned()
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn canonicalize_from_existing_parent(path: &Path) -> Option<PathBuf> {
+    let mut suffix = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(mut canonical) = current.canonicalize() {
+            for component in suffix.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+        suffix.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_seatbelt_access_policy(
+    action: &str,
+    param_prefix: &str,
+    roots: Vec<SeatbeltAccessRoot>,
+) -> (String, Vec<(String, PathBuf)>) {
+    let mut policy_components = Vec::new();
+    let mut params = Vec::new();
+
+    for (root_index, access_root) in roots.into_iter().enumerate() {
+        for (variant_index, root) in sandbox_path_variants(&access_root.root)
+            .into_iter()
+            .enumerate()
+        {
+            let root_param = if variant_index == 0 {
+                format!("{param_prefix}_{root_index}")
+            } else {
+                format!("{param_prefix}_{root_index}_{variant_index}")
+            };
+            params.push((root_param.clone(), root));
+            if access_root.excluded_subpaths.is_empty() {
+                policy_components.push(format!("(subpath (param \"{root_param}\"))"));
+                continue;
+            }
+
+            let mut require_parts = vec![format!("(subpath (param \"{root_param}\"))")];
+            for (excluded_index, excluded_subpath) in
+                access_root.excluded_subpaths.iter().enumerate()
+            {
+                for (excluded_variant_index, excluded) in sandbox_path_variants(excluded_subpath)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let excluded_param = if excluded_variant_index == 0 {
+                        format!("{param_prefix}_{root_index}_EXCLUDED_{excluded_index}")
+                    } else {
+                        format!(
+                            "{param_prefix}_{root_index}_EXCLUDED_{excluded_index}_{excluded_variant_index}"
+                        )
+                    };
+                    require_parts.push(format!(
+                        "(require-not (literal (param \"{excluded_param}\")))"
+                    ));
+                    require_parts.push(format!(
+                        "(require-not (subpath (param \"{excluded_param}\")))"
+                    ));
+                    params.push((excluded_param, excluded));
+                }
+            }
+            policy_components.push(format!("(require-all {} )", require_parts.join(" ")));
+        }
+    }
+
+    if policy_components.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        (
+            format!("(allow {action}\n{}\n)", policy_components.join(" ")),
+            params,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_seatbelt_unreadable_glob_policy(
+    file_system: &FileSystemSandboxPolicy,
+    cwd: &Path,
+) -> String {
+    let mut policy_components = Vec::new();
+    for pattern in file_system.get_unreadable_globs_with_cwd(cwd) {
+        for pattern in seatbelt_unreadable_glob_variants(&pattern) {
+            let Some(regex) = seatbelt_regex_for_unreadable_glob(&pattern) else {
+                continue;
+            };
+            let regex = regex.replace('"', "\\\"");
+            policy_components.push(format!(r#"(deny file-read* (regex #"{regex}"))"#));
+            policy_components.push(format!(r#"(deny file-write-unlink (regex #"{regex}"))"#));
+        }
+    }
+    policy_components.sort();
+    policy_components.dedup();
+    policy_components.join("\n")
+}
+
+#[cfg(target_os = "macos")]
+fn build_seatbelt_unreadable_path_policy(
+    unreadable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    writable_roots: &[PathBuf],
+) -> (String, Vec<(String, PathBuf)>) {
+    let mut policy_components = Vec::new();
+    let mut params = Vec::new();
+
+    for (root_index, root) in unreadable_roots.iter().enumerate() {
+        let readable_exceptions = descendant_paths(readable_roots, root);
+        let writable_exceptions = descendant_paths(writable_roots, root);
+        for (variant_index, root) in sandbox_path_variants(root).into_iter().enumerate() {
+            let root_param = if variant_index == 0 {
+                format!("UNREADABLE_ROOT_{root_index}")
+            } else {
+                format!("UNREADABLE_ROOT_{root_index}_{variant_index}")
+            };
+            policy_components.push(format!(
+                "(deny file-read* (literal (param \"{root_param}\")))"
+            ));
+            push_seatbelt_unreadable_subpath_rule(
+                &mut policy_components,
+                &mut params,
+                "file-read*",
+                &root_param,
+                &readable_exceptions,
+                &format!("UNREADABLE_ROOT_{root_index}_{variant_index}_READ_EXCEPTED"),
+            );
+            policy_components.push(format!(
+                "(deny file-write-unlink (literal (param \"{root_param}\")))"
+            ));
+            push_seatbelt_unreadable_subpath_rule(
+                &mut policy_components,
+                &mut params,
+                "file-write-unlink",
+                &root_param,
+                &writable_exceptions,
+                &format!("UNREADABLE_ROOT_{root_index}_{variant_index}_WRITE_EXCEPTED"),
+            );
+            params.push((root_param, root));
+        }
+    }
+
+    (policy_components.join("\n"), params)
+}
+
+#[cfg(target_os = "macos")]
+fn push_seatbelt_unreadable_subpath_rule(
+    policy_components: &mut Vec<String>,
+    params: &mut Vec<(String, PathBuf)>,
+    action: &str,
+    root_param: &str,
+    exceptions: &[PathBuf],
+    exception_param_prefix: &str,
+) {
+    if exceptions.is_empty() {
+        policy_components.push(format!(
+            "(deny {action} (subpath (param \"{root_param}\")))"
+        ));
+        return;
+    }
+
+    let mut require_parts = vec![format!("(subpath (param \"{root_param}\"))")];
+    for (exception_index, exception) in exceptions.iter().enumerate() {
+        for (variant_index, exception) in sandbox_path_variants(exception).into_iter().enumerate() {
+            let exception_param = if variant_index == 0 {
+                format!("{exception_param_prefix}_{exception_index}")
+            } else {
+                format!("{exception_param_prefix}_{exception_index}_{variant_index}")
+            };
+            require_parts.push(format!(
+                "(require-not (literal (param \"{exception_param}\")))"
+            ));
+            require_parts.push(format!(
+                "(require-not (subpath (param \"{exception_param}\")))"
+            ));
+            params.push((exception_param, exception));
+        }
+    }
+    policy_components.push(format!(
+        "(deny {action} (require-all {} ))",
+        require_parts.join(" ")
+    ));
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_unreadable_glob_variants(pattern: &str) -> Vec<String> {
+    let mut variants = vec![pattern.to_string()];
+    if let Some(canonical) = canonicalized_static_prefix_glob_pattern(pattern)
+        && !variants.iter().any(|existing| existing == &canonical)
+    {
+        variants.push(canonical);
+    }
+    variants
+}
+
+#[cfg(target_os = "macos")]
+fn canonicalized_static_prefix_glob_pattern(pattern: &str) -> Option<String> {
+    let first_glob_index = pattern
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']').then_some(index))
+        .unwrap_or(pattern.len());
+    let static_prefix = &pattern[..first_glob_index];
+    let slash_index = static_prefix.rfind('/')?;
+    let suffix = &pattern[slash_index + 1..];
+    let static_dir = if slash_index == 0 {
+        "/"
+    } else {
+        &static_prefix[..slash_index]
+    };
+    let mut candidate = PathBuf::from(static_dir);
+    let mut missing_suffix = PathBuf::new();
+
+    loop {
+        if let Ok(canonical) = candidate.canonicalize() {
+            let mut rebuilt = canonical;
+            if !missing_suffix.as_os_str().is_empty() {
+                rebuilt.push(missing_suffix);
+            }
+            let mut canonical_pattern = rebuilt.to_string_lossy().into_owned();
+            if !canonical_pattern.ends_with('/') {
+                canonical_pattern.push('/');
+            }
+            canonical_pattern.push_str(suffix);
+            return (canonical_pattern != pattern).then_some(canonical_pattern);
+        }
+
+        let file_name = candidate.file_name()?;
+        let mut next_missing_suffix = PathBuf::from(file_name);
+        if !missing_suffix.as_os_str().is_empty() {
+            next_missing_suffix.push(missing_suffix);
+        }
+        missing_suffix = next_missing_suffix;
+        if !candidate.pop() {
+            return None;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_regex_for_unreadable_glob(pattern: &str) -> Option<String> {
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let mut regex = String::from("^");
+    let mut chars = pattern.chars().collect::<std::collections::VecDeque<_>>();
+    let mut saw_glob = false;
+
+    while let Some(ch) = chars.pop_front() {
+        match ch {
+            '*' => {
+                saw_glob = true;
+                if chars.front() == Some(&'*') {
+                    chars.pop_front();
+                    if chars.front() == Some(&'/') {
+                        chars.pop_front();
+                        regex.push_str("(.*/)?");
+                    } else {
+                        regex.push_str(".*");
+                    }
+                } else {
+                    regex.push_str("[^/]*");
+                }
+            }
+            '?' => {
+                saw_glob = true;
+                regex.push_str("[^/]");
+            }
+            '[' => {
+                saw_glob = true;
+                let mut class = Vec::new();
+                let mut closed = false;
+                while let Some(class_ch) = chars.pop_front() {
+                    if class_ch == ']' {
+                        closed = true;
+                        break;
+                    }
+                    class.push(class_ch);
+                }
+                if !closed {
+                    regex.push_str("\\[");
+                    for class_ch in class.into_iter().rev() {
+                        chars.push_front(class_ch);
+                    }
+                    continue;
+                }
+                regex.push('[');
+                for class_ch in class {
+                    match class_ch {
+                        '\\' => regex.push_str("\\\\"),
+                        '!' if regex.ends_with('[') => regex.push('^'),
+                        '^' if regex.ends_with('[') => regex.push_str("\\^"),
+                        _ => regex.push(class_ch),
+                    }
+                }
+                regex.push(']');
+            }
+            ']' => {
+                saw_glob = true;
+                regex.push_str("\\]");
+            }
+            _ => regex.push_str(&regex_lite::escape(&ch.to_string())),
+        }
+    }
+
+    if !saw_glob {
+        while regex.len() > 2 && regex.ends_with('/') {
+            regex.pop();
+        }
+        if regex == "^/" {
+            regex.push_str(".*");
+        } else {
+            regex.push_str("(/.*)?");
+        }
+    }
+    regex.push('$');
+    Some(regex)
+}
+
+#[cfg(target_os = "macos")]
 fn create_seatbelt_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
@@ -1148,103 +2868,141 @@ fn create_seatbelt_command_args(
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
 ) -> Vec<String> {
-    let (file_write_policy, file_write_dir_params) = {
-        if sandbox_policy.has_full_disk_write_access() {
+    let mut file_system = file_system_policy_from_legacy(sandbox_policy);
+    let mut required_temp_roots = vec![session_temp_dir.to_path_buf()];
+    match sandbox_policy {
+        SandboxPolicy::ReadOnly { .. } => {
+            required_temp_roots.extend(temp_roots_from_system(false, false));
+        }
+        SandboxPolicy::WorkspaceWrite {
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp,
+            ..
+        } => {
+            required_temp_roots.extend(temp_roots_from_system(
+                *exclude_tmpdir_env_var,
+                *exclude_slash_tmp,
+            ));
+        }
+        _ => {}
+    }
+    required_temp_roots.sort();
+    required_temp_roots.dedup();
+    for root in required_temp_roots {
+        if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+            && !file_system.can_write_path_with_cwd(
+                &root,
+                sandbox_policy_cwd,
+                Some(session_temp_dir),
+            )
+        {
+            file_system.entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: root },
+                access: FileSystemAccessMode::Write,
+            });
+        }
+    }
+    for root in helper_read_roots_from_command(&command) {
+        if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+            && !file_system.can_read_path_with_cwd(
+                &root,
+                sandbox_policy_cwd,
+                Some(session_temp_dir),
+            )
+        {
+            file_system.entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: root },
+                access: FileSystemAccessMode::Read,
+            });
+        }
+    }
+    let unreadable_roots =
+        file_system.get_unreadable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
+    let readable_roots = if file_system.has_full_disk_read_access() {
+        Vec::new()
+    } else {
+        file_system.get_readable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
+    };
+    let writable_roots = if file_system.has_full_disk_write_access() {
+        Vec::new()
+    } else {
+        file_system.get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir))
+    };
+    let writable_root_paths = writable_roots
+        .iter()
+        .map(|root| root.root.clone())
+        .collect::<Vec<_>>();
+
+    let (file_write_policy, file_write_dir_params) = if file_system.has_full_disk_write_access() {
+        if unreadable_roots.is_empty() {
             (
                 r#"(allow file-write* (regex #"^/"))"#.to_string(),
                 Vec::new(),
             )
         } else {
-            let writable_roots = sandbox_policy
-                .get_writable_roots_with_cwd(sandbox_policy_cwd, Some(session_temp_dir));
-            let mut writable_folder_policies = Vec::new();
-            let mut file_write_params = Vec::new();
-
-            for (index, wr) in writable_roots.iter().enumerate() {
-                // NOTE: macOS has multiple common path spellings for the same locations:
-                // - `/tmp` vs `/private/tmp`
-                // - `/var/...` vs `/private/var/...`
-                //
-                // Seatbelt path matching is sensitive to these differences in practice, so we
-                // include both the original and canonicalized paths for each writable root (and
-                // any read-only exclusions) to avoid accidental denials.
-                let mut root_candidates = Vec::new();
-                root_candidates.push(wr.root.clone());
-                if let Ok(canonical_root) = wr.root.canonicalize() {
-                    root_candidates.push(canonical_root);
-                }
-                let mut seen_root = std::collections::HashSet::<String>::new();
-                let mut root_params = Vec::new();
-                for (variant, root_path) in root_candidates.into_iter().enumerate() {
-                    let key = root_path.to_string_lossy().to_string();
-                    if !seen_root.insert(key) {
-                        continue;
-                    }
-                    let root_param = if variant == 0 {
-                        format!("WRITABLE_ROOT_{index}")
-                    } else {
-                        format!("WRITABLE_ROOT_{index}_{variant}")
-                    };
-                    file_write_params.push((root_param.clone(), root_path));
-                    root_params.push(root_param);
-                }
-
-                if wr.read_only_subpaths.is_empty() {
-                    for root_param in root_params {
-                        writable_folder_policies
-                            .push(format!("(subpath (param \"{root_param}\"))"));
-                    }
-                } else {
-                    for root_param in root_params {
-                        let mut require_parts = Vec::new();
-                        require_parts.push(format!("(subpath (param \"{root_param}\"))"));
-
-                        for (subpath_index, ro) in wr.read_only_subpaths.iter().enumerate() {
-                            let mut ro_candidates = Vec::new();
-                            ro_candidates.push(ro.to_path_buf());
-                            if let Ok(canonical_ro) = ro.canonicalize() {
-                                ro_candidates.push(canonical_ro);
-                            }
-                            let mut seen_ro = std::collections::HashSet::<String>::new();
-                            for (ro_variant, ro_path) in ro_candidates.into_iter().enumerate() {
-                                let key = ro_path.to_string_lossy().to_string();
-                                if !seen_ro.insert(key) {
-                                    continue;
-                                }
-                                let ro_param = if ro_variant == 0 {
-                                    format!("WRITABLE_ROOT_{index}_RO_{subpath_index}")
-                                } else {
-                                    format!("WRITABLE_ROOT_{index}_RO_{subpath_index}_{ro_variant}")
-                                };
-                                require_parts.push(format!(
-                                    "(require-not (subpath (param \"{ro_param}\")))"
-                                ));
-                                file_write_params.push((ro_param, ro_path));
-                            }
-                        }
-
-                        writable_folder_policies
-                            .push(format!("(require-all {} )", require_parts.join(" ")));
-                    }
-                }
-            }
-
-            if writable_folder_policies.is_empty() {
-                ("".to_string(), Vec::new())
-            } else {
-                let file_write_policy = format!(
-                    "(allow file-write*\n{}\n)",
-                    writable_folder_policies.join(" ")
-                );
-                (file_write_policy, file_write_params)
-            }
+            build_seatbelt_access_policy(
+                "file-write*",
+                "WRITABLE_ROOT",
+                vec![SeatbeltAccessRoot {
+                    root: PathBuf::from("/"),
+                    excluded_subpaths: unreadable_roots.clone(),
+                }],
+            )
         }
+    } else {
+        build_seatbelt_access_policy(
+            "file-write*",
+            "WRITABLE_ROOT",
+            writable_roots
+                .iter()
+                .map(|root| SeatbeltAccessRoot {
+                    root: root.root.clone(),
+                    excluded_subpaths: root.read_only_subpaths.clone(),
+                })
+                .collect(),
+        )
     };
 
-    let file_read_policy = if sandbox_policy.has_full_disk_read_access() {
-        "; allow read-only file operations\n(allow file-read*)"
+    let (file_read_policy, file_read_dir_params) = if file_system.has_full_disk_read_access() {
+        if unreadable_roots.is_empty() {
+            (
+                "; allow read-only file operations\n(allow file-read*)".to_string(),
+                Vec::new(),
+            )
+        } else {
+            let (policy, params) = build_seatbelt_access_policy(
+                "file-read*",
+                "READABLE_ROOT",
+                vec![SeatbeltAccessRoot {
+                    root: PathBuf::from("/"),
+                    excluded_subpaths: unreadable_roots.clone(),
+                }],
+            );
+            (
+                format!("; allow read-only file operations\n{policy}"),
+                params,
+            )
+        }
     } else {
-        ""
+        let (policy, params) = build_seatbelt_access_policy(
+            "file-read*",
+            "READABLE_ROOT",
+            readable_roots
+                .iter()
+                .map(|root| SeatbeltAccessRoot {
+                    excluded_subpaths: descendant_paths(&unreadable_roots, root),
+                    root: root.clone(),
+                })
+                .collect(),
+        );
+        if policy.is_empty() {
+            (String::new(), params)
+        } else {
+            (
+                format!("; allow read-only file operations\n{policy}"),
+                params,
+            )
+        }
     };
 
     let proxy = proxy_policy_inputs_from_env(network_env);
@@ -1258,11 +3016,35 @@ fn create_seatbelt_command_args(
         &proxy,
     );
 
-    let full_policy = format!(
-        "{MACOS_SEATBELT_BASE_POLICY}\n{file_read_policy}\n{file_write_policy}\n{network_policy}"
+    let deny_read_policy = build_seatbelt_unreadable_glob_policy(&file_system, sandbox_policy_cwd);
+    let (deny_path_policy, deny_path_params) = build_seatbelt_unreadable_path_policy(
+        &unreadable_roots,
+        &readable_roots,
+        &writable_root_paths,
     );
+    let mut policy_sections = vec![
+        MACOS_SEATBELT_BASE_POLICY.to_string(),
+        file_read_policy,
+        file_write_policy,
+        network_policy,
+    ];
+    if file_system.include_platform_defaults() {
+        policy_sections.push(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS.to_string());
+    }
+    policy_sections.push(deny_read_policy);
+    policy_sections.push(deny_path_policy);
+    let full_policy = policy_sections.join("\n");
+    if let Some(path) = crate::debug_logs::log_path("seatbelt-policy.sbpl") {
+        let _ = std::fs::write(path, &full_policy);
+    }
 
-    let dir_params = [file_write_dir_params, macos_dir_params()].concat();
+    let dir_params = [
+        file_read_dir_params,
+        file_write_dir_params,
+        deny_path_params,
+        macos_dir_params(),
+    ]
+    .concat();
 
     let mut seatbelt_args = vec!["-p".to_string(), full_policy];
     let definition_args = dir_params
@@ -1272,6 +3054,20 @@ fn create_seatbelt_command_args(
     seatbelt_args.push("--".to_string());
     seatbelt_args.extend(command);
     seatbelt_args
+}
+
+#[cfg(target_os = "macos")]
+fn helper_read_roots_from_command(command: &[String]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(program) = command.first()
+        && let Some(parent) = Path::new(program).parent()
+        && let Some(parent) = ensure_absolute(parent.to_path_buf())
+    {
+        roots.push(parent);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 #[cfg(target_os = "linux")]
@@ -1288,6 +3084,7 @@ pub fn run_linux_sandbox_main() -> ! {
 #[cfg(target_os = "linux")]
 struct LinuxSandboxArgs {
     sandbox_policy_cwd: PathBuf,
+    session_temp_dir: PathBuf,
     sandbox_policy: SandboxPolicy,
     command: Vec<std::ffi::OsString>,
     use_bwrap_sandbox: bool,
@@ -1302,6 +3099,8 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
         linux_apply_sandbox_policy_to_current_thread(
             &args.sandbox_policy,
             &args.sandbox_policy_cwd,
+            &args.session_temp_dir,
+            false,
         )?;
         linux_execvp(args.command)?;
         return Ok(());
@@ -1310,7 +3109,12 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
         linux_exec_bwrap_sandbox(args)?;
         return Ok(());
     }
-    linux_apply_sandbox_policy_to_current_thread(&args.sandbox_policy, &args.sandbox_policy_cwd)?;
+    linux_apply_sandbox_policy_to_current_thread(
+        &args.sandbox_policy,
+        &args.sandbox_policy_cwd,
+        &args.session_temp_dir,
+        true,
+    )?;
     linux_execvp(args.command)?;
     Ok(())
 }
@@ -1318,6 +3122,7 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
     let mut sandbox_policy_cwd: Option<PathBuf> = None;
+    let mut session_temp_dir: Option<PathBuf> = None;
     let mut sandbox_policy: Option<SandboxPolicy> = None;
     let mut command: Vec<std::ffi::OsString> = Vec::new();
     let mut use_bwrap_sandbox = false;
@@ -1345,6 +3150,13 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
             sandbox_policy_cwd = Some(PathBuf::from(value));
             continue;
         }
+        if arg == "--session-temp-dir" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --session-temp-dir".to_string())?;
+            session_temp_dir = Some(PathBuf::from(value));
+            continue;
+        }
         if arg == "--sandbox-policy" {
             let value = args
                 .next()
@@ -1367,6 +3179,8 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
 
     let sandbox_policy_cwd =
         sandbox_policy_cwd.ok_or_else(|| "missing --sandbox-policy-cwd".to_string())?;
+    let session_temp_dir =
+        session_temp_dir.ok_or_else(|| "missing --session-temp-dir".to_string())?;
     let sandbox_policy = sandbox_policy.ok_or_else(|| "missing --sandbox-policy".to_string())?;
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
@@ -1374,6 +3188,7 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
 
     Ok(LinuxSandboxArgs {
         sandbox_policy_cwd,
+        session_temp_dir,
         sandbox_policy,
         command,
         use_bwrap_sandbox,
@@ -1408,6 +3223,8 @@ fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<Stri
         current_exe.to_string_lossy().to_string(),
         "--sandbox-policy-cwd".to_string(),
         args.sandbox_policy_cwd.to_string_lossy().to_string(),
+        "--session-temp-dir".to_string(),
+        args.session_temp_dir.to_string_lossy().to_string(),
         "--sandbox-policy".to_string(),
         policy_json,
         "--apply-seccomp-then-exec".to_string(),
@@ -1422,34 +3239,103 @@ fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<Stri
 }
 
 #[cfg(target_os = "linux")]
+struct LinuxBwrapCommand {
+    args: Vec<String>,
+    preserved_files: Vec<std::fs::File>,
+    empty_file_source_index: Option<usize>,
+    preserved_tempdirs: Vec<tempfile::TempDir>,
+    synthetic_mount_targets: Vec<LinuxSyntheticMountTarget>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LinuxSyntheticMountTarget {
+    EmptyFile(PathBuf),
+    EmptyDirectory(PathBuf),
+}
+
+#[cfg(target_os = "linux")]
 fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
     let bwrap_program = linux_find_bwrap_program()
         .ok_or_else(|| "bwrap executable not found (tried /usr/bin/bwrap and PATH)".to_string())?;
     let inner = linux_build_inner_seccomp_command(&args)?;
+    let file_system_policy =
+        linux_effective_file_system_policy(&args.sandbox_policy, &args.session_temp_dir);
+    let network_mode = linux_bwrap_network_mode(&args.sandbox_policy);
     let mount_proc = !args.no_proc
         && linux_bwrap_supports_proc_mount(
             bwrap_program.as_path(),
-            &args.sandbox_policy,
+            &file_system_policy,
             &args.sandbox_policy_cwd,
+            &args.session_temp_dir,
+            network_mode,
         );
-    let bwrap_args = create_linux_bwrap_command_args(
+    let bwrap_command = create_linux_bwrap_command_args(
         inner,
-        &args.sandbox_policy,
+        &file_system_policy,
         &args.sandbox_policy_cwd,
+        &args.session_temp_dir,
         mount_proc,
+        network_mode,
     )?;
-    let mut full_command = Vec::with_capacity(1 + bwrap_args.len());
+    let LinuxBwrapCommand {
+        args,
+        preserved_files,
+        empty_file_source_index: _,
+        preserved_tempdirs,
+        synthetic_mount_targets,
+    } = bwrap_command;
+    make_linux_files_inheritable(&preserved_files)?;
+    let synthetic_mount_targets_for_cleanup = synthetic_mount_targets.clone();
+    let mut full_command = Vec::with_capacity(1 + args.len());
     full_command.push(bwrap_program.into_os_string());
-    full_command.extend(bwrap_args.into_iter().map(std::ffi::OsString::from));
-    linux_execvp(full_command)?;
+    full_command.extend(args.into_iter().map(std::ffi::OsString::from));
+    if !synthetic_mount_targets_for_cleanup.is_empty() || !preserved_tempdirs.is_empty() {
+        linux_run_bwrap_child_with_cleanup(
+            full_command,
+            synthetic_mount_targets_for_cleanup,
+            preserved_files,
+            preserved_tempdirs,
+        )?;
+        return Ok(());
+    }
+    let exec_result = linux_execvp(full_command);
+    drop(preserved_files);
+    drop(preserved_tempdirs);
+    exec_result?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxBwrapNetworkMode {
+    FullAccess,
+    Isolated,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBwrapNetworkMode {
+    fn should_unshare_network(self) -> bool {
+        matches!(self, LinuxBwrapNetworkMode::Isolated)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bwrap_network_mode(policy: &SandboxPolicy) -> LinuxBwrapNetworkMode {
+    if policy.has_full_network_access() {
+        LinuxBwrapNetworkMode::FullAccess
+    } else {
+        LinuxBwrapNetworkMode::Isolated
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn linux_bwrap_supports_proc_mount(
     bwrap_program: &Path,
-    sandbox_policy: &SandboxPolicy,
+    file_system_policy: &FileSystemSandboxPolicy,
     sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    network_mode: LinuxBwrapNetworkMode,
 ) -> bool {
     let true_path = if Path::new("/usr/bin/true").is_file() {
         "/usr/bin/true"
@@ -1458,18 +3344,25 @@ fn linux_bwrap_supports_proc_mount(
     } else {
         "true"
     };
-    let args = match create_linux_bwrap_command_args(
+    let bwrap_command = match create_linux_bwrap_command_args(
         vec![true_path.to_string()],
-        sandbox_policy,
+        file_system_policy,
         sandbox_policy_cwd,
+        session_temp_dir,
         true,
+        network_mode,
     ) {
-        Ok(args) => args,
+        Ok(command) => command,
         Err(_) => return false,
     };
+    if make_linux_files_inheritable(&bwrap_command.preserved_files).is_err() {
+        return false;
+    }
     let output = std::process::Command::new(bwrap_program)
-        .args(&args)
+        .args(&bwrap_command.args)
         .output();
+    let synthetic_mount_targets = bwrap_command.synthetic_mount_targets.clone();
+    let _ = cleanup_linux_synthetic_mount_targets(&synthetic_mount_targets);
     let Ok(output) = output else {
         return false;
     };
@@ -1481,86 +3374,329 @@ fn linux_bwrap_supports_proc_mount(
         eprintln!("codex-linux-sandbox: bwrap could not mount /proc; retrying with --no-proc");
         return false;
     }
-    true
+    if is_bwrap_proc_probe_quiet_retry_failure(stderr.as_ref()) {
+        return false;
+    }
+    eprintln!(
+        "codex-linux-sandbox: bwrap /proc probe failed; retrying with --no-proc: {}",
+        stderr.trim()
+    );
+    false
 }
 
 #[cfg(target_os = "linux")]
 fn create_linux_bwrap_command_args(
     command: Vec<String>,
-    sandbox_policy: &SandboxPolicy,
+    file_system_policy: &FileSystemSandboxPolicy,
     sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
     mount_proc: bool,
-) -> Result<Vec<String>, String> {
-    let sandbox_policy = sanitize_linux_sandbox_policy(sandbox_policy);
-    let writable_roots = linux_writable_roots(&sandbox_policy, sandbox_policy_cwd);
-    linux_ensure_bwrap_mount_targets_exist(&writable_roots)?;
-
+    network_mode: LinuxBwrapNetworkMode,
+) -> Result<LinuxBwrapCommand, String> {
     let mut bwrap_args = vec![
         "--die-with-parent".to_string(),
         "--new-session".to_string(),
+        "--unshare-user".to_string(),
         "--unshare-pid".to_string(),
     ];
-    if !sandbox_policy.has_full_network_access() {
+    let mut bwrap_command =
+        linux_bwrap_filesystem_args(file_system_policy, sandbox_policy_cwd, session_temp_dir)?;
+    bwrap_args.append(&mut bwrap_command.args);
+    if network_mode.should_unshare_network() {
         bwrap_args.push("--unshare-net".to_string());
     }
     if mount_proc {
         bwrap_args.push("--proc".to_string());
         bwrap_args.push("/proc".to_string());
     }
-    bwrap_args.extend(["--ro-bind".to_string(), "/".to_string(), "/".to_string()]);
-
-    for root in &writable_roots {
-        let root_str = root.to_string_lossy().to_string();
-        bwrap_args.extend(["--bind".to_string(), root_str.clone(), root_str]);
-    }
-
-    let read_only_subpaths = collect_linux_read_only_subpaths(&writable_roots);
-    for subpath in read_only_subpaths {
-        if let Some(symlink_path) = find_symlink_in_path(&subpath, &writable_roots) {
-            let target = symlink_path.to_string_lossy().to_string();
-            bwrap_args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), target]);
-            continue;
-        }
-
-        if !subpath.exists() {
-            if let Some(first_missing) = find_first_non_existent_component(&subpath)
-                && is_within_allowed_write_paths(&first_missing, &writable_roots)
-            {
-                let target = first_missing.to_string_lossy().to_string();
-                bwrap_args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), target]);
-            }
-            continue;
-        }
-
-        if is_within_allowed_write_paths(&subpath, &writable_roots) {
-            let target = subpath.to_string_lossy().to_string();
-            bwrap_args.extend(["--ro-bind".to_string(), target.clone(), target]);
-        }
-    }
-
-    bwrap_args.extend([
-        "--dev-bind".to_string(),
-        "/dev/null".to_string(),
-        "/dev/null".to_string(),
-    ]);
-
-    let command_index = bwrap_args.len();
     bwrap_args.push("--".to_string());
     bwrap_args.extend(command);
-    bwrap_args.splice(
-        command_index..command_index,
-        ["--argv0".to_string(), "codex-linux-sandbox".to_string()],
-    );
-    Ok(bwrap_args)
+    Ok(LinuxBwrapCommand {
+        args: bwrap_args,
+        preserved_files: bwrap_command.preserved_files,
+        empty_file_source_index: bwrap_command.empty_file_source_index,
+        preserved_tempdirs: bwrap_command.preserved_tempdirs,
+        synthetic_mount_targets: bwrap_command.synthetic_mount_targets,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn linux_ensure_bwrap_mount_targets_exist(writable_roots: &[PathBuf]) -> Result<(), String> {
-    for root in writable_roots {
-        if !root.exists() {
+const LINUX_PLATFORM_DEFAULT_READ_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/nix/store",
+    "/run/current-system/sw",
+];
+
+#[cfg(target_os = "linux")]
+const MAX_UNREADABLE_GLOB_MATCHES: usize = 8192;
+
+#[cfg(target_os = "linux")]
+fn linux_bwrap_filesystem_args(
+    file_system_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+    session_temp_dir: &Path,
+) -> Result<LinuxBwrapCommand, String> {
+    let unreadable_globs = file_system_policy.get_unreadable_globs_with_cwd(cwd);
+    if file_system_policy.has_full_disk_write_access() && unreadable_globs.is_empty() {
+        return Ok(LinuxBwrapCommand {
+            args: vec!["--bind".to_string(), "/".to_string(), "/".to_string()],
+            preserved_files: Vec::new(),
+            empty_file_source_index: None,
+            preserved_tempdirs: Vec::new(),
+            synthetic_mount_targets: Vec::new(),
+        });
+    }
+    let mut writable_roots = file_system_policy
+        .get_writable_roots_with_cwd(cwd, Some(session_temp_dir))
+        .into_iter()
+        .collect::<Vec<_>>();
+    if writable_roots.is_empty()
+        && file_system_policy.has_full_disk_write_access()
+        && !unreadable_globs.is_empty()
+    {
+        writable_roots.push(WritableRoot {
+            root: PathBuf::from("/"),
+            read_only_subpaths: Vec::new(),
+            protected_metadata_names: Vec::new(),
+        });
+    }
+    validate_linux_unreadable_globs_for_future_writes(&unreadable_globs, cwd, &writable_roots)?;
+
+    let mut unreadable_roots = file_system_policy
+        .get_unreadable_roots_with_cwd(cwd, Some(session_temp_dir))
+        .into_iter()
+        .collect::<Vec<_>>();
+    unreadable_roots.extend(expand_linux_unreadable_globs(
+        &unreadable_globs,
+        cwd,
+        file_system_policy.glob_scan_max_depth,
+    )?);
+    unreadable_roots.sort();
+    unreadable_roots.dedup();
+
+    let mut command = LinuxBwrapCommand {
+        args: if file_system_policy.has_full_disk_read_access() {
+            vec![
+                "--ro-bind".to_string(),
+                "/".to_string(),
+                "/".to_string(),
+                "--dev".to_string(),
+                "/dev".to_string(),
+            ]
+        } else {
+            let mut args = vec![
+                "--tmpfs".to_string(),
+                "/".to_string(),
+                "--dev".to_string(),
+                "/dev".to_string(),
+            ];
+            let mut readable_roots = file_system_policy
+                .get_readable_roots_with_cwd(cwd, Some(session_temp_dir))
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            if file_system_policy.include_platform_defaults() {
+                readable_roots.extend(
+                    LINUX_PLATFORM_DEFAULT_READ_ROOTS
+                        .iter()
+                        .map(PathBuf::from)
+                        .filter(|path| path.exists()),
+                );
+            }
+            if readable_roots.iter().any(|root| root == Path::new("/")) {
+                args = vec![
+                    "--ro-bind".to_string(),
+                    "/".to_string(),
+                    "/".to_string(),
+                    "--dev".to_string(),
+                    "/dev".to_string(),
+                ];
+            } else {
+                for root in readable_roots {
+                    if !root.exists() {
+                        continue;
+                    }
+                    let mount_root = if writable_roots
+                        .iter()
+                        .any(|writable_root| root.starts_with(&writable_root.root))
+                    {
+                        linux_canonical_target_if_symlinked_path(&root).unwrap_or(root)
+                    } else {
+                        root
+                    };
+                    append_linux_mount_target_parent_dir_args(
+                        &mut args,
+                        &mount_root,
+                        Path::new("/"),
+                    );
+                    args.push("--ro-bind".to_string());
+                    args.push(linux_path_to_string(&mount_root));
+                    args.push(linux_path_to_string(&mount_root));
+                }
+            }
+            args
+        },
+        preserved_files: Vec::new(),
+        empty_file_source_index: None,
+        preserved_tempdirs: Vec::new(),
+        synthetic_mount_targets: Vec::new(),
+    };
+    prepare_linux_missing_writable_roots(&mut command, &writable_roots)?;
+
+    let mut allowed_write_paths = Vec::with_capacity(writable_roots.len() * 2);
+    for writable_root in &writable_roots {
+        allowed_write_paths.push(writable_root.root.clone());
+        if let Some(target) = linux_canonical_target_if_symlinked_path(&writable_root.root) {
+            allowed_write_paths.push(target);
+        }
+    }
+
+    let unreadable_paths = unreadable_roots
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    writable_roots.sort_by_key(|writable_root| linux_path_depth(&writable_root.root));
+
+    let mut unreadable_ancestors_of_writable_roots = unreadable_roots
+        .iter()
+        .filter(|path| {
+            let unreadable_root = path.as_path();
+            !allowed_write_paths
+                .iter()
+                .any(|root| unreadable_root.starts_with(root))
+                && allowed_write_paths
+                    .iter()
+                    .any(|root| root.starts_with(unreadable_root))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    unreadable_ancestors_of_writable_roots.sort_by_key(|path| linux_path_depth(path));
+    for unreadable_root in &unreadable_ancestors_of_writable_roots {
+        append_linux_unreadable_root_args(&mut command, unreadable_root, &allowed_write_paths)?;
+    }
+
+    for writable_root in &writable_roots {
+        let root = writable_root.root.as_path();
+        if let Some(masking_root) = unreadable_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|unreadable_root| root.starts_with(unreadable_root))
+            .max_by_key(|unreadable_root| linux_path_depth(unreadable_root))
+        {
+            append_linux_mount_target_parent_dir_args(&mut command.args, root, masking_root);
+        } else if !file_system_policy.has_full_disk_read_access() {
+            append_linux_mount_target_parent_dir_args(&mut command.args, root, Path::new("/"));
+        }
+
+        let symlink_target = linux_canonical_target_if_symlinked_path(root);
+        let mount_root = symlink_target.as_deref().unwrap_or(root);
+        if symlink_target.is_some() && !file_system_policy.has_full_disk_read_access() {
+            append_linux_mount_target_parent_dir_args(
+                &mut command.args,
+                mount_root,
+                Path::new("/"),
+            );
+        }
+        command.args.push("--bind".to_string());
+        command.args.push(linux_path_to_string(mount_root));
+        command.args.push(linux_path_to_string(mount_root));
+        if symlink_target.is_some() {
+            command.args.push("--bind".to_string());
+            command.args.push(linux_path_to_string(mount_root));
+            command.args.push(linux_path_to_string(root));
+        }
+
+        let mut read_only_subpaths = writable_root
+            .read_only_subpaths
+            .iter()
+            .filter(|path| !unreadable_paths.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in &writable_root.protected_metadata_names {
+            let path = root.join(name);
+            if !read_only_subpaths.iter().any(|subpath| subpath == &path) {
+                read_only_subpaths.push(path);
+            }
+        }
+        if let Some(target) = &symlink_target {
+            read_only_subpaths =
+                remap_linux_paths_for_symlink_target(read_only_subpaths, root, target);
+        }
+        read_only_subpaths.sort_by_key(|path| linux_path_depth(path));
+        for subpath in read_only_subpaths {
+            append_linux_read_only_subpath_args(&mut command, &subpath, &allowed_write_paths)?;
+        }
+
+        let mut nested_unreadable_roots = unreadable_roots
+            .iter()
+            .filter(|path| path.starts_with(root))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(target) = &symlink_target {
+            nested_unreadable_roots =
+                remap_linux_paths_for_symlink_target(nested_unreadable_roots, root, target);
+        }
+        nested_unreadable_roots.sort_by_key(|path| linux_path_depth(path));
+        for unreadable_root in nested_unreadable_roots {
+            append_linux_unreadable_root_args(
+                &mut command,
+                &unreadable_root,
+                &allowed_write_paths,
+            )?;
+        }
+    }
+
+    let mut rootless_unreadable_roots = unreadable_roots
+        .iter()
+        .filter(|path| {
+            let unreadable_root = path.as_path();
+            !allowed_write_paths
+                .iter()
+                .any(|root| unreadable_root.starts_with(root) || root.starts_with(unreadable_root))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    rootless_unreadable_roots.sort_by_key(|path| linux_path_depth(path));
+    for unreadable_root in rootless_unreadable_roots {
+        append_linux_unreadable_root_args(&mut command, &unreadable_root, &allowed_write_paths)?;
+    }
+
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_to_string(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_depth(path: &Path) -> usize {
+    path.components().count()
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_unreadable_globs_for_future_writes(
+    patterns: &[String],
+    cwd: &Path,
+    writable_roots: &[WritableRoot],
+) -> Result<(), String> {
+    for pattern in patterns {
+        if !linux_pattern_has_glob_metachar(pattern) {
+            continue;
+        }
+        let Some((search_root, _glob)) = split_linux_glob_pattern_for_search(pattern, cwd) else {
+            continue;
+        };
+        if writable_roots.iter().any(|writable_root| {
+            path_is_at_or_under_root(&writable_root.root, &search_root)
+                || path_is_at_or_under_root(&search_root, &writable_root.root)
+        }) {
             return Err(format!(
-                "sandbox expected writable root {}, but it does not exist",
-                root.display()
+                "cannot enforce sandbox deny-read glob {pattern} for future paths under writable roots with the Linux bubblewrap backend"
             ));
         }
     }
@@ -1568,25 +3704,658 @@ fn linux_ensure_bwrap_mount_targets_exist(writable_roots: &[PathBuf]) -> Result<
 }
 
 #[cfg(target_os = "linux")]
-fn collect_linux_read_only_subpaths(writable_roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut subpaths = std::collections::BTreeSet::<PathBuf>::new();
-    for root in writable_roots {
-        for subpath in compute_linux_read_only_subpaths(root) {
-            subpaths.insert(subpath);
-        }
-    }
-    subpaths.into_iter().collect()
+fn linux_pattern_has_glob_metachar(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
 }
 
 #[cfg(target_os = "linux")]
 fn is_within_allowed_write_paths(path: &Path, allowed_write_paths: &[PathBuf]) -> bool {
     allowed_write_paths
         .iter()
-        .any(|root| path.starts_with(root.as_path()))
+        .any(|root| path.starts_with(root))
 }
 
 #[cfg(target_os = "linux")]
-fn find_symlink_in_path(target_path: &Path, allowed_write_paths: &[PathBuf]) -> Option<PathBuf> {
+fn linux_canonical_target_if_symlinked_path(path: &Path) -> Option<PathBuf> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::RootDir => {
+                current.push(Path::new("/"));
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                current.pop();
+                continue;
+            }
+            Component::Normal(part) => current.push(part),
+            Component::Prefix(_) => continue,
+        }
+
+        let metadata = std::fs::symlink_metadata(&current).ok()?;
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::canonicalize(path).ok()?;
+            if target.as_path() == path {
+                return None;
+            }
+            return Some(target);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn remap_linux_paths_for_symlink_target(
+    paths: Vec<PathBuf>,
+    root: &Path,
+    target: &Path,
+) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .map(|path| {
+            if let Ok(relative) = path.strip_prefix(root) {
+                target.join(relative)
+            } else {
+                path
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_mount_target_parent_dir_args(
+    args: &mut Vec<String>,
+    mount_target: &Path,
+    anchor: &Path,
+) {
+    let mount_target_dir = if mount_target.is_dir() {
+        mount_target
+    } else if let Some(parent) = mount_target.parent() {
+        parent
+    } else {
+        return;
+    };
+    let mut mount_target_dirs = mount_target_dir
+        .ancestors()
+        .take_while(|path| *path != anchor)
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    mount_target_dirs.reverse();
+    for dir in mount_target_dirs {
+        args.push("--perms".to_string());
+        args.push("555".to_string());
+        args.push("--dir".to_string());
+        args.push(linux_path_to_string(&dir));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_missing_writable_roots(
+    command: &mut LinuxBwrapCommand,
+    writable_roots: &[WritableRoot],
+) -> Result<(), String> {
+    for writable_root in writable_roots {
+        let root = writable_root.root.as_path();
+        if root.exists() {
+            continue;
+        }
+        let Some(first_missing) = find_first_non_existent_component(root) else {
+            continue;
+        };
+        std::fs::create_dir_all(root).map_err(|err| {
+            format!(
+                "failed to create missing sandbox writable root {}: {err}",
+                root.display()
+            )
+        })?;
+
+        let mut created_dirs = root
+            .ancestors()
+            .take_while(|path| *path != first_missing)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        created_dirs.push(first_missing);
+        created_dirs.reverse();
+        command.synthetic_mount_targets.extend(
+            created_dirs
+                .into_iter()
+                .map(LinuxSyntheticMountTarget::EmptyDirectory),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_read_only_subpath_args(
+    command: &mut LinuxBwrapCommand,
+    subpath: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> Result<(), String> {
+    if let Some(symlink) = first_writable_symlink_component_in_path(subpath, allowed_write_paths) {
+        return Err(format!(
+            "cannot enforce sandbox read-only path {} because it crosses writable symlink {}",
+            subpath.display(),
+            symlink.display()
+        ));
+    }
+    if !subpath.exists() {
+        if let Some(first_missing) = find_first_non_existent_component(subpath)
+            && is_within_allowed_write_paths(&first_missing, allowed_write_paths)
+        {
+            append_linux_missing_read_only_subpath_args(
+                command,
+                &first_missing,
+                allowed_write_paths,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if is_within_allowed_write_paths(subpath, allowed_write_paths) {
+        if linux_protected_metadata_name(subpath).is_some()
+            && linux_path_is_empty_directory(subpath)
+        {
+            append_linux_empty_directory_ro_bind_args(command, subpath, allowed_write_paths)?;
+        } else {
+            command.args.push("--ro-bind".to_string());
+            command.args.push(linux_path_to_string(subpath));
+            command.args.push(linux_path_to_string(subpath));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_protected_metadata_name(path: &Path) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| PROTECTED_METADATA_SUBPATHS.contains(name))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_is_empty_directory(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_dir() {
+        return false;
+    }
+    std::fs::read_dir(path)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_none()
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_missing_read_only_subpath_args(
+    command: &mut LinuxBwrapCommand,
+    path: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> Result<(), String> {
+    if linux_protected_metadata_name(path).is_some() {
+        append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
+        command
+            .synthetic_mount_targets
+            .push(LinuxSyntheticMountTarget::EmptyDirectory(
+                path.to_path_buf(),
+            ));
+    } else {
+        append_linux_empty_file_bind_data_args(command, path, Some("000"), true)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_empty_directory_ro_bind_args(
+    command: &mut LinuxBwrapCommand,
+    path: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> Result<(), String> {
+    let source_dir = create_linux_empty_directory_bind_source(allowed_write_paths)?;
+    command.args.push("--dir".to_string());
+    command.args.push(linux_path_to_string(path));
+    command.args.push("--ro-bind".to_string());
+    command.args.push(linux_path_to_string(source_dir.path()));
+    command.args.push(linux_path_to_string(path));
+    command.preserved_tempdirs.push(source_dir);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_linux_empty_directory_bind_source(
+    allowed_write_paths: &[PathBuf],
+) -> Result<tempfile::TempDir, String> {
+    let mut errors = Vec::new();
+    for parent in linux_empty_directory_bind_source_parents() {
+        let Some(parent) = ensure_absolute(parent) else {
+            continue;
+        };
+        if linux_path_is_within_allowed_write_paths_or_canonical(&parent, allowed_write_paths) {
+            errors.push(format!(
+                "{} is inside a sandbox writable root",
+                parent.display()
+            ));
+            continue;
+        }
+        if let Err(err) = std::fs::create_dir_all(&parent) {
+            errors.push(format!("{}: {err}", parent.display()));
+            continue;
+        }
+        let tempdir = match Builder::new()
+            .prefix("mcp-repl-bwrap-empty-dir-")
+            .tempdir_in(&parent)
+        {
+            Ok(tempdir) => tempdir,
+            Err(err) => {
+                errors.push(format!("{}: {err}", parent.display()));
+                continue;
+            }
+        };
+        if linux_path_is_within_allowed_write_paths_or_canonical(
+            tempdir.path(),
+            allowed_write_paths,
+        ) {
+            errors.push(format!(
+                "{} is inside a sandbox writable root",
+                tempdir.path().display()
+            ));
+            drop(tempdir);
+            continue;
+        }
+        return Ok(tempdir);
+    }
+
+    let detail = if errors.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", errors.join("; "))
+    };
+    Err(format!(
+        "failed to create host-only empty directory for Linux bubblewrap read-only bind source outside writable roots{detail}"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_empty_directory_bind_source_parents() -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        parents.push(
+            PathBuf::from(home)
+                .join(".cache")
+                .join("mcp-repl")
+                .join("bwrap"),
+        );
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !runtime_dir.is_empty()
+    {
+        parents.push(PathBuf::from(runtime_dir).join("mcp-repl-bwrap"));
+    }
+    parents.push(PathBuf::from("/var/tmp"));
+    parents.push(std::env::temp_dir());
+    parents.sort();
+    parents.dedup();
+    parents
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_is_within_allowed_write_paths_or_canonical(
+    path: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> bool {
+    if is_within_allowed_write_paths(path, allowed_write_paths) {
+        return true;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|canonical| is_within_allowed_write_paths(&canonical, allowed_write_paths))
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_empty_file_bind_data_args(
+    command: &mut LinuxBwrapCommand,
+    path: &Path,
+    perms: Option<&str>,
+    synthetic: bool,
+) -> Result<(), String> {
+    let empty_file_source_index = if let Some(index) = command.empty_file_source_index {
+        index
+    } else {
+        command
+            .preserved_files
+            .push(std::fs::File::open("/dev/null").map_err(|err| err.to_string())?);
+        let index = command.preserved_files.len() - 1;
+        command.empty_file_source_index = Some(index);
+        index
+    };
+    if let Some(perms) = perms {
+        command.args.push("--perms".to_string());
+        command.args.push(perms.to_string());
+    }
+    let fd = command.preserved_files[empty_file_source_index]
+        .as_raw_fd()
+        .to_string();
+    command.args.push("--ro-bind-data".to_string());
+    command.args.push(fd);
+    command.args.push(linux_path_to_string(path));
+    if synthetic {
+        command
+            .synthetic_mount_targets
+            .push(LinuxSyntheticMountTarget::EmptyFile(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn make_linux_files_inheritable(files: &[std::fs::File]) -> Result<(), String> {
+    for file in files {
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_bwrap_child_with_cleanup(
+    command: Vec<std::ffi::OsString>,
+    synthetic_mount_targets: Vec<LinuxSyntheticMountTarget>,
+    preserved_files: Vec<std::fs::File>,
+    preserved_tempdirs: Vec<tempfile::TempDir>,
+) -> Result<(), String> {
+    let setup_signal_mask = LinuxBwrapForwardedSignalMask::block()?;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if pid == 0 {
+        reset_linux_bwrap_forwarded_signal_handlers_to_default();
+        if let Err(err) = setup_signal_mask.restore() {
+            eprintln!("failed to restore signal mask before bubblewrap exec: {err}");
+            unsafe { libc::_exit(1) };
+        }
+        let setpgid_result = unsafe { libc::setpgid(0, 0) };
+        if setpgid_result < 0 {
+            eprintln!(
+                "failed to place bubblewrap child in its own process group: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { libc::_exit(1) };
+        }
+        if let Err(err) = linux_execvp(command) {
+            eprintln!("{err}");
+            unsafe { libc::_exit(1) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+
+    let signal_forwarders = LinuxBwrapForwardedSignalHandlers::install(pid)?;
+    setup_signal_mask.restore()?;
+    let status = linux_wait_for_child(pid)?;
+    let cleanup_signal_mask = LinuxBwrapForwardedSignalMask::block()?;
+    LINUX_BWRAP_CHILD_PID.store(0, Ordering::SeqCst);
+    let cleanup_result = cleanup_linux_synthetic_mount_targets(&synthetic_mount_targets);
+    let restore_result = signal_forwarders.restore();
+    let mask_restore_result = cleanup_signal_mask.restore();
+    drop(preserved_files);
+    drop(preserved_tempdirs);
+    cleanup_result?;
+    restore_result?;
+    mask_restore_result?;
+    linux_exit_with_wait_status(status);
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxBwrapForwardedSignalMask {
+    previous: libc::sigset_t,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBwrapForwardedSignalMask {
+    fn block() -> Result<Self, String> {
+        let mut blocked: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut blocked);
+            for signal in LINUX_BWRAP_FORWARDED_SIGNALS {
+                libc::sigaddset(&mut blocked, *signal);
+            }
+            if libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous) < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        Ok(Self { previous })
+    }
+
+    fn restore(&self) -> Result<(), String> {
+        let restored = self.previous;
+        let result =
+            unsafe { libc::sigprocmask(libc::SIG_SETMASK, &restored, std::ptr::null_mut()) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxBwrapForwardedSignalHandlers {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxBwrapForwardedSignalHandlers {
+    fn install(pid: libc::pid_t) -> Result<Self, String> {
+        LINUX_BWRAP_CHILD_PID.store(pid, Ordering::SeqCst);
+        let mut previous = Vec::with_capacity(LINUX_BWRAP_FORWARDED_SIGNALS.len());
+        for signal in LINUX_BWRAP_FORWARDED_SIGNALS {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            let mut previous_action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction =
+                forward_signal_to_linux_bwrap_child as *const () as libc::sighandler_t;
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(*signal, &action, &mut previous_action) < 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+            }
+            previous.push((*signal, previous_action));
+        }
+        replay_pending_linux_bwrap_signal(pid);
+        Ok(Self { previous })
+    }
+
+    fn restore(self) -> Result<(), String> {
+        LINUX_BWRAP_CHILD_PID.store(0, Ordering::SeqCst);
+        LINUX_BWRAP_PENDING_FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
+        for (signal, previous_action) in self.previous {
+            let result = unsafe { libc::sigaction(signal, &previous_action, std::ptr::null_mut()) };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+extern "C" fn forward_signal_to_linux_bwrap_child(signal: libc::c_int) {
+    LINUX_BWRAP_PENDING_FORWARDED_SIGNAL.store(signal, Ordering::SeqCst);
+    let pid = LINUX_BWRAP_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        send_signal_to_linux_bwrap_child(pid, signal);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn replay_pending_linux_bwrap_signal(pid: libc::pid_t) {
+    let signal = LINUX_BWRAP_PENDING_FORWARDED_SIGNAL.swap(0, Ordering::SeqCst);
+    if signal > 0 {
+        send_signal_to_linux_bwrap_child(pid, signal);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_signal_to_linux_bwrap_child(pid: libc::pid_t, signal: libc::c_int) {
+    unsafe {
+        libc::kill(-pid, signal);
+        libc::kill(pid, signal);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reset_linux_bwrap_forwarded_signal_handlers_to_default() {
+    for signal in LINUX_BWRAP_FORWARDED_SIGNALS {
+        unsafe {
+            libc::signal(*signal, libc::SIG_DFL);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_wait_for_child(pid: libc::pid_t) -> Result<libc::c_int, String> {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result >= 0 {
+            return Ok(status);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err.to_string());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_exit_with_wait_status(status: libc::c_int) -> ! {
+    if libc::WIFEXITED(status) {
+        process::exit(libc::WEXITSTATUS(status));
+    }
+    if libc::WIFSIGNALED(status) {
+        let signal = libc::WTERMSIG(status);
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::kill(libc::getpid(), signal);
+        }
+        process::exit(128 + signal);
+    }
+    process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_linux_synthetic_mount_targets(
+    targets: &[LinuxSyntheticMountTarget],
+) -> Result<(), String> {
+    for target in targets.iter().rev() {
+        match target {
+            LinuxSyntheticMountTarget::EmptyFile(path) => {
+                cleanup_linux_synthetic_empty_file(path)?;
+            }
+            LinuxSyntheticMountTarget::EmptyDirectory(path) => {
+                cleanup_linux_synthetic_empty_directory(path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_linux_synthetic_empty_file(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    if metadata.file_type().is_file() && metadata.len() == 0 {
+        std::fs::remove_file(path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_linux_synthetic_empty_directory(path: &Path) -> Result<(), String> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_unreadable_root_args(
+    command: &mut LinuxBwrapCommand,
+    unreadable_root: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> Result<(), String> {
+    if let Some(symlink) =
+        first_writable_symlink_component_in_path(unreadable_root, allowed_write_paths)
+    {
+        return Err(format!(
+            "cannot enforce sandbox deny-read path {} because it crosses writable symlink {}",
+            unreadable_root.display(),
+            symlink.display()
+        ));
+    }
+
+    if !unreadable_root.exists() {
+        if let Some(first_missing) = find_first_non_existent_component(unreadable_root)
+            && is_within_allowed_write_paths(&first_missing, allowed_write_paths)
+        {
+            append_linux_empty_file_bind_data_args(command, &first_missing, Some("000"), true)?;
+        }
+        return Ok(());
+    }
+
+    if unreadable_root.is_dir() {
+        let mut writable_descendants = allowed_write_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|path| *path != unreadable_root && path.starts_with(unreadable_root))
+            .collect::<Vec<_>>();
+        command.args.push("--perms".to_string());
+        command.args.push(if writable_descendants.is_empty() {
+            "000".to_string()
+        } else {
+            "111".to_string()
+        });
+        command.args.push("--tmpfs".to_string());
+        command.args.push(linux_path_to_string(unreadable_root));
+        writable_descendants.sort_by_key(|path| linux_path_depth(path));
+        for writable_descendant in writable_descendants {
+            append_linux_mount_target_parent_dir_args(
+                &mut command.args,
+                writable_descendant,
+                unreadable_root,
+            );
+        }
+        command.args.push("--remount-ro".to_string());
+        command.args.push(linux_path_to_string(unreadable_root));
+    } else {
+        append_linux_empty_file_bind_data_args(command, unreadable_root, Some("000"), false)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn first_writable_symlink_component_in_path(
+    target_path: &Path,
+    allowed_write_paths: &[PathBuf],
+) -> Option<PathBuf> {
     let mut current = PathBuf::new();
     for component in target_path.components() {
         use std::path::Component;
@@ -1615,6 +4384,298 @@ fn find_symlink_in_path(target_path: &Path, allowed_write_paths: &[PathBuf]) -> 
         }
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn expand_linux_unreadable_globs(
+    patterns: &[String],
+    cwd: &Path,
+    max_depth: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    if patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut patterns_by_search_root = std::collections::BTreeMap::<PathBuf, Vec<String>>::new();
+    let mut expanded = std::collections::BTreeSet::new();
+    for pattern in patterns {
+        if let Some((search_root, glob)) = split_linux_glob_pattern_for_search(pattern, cwd)
+            && search_root.is_dir()
+        {
+            if search_root == Path::new("/") && !matches!(max_depth, Some(depth) if depth > 0) {
+                return Err(format!(
+                    "unreadable glob pattern {pattern} is rooted at / and requires a positive glob_scan_max_depth"
+                ));
+            }
+            if max_depth == Some(0) {
+                continue;
+            }
+            patterns_by_search_root
+                .entry(search_root)
+                .or_default()
+                .push(glob);
+        } else if let Some(path) = resolve_candidate_path(Path::new(pattern), cwd) {
+            if let Some(target) = linux_canonical_target_if_symlinked_path(&path) {
+                expanded.insert(target);
+            }
+            expanded.insert(path);
+        }
+    }
+
+    for (search_root, globs) in patterns_by_search_root {
+        for path in linux_glob_files(search_root.as_path(), &globs, max_depth)? {
+            if let Some(target) = linux_canonical_target_if_symlinked_path(&path) {
+                expanded.insert(target);
+            }
+            expanded.insert(path);
+            if expanded.len() > MAX_UNREADABLE_GLOB_MATCHES {
+                return Err(format!(
+                    "unreadable glob expansion for {} matched more than {MAX_UNREADABLE_GLOB_MATCHES} paths",
+                    search_root.display()
+                ));
+            }
+        }
+    }
+    Ok(expanded.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+fn split_linux_glob_pattern_for_search(pattern: &str, cwd: &Path) -> Option<(PathBuf, String)> {
+    let absolute = resolve_candidate_path(Path::new(pattern), cwd)?;
+    let pattern = absolute.to_string_lossy();
+    let first_glob_index = pattern
+        .char_indices()
+        .find_map(|(index, ch)| matches!(ch, '*' | '?' | '[' | ']').then_some(index))?;
+    let static_prefix = &pattern[..first_glob_index];
+    if static_prefix.is_empty() {
+        return None;
+    }
+    let search_root_end = if static_prefix.ends_with('/') {
+        static_prefix.len() - 1
+    } else {
+        static_prefix.rfind('/').unwrap_or(0)
+    };
+    let search_root = if search_root_end == 0 {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(&pattern[..search_root_end])
+    };
+    let glob = escape_unclosed_glob_classes(&pattern[search_root_end + 1..]);
+    (!glob.is_empty()).then_some((search_root, glob))
+}
+
+#[cfg(target_os = "linux")]
+fn escape_unclosed_glob_classes(glob: &str) -> String {
+    let mut escaped = String::with_capacity(glob.len());
+    let mut chars = glob.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '[' {
+            escaped.push(ch);
+            continue;
+        }
+        let mut class = String::new();
+        let mut closed = false;
+        for class_ch in chars.by_ref() {
+            if class_ch == ']' {
+                closed = true;
+                break;
+            }
+            class.push(class_ch);
+        }
+        if closed {
+            escaped.push('[');
+            escaped.push_str(&class);
+            escaped.push(']');
+        } else {
+            escaped.push_str(r"\[");
+            escaped.push_str(&class);
+        }
+    }
+    escaped
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glob_files(
+    search_root: &Path,
+    globs: &[String],
+    max_depth: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut command = std::process::Command::new("rg");
+    command
+        .arg("--files")
+        .arg("--hidden")
+        .arg("--no-ignore")
+        .arg("--null");
+    if let Some(max_depth) = max_depth {
+        command.arg("--max-depth").arg(max_depth.to_string());
+    }
+    for glob in globs {
+        command.arg("--glob").arg(glob);
+    }
+    command.arg("--").arg(search_root);
+
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return linux_glob_files_internal(search_root, globs, max_depth);
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    let mut paths = if !output.status.success() {
+        if output.status.code() == Some(1) && output.stderr.is_empty() {
+            Vec::new()
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "ripgrep unreadable glob scan failed for {}: {stderr}",
+                search_root.display()
+            ));
+        }
+    } else {
+        output
+            .stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                let path = PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
+                if path.is_absolute() {
+                    path
+                } else {
+                    search_root.join(path)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    paths.extend(linux_glob_directories_internal(
+        search_root,
+        globs,
+        max_depth,
+    )?);
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_glob_directories_internal(
+    search_root: &Path,
+    globs: &[String],
+    max_depth: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for glob in globs {
+        let glob = globset::GlobBuilder::new(glob)
+            .literal_separator(true)
+            .allow_unclosed_class(true)
+            .build()
+            .map_err(|err| {
+                format!(
+                    "unreadable glob pattern is invalid for {}: {err}",
+                    search_root.display()
+                )
+            })?;
+        builder.add(glob);
+    }
+    let glob_set = builder.build().map_err(|err| {
+        format!(
+            "unreadable glob matcher failed for {}: {err}",
+            search_root.display()
+        )
+    })?;
+    let mut paths = Vec::new();
+    collect_linux_glob_directories(search_root, search_root, &glob_set, max_depth, &mut paths)?;
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_glob_directories(
+    search_root: &Path,
+    dir: &Path,
+    glob_set: &globset::GlobSet,
+    remaining_depth: Option<usize>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|err| err.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|err| err.to_string())?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let relative = path.strip_prefix(search_root).unwrap_or(path.as_path());
+        if glob_set.is_match(relative) {
+            paths.push(path.clone());
+        }
+        let remaining_depth = match remaining_depth {
+            Some(0 | 1) => continue,
+            Some(depth) => Some(depth - 1),
+            None => None,
+        };
+        collect_linux_glob_directories(search_root, &path, glob_set, remaining_depth, paths)?;
+    }
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+fn linux_glob_files_internal(
+    search_root: &Path,
+    globs: &[String],
+    max_depth: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for glob in globs {
+        let glob = globset::GlobBuilder::new(glob)
+            .literal_separator(true)
+            .allow_unclosed_class(true)
+            .build()
+            .map_err(|err| {
+                format!(
+                    "unreadable glob pattern is invalid for {}: {err}",
+                    search_root.display()
+                )
+            })?;
+        builder.add(glob);
+    }
+    let glob_set = builder.build().map_err(|err| {
+        format!(
+            "unreadable glob matcher failed for {}: {err}",
+            search_root.display()
+        )
+    })?;
+    let mut paths = Vec::new();
+    collect_linux_glob_files(search_root, search_root, &glob_set, max_depth, &mut paths)?;
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_glob_files(
+    search_root: &Path,
+    dir: &Path,
+    glob_set: &globset::GlobSet,
+    remaining_depth: Option<usize>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|err| err.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|err| err.to_string())?;
+        let relative = path.strip_prefix(search_root).unwrap_or(path.as_path());
+        if (file_type.is_file() || file_type.is_symlink() || file_type.is_dir())
+            && glob_set.is_match(relative)
+        {
+            paths.push(path.clone());
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let remaining_depth = match remaining_depth {
+            Some(0 | 1) => continue,
+            Some(depth) => Some(depth - 1),
+            None => None,
+        };
+        collect_linux_glob_files(search_root, &path, glob_set, remaining_depth, paths)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1648,24 +4709,73 @@ fn is_proc_mount_failure(stderr: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn is_bwrap_proc_probe_quiet_retry_failure(stderr: &str) -> bool {
+    stderr.contains("Can't bind mount /oldroot/")
+        && stderr.contains(" on /newroot/")
+        && (stderr.contains("Unable to mount source on destination: No such file or directory")
+            || stderr
+                .contains("Unable to remount destination with correct flags: Invalid argument"))
+}
+
+#[cfg(target_os = "linux")]
 fn linux_apply_sandbox_policy_to_current_thread(
     sandbox_policy: &SandboxPolicy,
     cwd: &Path,
+    session_temp_dir: &Path,
+    apply_landlock_fs: bool,
 ) -> Result<(), String> {
-    if !sandbox_policy.has_full_disk_write_access() || !sandbox_policy.has_full_network_access() {
+    let file_system_policy = linux_effective_file_system_policy(sandbox_policy, session_temp_dir);
+    if !file_system_policy.has_full_disk_write_access() || !sandbox_policy.has_full_network_access()
+    {
         linux_set_no_new_privs()?;
     }
 
     if !sandbox_policy.has_full_network_access() {
-        linux_install_network_seccomp_filter_on_current_thread()?;
+        linux_install_network_seccomp_filter_on_current_thread(
+            LinuxNetworkSeccompMode::Restricted,
+        )?;
     }
 
-    if !sandbox_policy.has_full_disk_write_access() {
-        let writable_roots = linux_writable_roots(sandbox_policy, cwd);
+    if apply_landlock_fs && !file_system_policy.has_full_disk_write_access() {
+        if !file_system_policy.has_full_disk_read_access() {
+            return Err(
+                "restricted read access is not supported by the legacy Linux Landlock filesystem backend"
+                    .to_string(),
+            );
+        }
+        let writable_roots =
+            linux_landlock_writable_root_paths(&file_system_policy, cwd, session_temp_dir)?;
         linux_install_filesystem_landlock_rules_on_current_thread(writable_roots)?;
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_writable_root_paths(
+    file_system_policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+    session_temp_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let writable_roots =
+        file_system_policy.get_writable_roots_with_cwd(cwd, Some(session_temp_dir));
+    for writable_root in &writable_roots {
+        if matches!(
+            sandbox_path_relation(&writable_root.root, session_temp_dir),
+            Some(SandboxPathRelation::Same)
+        ) {
+            continue;
+        }
+        if !writable_root.read_only_subpaths.is_empty()
+            || !writable_root.protected_metadata_names.is_empty()
+        {
+            return Err(format!(
+                "read-only carveouts inside writable root {} are not supported by the legacy Linux Landlock filesystem backend",
+                writable_root.root.display()
+            ));
+        }
+    }
+    Ok(writable_roots.into_iter().map(|root| root.root).collect())
 }
 
 #[cfg(target_os = "linux")]
@@ -1675,33 +4785,6 @@ fn linux_set_no_new_privs() -> Result<(), String> {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_writable_roots(policy: &SandboxPolicy, cwd: &Path) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let Some(cwd) = ensure_absolute(cwd.to_path_buf()) else {
-        return roots;
-    };
-
-    if let SandboxPolicy::WorkspaceWrite {
-        writable_roots,
-        exclude_tmpdir_env_var,
-        exclude_slash_tmp,
-        network_access: _,
-    } = policy
-    {
-        roots.extend(writable_roots.iter().cloned().filter_map(ensure_absolute));
-        roots.push(cwd);
-        roots.extend(temp_roots_from_system(
-            *exclude_tmpdir_env_var,
-            *exclude_slash_tmp,
-        ));
-    }
-
-    roots.sort();
-    roots.dedup();
-    roots
 }
 
 #[cfg(target_os = "linux")]
@@ -1743,7 +4826,17 @@ fn linux_install_filesystem_landlock_rules_on_current_thread(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_install_network_seccomp_filter_on_current_thread() -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxNetworkSeccompMode {
+    Restricted,
+    #[allow(dead_code)]
+    ProxyRouted,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_install_network_seccomp_filter_on_current_thread(
+    mode: LinuxNetworkSeccompMode,
+) -> Result<(), String> {
     use seccompiler::{
         BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
         SeccompRule, TargetArch, apply_filter,
@@ -1755,37 +4848,75 @@ fn linux_install_network_seccomp_filter_on_current_thread() -> Result<(), String
         rules.insert(nr, vec![]);
     };
 
-    deny_syscall(libc::SYS_connect);
-    deny_syscall(libc::SYS_accept);
-    deny_syscall(libc::SYS_accept4);
-    deny_syscall(libc::SYS_bind);
-    deny_syscall(libc::SYS_listen);
-    deny_syscall(libc::SYS_getpeername);
-    deny_syscall(libc::SYS_getsockname);
-    deny_syscall(libc::SYS_shutdown);
-    deny_syscall(libc::SYS_sendto);
-    deny_syscall(libc::SYS_sendmmsg);
-    deny_syscall(libc::SYS_recvmmsg);
-    deny_syscall(libc::SYS_getsockopt);
-    deny_syscall(libc::SYS_setsockopt);
     deny_syscall(libc::SYS_ptrace);
+    deny_syscall(libc::SYS_process_vm_readv);
+    deny_syscall(libc::SYS_process_vm_writev);
     deny_syscall(libc::SYS_io_uring_setup);
     deny_syscall(libc::SYS_io_uring_enter);
     deny_syscall(libc::SYS_io_uring_register);
 
-    let unix_only_rule = SeccompRule::new(vec![
-        SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Ne,
-            libc::AF_UNIX as u64,
-        )
-        .map_err(|err| err.to_string())?,
-    ])
-    .map_err(|err| err.to_string())?;
+    match mode {
+        LinuxNetworkSeccompMode::Restricted => {
+            deny_syscall(libc::SYS_connect);
+            deny_syscall(libc::SYS_accept);
+            deny_syscall(libc::SYS_accept4);
+            deny_syscall(libc::SYS_bind);
+            deny_syscall(libc::SYS_listen);
+            deny_syscall(libc::SYS_getpeername);
+            deny_syscall(libc::SYS_getsockname);
+            deny_syscall(libc::SYS_shutdown);
+            deny_syscall(libc::SYS_sendto);
+            deny_syscall(libc::SYS_sendmmsg);
+            deny_syscall(libc::SYS_recvmmsg);
+            deny_syscall(libc::SYS_getsockopt);
+            deny_syscall(libc::SYS_setsockopt);
 
-    rules.insert(libc::SYS_socket, vec![unix_only_rule.clone()]);
-    rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
+            let unix_only_rule = SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(|err| err.to_string())?,
+            ])
+            .map_err(|err| err.to_string())?;
+
+            rules.insert(libc::SYS_socket, vec![unix_only_rule.clone()]);
+            rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
+        }
+        LinuxNetworkSeccompMode::ProxyRouted => {
+            let deny_non_ip_socket = SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_INET as u64,
+                )
+                .map_err(|err| err.to_string())?,
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_INET6 as u64,
+                )
+                .map_err(|err| err.to_string())?,
+            ])
+            .map_err(|err| err.to_string())?;
+            let deny_non_unix_socketpair = SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(|err| err.to_string())?,
+            ])
+            .map_err(|err| err.to_string())?;
+            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
+            rules.insert(libc::SYS_socketpair, vec![deny_non_unix_socketpair]);
+        }
+    }
 
     let arch = if cfg!(target_arch = "x86_64") {
         TargetArch::x86_64
@@ -1817,8 +4948,28 @@ pub fn invoked_as_codex_windows_sandbox() -> bool {
 }
 
 #[cfg(target_os = "windows")]
+pub fn invoked_as_codex_windows_sandbox_logon_offline() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--windows-sandbox-logon-offline"))
+}
+
+#[cfg(target_os = "windows")]
 pub fn run_windows_sandbox_main() -> ! {
     match windows_sandbox_main_impl() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_windows_sandbox_logon_offline_main() -> ! {
+    let child_args = std::env::args_os()
+        .skip(2)
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    match crate::windows_sandbox_setup::run_offline_logon_wrapper(child_args) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("{err}");
@@ -2536,6 +5687,61 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn prepare_worker_command_respects_legacy_workspace_temp_exclusions() {
+        let ambient_tmpdir = std::env::temp_dir();
+        let root = ambient_tmpdir.join(format!("mcp-repl-temp-exclusions-{}", std::process::id()));
+        let session_temp_dir = root.join("session-tempdir");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![workspace.clone()],
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+            sandbox_cwd: workspace,
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state);
+
+        let prepared = prepared.expect("prepare_worker_command should succeed");
+        let writable_roots = prepared
+            .args
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("-DWRITABLE_ROOT_"))
+            .filter_map(|definition| {
+                definition
+                    .split_once('=')
+                    .map(|(_, value)| PathBuf::from(value))
+            })
+            .collect::<Vec<_>>();
+
+        let required_session_variants = sandbox_path_variants(&session_temp_dir);
+        assert!(
+            required_session_variants
+                .iter()
+                .any(|path| writable_roots.iter().any(|root| root == path)),
+            "session temp dir must stay writable: {writable_roots:?}"
+        );
+
+        let mut excluded_temp_variants = sandbox_path_variants(Path::new("/tmp"));
+        excluded_temp_variants.extend(sandbox_path_variants(&ambient_tmpdir));
+        assert!(
+            excluded_temp_variants
+                .iter()
+                .all(|path| !writable_roots.iter().any(|root| root == path)),
+            "excluded temp roots must not be re-added as writable: {writable_roots:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn prepare_worker_command_with_managed_proxy_injects_proxy_env_and_seatbelt_ports() {
         let proxy = crate::managed_network::ManagedNetworkProxy::start(
             crate::managed_network::ManagedProxyConfig {
@@ -2592,6 +5798,101 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepare_worker_command_with_managed_proxy_uses_session_temp_home() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: false,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-offline-home-test-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = tmp.path().join("session");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("worker.exe"),
+            vec!["worker".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+        let session_temp = session_temp_dir.to_string_lossy().to_string();
+
+        assert_eq!(
+            prepared.env.get("HOME").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+        assert_eq!(
+            prepared.env.get("R_USER").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+        assert_eq!(
+            prepared.env.get("USERPROFILE").map(String::as_str),
+            Some(session_temp.as_str())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepare_worker_command_with_managed_proxy_routes_local_targets_through_proxy() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: true,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-offline-proxy-test-")
+            .tempdir()
+            .expect("tempdir");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: tmp.path().join("session"),
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+        state.managed_network_policy.allow_local_binding = true;
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("worker.exe"),
+            vec!["worker".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+
+        assert_eq!(prepared.env.get("NO_PROXY").map(String::as_str), Some(""));
+        assert_eq!(prepared.env.get("no_proxy").map(String::as_str), Some(""));
+        assert_eq!(
+            prepared.env.get("npm_config_noproxy").map(String::as_str),
+            Some("")
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn proc_mount_failure_detects_expected_stderr() {
@@ -2599,6 +5900,573 @@ mod tests {
             "bwrap: Can't mount proc on /newroot/proc: Invalid argument"
         ));
         assert!(!is_proc_mount_failure("bwrap: unrelated failure"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_proc_probe_quiet_retry_detects_old_bind_target_stderr() {
+        assert!(is_bwrap_proc_probe_quiet_retry_failure(
+            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-bm2Cuc on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to mount source on destination: No such file or directory"
+        ));
+        assert!(is_bwrap_proc_probe_quiet_retry_failure(
+            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-FlEdOV on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to remount destination with correct flags: Invalid argument"
+        ));
+        assert!(!is_bwrap_proc_probe_quiet_retry_failure(
+            "bwrap: Unable to remount destination with correct flags: Invalid argument"
+        ));
+        assert!(!is_bwrap_proc_probe_quiet_retry_failure(
+            "bwrap: unrelated failure"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_root_anchored_unreadable_globs_split_under_root() {
+        let cwd = Path::new("/tmp");
+
+        assert_eq!(
+            split_linux_glob_pattern_for_search("/*", cwd),
+            Some((PathBuf::from("/"), "*".to_string()))
+        );
+        assert_eq!(
+            split_linux_glob_pattern_for_search("/**/*.pem", cwd),
+            Some((PathBuf::from("/"), "**/*.pem".to_string()))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_root_anchored_unreadable_globs_without_bounded_scan_fail_closed() {
+        let patterns = vec!["/*".to_string()];
+        let err = expand_linux_unreadable_globs(&patterns, Path::new("/tmp"), None)
+            .expect_err("root-anchored glob without max depth should fail closed");
+        assert!(
+            err.contains("requires a positive glob_scan_max_depth"),
+            "unexpected error: {err}"
+        );
+
+        let patterns = vec!["/**/*.pem".to_string()];
+        let err = expand_linux_unreadable_globs(&patterns, Path::new("/tmp"), Some(0))
+            .expect_err("root-anchored glob with disabled scan should fail closed");
+        assert!(
+            err.contains("requires a positive glob_scan_max_depth"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unreadable_wildcard_globs_under_writable_roots_fail_closed() {
+        let writable_roots = vec![WritableRoot {
+            root: PathBuf::from("/tmp/mcp-repl-writable"),
+            read_only_subpaths: Vec::new(),
+            protected_metadata_names: Vec::new(),
+        }];
+        let patterns = vec!["/tmp/mcp-repl-writable/**/*.env".to_string()];
+
+        let err = validate_linux_unreadable_globs_for_future_writes(
+            &patterns,
+            Path::new("/tmp/mcp-repl-writable"),
+            &writable_roots,
+        )
+        .expect_err("writable wildcard glob should fail closed");
+
+        assert!(
+            err.contains("cannot enforce sandbox deny-read glob"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_landlock_writable_roots_with_carveouts_fail_closed() {
+        let writable_root = PathBuf::from("/tmp/mcp-repl-landlock-writable");
+        let session_temp_dir = PathBuf::from("/tmp/mcp-repl-landlock-session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: writable_root.clone(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let err = linux_landlock_writable_root_paths(
+            &file_system_policy,
+            &writable_root,
+            &session_temp_dir,
+        )
+        .expect_err("legacy Landlock should reject writable roots with protected carveouts");
+
+        assert!(
+            err.contains("read-only carveouts inside writable root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&writable_root.display().to_string()),
+            "error should identify the widened writable root: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_landlock_allows_internal_session_temp_writable_root() {
+        let cwd = PathBuf::from("/tmp/mcp-repl-landlock-workspace");
+        let session_temp_dir = PathBuf::from("/tmp/mcp-repl-landlock-session");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            &session_temp_dir,
+        );
+
+        let writable_roots =
+            linux_landlock_writable_root_paths(&file_system_policy, &cwd, &session_temp_dir)
+                .expect("session temp writable root should not make legacy Landlock fail closed");
+
+        assert_eq!(writable_roots, vec![session_temp_dir]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_literal_unreadable_globs_include_missing_future_path() {
+        let cwd = Path::new("/tmp/mcp-repl-literal-glob");
+        let patterns = vec!["secret.env".to_string()];
+
+        let expanded = expand_linux_unreadable_globs(&patterns, cwd, None)
+            .expect("literal missing glob should expand to a concrete path");
+
+        assert_eq!(expanded, vec![cwd.join("secret.env")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_internal_glob_scanner_includes_matching_directories() {
+        let root = Builder::new()
+            .prefix("mcp-repl-deny-glob-dir-")
+            .tempdir()
+            .expect("tempdir");
+        let denied_dir = root.path().join("secrets");
+        let denied_child = denied_dir.join("token.txt");
+        std::fs::create_dir_all(&denied_dir).expect("create denied dir");
+        std::fs::write(&denied_child, "secret").expect("write denied child");
+        std::fs::write(root.path().join("secrets.txt"), "secret").expect("write denied file");
+
+        let expanded = linux_glob_files_internal(root.path(), &["secrets*".to_string()], None)
+            .expect("fallback glob scan should succeed");
+
+        let denied_file = root.path().join("secrets.txt");
+        assert!(
+            expanded.iter().any(|path| path == &denied_dir),
+            "fallback glob scan should include matching directories: {expanded:?}"
+        );
+        assert!(
+            expanded.iter().any(|path| path == &denied_file),
+            "fallback glob scan should still include matching files: {expanded:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_glob_scanner_includes_matching_directories() {
+        let root = Builder::new()
+            .prefix("mcp-repl-deny-glob-rg-dir-")
+            .tempdir()
+            .expect("tempdir");
+        let denied_dir = root.path().join("secrets");
+        let denied_child = denied_dir.join("token.txt");
+        std::fs::create_dir_all(&denied_dir).expect("create denied dir");
+        std::fs::write(&denied_child, "secret").expect("write denied child");
+        std::fs::write(root.path().join("secrets.txt"), "secret").expect("write denied file");
+
+        let expanded = linux_glob_files(root.path(), &["secrets*".to_string()], None)
+            .expect("glob scan should succeed");
+
+        let denied_file = root.path().join("secrets.txt");
+        assert!(
+            expanded.iter().any(|path| path == &denied_dir),
+            "glob scan should include matching directories: {expanded:?}"
+        );
+        assert!(
+            expanded.iter().any(|path| path == &denied_file),
+            "glob scan should still include matching files: {expanded:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_minimal_with_deny_keeps_platform_defaults_readable() {
+        let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
+            .iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+        else {
+            eprintln!("no Linux platform default roots exist; skipping");
+            return;
+        };
+        let cwd = Path::new("/tmp/mcp-repl-minimal-deny-workspace");
+        let session_temp_dir = Path::new("/tmp/mcp-repl-minimal-deny-session");
+        let denied_path = cwd.join("secret.txt");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Minimal,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: denied_path },
+                access: FileSystemAccessMode::Deny,
+            },
+        ]);
+
+        let command = linux_bwrap_filesystem_args(&file_system_policy, cwd, session_temp_dir)
+            .expect("minimal deny profile should build bwrap args");
+        let platform_root = linux_path_to_string(platform_root);
+
+        assert!(
+            command.args.windows(3).any(|args| args[0] == "--ro-bind"
+                && args[1] == platform_root
+                && args[2] == platform_root),
+            "minimal deny profile should mount platform runtime roots: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_project_roots_read_keeps_platform_defaults_readable() {
+        let Some(platform_root) = LINUX_PLATFORM_DEFAULT_READ_ROOTS
+            .iter()
+            .map(Path::new)
+            .find(|path| path.exists())
+        else {
+            eprintln!("no Linux platform default roots exist; skipping");
+            return;
+        };
+        let root = Builder::new()
+            .prefix("mcp-repl-project-roots-read-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        std::fs::create_dir_all(&session_temp_dir).expect("create session temp dir");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::ProjectRoots { subpath: None },
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let command = linux_bwrap_filesystem_args(
+            &file_system_policy,
+            root.path(),
+            session_temp_dir.as_path(),
+        )
+        .expect("project-roots read profile should build bwrap args");
+        let platform_root = linux_path_to_string(platform_root);
+
+        assert!(
+            command.args.windows(3).any(|args| args[0] == "--ro-bind"
+                && args[1] == platform_root
+                && args[2] == platform_root),
+            "project-roots read profile should mount platform runtime roots: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_protected_metadata_uses_namespace_dir_and_read_only_empty_bind() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-protected-metadata-")
+            .tempdir()
+            .expect("tempdir");
+        let codex_path = root.path().join(".codex");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: codex_path.clone(),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+        ]);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
+                .expect("missing protected metadata should build bwrap args");
+        let codex_text = linux_path_to_string(&codex_path);
+        let dir_index = command
+            .args
+            .windows(2)
+            .position(|args| args[0] == "--dir" && args[1] == codex_text)
+            .expect("missing protected metadata should create its mount target inside bwrap");
+        let bind_index = command
+            .args
+            .windows(3)
+            .position(|args| args[0] == "--ro-bind" && args[2] == codex_text)
+            .expect("missing protected metadata should use a read-only empty directory bind");
+        assert!(
+            dir_index < bind_index,
+            "protected metadata mount target must exist before the bind: {:?}",
+            command.args
+        );
+        let bind_args = command
+            .args
+            .windows(3)
+            .find(|args| args[0] == "--ro-bind" && args[2] == codex_text)
+            .expect("missing protected metadata should use a read-only empty directory bind");
+        let source_path = PathBuf::from(&bind_args[1]);
+
+        assert!(
+            !codex_path.exists(),
+            "missing protected metadata target should be created inside bwrap, not on the host"
+        );
+        assert!(
+            command
+                .preserved_tempdirs
+                .iter()
+                .any(|tempdir| tempdir.path() == source_path),
+            "directory bind should reference a preserved empty source directory"
+        );
+        assert!(
+            !command
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--remount-ro" && args[1] == codex_text),
+            "missing protected metadata should not require tmpfs remount-ro: {:?}",
+            command.args
+        );
+        let protected_target = LinuxSyntheticMountTarget::EmptyDirectory(codex_path.clone());
+        assert!(
+            command.synthetic_mount_targets.contains(&protected_target),
+            "missing protected metadata target should be cleaned up after bwrap exits: {:?}",
+            command.synthetic_mount_targets
+        );
+        assert!(
+            command
+                .preserved_tempdirs
+                .iter()
+                .all(|tempdir| !tempdir.path().starts_with(root.path())),
+            "empty bind sources must stay outside sandbox writable roots"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_empty_protected_metadata_uses_private_bind_source() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-empty-protected-metadata-")
+            .tempdir()
+            .expect("tempdir");
+        let codex_path = root.path().join(".codex");
+        std::fs::create_dir_all(&codex_path).expect("empty metadata dir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: codex_path.clone(),
+                },
+                access: FileSystemAccessMode::Read,
+            },
+        ]);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
+                .expect("empty protected metadata should build bwrap args");
+        let codex_text = linux_path_to_string(&codex_path);
+        let bind_args = command
+            .args
+            .windows(3)
+            .find(|args| args[0] == "--ro-bind" && args[2] == codex_text)
+            .expect("empty protected metadata should use a read-only empty directory bind");
+        let source_path = PathBuf::from(&bind_args[1]);
+
+        assert_ne!(
+            source_path, codex_path,
+            "empty protected metadata must not use the transient target as its bind source"
+        );
+        assert!(
+            command
+                .preserved_tempdirs
+                .iter()
+                .any(|tempdir| tempdir.path() == source_path),
+            "directory bind should reference a preserved empty source directory"
+        );
+        assert!(
+            !command
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(codex_path)),
+            "existing empty protected metadata should not require host cleanup: {:?}",
+            command.synthetic_mount_targets
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_temp_roots_do_not_synthesize_global_metadata_dirs() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-temp-root-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("tempdir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::workspace_write(&[], false, false);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, &workspace, &session_temp_dir)
+                .expect("workspace-write profile should build bwrap args");
+        let temp_roots = temp_roots_from_system(false, false);
+        let global_metadata_paths = temp_roots
+            .iter()
+            .flat_map(|root| {
+                PROTECTED_METADATA_SUBPATHS
+                    .iter()
+                    .map(|name| root.join(name))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for metadata_path in global_metadata_paths {
+            let metadata_text = linux_path_to_string(&metadata_path);
+            assert!(
+                !command
+                    .args
+                    .windows(3)
+                    .any(|args| args[0] == "--ro-bind" && args[2] == metadata_text),
+                "ambient temp metadata should not become a synthetic bwrap bind target: {:?}",
+                command.args
+            );
+            assert!(
+                !command
+                    .synthetic_mount_targets
+                    .contains(&LinuxSyntheticMountTarget::EmptyDirectory(metadata_path)),
+                "ambient temp metadata should not be created and cleaned as a synthetic target"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_read_only_keeps_private_session_metadata_binds() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-read-only-session-")
+            .tempdir()
+            .expect("tempdir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            &session_temp_dir,
+        );
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, &workspace, &session_temp_dir)
+                .expect("read-only profile should build bwrap args");
+        let git_text = linux_path_to_string(&session_temp_dir.join(".git"));
+
+        assert!(
+            command
+                .args
+                .windows(3)
+                .any(|args| args[0] == "--ro-bind" && args[2] == git_text),
+            "read-only session temp metadata should use private synthetic binds: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_command_does_not_require_newer_argv0_option() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-argv0-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let command = create_linux_bwrap_command_args(
+            vec!["/bin/true".to_string()],
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+            false,
+            LinuxBwrapNetworkMode::FullAccess,
+        )
+        .expect("workspace-write profile should build bwrap args");
+
+        assert!(
+            !command.args.iter().any(|arg| arg == "--argv0"),
+            "bwrap args should work with Ubuntu 22.04 bubblewrap 0.6.1: {:?}",
+            command.args
+        );
     }
 
     #[test]
@@ -2680,6 +6548,43 @@ mod tests {
             Some("0"),
             "managed network marker must be explicitly disabled when no domain restrictions exist"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn read_only_windows_command_keeps_current_user_wrapper_without_managed_proxy() {
+        let session_temp_dir = std::env::temp_dir().join(format!(
+            "mcp-repl-session-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            session_temp_dir: session_temp_dir.clone(),
+            ..SandboxState::default()
+        };
+
+        let prepared =
+            prepare_worker_command(Path::new("worker.exe"), vec!["worker".to_string()], &state)
+                .expect("read-only Windows worker command should prepare");
+
+        assert!(
+            prepared.args.contains(&"--windows-sandbox".to_string()),
+            "read-only Windows workers should still use the Windows sandbox wrapper"
+        );
+        assert!(
+            !prepared
+                .args
+                .contains(&"--windows-sandbox-logon-offline".to_string()),
+            "read-only without managed proxy should stay on the current-user launch path"
+        );
+
+        let _ = std::fs::remove_dir_all(session_temp_dir);
     }
 
     #[cfg(target_os = "windows")]
@@ -2828,13 +6733,51 @@ mod tests {
     }
 
     #[test]
-    fn codex_sandbox_state_meta_does_not_force_internal_linux_bwrap() {
+    fn codex_sandbox_state_meta_parses_current_permission_profile_payload() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
+
         let update = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "danger-full-access"
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": sandbox_cwd,
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
                 serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
@@ -2842,26 +6785,115 @@ mod tests {
                 serde_json::Value::Null
             },
         }))
+        .expect("current Codex sandbox metadata");
+
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
+        assert_eq!(update.sandbox_cwd, Some(sandbox_cwd));
+        #[cfg(target_os = "linux")]
+        assert_eq!(update.use_legacy_landlock, Some(false));
+        #[cfg(target_os = "linux")]
+        assert!(update.use_linux_sandbox_bwrap.is_none());
+        #[cfg(not(target_os = "linux"))]
+        assert!(update.use_linux_sandbox_bwrap.is_none());
+    }
+
+    #[test]
+    fn codex_sandbox_state_meta_use_legacy_landlock_disables_linux_bwrap() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": true,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
         .expect("codex sandbox metadata");
 
+        #[cfg(target_os = "linux")]
+        assert_eq!(update.use_linux_sandbox_bwrap, Some(false));
+        #[cfg(not(target_os = "linux"))]
+        assert!(update.use_linux_sandbox_bwrap.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_sandbox_state_meta_non_legacy_preserves_disabled_linux_bwrap() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
+        let non_legacy_update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": "/tmp/codex-linux-sandbox",
+        }))
+        .expect("non-legacy Codex sandbox metadata");
+        let mut state = SandboxState {
+            use_linux_sandbox_bwrap: false,
+            ..SandboxState::default()
+        };
+
+        state.apply_update(non_legacy_update);
+
         assert!(
-            update.use_linux_sandbox_bwrap.is_none(),
-            "Codex tool-call metadata should not force mcp-repl's internal best-effort bwrap mode"
+            !state.use_linux_sandbox_bwrap,
+            "non-legacy Codex metadata should not override an explicitly disabled Linux bwrap default"
         );
     }
 
     #[test]
     fn codex_sandbox_state_meta_rejects_relative_workspace_write_roots() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
+        let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
+            .expect("absolute sandbox cwd should convert to file URI")
+            .to_string();
         let err = sandbox_state_update_from_codex_meta(&json!({
-            "sandboxPolicy": {
-                "type": "workspace-write",
-                "writable_roots": ["relative-root"],
-                "network_access": false,
-                "exclude_tmpdir_env_var": false,
-                "exclude_slash_tmp": false
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": "relative-root"
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
             },
-            "sandboxCwd": sandbox_cwd,
+            "sandboxCwd": sandbox_cwd_uri,
             "useLegacyLandlock": false,
             "codexLinuxSandboxExe": if cfg!(target_os = "linux") {
                 serde_json::Value::String("/tmp/codex-linux-sandbox".to_string())
@@ -2872,12 +6904,349 @@ mod tests {
         .expect_err("relative writable roots should fail closed");
 
         assert!(
-            err.contains("sandboxPolicy.writable_roots"),
-            "expected writable_roots validation error, got: {err}"
+            err.contains("permissionProfile.file_system.entries.path"),
+            "expected path validation error, got: {err}"
         );
         assert!(
             err.contains("relative-root"),
             "expected failing relative root to be named in the error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn codex_permission_profile_meta_maps_workspace_write() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-workspace");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": sandbox_cwd
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "slash_tmp" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": sandbox_cwd.join(".git")
+                            },
+                            "access": "read"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("Codex permission profile metadata should map to a legacy sandbox update");
+
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_permission_profile_meta_accepts_file_uri_sandbox_cwd() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-uri-cwd");
+        let sandbox_cwd_uri = file_url_for_test_path(&sandbox_cwd);
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("file URI sandboxCwd should parse");
+
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::Managed {
+                file_system: FileSystemSandboxPolicy::read_only(),
+                network_access: NetworkAccess::Restricted,
+            }
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            update.sandbox_policy,
+            SandboxPolicy::ReadOnly {
+                network_access: false,
+            }
+        );
+    }
+
+    fn file_url_for_test_path(path: &Path) -> String {
+        let path = path.to_string_lossy().replace('\\', "/");
+        if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        }
+    }
+
+    #[test]
+    fn codex_permission_profile_meta_maps_disabled_to_full_access() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-full-access");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("disabled Codex permission profile should map to full access");
+
+        assert_eq!(update.sandbox_cwd.as_deref(), Some(sandbox_cwd.as_path()));
+        assert_eq!(update.sandbox_policy, SandboxPolicy::DangerFullAccess);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_meta_accepts_minimal_read_policy() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-minimal-read");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "minimal" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex minimal read metadata should parse");
+
+        assert!(
+            !update.sandbox_policy.has_full_disk_read_access(),
+            "minimal read policy must not be flattened to full read access"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_meta_accepts_deny_read_carveout() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-deny-read");
+        let private_dir = sandbox_cwd.join("private");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": private_dir
+                            },
+                            "access": "deny"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex deny-read metadata should parse");
+
+        assert!(
+            !update.sandbox_policy.has_full_disk_read_access(),
+            "deny-read carveout must not be flattened to full read access"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_project_read_includes_seatbelt_platform_defaults() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-project-read");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "tmpdir" }
+                            },
+                            "access": "write"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex project read metadata should parse");
+        let state = SandboxState {
+            sandbox_policy: update.sandbox_policy,
+            sandbox_cwd: update.sandbox_cwd.expect("sandbox cwd"),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("seatbelt command should prepare");
+        let policy = prepared
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .expect("seatbelt policy argument");
+
+        assert!(
+            policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
+            "expected restricted profile seatbelt policy to include platform defaults: {policy}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_permission_profile_glob_deny_is_rendered_in_seatbelt_policy() {
+        let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-glob-deny");
+        let update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "managed",
+                "file_system": {
+                    "type": "restricted",
+                    "entries": [
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "root" }
+                            },
+                            "access": "read"
+                        },
+                        {
+                            "path": {
+                                "type": "special",
+                                "value": { "kind": "project_roots" }
+                            },
+                            "access": "write"
+                        },
+                        {
+                            "path": {
+                                "type": "glob_pattern",
+                                "pattern": "**/*.env"
+                            },
+                            "access": "deny"
+                        }
+                    ]
+                },
+                "network": "restricted"
+            },
+            "sandboxCwd": sandbox_cwd,
+            "useLegacyLandlock": false,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("current Codex glob-deny metadata should parse");
+        let state = SandboxState {
+            sandbox_policy: update.sandbox_policy,
+            sandbox_cwd: update.sandbox_cwd.expect("sandbox cwd"),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("seatbelt command should prepare");
+        let policy = prepared
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .expect("seatbelt policy argument");
+
+        assert!(
+            policy.contains("(deny file-read* (regex #\""),
+            "expected glob deny read rule in seatbelt policy: {policy}"
+        );
+        assert!(
+            policy.contains("(deny file-write-unlink (regex #\""),
+            "expected glob deny unlink rule in seatbelt policy: {policy}"
         );
     }
 
@@ -2921,9 +7290,62 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn prepare_worker_command_accepts_managed_policy_on_linux() {
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::Managed {
+                file_system: FileSystemSandboxPolicy {
+                    kind: FileSystemSandboxKind::Restricted,
+                    glob_scan_max_depth: None,
+                    entries: vec![FileSystemSandboxEntry {
+                        path: FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        access: FileSystemAccessMode::Read,
+                    }],
+                },
+                network_access: NetworkAccess::Restricted,
+            },
+            ..SandboxState::default()
+        };
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("managed policies should prepare through the Linux helper");
+        assert_eq!(
+            prepared.program,
+            std::env::current_exe().expect("current exe")
+        );
+        assert!(
+            prepared.args.iter().any(|arg| arg == "--use-bwrap-sandbox"),
+            "managed Linux policy should use the default bwrap path: {:?}",
+            prepared.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sandbox_state_defaults_with_environment_respects_linux_bwrap_env() {
         let _guard = linux_bwrap_env_lock();
         let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
+
+        unsafe {
+            std::env::remove_var(LINUX_BWRAP_ENABLED_ENV);
+        }
+        let defaults = sandbox_state_defaults_with_environment();
+        assert!(
+            defaults.use_linux_sandbox_bwrap,
+            "unset Linux bwrap env should preserve the Linux default"
+        );
+
+        unsafe {
+            std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "0");
+        }
+        let defaults = sandbox_state_defaults_with_environment();
+        assert!(
+            !defaults.use_linux_sandbox_bwrap,
+            "explicit false Linux bwrap env should disable bwrap"
+        );
+
         unsafe {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
         }

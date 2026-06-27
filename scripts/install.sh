@@ -30,9 +30,9 @@ verify_downloaded_binary() {
   fi
 }
 
-CHANNEL="stable"
-if [ "${1:-}" = "--dev" ]; then
-  CHANNEL="dev"
+if [ "$#" -ne 0 ]; then
+  echo "unexpected argument: $1" >&2
+  exit 1
 fi
 
 OS="$(uname -s)"
@@ -68,11 +68,7 @@ esac
 
 require_supported_linux_runtime
 
-if [ "$CHANNEL" = "stable" ]; then
-  URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/${APP}-${TARGET}.tar.gz"
-else
-  URL="https://github.com/${OWNER}/${REPO}/releases/download/dev/${APP}-${TARGET}.tar.gz"
-fi
+URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/${APP}-${TARGET}.tar.gz"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT

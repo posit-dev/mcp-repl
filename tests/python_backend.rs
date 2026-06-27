@@ -3,6 +3,7 @@
 mod common;
 
 use common::TestResult;
+use regex_lite::Regex;
 use rmcp::model::RawContent;
 use std::fs;
 #[cfg(unix)]
@@ -55,6 +56,14 @@ fn visible_reply_text(text: &str) -> TestResult<String> {
         return Ok(fs::read_to_string(path)?);
     }
     Ok(text.to_string())
+}
+
+fn strip_ansi_controls(text: &str) -> String {
+    static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+    ANSI_RE
+        .get_or_init(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("ANSI regex"))
+        .replace_all(text, "")
+        .into_owned()
 }
 
 fn require_python() -> bool {
@@ -135,11 +144,11 @@ fn assert_no_pager_markers(text: &str, context: &str) {
 }
 
 fn interrupt_recovery_deadline() -> Instant {
-    Instant::now() + Duration::from_secs(if cfg!(target_os = "macos") { 20 } else { 5 })
+    Instant::now() + Duration::from_secs(20)
 }
 
 fn python_startup_probe_budget() -> Duration {
-    Duration::from_secs(if cfg!(target_os = "macos") { 90 } else { 10 })
+    Duration::from_secs(90)
 }
 
 async fn start_python_session_with_env_vars(
@@ -671,11 +680,7 @@ async fn wait_for_file_text(path: &Path, expected: &str) -> TestResult<()> {
 
 #[cfg(unix)]
 fn shutdown_completion_budget() -> Duration {
-    if cfg!(target_os = "macos") {
-        Duration::from_millis(1_500)
-    } else {
-        Duration::from_millis(1_200)
-    }
+    Duration::from_millis(1_500)
 }
 
 #[cfg(unix)]
@@ -802,6 +807,147 @@ emit_at_wait = True; value = input("plot wait> ")
         image_count(&result),
         1,
         "expected plot hook to flush before stdin wait completed the request, got text: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_timeout_drains_later_stderr_after_incomplete_stdout_utf8_tail() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+import time
+sys.stdout.buffer.write(bytes([0xC3]))
+sys.stdout.flush()
+sys.stderr.write("STDERR_READY\\n")
+sys.stderr.flush()
+time.sleep(1)
+sys.stdout.buffer.write(bytes([0xA9]))
+sys.stdout.flush()
+time.sleep(0.1)
+sys.stdout.write("STDOUT_DONE\\n")
+sys.stdout.flush()
+""")"#,
+            Some(0.2),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        is_busy_response(&text),
+        "expected request to remain pending after timeout, got: {text:?}"
+    );
+    assert!(
+        text.contains("\\xC3"),
+        "timeout reply should flush the incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: STDERR_READY\n"),
+        "timeout reply should expose later stderr after the incomplete stdout UTF-8 tail, got: {text:?}"
+    );
+    let head_idx = text
+        .find("\\xC3")
+        .ok_or_else(|| format!("expected sealed UTF-8 head in timeout reply, got: {text:?}"))?;
+    let stderr_idx = text
+        .find("STDERR_READY")
+        .ok_or_else(|| format!("expected stderr in timeout reply, got: {text:?}"))?;
+    assert!(
+        head_idx < stderr_idx,
+        "expected sealed UTF-8 head before later stderr, got: {text:?}"
+    );
+
+    let mut poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let mut poll_text = result_text(&poll);
+    let mut completion_text = poll_text.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && is_busy_response(&poll_text) {
+        sleep(Duration::from_millis(50)).await;
+        poll = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        poll_text = result_text(&poll);
+        completion_text.push_str(&poll_text);
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&poll_text),
+        "expected request to finish after polling, got: {completion_text:?}"
+    );
+    assert!(
+        !completion_text.contains("STDERR_READY"),
+        "stderr already drained in timeout reply should not repeat on completion polls, got: {completion_text:?}"
+    );
+    let done_idx = completion_text
+        .find("STDOUT_DONE")
+        .ok_or_else(|| format!("expected trailing stdout, got: {completion_text:?}"))?;
+    if let Some(tail_idx) = completion_text.find("\\xA9") {
+        assert!(
+            tail_idx < done_idx,
+            "expected continuation byte before later stdout, got: {completion_text:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_pager_timeout_preserves_unterminated_stderr_state_on_poll() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(mut session) = start_python_pager_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import sys
+import time
+sys.stderr.write("ERR_PART")
+sys.stderr.flush()
+time.sleep(1)
+sys.stderr.write("ERR_REST\\n")
+sys.stderr.flush()
+""")"#,
+            Some(0.2),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    assert!(
+        is_busy_response(&text),
+        "expected request to remain pending after timeout, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: ERR_PART"),
+        "expected timeout reply to include the first stderr fragment, got: {text:?}"
+    );
+
+    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll = common::wait_until_not_busy(
+        &mut session,
+        poll,
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+    )
+    .await?;
+    let poll_text = result_text(&poll);
+
+    session.cancel().await?;
+
+    assert!(
+        poll_text.contains("ERR_REST"),
+        "expected stderr continuation on poll, got: {poll_text:?}"
+    );
+    assert!(
+        !poll_text.contains("stderr: ERR_REST"),
+        "stderr continuation should not receive a second prefix, got: {poll_text:?}"
     );
     Ok(())
 }
@@ -971,7 +1117,7 @@ print("LOCAL_IMPORT", local_import_probe.VALUE)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
+async fn python_incomplete_bracket_reports_syntax_error() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -980,8 +1126,12 @@ async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult
     let result = session.write_stdin_raw_with("x = (", Some(5.0)).await?;
     let text = result_text(&result);
     assert!(
-        text.contains("... "),
-        "expected bracket continuation prompt, got: {text:?}"
+        text.contains("SyntaxError"),
+        "expected incomplete bracket cell to report SyntaxError, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "incomplete bracket cell should not report continuation prompt, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -989,139 +1139,117 @@ async fn python_bracket_continuation_reports_continuation_prompt() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_line_by_line_bracket_continuation_reports_continuation_prompt() -> TestResult<()> {
+async fn python_multiline_bracket_cell_runs_in_one_call() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
-    let result = session.write_stdin_raw_with("x = (", Some(5.0)).await?;
-    let text = result_text(&result);
-    assert!(
-        text.contains("... "),
-        "expected opening bracket to report continuation prompt, got: {text:?}"
-    );
-
-    let result = session.write_stdin_raw_with("1", Some(5.0)).await?;
-    let text = result_text(&result);
-    assert!(
-        !is_busy_response(&text),
-        "expected bracket item to return a continuation prompt, got: {text:?}"
-    );
-    assert!(
-        text.contains("... "),
-        "expected bracket item to report continuation prompt, got: {text:?}"
-    );
-
     let result = session
-        .write_stdin_raw_with(")\nprint('LINE_BY_LINE_BRACKET', x)", Some(5.0))
+        .write_stdin_raw_with("x = (\n1\n)\nprint('MULTILINE_BRACKET', x)", Some(5.0))
         .await?;
     let text = result_text(&result);
     session.cancel().await?;
 
     assert!(
-        text.contains("LINE_BY_LINE_BRACKET 1"),
-        "expected bracket expression to complete, got: {text:?}"
+        text.contains("MULTILINE_BRACKET 1"),
+        "expected multiline bracket cell to complete, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "multiline bracket cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_blank_line_inside_bracket_reports_continuation_prompt() -> TestResult<()> {
+async fn python_blank_line_inside_bracket_cell_runs() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
-    let result = session.write_stdin_raw_with("x = [\n\n", Some(5.0)).await?;
-    let text = result_text(&result);
-
-    assert!(
-        !is_busy_response(&text),
-        "expected blank line inside bracket to return a continuation prompt, got: {text:?}"
-    );
-    assert!(
-        text.contains("... "),
-        "expected blank line inside bracket to report continuation prompt, got: {text:?}"
-    );
-    assert!(
-        !text.contains(">>> "),
-        "expected blank line inside bracket not to report primary prompt, got: {text:?}"
-    );
-
     let result = session
-        .write_stdin_raw_with("]\nprint('BLANK_LIST', x)", Some(5.0))
+        .write_stdin_raw_with("x = [\n\n]\nprint('BLANK_LIST', x)", Some(5.0))
         .await?;
     let text = result_text(&result);
     session.cancel().await?;
 
-    assert!(
-        !is_busy_response(&text),
-        "expected follow-up line after blank continuation not to stay busy, got: {text:?}"
-    );
     assert!(
         text.contains("BLANK_LIST []"),
-        "expected follow-up line after blank continuation to complete, got: {text:?}"
+        "expected blank-line bracket cell to complete, got: {text:?}"
     );
     assert!(
-        text.contains(">>> "),
-        "expected completed follow-up line to report primary prompt, got: {text:?}"
+        !text.contains("... "),
+        "blank-line bracket cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_blank_line_inside_triple_quoted_block_reports_continuation_prompt() -> TestResult<()>
-{
+async fn python_blank_line_inside_triple_quoted_block_cell_runs() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
     let result = session
-        .write_stdin_raw_with("if True:\n    x = \"\"\"\n    \n    \"\"\"", Some(1.0))
+        .write_stdin_raw_with(
+            "if True:\n    x = \"\"\"\n    \n    \"\"\"\nprint('TRIPLE_BLANK', len(x.splitlines()))",
+            Some(1.0),
+        )
         .await?;
     let text = result_text(&result);
     session.cancel().await?;
 
     assert!(
         !is_busy_response(&text),
-        "expected blank line inside triple-quoted block to return a continuation prompt, got: {text:?}"
+        "expected blank line inside triple-quoted block to complete, got: {text:?}"
     );
     assert!(
-        text.contains("... "),
-        "expected blank line inside triple-quoted block to report continuation prompt, got: {text:?}"
+        text.contains("TRIPLE_BLANK"),
+        "expected triple-quoted block cell to run following top-level code, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "triple-quoted block cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_blank_line_inside_parenthesized_block_reports_continuation_prompt() -> TestResult<()>
-{
+async fn python_blank_line_inside_parenthesized_block_cell_runs() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
     let result = session
-        .write_stdin_raw_with("if True:\n    x = (\n    \n        1\n    )", Some(1.0))
+        .write_stdin_raw_with(
+            "if True:\n    x = (\n    \n        1\n    )\nprint('PAREN_BLANK', x)",
+            Some(1.0),
+        )
         .await?;
     let text = result_text(&result);
     session.cancel().await?;
 
     assert!(
         !is_busy_response(&text),
-        "expected blank line inside parenthesized block to return a continuation prompt, got: {text:?}"
+        "expected parenthesized block cell to complete, got: {text:?}"
     );
     assert!(
-        text.contains("... "),
-        "expected blank line inside parenthesized block to report continuation prompt, got: {text:?}"
+        text.contains("PAREN_BLANK 1"),
+        "expected parenthesized block cell to run following top-level code, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "parenthesized block cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_closed_indented_expression_reports_primary_prompt() -> TestResult<()> {
+async fn python_closed_indented_expression_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1138,10 +1266,6 @@ async fn python_closed_indented_expression_reports_primary_prompt() -> TestResul
         "expected closed indented expression to execute, got: {text:?}"
     );
     assert!(
-        text.contains(">>> "),
-        "expected closed indented expression to report primary prompt, got: {text:?}"
-    );
-    assert!(
         !text.contains("... "),
         "expected closed indented expression not to report continuation prompt, got: {text:?}"
     );
@@ -1149,7 +1273,7 @@ async fn python_closed_indented_expression_reports_primary_prompt() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_closed_multiline_string_with_colon_reports_primary_prompt() -> TestResult<()> {
+async fn python_closed_multiline_string_with_colon_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1162,10 +1286,6 @@ async fn python_closed_multiline_string_with_colon_reports_primary_prompt() -> T
     assert!(
         !is_busy_response(&text),
         "expected closed multiline string to complete, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected closed multiline string to report primary prompt, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
@@ -1255,7 +1375,7 @@ async fn python_large_buffered_tail_after_timed_out_line_stays_busy() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
+async fn python_terminated_block_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -1275,7 +1395,7 @@ async fn python_terminated_block_reports_primary_prompt() -> TestResult<()> {
     );
     assert!(
         !text.contains(r#"prompt: "... ""#),
-        "expected primary prompt after terminated block, got: {text:?}"
+        "terminated block should not render a continuation prompt, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -1316,6 +1436,48 @@ async fn python_sys_exit_terminates_session_without_traceback() -> TestResult<()
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_exit_with_non_daemon_thread_waits_for_shutdown() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let exit = session
+        .write_stdin_raw_with(
+            r#"import sys, threading, time
+def hold_session_open():
+    time.sleep(5.0)
+
+threading.Thread(target=hold_session_open).start()
+sys.exit()
+"#,
+            Some(0.5),
+        )
+        .await?;
+    let exit_text = result_text(&exit);
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_NON_DAEMON_EXIT')", Some(0.5))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        is_busy_response(&exit_text),
+        "expected CPython shutdown to remain busy while waiting for the non-daemon thread, got: {exit_text:?}"
+    );
+    assert!(
+        is_busy_response(&follow_up_text),
+        "expected no synthetic session_end or immediate respawn while CPython shutdown is still alive, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("AFTER_NON_DAEMON_EXIT"),
+        "follow-up should not run until CPython shutdown completes, got: {follow_up_text:?}"
+    );
     Ok(())
 }
 
@@ -1392,6 +1554,45 @@ sys.exit()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_sys_exit_returns_atexit_output_before_session_end() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"import atexit, sys
+def report():
+    print("ATEXIT_STDOUT")
+    sys.stderr.write("ATEXIT_STDERR\n")
+
+atexit.register(report)
+sys.exit()
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python sys.exit() with atexit output remained busy".into());
+    }
+
+    assert!(
+        text.contains("ATEXIT_STDOUT") && text.contains("ATEXIT_STDERR"),
+        "expected atexit stdout/stderr before session end, got: {text:?}"
+    );
+    assert!(
+        !text.contains("worker protocol error"),
+        "atexit output should not arrive after session_end, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_reads_from_sys_stdin() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -1444,7 +1645,6 @@ if os.name == "nt":
 print("PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 print("INPUT_IMPL", builtins.input.__module__, builtins.input.__name__)
 value = input("pty> ")
-hello
 print("PTY_INPUT", value)
 "#,
             Some(5.0),
@@ -1455,7 +1655,13 @@ print("PTY_INPUT", value)
         session.cancel().await?;
         return Err("python PTY input() path test remained busy".into());
     }
+    assert!(
+        text.contains("pty> "),
+        "expected input prompt, got: {text:?}"
+    );
 
+    let answer = session.write_stdin_raw_with("hello", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
     session.cancel().await?;
 
     assert!(
@@ -1472,8 +1678,8 @@ print("PTY_INPUT", value)
         "expected input() to use CPython's builtin implementation, got: {text:?}"
     );
     assert!(
-        text.contains("PTY_INPUT hello"),
-        "expected CPython input() to consume the PTY-backed answer, got: {text:?}"
+        answer_text.contains("PTY_INPUT hello"),
+        "expected CPython input() to consume the PTY-backed answer, got: {answer_text:?}"
     );
     Ok(())
 }
@@ -1567,9 +1773,6 @@ finally:
 print("WIN_STDIN_VALUES", first, second, third)
 print("REPLACED_STDIN_ISATTY", replaced_stdin_isatty)
 """)
-alpha
-beta
-gamma
 "#,
             Some(5.0),
         )
@@ -1589,28 +1792,67 @@ gamma
         session.cancel().await?;
         return Err("python Windows PTY stdin bridge test remained busy".into());
     }
+    assert!(
+        text.contains("win> "),
+        "expected Windows input prompt, got: {text:?}"
+    );
+
+    let mut all_text = text.clone();
+
+    let alpha = session.write_stdin_raw_with("alpha", Some(5.0)).await?;
+    text = result_text(&alpha);
+    all_text.push_str(&text);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+            all_text.push_str(&text);
+        }
+    }
+
+    let beta_gamma = session
+        .write_stdin_raw_with("beta\ngamma", Some(5.0))
+        .await?;
+    text = result_text(&beta_gamma);
+    all_text.push_str(&text);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("WIN_STDIN_VALUES alpha beta gamma")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+            all_text.push_str(&text);
+        }
+    }
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python Windows PTY stdin bridge follow-up test remained busy".into());
+    }
 
     session.cancel().await?;
 
     assert!(
-        text.contains("PTY_FDS True True True"),
-        "expected Python fds to be TTY-backed, got: {text:?}"
+        all_text.contains("PTY_FDS True True True"),
+        "expected Python fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("CRT_ISATTY True True True"),
-        "expected Windows CRT fds to be TTY-backed, got: {text:?}"
+        all_text.contains("CRT_ISATTY True True True"),
+        "expected Windows CRT fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("STDIN_BRIDGE __main__ McpInputStream True"),
-        "expected Windows sys.stdin bridge to report TTY-backed stdin, got: {text:?}"
+        all_text.contains("STDIN_BRIDGE __main__ McpInputStream True"),
+        "expected Windows sys.stdin bridge to report TTY-backed stdin, got: {all_text:?}"
     );
     assert!(
-        text.contains("WIN_STDIN_VALUES alpha beta gamma"),
-        "expected input/sys.stdin/dup fd reads to consume buffered input batch, got: {text:?}"
+        all_text.contains("WIN_STDIN_VALUES alpha beta gamma"),
+        "expected input/sys.stdin/dup fd reads to consume buffered input batch, got: {all_text:?}"
     );
     assert!(
-        text.contains("REPLACED_STDIN_ISATTY False"),
-        "expected replaced stdin fd to fall back to real isatty state, got: {text:?}"
+        all_text.contains("REPLACED_STDIN_ISATTY False"),
+        "expected replaced stdin fd to fall back to real isatty state, got: {all_text:?}"
     );
     Ok(())
 }
@@ -1643,6 +1885,10 @@ print("RAW_STDIN_RESULT", data.decode("utf-8").strip())
     assert!(
         first_text.contains("RAW_STDIN_WAITING"),
         "expected code before raw stdin wait to run, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "raw stdin read should report a wait before the follow-up input batch, got: {first_text:?}"
     );
     assert!(
         !first_text.contains("RAW_STDIN_RESULT"),
@@ -1687,25 +1933,43 @@ async fn python_pty_direct_stdin_reads_consume_buffered_input_batch() -> TestRes
         .write_stdin_raw_with(
             r#"import os, sys
 line = sys.stdin.readline().strip()
-alpha
 data = os.read(0, 5).decode("utf-8")
-bravo
 print("DIRECT_STDIN_VALUES", line, data)
 "#,
-            Some(5.0),
+            Some(1.0),
         )
         .await?;
     let mut text = result_text(&result);
     if is_busy_response(&text) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline
-            && is_busy_response(&text)
-            && !text.contains("DIRECT_STDIN_VALUES alpha bravo")
-        {
+        while Instant::now() < deadline && is_busy_response(&text) {
             sleep(Duration::from_millis(50)).await;
             text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
         }
     }
+    assert!(
+        text.contains("<<repl status: waiting for input>>"),
+        "expected first direct stdin read to wait for follow-up input, got: {text:?}"
+    );
+
+    let alpha = session.write_stdin_raw_with("alpha", Some(5.0)).await?;
+    let mut text = result_text(&alpha);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        text.contains("<<repl status: waiting for input>>"),
+        "expected raw stdin read to wait for second follow-up input, got: {text:?}"
+    );
+
+    let bravo = session
+        .write_stdin_raw_unterminated_with("bravo", Some(5.0))
+        .await?;
+    let text = result_text(&bravo);
 
     session.cancel().await?;
 
@@ -1732,9 +1996,8 @@ async fn python_sys_stdin_buffer_read_leaves_followup_turn_visible() -> TestResu
         .write_stdin_raw_with(
             r#"import sys
 buffer_value = sys.stdin.buffer.readline().decode("utf-8").strip()
-buffered
 "#,
-            Some(5.0),
+            Some(1.0),
         )
         .await?;
     let mut text = result_text(&result);
@@ -1746,8 +2009,15 @@ buffered
         }
     }
     assert!(
-        !is_busy_response(&text),
-        "expected sys.stdin.buffer read to consume the queued line, got: {text:?}"
+        text.contains("<<repl status: waiting for input>>"),
+        "expected sys.stdin.buffer read to wait for follow-up input, got: {text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("buffered", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        !is_busy_response(&answer_text),
+        "expected sys.stdin.buffer read to consume the follow-up line, got: {answer_text:?}"
     );
 
     let followup = session
@@ -1805,6 +2075,328 @@ print("RAW_PARTIAL_RESULT", data.decode("utf-8").strip(), flush=True)
     assert!(
         second_text.contains("RAW_PARTIAL_RESULT delta"),
         "expected output after the partial raw stdin read to stay attached to the follow-up reply, got: {second_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_detached_raw_stdin_read_followup_completes() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import os, threading, time
+def read_later():
+    time.sleep(0.2)
+    print("DETACHED_RAW_THREAD_WAITING", flush=True)
+    data = os.read(0, 5)
+    print("DETACHED_RAW_THREAD_READ", data.decode("utf-8"), flush=True)
+threading.Thread(target=read_later, daemon=True).start()
+print("DETACHED_RAW_MAIN_DONE", flush=True)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("DETACHED_RAW_MAIN_DONE"),
+        "expected main cell to finish before detached raw stdin read, got: {first_text:?}"
+    );
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_text = String::new();
+    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_THREAD_WAITING") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        wait_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        wait_text.contains("DETACHED_RAW_THREAD_WAITING"),
+        "expected detached raw stdin reader to start before follow-up input, got: {wait_text:?}"
+    );
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(3),
+        session.write_stdin_raw_unterminated_with("alpha", Some(10.0)),
+    )
+    .await;
+    let second = match second {
+        Ok(result) => result?,
+        Err(_) => {
+            session.cancel().await?;
+            panic!("detached raw stdin follow-up did not complete after consuming input");
+        }
+    };
+    let mut text = result_text(&second);
+    let output_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < output_deadline && !text.contains("DETACHED_RAW_THREAD_READ alpha") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        text.push_str(&result_text(&poll));
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text) && !text.contains("worker response timed out"),
+        "expected detached raw stdin follow-up turn to complete, got: {text:?}"
+    );
+    assert!(
+        text.contains("DETACHED_RAW_THREAD_READ alpha"),
+        "expected detached raw stdin read to consume follow-up bytes, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_detached_raw_stdin_reads_consume_one_answer_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import os, threading, time
+def read_later():
+    time.sleep(0.2)
+    print("DETACHED_RAW_PAIR_WAITING", flush=True)
+    first = os.read(0, 2)
+    second = os.read(0, 2)
+    print("DETACHED_RAW_PAIR_READ", first.decode("utf-8"), second.decode("utf-8"), flush=True)
+threading.Thread(target=read_later, daemon=True).start()
+print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("DETACHED_RAW_PAIR_MAIN_DONE"),
+        "expected main cell to finish before detached raw stdin reads, got: {first_text:?}"
+    );
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_text = String::new();
+    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_PAIR_WAITING") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        wait_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        wait_text.contains("DETACHED_RAW_PAIR_WAITING"),
+        "expected detached raw stdin reader to start before follow-up input, got: {wait_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_unterminated_with("abcd", Some(1.0))
+        .await?;
+    let mut answer_text = result_text(&answer);
+    let output_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < output_deadline && !answer_text.contains("DETACHED_RAW_PAIR_READ ab cd")
+    {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        answer_text.push_str(&result_text(&poll));
+    }
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains("DETACHED_RAW_PAIR_READ ab cd"),
+        "expected one answer turn to satisfy both detached raw stdin reads, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_foreground_raw_stdin_partial_read_does_not_preserve_for_unrelated_thread()
+-> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+    let temp_dir = tempdir()?;
+    let release_path = temp_dir.path().join("release-unrelated-raw-reader");
+    let release_path_literal = serde_json::to_string(
+        release_path
+            .to_str()
+            .ok_or("raw reader release path must be valid utf-8")?,
+    )?;
+
+    let first = session
+        .write_stdin_raw_with(
+            format!(
+                r#"import os, pathlib, threading, time
+release_path = pathlib.Path({release_path_literal})
+def unrelated_reader():
+    while not release_path.exists():
+        time.sleep(0.01)
+    data = os.read(0, 1)
+    print("UNRELATED_RAW_READ", data.decode("utf-8"), flush=True)
+threading.Thread(target=unrelated_reader, daemon=True).start()
+data = os.read(0, 1)
+print("FOREGROUND_RAW_READ", data.decode("utf-8"), flush=True)
+"#
+            ),
+            Some(1.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "expected foreground raw read to wait for input, got: {first_text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_unterminated_with("xy", Some(5.0))
+        .await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        answer_text.contains("FOREGROUND_RAW_READ x"),
+        "expected foreground raw read to consume first byte, got: {answer_text:?}"
+    );
+
+    fs::write(&release_path, "go")?;
+    let mut text = String::new();
+    let steal_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < steal_deadline && !text.contains("UNRELATED_RAW_READ") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        text.push_str(&result_text(&poll));
+    }
+    assert!(
+        !text.contains("UNRELATED_RAW_READ y"),
+        "unrelated background reader consumed preserved foreground raw stdin bytes: {text:?}"
+    );
+
+    let fresh = session
+        .write_stdin_raw_unterminated_with("z", Some(5.0))
+        .await?;
+    text.push_str(&result_text(&fresh));
+    session.cancel().await?;
+
+    assert!(
+        text.contains("UNRELATED_RAW_READ z"),
+        "expected unrelated reader to wait for fresh stdin, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_partial_raw_stdin_read_clears_leftover_newline_before_next_cell() -> TestResult<()>
+{
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import os
+data = os.read(0, 5).decode("utf-8")
+print("RAW_PARTIAL_EXACT", data)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "expected raw stdin read to wait for follow-up input, got: {first_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("bravo", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        answer_text.contains("RAW_PARTIAL_EXACT bravo"),
+        "expected raw stdin read to consume five bytes from the answer, got: {answer_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('AFTER_PARTIAL_RAW_CELL')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&follow_up_text),
+        "expected fresh cell after partial raw stdin read to finish, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("AFTER_PARTIAL_RAW_CELL"),
+        "expected fresh cell after partial raw stdin read to run, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_sys_stdin_partial_text_read_clears_buffer_before_next_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            r#"import sys
+value = sys.stdin.read(2)
+print("TEXT_PARTIAL_READ", value)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: waiting for input>>"),
+        "expected partial sys.stdin read to wait for follow-up input, got: {first_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("abcdef", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        answer_text.contains("TEXT_PARTIAL_READ ab"),
+        "expected sys.stdin.read(2) to consume the first two characters, got: {answer_text:?}"
+    );
+
+    let next = session
+        .write_stdin_raw_with(
+            r#"import sys
+line = sys.stdin.readline().strip()
+print("TEXT_PARTIAL_NEXT", line)
+"#,
+            Some(1.0),
+        )
+        .await?;
+    let next_text = result_text(&next);
+    assert!(
+        next_text.contains("<<repl status: waiting for input>>"),
+        "expected fresh cell to wait for new stdin instead of buffered leftovers, got: {next_text:?}"
+    );
+
+    let fresh = session.write_stdin_raw_with("fresh", Some(5.0)).await?;
+    let fresh_text = result_text(&fresh);
+    session.cancel().await?;
+
+    assert!(
+        fresh_text.contains("TEXT_PARTIAL_NEXT fresh"),
+        "expected fresh stdin to satisfy the next cell, got: {fresh_text:?}"
     );
     Ok(())
 }
@@ -1996,18 +2588,37 @@ async fn python_smoke_without_register_at_fork() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_files_mode()
+async fn python_follow_up_after_resolved_timeout_skips_leading_fresh_echo_in_files_mode()
 -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp = tempdir()?;
+    let release_path = temp.path().join("release-timeout");
+    let done_path = temp.path().join("done-timeout");
+    let release_literal = serde_json::to_string(
+        release_path
+            .to_str()
+            .ok_or("timeout release path must be valid utf-8")?,
+    )?;
+    let done_literal = serde_json::to_string(
+        done_path
+            .to_str()
+            .ok_or("timeout done path must be valid utf-8")?,
+    )?;
+    let first_input = format!(
+        r#"import pathlib, time
+release_path = pathlib.Path({release_literal})
+while not release_path.exists():
+    time.sleep(0.01)
+print('DETACHED_OK', flush=True)
+pathlib.Path({done_literal}).write_text('done')
+"#
+    );
 
     let first = session
-        .write_stdin_raw_with(
-            "import time; time.sleep(0.2); print('DETACHED_OK')",
-            Some(0.05),
-        )
+        .write_stdin_raw_with(first_input.as_str(), Some(0.05))
         .await?;
     let first_text = result_text(&first);
     assert!(
@@ -2015,12 +2626,8 @@ async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_f
         "expected the initial Python request to time out, got: {first_text:?}"
     );
 
-    sleep(Duration::from_millis(if cfg!(target_os = "macos") {
-        700
-    } else {
-        350
-    }))
-    .await;
+    fs::write(&release_path, "go")?;
+    wait_for_file_text(&done_path, "done").await?;
 
     let follow_up = session
         .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
@@ -2045,8 +2652,13 @@ async fn python_follow_up_after_resolved_timeout_trims_detached_echo_prefix_in_f
         "expected the fresh Python follow-up result, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("import time; time.sleep(0.2); print('DETACHED_OK')"),
-        "did not expect the timed-out Python echo to leak into the next visible reply, got: {follow_up_text:?}"
+        !follow_up_text.contains(">>> import pathlib, time")
+            && !follow_up_text.contains("release_path = pathlib.Path"),
+        "did not expect timed-out Python source to be synthesized into the next visible reply, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains(">>> print('FOLLOWUP_OK')"),
+        "fresh Python follow-up input echo should be absent, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -2466,7 +3078,481 @@ async fn python_multiline_block() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestResult<()> {
+async fn python_cell_runs_block_and_following_top_level_code() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "total = 0\nfor x in range(4):\n    total += x\nprint('CELL_TOTAL', total)",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected complete cell to finish in one request, got: {text:?}"
+    );
+    assert!(
+        text.contains("CELL_TOTAL 6"),
+        "expected block and following top-level code to run as one cell, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "cell execution should not leave Python at a continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_fifo_cell_contract_uses_stdin_only_while_read_waits() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with("counter = 41\ncounter", Some(5.0))
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        !is_busy_response(&first_text),
+        "expected initial cell to finish, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("41"),
+        "expected final expression display, got: {first_text:?}"
+    );
+    assert!(
+        !first_text.contains(">>> ") && !first_text.contains("... "),
+        "completed cells should not render top-level Python prompts, got: {first_text:?}"
+    );
+
+    let second = session
+        .write_stdin_raw_with("counter += 1\ncounter", Some(5.0))
+        .await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("42"),
+        "expected globals to persist across cells, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains(">>> ") && !second_text.contains("... "),
+        "completed follow-up cells should stay prompt-free, got: {second_text:?}"
+    );
+
+    let prompt = session
+        .write_stdin_raw_with("name = input('name: ')", Some(1.0))
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("name: "),
+        "expected real input() prompt to stay visible, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("Ada", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        !is_busy_response(&answer_text),
+        "expected answer to complete the waiting input() call, got: {answer_text:?}"
+    );
+    assert!(
+        !answer_text.contains("NameError"),
+        "stdin answer should not execute as a top-level cell, got: {answer_text:?}"
+    );
+
+    let idle = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let idle_text = result_text(&idle);
+    assert!(
+        idle_text.contains("<<repl status: idle>>"),
+        "expected empty poll after input() answer to report idle, got: {idle_text:?}"
+    );
+    assert!(
+        !idle_text.contains("name: "),
+        "empty poll after input() answer must not repeat stale input prompt, got: {idle_text:?}"
+    );
+
+    let follow_up = session.write_stdin_raw_with("name", Some(5.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("'Ada'"),
+        "expected later input to execute as a fresh cell after input() completed, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains(">>> ") && !follow_up_text.contains("... "),
+        "fresh cell after input() should stay prompt-free, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_prompt_free_paged_completion_dismisses_without_protocol_error() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    if !require_python() {
+        return Ok(());
+    }
+
+    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        Vec::new(),
+        120,
+    )
+    .await?;
+
+    let input = "for i in range(40):\n    print(f'PROMPT_FREE_PAGER_LINE {i:03d}')";
+    let initial = session.write_stdin_raw_with(input, Some(10.0)).await?;
+    let initial = common::wait_until_not_busy(
+        &mut session,
+        initial,
+        Duration::from_millis(100),
+        python_startup_probe_budget(),
+    )
+    .await?;
+    let initial_text = result_text(&initial);
+    if python_backend_unavailable(&initial_text) {
+        eprintln!("python backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected oversized Python cell output to activate pager, got: {initial_text:?}"
+    );
+
+    let tail = session.write_stdin_raw_with(":tail 1", Some(5.0)).await?;
+    let tail_text = result_text(&tail);
+    session.cancel().await?;
+
+    assert!(
+        tail_text.contains("(END"),
+        "expected :tail to dismiss pager at the end, got: {tail_text:?}"
+    );
+    assert!(
+        !tail_text.contains("[repl] protocol error: missing prompt after pager dismiss"),
+        "prompt-free Python pager completion should not report a missing prompt, got: {tail_text:?}"
+    );
+    assert!(
+        !tail_text.contains(">>> ") && !tail_text.contains("... "),
+        "prompt-free Python pager completion should not append Python prompts, got: {tail_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_runner_accepts_legacy_codeop_compile_api() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    if !require_python() {
+        return Ok(());
+    }
+
+    let codeop_dir = tempdir()?;
+    fs::write(
+        codeop_dir.path().join("codeop.py"),
+        r#"
+import __future__
+
+PyCF_DONT_IMPLY_DEDENT = 0x200
+_features = [getattr(__future__, name) for name in __future__.all_feature_names]
+
+
+class Compile:
+    def __init__(self):
+        self.flags = PyCF_DONT_IMPLY_DEDENT
+
+    def __call__(self, source, filename, symbol):
+        codeob = compile(source, filename, symbol, self.flags, True)
+        for feature in _features:
+            if codeob.co_flags & feature.compiler_flag:
+                self.flags |= feature.compiler_flag
+        return codeob
+"#,
+    )?;
+
+    let Some(session) = start_python_session_with_env_vars(vec![(
+        "PYTHONPATH".to_string(),
+        codeop_dir.path().display().to_string(),
+    )])
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "from __future__ import annotations\nclass Box:\n    value: MissingName\nprint('LEGACY_CODEOP_OK', Box.__annotations__['value'])",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected legacy codeop cell to finish, got: {text:?}"
+    );
+    assert!(
+        text.contains("LEGACY_CODEOP_OK MissingName"),
+        "expected legacy codeop cell to run with future annotations, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_final_expression_displays_after_block() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("def f():\n    return 7\nf()", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected final-expression cell to finish in one request, got: {text:?}"
+    );
+    assert!(
+        text.contains("7"),
+        "expected final expression to be displayed, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "cell execution should not require a blank line before final expression, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_final_expression_matching_input_remains_visible() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("2", Some(5.0)).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected final-expression cell to finish in one request, got: {text:?}"
+    );
+    assert_eq!(
+        text.trim(),
+        "2",
+        "expected displayhook output matching the input to be preserved, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_incomplete_code_reports_error_not_continuation() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("for x in range(3):", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("SyntaxError") || text.contains("IndentationError"),
+        "expected incomplete cell to report a Python syntax error, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "incomplete cell should not leave Python at a continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_custom_displayhook_is_honored() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            "import sys\ndef hook(value):\n    print('DISPLAYHOOK_VALUE', value)\nsys.displayhook = hook\n21 + 21",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&text),
+        "expected displayhook cell to finish, got: {text:?}"
+    );
+    assert!(
+        text.contains("DISPLAYHOOK_VALUE 42"),
+        "expected final expression to use custom displayhook, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_preserves_future_annotations_between_calls() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with("from __future__ import annotations", Some(5.0))
+        .await?;
+    let setup_text = result_text(&setup);
+    assert!(
+        !setup_text.contains("Traceback"),
+        "expected future import setup to succeed, got: {setup_text:?}"
+    );
+
+    let result = session
+        .write_stdin_raw_with(
+            "def f(value: list[int]) -> dict[str, int]:\n    return {}\nprint('FUTURE_ANNOTATIONS', isinstance(f.__annotations__['value'], str), f.__annotations__['value'])",
+            Some(5.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("FUTURE_ANNOTATIONS True list[int]"),
+        "expected future annotations to persist across cells, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_runner_survives_shadowed_user_globals() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            "ast = 1\nglobals = 2\ncompile = 3\nprint('SHADOW_SETUP')",
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    assert!(
+        setup_text.contains("SHADOW_SETUP"),
+        "expected shadowing setup to run, got: {setup_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('SHADOW_FOLLOWUP')\n40 + 2", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&follow_up_text),
+        "expected follow-up after shadowed globals to finish, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SHADOW_FOLLOWUP") && follow_up_text.contains("42"),
+        "expected follow-up cell to run after user globals shadow helper names, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_input_wait_consumes_follow_up_stdin() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let prompt = session
+        .write_stdin_raw_with("name = input('name: ')", Some(1.0))
+        .await?;
+    let prompt_text = result_text(&prompt);
+    assert!(
+        prompt_text.contains("name: "),
+        "expected input prompt, got: {prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("Ada", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        !is_busy_response(&answer_text),
+        "expected answer to complete the input wait, got: {answer_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('CELL_INPUT_NAME', name)", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("CELL_INPUT_NAME Ada"),
+        "expected follow-up input to be stdin, got prompt: {prompt_text:?}; answer: {answer_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_custom_input_loop_consumes_follow_up_stdin() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let first = session
+        .write_stdin_raw_with(
+            "for label in ('a', 'b'):\n    value = input(label + '> ')\n    print('LOOP_VALUE', label, value)\nprint('LOOP_DONE')",
+            Some(1.0),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("a> "),
+        "expected first loop prompt, got: {first_text:?}"
+    );
+
+    let second = session.write_stdin_raw_with("one", Some(5.0)).await?;
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("LOOP_VALUE a one") && second_text.contains("b> "),
+        "expected first answer and second prompt, got: {second_text:?}"
+    );
+
+    let third = session.write_stdin_raw_with("two", Some(5.0)).await?;
+    let third_text = result_text(&third);
+    session.cancel().await?;
+
+    assert!(
+        third_text.contains("LOOP_VALUE b two") && third_text.contains("LOOP_DONE"),
+        "expected second answer and loop completion, got: {third_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_multiline_block_skips_leading_consumed_input_echo() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2478,7 +3564,7 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
     let text = result_text(&result);
     if is_busy_response(&text) {
         eprintln!(
-            "python_multiline_block_does_not_echo_input_in_visible_reply remained busy; skipping"
+            "python_multiline_block_skips_leading_consumed_input_echo remained busy; skipping"
         );
         session.cancel().await?;
         return Ok(());
@@ -2490,11 +3576,11 @@ async fn python_multiline_block_does_not_echo_input_in_visible_reply() -> TestRe
     assert!(visible.contains("3"), "expected 3, got: {visible:?}");
     assert!(
         !visible.contains("def f():"),
-        "did not expect the multiline function definition to echo back, got: {visible:?}"
+        "multiline function definition echo should be absent, got: {visible:?}"
     );
     assert!(
         !visible.contains("return 3"),
-        "did not expect the multiline body to echo back, got: {visible:?}"
+        "multiline body echo should be absent, got: {visible:?}"
     );
     Ok(())
 }
@@ -2527,7 +3613,7 @@ async fn python_buffered_multiline_prompt_does_not_complete_request_early() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_incomplete_block_reports_continuation_prompt() -> TestResult<()> {
+async fn python_cell_block_executes_without_blank_line() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2540,14 +3626,18 @@ async fn python_incomplete_block_reports_continuation_prompt() -> TestResult<()>
     session.cancel().await?;
 
     assert!(
-        text.contains("... "),
-        "expected incomplete Python block to report continuation prompt, got: {text:?}"
+        text.contains("x"),
+        "expected complete block cell to execute without a trailing blank line, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "complete block cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_line_by_line_block_body_reports_continuation_prompt() -> TestResult<()> {
+async fn python_block_header_alone_reports_indentation_error() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2555,37 +3645,21 @@ async fn python_line_by_line_block_body_reports_continuation_prompt() -> TestRes
 
     let result = session.write_stdin_raw_with("if True:", Some(5.0)).await?;
     let text = result_text(&result);
-    assert!(
-        text.contains("... "),
-        "expected block header to report continuation prompt, got: {text:?}"
-    );
-
-    let result = session.write_stdin_raw_with("    pass", Some(5.0)).await?;
-    let text = result_text(&result);
-    assert!(
-        !is_busy_response(&text),
-        "expected block body to return a continuation prompt, got: {text:?}"
-    );
-    assert!(
-        text.contains("... "),
-        "expected block body to report continuation prompt, got: {text:?}"
-    );
-
-    let result = session
-        .write_stdin_raw_with("\nprint('LINE_BY_LINE_BLOCK_DONE')", Some(5.0))
-        .await?;
-    let text = result_text(&result);
     session.cancel().await?;
 
     assert!(
-        text.contains("LINE_BY_LINE_BLOCK_DONE"),
-        "expected block to complete after blank line, got: {text:?}"
+        text.contains("IndentationError"),
+        "expected block header cell to report IndentationError, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "block header cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_commented_block_header_reports_continuation_prompt() -> TestResult<()> {
+async fn python_commented_block_header_reports_indentation_error() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2598,14 +3672,18 @@ async fn python_commented_block_header_reports_continuation_prompt() -> TestResu
     session.cancel().await?;
 
     assert!(
-        text.contains("... "),
-        "expected commented Python block header to report continuation prompt, got: {text:?}"
+        text.contains("IndentationError"),
+        "expected commented block header cell to report IndentationError, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "commented block header cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_comment_only_block_body_reports_continuation_prompt() -> TestResult<()> {
+async fn python_comment_only_block_body_reports_indentation_error() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2618,14 +3696,18 @@ async fn python_comment_only_block_body_reports_continuation_prompt() -> TestRes
     session.cancel().await?;
 
     assert!(
-        text.contains("... "),
-        "expected comment-only Python block body to report continuation prompt, got: {text:?}"
+        text.contains("IndentationError"),
+        "expected comment-only block body cell to report IndentationError, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "comment-only block body cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_comment_backslash_reports_primary_prompt() -> TestResult<()> {
+async fn python_comment_backslash_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2638,10 +3720,6 @@ async fn python_comment_backslash_reports_primary_prompt() -> TestResult<()> {
     assert!(
         !is_busy_response(&text),
         "expected comment backslash input to complete, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected comment backslash input to report primary prompt, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
@@ -2662,7 +3740,7 @@ async fn python_comment_backslash_reports_primary_prompt() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_decorator_reports_continuation_prompt() -> TestResult<()> {
+async fn python_decorator_without_definition_reports_syntax_error() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2675,14 +3753,18 @@ async fn python_decorator_reports_continuation_prompt() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        text.contains("... "),
-        "expected Python decorator to report continuation prompt, got: {text:?}"
+        text.contains("SyntaxError"),
+        "expected decorator-only cell to report SyntaxError, got: {text:?}"
+    );
+    assert!(
+        !text.contains("... "),
+        "decorator-only cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_whitespace_only_reports_primary_prompt() -> TestResult<()> {
+async fn python_whitespace_only_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2693,18 +3775,14 @@ async fn python_whitespace_only_reports_primary_prompt() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        text.contains(">>> "),
-        "expected whitespace-only Python input to report primary prompt, got: {text:?}"
-    );
-    assert!(
-        !text.contains("... "),
-        "expected whitespace-only Python input not to report continuation prompt, got: {text:?}"
+        !text.contains(">>> ") && !text.contains("... "),
+        "expected whitespace-only Python input not to render top-level prompts, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_invalid_top_level_indent_reports_primary_prompt() -> TestResult<()> {
+async fn python_invalid_top_level_indent_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2721,10 +3799,6 @@ async fn python_invalid_top_level_indent_reports_primary_prompt() -> TestResult<
         "expected invalid top-level indent to raise IndentationError, got: {text:?}"
     );
     assert!(
-        text.contains(">>> "),
-        "expected invalid top-level indent to report primary prompt, got: {text:?}"
-    );
-    assert!(
         !text.contains("... "),
         "expected invalid top-level indent not to report continuation prompt, got: {text:?}"
     );
@@ -2732,7 +3806,7 @@ async fn python_invalid_top_level_indent_reports_primary_prompt() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_syntax_error_dedent_reports_primary_prompt() -> TestResult<()> {
+async fn python_dedented_block_cell_runs() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2745,22 +3819,18 @@ async fn python_syntax_error_dedent_reports_primary_prompt() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        text.contains("SyntaxError"),
-        "expected dedented incomplete suite to raise SyntaxError, got: {text:?}"
-    );
-    assert!(
-        text.contains(">>> "),
-        "expected dedented SyntaxError to report primary prompt, got: {text:?}"
+        text.contains("1") && text.contains("2"),
+        "expected dedented top-level code after block to run in one cell, got: {text:?}"
     );
     assert!(
         !text.contains("... "),
-        "expected dedented SyntaxError not to report continuation prompt, got: {text:?}"
+        "dedented block cell should not report continuation prompt, got: {text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_unterminated_single_quote_reports_primary_prompt() -> TestResult<()> {
+async fn python_unterminated_single_quote_stays_prompt_free() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -2775,12 +3845,40 @@ async fn python_unterminated_single_quote_reports_primary_prompt() -> TestResult
         "expected unterminated single quote to raise SyntaxError, got: {text:?}"
     );
     assert!(
-        text.contains(">>> "),
-        "expected unterminated single quote to report primary prompt, got: {text:?}"
-    );
-    assert!(
         !text.contains("... "),
         "expected unterminated single quote not to report continuation prompt, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_final_expression_syntax_error_has_no_setup_side_effects() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with("failed_eval_side_effect = 1\nyield 2", Some(5.0))
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("SyntaxError"),
+        "expected invalid final expression to raise SyntaxError, got: {text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with(
+            "print('FAILED_EVAL_SIDE_EFFECT', 'failed_eval_side_effect' in globals())",
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("FAILED_EVAL_SIDE_EFFECT False"),
+        "failed final-expression compile should not run setup statements, got initial: {text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -2868,7 +3966,7 @@ async fn python_input_roundtrip() -> TestResult<()> {
 
     let mut text = result_text(
         &session
-            .write_stdin_raw_with("x = input('prompt> ')", Some(1.0))
+            .write_stdin_raw_with("x = input('prompt> ')\nprint('INPUT_VALUE', x)", Some(1.0))
             .await?,
     );
     if is_busy_response(&text) {
@@ -2885,11 +3983,7 @@ async fn python_input_roundtrip() -> TestResult<()> {
     }
     assert!(text.contains("prompt>"), "expected prompt, got: {text:?}");
 
-    let mut text = result_text(
-        &session
-            .write_stdin_raw_with("hello\nprint('INPUT_VALUE', x)", Some(5.0))
-            .await?,
-    );
+    let mut text = result_text(&session.write_stdin_raw_with("hello", Some(5.0)).await?);
     if is_busy_response(&text) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
@@ -2907,7 +4001,7 @@ async fn python_input_roundtrip() -> TestResult<()> {
     }
     assert!(
         text.contains("INPUT_VALUE hello"),
-        "expected queued tail after input() to run, got: {text:?}"
+        "expected code after input() to run after follow-up stdin, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -2934,7 +4028,6 @@ print("SANDBOX_CRT_ISATTY", bool(crt._isatty(0)), bool(crt._isatty(1)), bool(crt
 """)
 print("SANDBOX_PTY_FDS", os.isatty(0), os.isatty(1), os.isatty(2))
 value = input("sandbox> ")
-inside
 print("SANDBOX_INPUT", value)
 "#,
             Some(5.0),
@@ -2956,19 +4049,40 @@ print("SANDBOX_INPUT", value)
         return Err("python Windows sandbox PTY stdin bridge test remained busy".into());
     }
 
+    assert!(
+        text.contains("sandbox> "),
+        "expected sandboxed input prompt, got: {text:?}"
+    );
+    let mut all_text = text.clone();
+
+    let answer = session.write_stdin_raw_with("inside", Some(5.0)).await?;
+    text = result_text(&answer);
+    all_text.push_str(&text);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("SANDBOX_INPUT inside")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+            all_text.push_str(&text);
+        }
+    }
+
     session.cancel().await?;
 
     assert!(
-        text.contains("SANDBOX_PTY_FDS True True True"),
-        "expected sandboxed Python stdio fds to be TTY-backed, got: {text:?}"
+        all_text.contains("SANDBOX_PTY_FDS True True True"),
+        "expected sandboxed Python stdio fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("SANDBOX_CRT_ISATTY True True True"),
-        "expected sandboxed Windows CRT fds to be TTY-backed, got: {text:?}"
+        all_text.contains("SANDBOX_CRT_ISATTY True True True"),
+        "expected sandboxed Windows CRT fds to be TTY-backed, got: {all_text:?}"
     );
     assert!(
-        text.contains("SANDBOX_INPUT inside"),
-        "expected sandboxed input() to consume the buffered answer, got: {text:?}"
+        all_text.contains("SANDBOX_INPUT inside"),
+        "expected sandboxed input() to consume the follow-up answer, got: {all_text:?}"
     );
     Ok(())
 }
@@ -2983,7 +4097,7 @@ async fn python_input_accepts_crlf_buffered_line() -> TestResult<()> {
 
     let mut prompt_text = result_text(
         &session
-            .write_stdin_raw_with("x = input('p> ')", Some(1.0))
+            .write_stdin_raw_with("x = input('p> ')\nprint('got', x)", Some(1.0))
             .await?,
     );
     if is_busy_response(&prompt_text) {
@@ -3004,7 +4118,7 @@ async fn python_input_accepts_crlf_buffered_line() -> TestResult<()> {
     );
 
     let result = session
-        .write_stdin_raw_with("hello\r\nprint('got', x)\r\n", Some(5.0))
+        .write_stdin_raw_unterminated_with("hello\r\n", Some(5.0))
         .await?;
     let mut text = result_text(&result);
     if is_busy_response(&text) {
@@ -3060,6 +4174,7 @@ class DeferredStdout:
 sys.__stdout__ = DeferredStdout()
 sys.__stdout__.write("ORIGINAL_BEFORE_INPUT\\n")
 value = input("original> ")
+print('VALUE', value)
 """)
 "#,
             Some(1.0),
@@ -3081,9 +4196,7 @@ value = input("original> ")
         return Err("python original stdout input prompt remained busy".into());
     }
 
-    let answer = session
-        .write_stdin_raw_with("answer\nprint('VALUE', value)", Some(5.0))
-        .await?;
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
     let answer_text = result_text(&answer);
     session.cancel().await?;
 
@@ -3131,6 +4244,7 @@ sys.__stdout__ = DeferredStdout()
 marker = "ORIGINAL" + "_BEFORE_STDIN_COMPLETE_PROMPT"
 sys.__stdout__.write(marker + "\\n")
 value = input("delayed> ")
+print('DELAYED_VALUE', value)
 """)
 "#,
             Some(1.0),
@@ -3152,9 +4266,7 @@ value = input("delayed> ")
         return Err("python delayed input prompt remained busy".into());
     }
 
-    let answer = session
-        .write_stdin_raw_with("answer\nprint('DELAYED_VALUE', value)", Some(5.0))
-        .await?;
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
     let answer_text = result_text(&answer);
     session.cancel().await?;
 
@@ -3212,14 +4324,17 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
     );
 
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_INPUT_INTERRUPT')", Some(5.0))
+        .write_stdin_raw_with(
+            "print('AFTER_INPUT_INTERRUPT')\nprint('AFTER_INPUT_INTERRUPT_DONE')",
+            Some(5.0),
+        )
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;
 
     assert!(
-        follow_up_text.contains("AFTER_INPUT_INTERRUPT"),
-        "expected follow-up to run after input prompt interrupt, got: {follow_up_text:?}"
+        !is_busy_response(&follow_up_text) && follow_up_text.contains("AFTER_INPUT_INTERRUPT_DONE"),
+        "expected immediate follow-up to complete after input prompt interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -3339,7 +4454,7 @@ async fn python_interrupt_unblocks_primary_shaped_input_prompt() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResult<()> {
+async fn python_custom_primary_prompt_does_not_render_at_idle() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -3353,36 +4468,23 @@ async fn python_interrupt_at_custom_primary_prompt_reaches_worker() -> TestResul
         .await?;
     let setup_text = result_text(&setup);
     assert!(
-        setup_text.contains("CUSTOM_READY") && setup_text.contains("custom> "),
-        "expected custom primary prompt after setup, got: {setup_text:?}"
+        setup_text.contains("CUSTOM_READY"),
+        "expected setup output after custom primary prompt assignment, got: {setup_text:?}"
+    );
+    assert!(
+        !setup_text.contains("custom> "),
+        "completed cells should not render custom top-level prompts, got: {setup_text:?}"
     );
 
-    let interrupt = session
-        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
-        .await?;
-    let interrupt_text = result_text(&interrupt);
-    if is_busy_response(&interrupt_text) || interrupt_text.contains("timed out") {
-        eprintln!("idle custom prompt interrupt stayed busy in this Python runtime; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if !interrupt_text.contains("KeyboardInterrupt") {
-        session.cancel().await?;
-        return Err(format!(
-            "expected idle custom prompt interrupt to reach Python, got: {interrupt_text:?}"
-        )
-        .into());
-    }
-
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_CUSTOM_PROMPT_INTERRUPT')", Some(5.0))
+        .write_stdin_raw_with("print('AFTER_CUSTOM_PROMPT_SETUP')", Some(5.0))
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;
 
     assert!(
-        follow_up_text.contains("AFTER_CUSTOM_PROMPT_INTERRUPT"),
-        "expected follow-up after idle custom prompt interrupt, got: {follow_up_text:?}"
+        follow_up_text.contains("AFTER_CUSTOM_PROMPT_SETUP"),
+        "expected follow-up after custom primary prompt setup, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -3462,8 +4564,8 @@ async fn python_custom_prompts_do_not_escape_as_stderr() -> TestResult<()> {
         "expected request output after custom prompts, got: {setup_text:?}"
     );
     assert!(
-        setup_text.contains("custom> "),
-        "expected custom primary prompt metadata, got: {setup_text:?}"
+        !setup_text.contains("custom> "),
+        "completed cells should not render custom top-level prompts, got: {setup_text:?}"
     );
     assert_ne!(setup.is_error, Some(true));
     assert!(
@@ -3471,48 +4573,52 @@ async fn python_custom_prompts_do_not_escape_as_stderr() -> TestResult<()> {
         "custom primary prompt should not be attributed to stderr, got: {setup_text:?}"
     );
 
-    let continuation = session.write_stdin_raw_with("if True:", Some(5.0)).await?;
-    let continuation_text = result_text(&continuation);
+    let input_prompt = session
+        .write_stdin_raw_with(
+            "value = input('more... ')\nprint('CUSTOM_INPUT', value)",
+            Some(1.0),
+        )
+        .await?;
+    let input_prompt_text = result_text(&input_prompt);
+    assert!(
+        input_prompt_text.contains("more... "),
+        "expected custom-shaped input prompt metadata, got: {input_prompt_text:?}"
+    );
+    assert_ne!(input_prompt.is_error, Some(true));
+    assert!(
+        !input_prompt_text.contains("stderr: more... "),
+        "custom-shaped input prompt should not be attributed to stderr, got: {input_prompt_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
     session.cancel().await?;
 
     assert!(
-        continuation_text.contains("more... "),
-        "expected custom continuation prompt metadata, got: {continuation_text:?}"
-    );
-    assert_ne!(continuation.is_error, Some(true));
-    assert!(
-        !continuation_text.contains("stderr: more... "),
-        "custom continuation prompt should not be attributed to stderr, got: {continuation_text:?}"
+        answer_text.contains("CUSTOM_INPUT answer"),
+        "expected answer after custom-shaped input prompt, got: {answer_text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> TestResult<()> {
+async fn python_interrupt_aborts_running_cell_without_replaying_tail() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
-    let mut text = result_text(
+    let text = result_text(
         &session
-            .write_stdin_raw_with("if True:\n    print('SHOULD_NOT_RUN')", Some(1.0))
+            .write_stdin_raw_with(
+                "import time\ntime.sleep(30)\nprint('SHOULD_NOT_RUN')",
+                Some(0.2),
+            )
             .await?,
     );
-    if is_busy_response(&text) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("... ") {
-            sleep(Duration::from_millis(50)).await;
-            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
-        }
-    }
-    if is_busy_response(&text) {
-        session.cancel().await?;
-        return Err("python continuation prompt remained busy before interrupt".into());
-    }
     assert!(
-        text.contains("... "),
-        "expected continuation prompt before interrupt, got: {text:?}"
+        is_busy_response(&text),
+        "expected running cell to time out before interrupt, got: {text:?}"
     );
 
     let interrupt = session
@@ -3520,17 +4626,17 @@ async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> 
         .await?;
     let interrupt_text = result_text(&interrupt);
     if is_busy_response(&interrupt_text) {
-        eprintln!("continuation prompt interrupt stayed busy in this Python runtime; skipping");
+        eprintln!("running cell interrupt stayed busy in this Python runtime; skipping");
         session.cancel().await?;
         return Ok(());
     }
     assert!(
         !is_busy_response(&interrupt_text),
-        "expected continuation prompt interrupt to complete, got: {interrupt_text:?}"
+        "expected running cell interrupt to complete, got: {interrupt_text:?}"
     );
     assert!(
         !interrupt_text.contains("SHOULD_NOT_RUN"),
-        "interrupt submitted the pending block: {interrupt_text:?}"
+        "interrupt allowed tail code to run: {interrupt_text:?}"
     );
 
     let follow_up = session
@@ -3551,6 +4657,30 @@ async fn python_interrupt_aborts_continuation_prompt_without_running_block() -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let follow_up = session
+        .write_stdin_raw_with("\u{3}print('AFTER_IDLE_INTERRUPT')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_IDLE_INTERRUPT"),
+        "expected follow-up cell after idle Ctrl-C to run, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("KeyboardInterrupt"),
+        "idle Ctrl-C leaked into the follow-up cell, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
@@ -3558,7 +4688,10 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
     };
 
     let prompt = session
-        .write_stdin_raw_with("value = input()", Some(1.0))
+        .write_stdin_raw_with(
+            "value = input()\nprint('EMPTY_INPUT_VALUE', value)",
+            Some(1.0),
+        )
         .await?;
     let prompt_text = result_text(&prompt);
     assert!(
@@ -3609,7 +4742,10 @@ async fn python_empty_poll_after_empty_input_prompt_uses_idle_poll_path() -> Tes
     };
 
     let prompt = session
-        .write_stdin_raw_with("value = input()", Some(1.0))
+        .write_stdin_raw_with(
+            "value = input()\nprint('EMPTY_INPUT_VALUE', value)",
+            Some(1.0),
+        )
         .await?;
     let prompt_text = result_text(&prompt);
     assert!(
@@ -3624,9 +4760,7 @@ async fn python_empty_poll_after_empty_input_prompt_uses_idle_poll_path() -> Tes
         "expected empty poll to use normal idle status, got: {poll_text:?}"
     );
 
-    let answer = session
-        .write_stdin_raw_with("answer\nprint('EMPTY_INPUT_VALUE', value)", Some(5.0))
-        .await?;
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
     let answer_text = result_text(&answer);
     session.cancel().await?;
 
@@ -3723,7 +4857,10 @@ async fn python_poll_reports_empty_input_prompt_after_timeout() -> TestResult<()
     };
 
     let first = session
-        .write_stdin_raw_with("import time\ntime.sleep(0.3)\nvalue = input()", Some(0.1))
+        .write_stdin_raw_with(
+            "import time\ntime.sleep(0.3)\nvalue = input()\nprint('TIMED_EMPTY_INPUT_VALUE', value)",
+            Some(0.1),
+        )
         .await?;
     let first_text = result_text(&first);
     assert!(
@@ -3738,9 +4875,7 @@ async fn python_poll_reports_empty_input_prompt_after_timeout() -> TestResult<()
         "expected poll to report generic input wait, got: {poll_text:?}"
     );
 
-    let answer = session
-        .write_stdin_raw_with("answer\nprint('TIMED_EMPTY_INPUT_VALUE', value)", Some(5.0))
-        .await?;
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
     let answer_text = result_text(&answer);
     session.cancel().await?;
 
@@ -3763,7 +4898,10 @@ async fn python_input_roundtrip_under_debug_allocator() -> TestResult<()> {
 
     let mut text = result_text(
         &session
-            .write_stdin_raw_with("value = input('debug> ')", Some(1.0))
+            .write_stdin_raw_with(
+                "value = input('debug> ')\nprint('DEBUG_ALLOCATOR_INPUT', value)",
+                Some(1.0),
+            )
             .await?,
     );
     if is_busy_response(&text) {
@@ -3779,9 +4917,7 @@ async fn python_input_roundtrip_under_debug_allocator() -> TestResult<()> {
     }
     assert!(text.contains("debug>"), "expected prompt, got: {text:?}");
 
-    let answer = session
-        .write_stdin_raw_with("value\nprint('DEBUG_ALLOCATOR_INPUT', value)", Some(5.0))
-        .await?;
+    let answer = session.write_stdin_raw_with("value", Some(5.0)).await?;
     let answer_text = result_text(&answer);
     session.cancel().await?;
 
@@ -3872,7 +5008,7 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
             && is_busy_response(&exit_text)
-            && !exit_text.contains(">>>")
+            && !exit_text.contains("You are now leaving help")
         {
             sleep(Duration::from_millis(50)).await;
             exit_text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
@@ -3880,10 +5016,7 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
     }
     if is_busy_response(&exit_text) {
         session.cancel().await?;
-        return Err(format!(
-            "interactive help() did not return to the Python prompt: {exit_text:?}"
-        )
-        .into());
+        return Err(format!("interactive help() did not finish after q: {exit_text:?}").into());
     }
     let exit_visible = visible_reply_text(&exit_text)?;
 
@@ -3911,12 +5044,8 @@ async fn python_help_flows_stay_inline() -> TestResult<()> {
     );
     assert_no_pager_markers(&exit_visible, "help() roundtrip");
     assert!(
-        exit_visible.contains(">>>"),
-        "expected interactive help() to return to the Python prompt, got: {exit_visible:?}"
-    );
-    assert!(
         follow_up_text.contains("2"),
-        "expected a ready prompt after interactive help(), got: {follow_up_text:?}"
+        "expected follow-up cell after interactive help(), got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -4001,8 +5130,12 @@ async fn python_trailing_prompt_shaped_stdout_stays_visible() -> TestResult<()> 
     }
 
     assert!(
-        text.contains("PROMPT_STDOUT>>> >>> "),
-        "expected trailing prompt-shaped stdout and worker prompt to both remain visible, got: {text:?}"
+        text.contains("PROMPT_STDOUT>>> "),
+        "expected trailing prompt-shaped stdout to remain visible, got: {text:?}"
+    );
+    assert!(
+        !text.contains("PROMPT_STDOUT>>> >>> "),
+        "completed cells should not append an idle Python prompt, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -4030,8 +5163,8 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
         .await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
-        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
-        "expected prompt after interrupt, got: {interrupt_text:?}"
+        !is_busy_response(&interrupt_text) && interrupt_text.contains("KeyboardInterrupt"),
+        "expected interrupt to complete with KeyboardInterrupt, got: {interrupt_text:?}"
     );
 
     let deadline = interrupt_recovery_deadline();
@@ -4077,7 +5210,7 @@ async fn python_ctrl_c_prefix_preserves_followup_fresh_input_batch() -> TestResu
     let mut text = result_text(
         &session
             .write_stdin_raw_with(
-                "\u{3}value = input('after> ')\nqueued-answer\nprint('AFTER_STALE_INTERRUPT', value.strip())",
+                "\u{3}value = input('after> ')\nprint('AFTER_STALE_INTERRUPT', value.strip())",
                 Some(5.0),
             )
             .await?,
@@ -4092,6 +5225,15 @@ async fn python_ctrl_c_prefix_preserves_followup_fresh_input_batch() -> TestResu
         text = result_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
     }
 
+    assert!(
+        text.contains("after> "),
+        "expected fresh cell after ctrl-c prefix to reach input prompt, got: {text:?}"
+    );
+
+    let answer = session
+        .write_stdin_raw_with("queued-answer", Some(5.0))
+        .await?;
+    let text = result_text(&answer);
     session.cancel().await?;
 
     assert!(
@@ -4562,8 +5704,8 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
         .await?;
     let interrupt_text = result_text(&interrupt_result);
     assert!(
-        !is_busy_response(&interrupt_text) && interrupt_text.contains(">>>"),
-        "expected prompt after interrupt, got: {interrupt_text:?}"
+        !is_busy_response(&interrupt_text) && interrupt_text.contains("KeyboardInterrupt"),
+        "expected interrupt to complete with KeyboardInterrupt, got: {interrupt_text:?}"
     );
 
     let poll_result = session.write_stdin_raw_with("", Some(0.5)).await?;
@@ -4623,7 +5765,7 @@ async fn python_multistatement_payload_completes() -> TestResult<()> {
     };
 
     let result = session
-        .write_stdin_raw_with("def f():\n    return 3\n\nf()\nprint('done')", Some(5.0))
+        .write_stdin_raw_with("def f():\n    return 3\n\nprint('done')\nf()", Some(5.0))
         .await?;
     let text = result_text(&result);
     if is_busy_response(&text) {
@@ -4647,17 +5789,132 @@ async fn python_exception_reported_in_output() -> TestResult<()> {
 
     let result = session.write_stdin_raw_with("1/0", Some(5.0)).await?;
     let text = result_text(&result);
+    let plain_text = strip_ansi_controls(&text);
     if is_busy_response(&text) {
         eprintln!("python_exception_reported_in_output remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
     assert!(
-        text.contains("ZeroDivisionError"),
+        plain_text.contains("ZeroDivisionError"),
         "expected traceback, got: {text:?}"
+    );
+    assert!(
+        plain_text.contains("File \"<mcp-repl>\", line 1"),
+        "expected traceback to point at the user cell, got: {text:?}"
+    );
+    assert!(
+        !plain_text.contains("_mcp_repl_run_cell") && !plain_text.contains("File \"<string>\""),
+        "traceback should not expose the cell runner frame, got: {text:?}"
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_compile_syntax_error_hides_cell_runner_frames() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("return 1", Some(5.0)).await?;
+    let text = result_text(&result);
+    let plain_text = strip_ansi_controls(&text);
+    if is_busy_response(&text) {
+        eprintln!("python_compile_syntax_error_hides_cell_runner_frames remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        plain_text.contains("SyntaxError"),
+        "expected SyntaxError, got: {text:?}"
+    );
+    assert!(
+        plain_text.contains("File \"<mcp-repl>\", line 1"),
+        "expected syntax error to point at the user cell, got: {text:?}"
+    );
+    assert!(
+        !text.contains("_mcp_repl_run_cell")
+            && !text.contains("_mcp_repl_compile_complete")
+            && !text.contains("File \"<string>\""),
+        "traceback should not expose cell runner frames, got: {text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with(
+            r#"import sys
+print("SYS_LAST_TRACEBACK_IS_NONE", sys.last_traceback is None)
+print("SYS_LAST_EXC_TRACEBACK_IS_NONE", sys.last_exc.__traceback__ is None)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("SYS_LAST_TRACEBACK_IS_NONE True"),
+        "expected sys.last_traceback to omit cell runner frames, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_EXC_TRACEBACK_IS_NONE True"),
+        "expected sys.last_exc traceback to omit cell runner frames, got: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_cell_exception_updates_sys_last_exception() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session.write_stdin_raw_with("1/0", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_cell_exception_updates_sys_last_exception remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let follow_up = session
+        .write_stdin_raw_with(
+            r#"import sys
+print("SYS_LAST_VALUE", type(sys.last_value).__name__, str(sys.last_value))
+print("SYS_LAST_TYPE", sys.last_type.__name__)
+print("SYS_LAST_TRACEBACK", sys.last_traceback.tb_frame.f_code.co_filename, sys.last_traceback.tb_lineno)
+print("SYS_LAST_EXC", getattr(sys, "last_exc", sys.last_value) is sys.last_value)
+print("SYS_LAST_EXC_TRACEBACK", sys.last_exc.__traceback__ is sys.last_traceback)
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("SYS_LAST_VALUE ZeroDivisionError division by zero"),
+        "expected sys.last_value to preserve the failed cell exception, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_TYPE ZeroDivisionError"),
+        "expected sys.last_type to preserve the failed cell exception type, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_TRACEBACK <mcp-repl> 1"),
+        "expected sys.last_traceback to point at the failed user cell, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_EXC True"),
+        "expected sys.last_exc to match sys.last_value when available, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("SYS_LAST_EXC_TRACEBACK True"),
+        "expected sys.last_exc to carry the same traceback as sys.last_traceback, got: {follow_up_text:?}"
+    );
     Ok(())
 }
 
@@ -4669,7 +5926,10 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
     };
 
     let result = session
-        .write_stdin_raw_with("import pdb; pdb.set_trace()", Some(1.0))
+        .write_stdin_raw_with(
+            "value = 41\nbreakpoint()\nvalue += 1\nprint('PDB_AFTER_CONTINUE', value)",
+            Some(1.0),
+        )
         .await?;
     let text = result_text(&result);
     if is_busy_response(&text) {
@@ -4679,6 +5939,28 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
     }
     assert!(text.contains("(Pdb)"), "expected pdb prompt, got: {text:?}");
 
+    let result = session.write_stdin_raw_with("p value", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python_pdb_roundtrip remained busy after p value".into());
+    }
+    assert!(
+        text.contains("41") && text.contains("(Pdb)"),
+        "expected pdb to print value and stay at prompt, got: {text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("n", Some(5.0)).await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        session.cancel().await?;
+        return Err("python_pdb_roundtrip remained busy after next".into());
+    }
+    assert!(
+        text.contains("(Pdb)"),
+        "expected pdb prompt after next, got: {text:?}"
+    );
+
     let result = session.write_stdin_raw_with("c", Some(5.0)).await?;
     let text = result_text(&result);
     if is_busy_response(&text) {
@@ -4686,8 +5968,8 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
         return Err("python_pdb_roundtrip remained busy after continue".into());
     }
     assert!(
-        text.contains(">>>"),
-        "expected python prompt after continue, got: {text:?}"
+        text.contains("PDB_AFTER_CONTINUE 42"),
+        "expected Python cell to resume after pdb continue, got: {text:?}"
     );
 
     session.cancel().await?;
@@ -4695,19 +5977,19 @@ async fn python_pdb_roundtrip() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
+async fn python_input_consumes_follow_up_line() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
     let result = session
-        .write_stdin_raw_with("x = input('p> ')\nhello\nprint('got', x)", Some(5.0))
+        .write_stdin_raw_with("x = input('p> ')\nprint('got', x)", Some(1.0))
         .await?;
     let mut text = result_text(&result);
     if is_busy_response(&text) {
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("got hello") {
+        while Instant::now() < deadline && is_busy_response(&text) && !text.contains("p> ") {
             sleep(Duration::from_millis(50)).await;
             text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
         }
@@ -4718,20 +6000,23 @@ async fn python_input_can_consume_buffered_lines() -> TestResult<()> {
         return Ok(());
     }
     assert!(
-        text.contains("got hello"),
-        "expected input() to consume buffered hello, got: {text:?}"
-    );
-    assert!(
         text.contains("p> "),
-        "expected buffered input() prompt to stay visible, got: {text:?}"
+        "expected input() prompt to stay visible, got: {text:?}"
     );
 
+    let answer = session.write_stdin_raw_with("hello", Some(5.0)).await?;
+    let text = result_text(&answer);
     session.cancel().await?;
+
+    assert!(
+        text.contains("got hello"),
+        "expected input() to consume follow-up hello, got: {text:?}"
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_buffered_input_prompt_matching_primary_prompt_stays_visible() -> TestResult<()> {
+async fn python_input_prompt_matching_primary_prompt_stays_visible() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -4742,26 +6027,33 @@ async fn python_buffered_input_prompt_matching_primary_prompt_stays_visible() ->
             r#"import sys
 sys.ps1 = "same> "
 value = input("same> ")
-buffered
 print("MATCHED_PROMPT_VALUE", value)
 "#,
-            Some(5.0),
+            Some(1.0),
         )
         .await?;
     let text = result_text(&result);
-    session.cancel().await?;
 
     assert!(
         !is_busy_response(&text),
-        "expected buffered input request to complete, got: {text:?}"
+        "expected input request to reach prompt, got: {text:?}"
     );
     assert!(
-        text.matches("same> ").count() >= 2,
-        "expected input() prompt matching sys.ps1 and final prompt to stay visible, got: {text:?}"
+        text.contains("same> "),
+        "expected input() prompt matching sys.ps1 to stay visible, got: {text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("buffered", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        !answer_text.contains("same> "),
+        "completed cells should not render final prompt matching sys.ps1, got: {answer_text:?}"
     );
     assert!(
-        text.contains("MATCHED_PROMPT_VALUE buffered"),
-        "expected input() to consume buffered line, got: {text:?}"
+        answer_text.contains("MATCHED_PROMPT_VALUE buffered"),
+        "expected input() to consume follow-up line, got: {answer_text:?}"
     );
     Ok(())
 }
@@ -4829,5 +6121,214 @@ wait_and_print()
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_background_input_after_cell_return_completes_answer_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+import threading, time
+background_answer = None
+background_waiting = threading.Event()
+
+def background():
+    global background_answer
+    background_waiting.set()
+    background_answer = input('bg> ')
+    print('BACKGROUND_ANSWER', background_answer)
+
+threading.Thread(target=background, daemon=True).start()
+background_waiting.wait()
+time.sleep(0.2)
+print('CELL_RETURNED')
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&result);
+    assert!(
+        !is_busy_response(&setup_text),
+        "expected background input prompt setup to complete, got: {setup_text:?}"
+    );
+    assert!(
+        setup_text.contains("bg> "),
+        "expected background input prompt, got: {setup_text:?}"
+    );
+
+    let mut settled_text = setup_text.clone();
+    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < settle_deadline && !settled_text.contains("CELL_RETURNED") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        settled_text.push_str(&result_text(&poll));
+    }
+    assert!(
+        settled_text.contains("CELL_RETURNED"),
+        "expected foreground cell to return while background input stayed live, got: {settled_text:?}"
+    );
+    assert!(
+        settled_text.contains("bg> "),
+        "expected background input prompt to remain visible after foreground cell return, got: {settled_text:?}"
+    );
+
+    let answer = session.write_stdin_raw_with("ok", Some(1.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&answer_text),
+        "background input answer should complete its request, got: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("BACKGROUND_ANSWER ok"),
+        "expected background input answer output, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_background_input_consumes_buffered_lines_from_one_answer_turn() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+import threading, time
+background_waiting = threading.Event()
+
+def background():
+    background_waiting.set()
+    first = input('bg1> ')
+    second = input('bg2> ')
+    print('BACKGROUND_BOTH', first, second)
+
+threading.Thread(target=background, daemon=True).start()
+background_waiting.wait()
+time.sleep(0.2)
+print('CELL_RETURNED')
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&result);
+    assert!(
+        !is_busy_response(&setup_text),
+        "expected background input setup to complete, got: {setup_text:?}"
+    );
+    assert!(
+        setup_text.contains("bg1> "),
+        "expected first background input prompt, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+
+    let answer = session.write_stdin_raw_with("one\ntwo", Some(1.0)).await?;
+    let mut answer_text = result_text(&answer);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !answer_text.contains("BACKGROUND_BOTH one two") {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        answer_text.push_str(&result_text(&poll));
+    }
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains("BACKGROUND_BOTH one two"),
+        "expected one answer turn to satisfy both background input() calls, got: {answer_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_background_input_discards_extra_answer_lines_before_next_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let result = session
+        .write_stdin_raw_with(
+            r#"
+import threading, time
+background_waiting = threading.Event()
+
+def background():
+    background_waiting.set()
+    answer = input('bg> ')
+    print('BACKGROUND_ANSWER', answer)
+
+threading.Thread(target=background, daemon=True).start()
+background_waiting.wait()
+time.sleep(0.2)
+print('CELL_RETURNED')
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&result);
+    assert!(
+        !is_busy_response(&setup_text),
+        "expected background input prompt setup to complete, got: {setup_text:?}"
+    );
+    assert!(
+        setup_text.contains("bg> "),
+        "expected background input prompt, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+
+    let answer = session.write_stdin_raw_with("one\ntwo", Some(1.0)).await?;
+    let answer_text = result_text(&answer);
+    assert!(
+        !is_busy_response(&answer_text),
+        "background input answer should complete its request, got: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("BACKGROUND_ANSWER one"),
+        "expected background input to consume the first line, got: {answer_text:?}"
+    );
+
+    let foreground = session
+        .write_stdin_raw_with(
+            "foreground = input('fg> ')\nprint('FOREGROUND_ANSWER', foreground)",
+            Some(1.0),
+        )
+        .await?;
+    let foreground_text = result_text(&foreground);
+    assert!(
+        !is_busy_response(&foreground_text),
+        "expected foreground input prompt, got: {foreground_text:?}"
+    );
+    assert!(
+        foreground_text.contains("fg> "),
+        "expected foreground input to wait for fresh input, got: {foreground_text:?}"
+    );
+    assert!(
+        !foreground_text.contains("FOREGROUND_ANSWER two"),
+        "foreground input consumed stale detached stdin tail: {foreground_text:?}"
+    );
+
+    let fresh = session.write_stdin_raw_with("fresh", Some(5.0)).await?;
+    let fresh_text = result_text(&fresh);
+    session.cancel().await?;
+
+    assert!(
+        fresh_text.contains("FOREGROUND_ANSWER fresh"),
+        "expected foreground input to consume fresh line, got: {fresh_text:?}"
+    );
     Ok(())
 }

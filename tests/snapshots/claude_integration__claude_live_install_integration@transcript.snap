@@ -16,6 +16,7 @@ permission_mode: dontAsk
 1) mcp__r__repl
 >>> cat("CLAUDE_MCP_OK\n")
 <<< CLAUDE_MCP_OK
+<<< > 
 
 2) DONE
 result: DONE (end_turn)

@@ -23,8 +23,80 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn result_image_count(result: &rmcp::model::CallToolResult) -> usize {
+    result
+        .content
+        .iter()
+        .filter(|item| matches!(item.raw, RawContent::Image(_)))
+        .count()
+}
+
+fn first_image_index(result: &rmcp::model::CallToolResult) -> Option<usize> {
+    result
+        .content
+        .iter()
+        .position(|item| matches!(item.raw, RawContent::Image(_)))
+}
+
+fn first_text_index_containing(
+    result: &rmcp::model::CallToolResult,
+    needle: &str,
+) -> Option<usize> {
+    result.content.iter().position(|item| match &item.raw {
+        RawContent::Text(text) => text.text.contains(needle),
+        _ => false,
+    })
+}
+
+fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+    let end = text.find(suffix)?.saturating_add(suffix.len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
+}
+
+fn events_log_path(text: &str) -> Option<PathBuf> {
+    disclosed_path(text, "events.log")
+}
+
 fn read_optional(path: &std::path::Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
+}
+
+#[cfg(target_family = "unix")]
+fn extract_prefixed_value(text: &str, prefix: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .map(str::to_string)
+}
+
+#[cfg(target_family = "unix")]
+fn first_logged_pid(log: &str) -> Option<u32> {
+    log.lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.parse().ok())
+}
+
+#[cfg(target_family = "unix")]
+fn process_is_running(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_family = "unix")]
+fn wait_for_process_exit(pid: u32) -> TestResult<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !process_is_running(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!("expected process {pid} to exit after session_end respawn").into())
 }
 
 fn wait_for_log_contains(path: &std::path::Path, needle: &str) -> TestResult<String> {
@@ -119,6 +191,29 @@ async fn spawn_zod_server_with_extra_args(
     control_log: &std::path::Path,
     extra_args: Vec<String>,
 ) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(control_log, Vec::new(), extra_args).await
+}
+
+async fn spawn_zod_server_with_extra_env_and_extra_args(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        control_log,
+        extra_env,
+        Vec::new(),
+        extra_args,
+    )
+    .await
+}
+
+async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    server_env: Vec<(String, String)>,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
     let mut env = Map::new();
@@ -126,6 +221,9 @@ async fn spawn_zod_server_with_extra_args(
         "MCP_REPL_ZOD_CONTROL_LOG".to_string(),
         Value::String(control_log.display().to_string()),
     );
+    for (key, value) in extra_env {
+        env.insert(key.to_string(), Value::String(value.to_string()));
+    }
     let spec = json!({
         "executable": zod_worker_path()?,
         "args": [],
@@ -144,11 +242,73 @@ async fn spawn_zod_server_with_extra_args(
         "files".to_string(),
     ];
     args.extend(extra_args);
-    common::spawn_server_with_args(args).await
+    common::spawn_server_with_args_env(args, server_env).await
 }
 
 async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::McpTestSession> {
     spawn_zod_server_with_extra_args(control_log, Vec::new()).await
+}
+
+async fn spawn_zod_startup_ready_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![("MCP_REPL_ZOD_STARTUP_READY", "1")],
+        Vec::new(),
+    )
+    .await
+}
+
+async fn spawn_zod_delayed_interrupt_ready_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![
+            ("MCP_REPL_ZOD_STARTUP_READY", "1"),
+            ("MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS", "200"),
+        ],
+        Vec::new(),
+    )
+    .await
+}
+
+async fn spawn_zod_pager_server(
+    control_log: &std::path::Path,
+    page_chars: u64,
+) -> TestResult<common::McpTestSession> {
+    let tempdir = tempfile::tempdir()?;
+    let spec_path = tempdir.path().join("zod-worker.json");
+    let mut env = Map::new();
+    env.insert(
+        "MCP_REPL_ZOD_CONTROL_LOG".to_string(),
+        Value::String(control_log.display().to_string()),
+    );
+    let spec = json!({
+        "executable": zod_worker_path()?,
+        "args": [],
+        "working_dir": "inherit",
+        "env": env,
+        "stdin": "pipe",
+        "sandbox": "server"
+    });
+    std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
+    common::spawn_server_with_args_env(
+        vec![
+            "--worker-spec".to_string(),
+            spec_path.display().to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--oversized-output".to_string(),
+            "pager".to_string(),
+        ],
+        vec![(
+            "MCP_REPL_PAGER_PAGE_CHARS".to_string(),
+            page_chars.to_string(),
+        )],
+    )
+    .await
 }
 
 async fn spawn_zod_stalled_control_server(
@@ -286,7 +446,11 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
     );
     assert!(
         !text.contains("v5> hello v5"),
-        "default reply must elide synthetic input_line echo, got: {text:?}"
+        "leading generated input_line echo should be absent, got: {text:?}"
+    );
+    assert!(
+        text.contains("v5> "),
+        "expected worker prompt after v5 output, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_batch input=hello v5")?;
@@ -296,6 +460,996 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_startup_ready_server(&control_log).await?;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        session.call_tool_raw(
+            "repl",
+            json!({
+                "input": "prompt-free startup",
+                "timeout_ms": 20_000
+            }),
+        ),
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result?,
+        Err(_) => {
+            session.cancel().await?;
+            panic!(
+                "startup ready should accept first input without waiting for input_wait timeout"
+            );
+        }
+    };
+    let text = result_text(&result);
+
+    assert!(
+        text.contains("v5-output: prompt-free startup\n"),
+        "expected custom worker startup ready to accept first input, got: {text:?}"
+    );
+    let log = wait_for_log_contains(&control_log, "ready")?;
+    assert!(
+        log.contains("input_batch input=prompt-free startup"),
+        "expected first input after startup ready, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_prefix_waits_for_fresh_ready() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_delayed_interrupt_ready_server(&control_log).await?;
+
+    let result = session
+        .write_stdin_raw_with("\u{3}after fresh ready", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("v5-output: after fresh ready\n"),
+        "expected interrupt tail to run after fresh readiness, got: {text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "fresh_ready_after_interrupt")?;
+    let fresh_ready_idx = log
+        .find("fresh_ready_after_interrupt")
+        .expect("fresh readiness log should be present");
+    let input_idx = log
+        .find("input_batch input=after fresh ready")
+        .expect("interrupt tail input log should be present");
+    assert!(
+        fresh_ready_idx < input_idx,
+        "expected tail input only after fresh readiness, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_hidden_input_echoes_do_not_evict_visible_output() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let hidden_payload = "h".repeat(300_000);
+    let input = format!(
+        "repeat-output 1700000\nsilent {hidden_payload}\nsilent {hidden_payload}\nsilent {hidden_payload}"
+    );
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("ZOD_BEGIN"),
+        "hidden input echoes should not evict the beginning of visible pager output, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--"),
+        "expected the anchored output to remain paged, got: {text:?}"
+    );
+    assert!(
+        !text.contains("output gap detected") && !text.contains("output truncated"),
+        "hidden input echoes should not create a visible output gap, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_leading_hidden_input_echo_does_not_consume_first_page_budget() -> TestResult<()>
+{
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let hidden_payload = "h".repeat(30_000);
+    let input = format!("silent {hidden_payload}\nrepeat-output 10000");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("ZOD_BEGIN"),
+        "leading hidden input echo should not evict the first visible pager output, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--"),
+        "expected the visible output to remain paged, got: {text:?}"
+    );
+    assert!(
+        !text.contains("silent "),
+        "leading input echo should stay hidden in pager replies, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_refresh_keeps_later_input_echo_hidden() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "pager-refresh-input-echo",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let first_text = result_text(&result);
+    assert!(
+        first_text.contains("<<repl status: busy") && first_text.contains("--More--"),
+        "expected timed-out request with active pager, got: {first_text:?}"
+    );
+
+    wait_for_log_contains(&control_log, "refresh_pager_tail")?;
+    let tail = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": ":seek @8500",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let tail_text = result_text(&tail);
+
+    session.cancel().await?;
+
+    assert!(
+        tail_text.contains("ZOD_REFRESH_TAIL"),
+        "expected refreshed pager tail output, got: {tail_text:?}"
+    );
+    assert!(
+        !tail_text.contains("v5> refreshed-hidden-echo"),
+        "refreshed input echo should remain transcript-only in pager output, got: {tail_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.starts_with("stderr: boom\n"),
+        "hidden input echoes should not create a leading blank line before stderr, got: {text:?}"
+    );
+    assert!(
+        !text.contains("v5> emit-stderr-after-input"),
+        "leading generated input_line echo should be absent, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_reset_clears_stderr_prefix_state() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stderr",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("stderr: partial"),
+        "expected first reply to drain partial stderr, got: {first_text:?}"
+    );
+
+    let reset = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{4}",
+                "timeout_ms": 1_000
+            }),
+        )
+        .await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("[repl] new session started"),
+        "expected reset to restart the worker, got: {reset_text:?}"
+    );
+
+    let stderr_after_stderr = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let stderr_after_stderr_text = result_text(&stderr_after_stderr);
+    assert!(
+        stderr_after_stderr_text.starts_with("stderr: boom\n"),
+        "reset should restore stderr prefixing after partial stderr, got: {stderr_after_stderr_text:?}"
+    );
+
+    let stdout = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stdout",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let stdout_text = result_text(&stdout);
+    assert!(
+        stdout_text.contains("partial"),
+        "expected reply to drain partial stdout, got: {stdout_text:?}"
+    );
+
+    let reset = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{4}",
+                "timeout_ms": 1_000
+            }),
+        )
+        .await?;
+    let reset_text = result_text(&reset);
+    assert!(
+        reset_text.contains("[repl] new session started"),
+        "expected second reset to restart the worker, got: {reset_text:?}"
+    );
+
+    let stderr_after_stdout = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let stderr_after_stdout_text = result_text(&stderr_after_stdout);
+    assert!(
+        stderr_after_stdout_text.starts_with("stderr: boom\n"),
+        "reset should not add stale stdout separation before fresh stderr, got: {stderr_after_stdout_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_stderr_label_starts_after_unterminated_stdout() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stdout-then-newline-stderr",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("partial\nstderr: \nerr\n"),
+        "stderr label should start on a fresh line after partial stdout, got: {text:?}"
+    );
+    assert!(
+        !text.contains("partialstderr:"),
+        "stderr label should not be concatenated to partial stdout, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_hidden_input_echo_preserves_unterminated_stdout_before_stderr() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stdout\nemit-stderr-after-input",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("partial\nstderr: boom\n"),
+        "hidden input echo should not hide unterminated stdout before stderr, got: {text:?}"
+    );
+    assert!(
+        !text.contains("partialstderr:"),
+        "stderr label should not be concatenated to partial stdout across hidden input echo, got: {text:?}"
+    );
+    assert!(
+        !text.contains("v5> emit-stderr-after-input"),
+        "generated input_line echo should be absent, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-then-exit",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xC3\n[repl] session ended\n"),
+        "session-end notice should start after the flushed partial UTF-8 tail, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3[repl]"),
+        "session-end notice should not be concatenated to an escaped UTF-8 tail, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-before-delayed-image",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let timeout_text = result_text(&timed_out);
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert!(
+        !timeout_text.contains("é"),
+        "timeout reply should not wait for the delayed UTF-8 tail grace, got: {timeout_text:?}"
+    );
+    assert_eq!(
+        result_image_count(&timed_out),
+        1,
+        "timeout reply should include the image emitted before the timeout"
+    );
+
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&completed);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xA9"),
+        "the delayed UTF-8 continuation should remain available on the follow-up poll, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-stderr-then-sleep",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let timeout_text = result_text(&timed_out);
+
+    session.cancel().await?;
+
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert!(
+        timeout_text.contains("\\xC3"),
+        "timeout drain should flush an incomplete leading UTF-8 tail, got: {timeout_text:?}"
+    );
+    assert!(
+        timeout_text.contains("stderr: tail-visible\n"),
+        "timeout drain should expose later stderr after an incomplete UTF-8 tail, got: {timeout_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_timeout_does_not_wait_for_utf8_tail_grace_after_expiry() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let started = std::time::Instant::now();
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-then-sleep",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    let timeout_text = result_text(&timed_out);
+
+    session.cancel().await?;
+
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the incomplete UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "timeout should not wait for the UTF-8 tail grace after expiry; elapsed {elapsed:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-utf8-then-exit",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xC3\n[repl] session ended\n"),
+        "pager final reply should flush the partial UTF-8 tail before the session-end notice, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3[repl]"),
+        "session-end notice should not be concatenated to an escaped UTF-8 tail, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_timeout_drains_event_after_incomplete_utf8() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let timed_out = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-before-delayed-image",
+                "timeout_ms": 50
+            }),
+        )
+        .await?;
+    let timeout_text = result_text(&timed_out);
+
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
+    );
+    assert!(
+        !timeout_text.contains("é"),
+        "pager timeout should not wait for the delayed UTF-8 tail grace, got: {timeout_text:?}"
+    );
+    assert_eq!(
+        result_image_count(&timed_out),
+        1,
+        "pager timeout should include the image emitted before the timeout"
+    );
+
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&completed);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("\\xA9"),
+        "the delayed UTF-8 continuation should remain available on the pager follow-up poll, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_preserves_equal_offset_update_notice_before_image() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 1_000).await?;
+
+    let initial = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "output-source-image",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    assert_eq!(
+        result_image_count(&initial),
+        1,
+        "expected initial image to establish update state"
+    );
+
+    let update = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "output-image-update-with-tail",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+
+    session.cancel().await?;
+
+    let notice = "[repl] image update from previous request shown as a new image";
+    let notice_index = first_text_index_containing(&update, notice)
+        .ok_or("expected image update notice in pager reply")?;
+    let image_index = first_image_index(&update).ok_or_else(|| {
+        format!(
+            "expected updated image in pager reply, got content order: {:?}",
+            update.content
+        )
+    })?;
+    assert!(
+        notice_index < image_index,
+        "expected equal-offset update notice before image, got content order: {:?}",
+        update.content
+    );
+
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_raw_split_utf8_survives_input_wait_marker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "raw-split-utf8-around-input-wait",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+
+    wait_for_log_contains(&control_log, "input_wait")?;
+    std::thread::sleep(Duration::from_millis(250));
+
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&completed);
+    let combined_text = format!("{first_text}{text}");
+
+    session.cancel().await?;
+
+    assert!(
+        combined_text.contains("é\n"),
+        "split raw UTF-8 should render as one character after input_wait, got: {combined_text:?}"
+    );
+    assert!(
+        !combined_text.contains("\\xC3") && !combined_text.contains("\\xA9"),
+        "split raw UTF-8 should not render as escaped bytes, got: {combined_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_pager_server(&control_log, 4_000).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "output-matching-input-line",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("v5> output-matching-input-line\nVISIBLE\n"),
+        "output_text that matches input_line metadata should remain visible in pager mode, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_settles_split_utf8_tail_before_request_boundary() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é\n"),
+        "completion should combine delayed UTF-8 continuation bytes before the request boundary, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "completion should not seal split UTF-8 bytes when the continuation arrives during settle, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-then-more-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é after\n"),
+        "completion should keep settling after UTF-8 recovery near the grace deadline, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "completion should not seal split UTF-8 bytes when the continuation arrives during settle, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let start = std::time::Instant::now();
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-then-continuous-output-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let elapsed = start.elapsed();
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        elapsed < Duration::from_millis(1_600),
+        "completion should cap UTF-8 settle even when later output prevents stability; elapsed {elapsed:?}, got: {text:?}"
+    );
+    assert!(
+        text.contains("é"),
+        "completion should include UTF-8 recovery before the cap, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "partial-stderr-utf8-then-late-stderr-after-completion",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        !first_text.contains("\\xC3"),
+        "completed request should keep an incomplete UTF-8 tail detached, got: {first_text:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let second_text = result_text(&second);
+
+    session.cancel().await?;
+
+    assert!(
+        second_text.contains("stderr: \\xC3stderr: after\n"),
+        "request boundary should reset stderr rendering after sealing the prior UTF-8 tail, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("stderr: \\xC3after\n"),
+        "stderr rendering state leaked across the sealed UTF-8 tail, got: {second_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-interleaved-stderr",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("é"),
+        "split stdout UTF-8 should render as one character, got: {text:?}"
+    );
+    assert!(
+        text.contains("stderr: err\n"),
+        "interleaved stderr should remain visible, got: {text:?}"
+    );
+    let stdout_index = text
+        .find("é")
+        .expect("split stdout UTF-8 should render as one character");
+    let stderr_index = text
+        .find("stderr: err\n")
+        .expect("interleaved stderr should remain visible");
+    assert!(
+        stdout_index < stderr_index,
+        "split stdout UTF-8 should keep its original position before stderr, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "split stdout UTF-8 should not render as escaped bytes, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_v5_split_utf8_stdout_stays_before_interleaved_image() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "split-utf8-before-image",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    let image_index = result
+        .content
+        .iter()
+        .position(|item| matches!(item.raw, RawContent::Image(_)))
+        .ok_or("expected interleaved image in reply")?;
+    let text_before_image = result.content[..image_index]
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    assert!(
+        text_before_image.contains("é"),
+        "split stdout UTF-8 should render before the following image, got contents: {:?}",
+        result.content
+    );
+    assert!(
+        text.contains("é"),
+        "split stdout UTF-8 should render as one character, got: {text:?}"
+    );
+    assert!(
+        !text.contains("\\xC3") && !text.contains("\\xA9"),
+        "split stdout UTF-8 should not render as escaped bytes, got: {text:?}"
+    );
+
     Ok(())
 }
 
@@ -351,6 +1505,459 @@ async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<(
     Ok(())
 }
 
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-park",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "park_after_session_end")?;
+    let old_pid = first_logged_pid(&log).ok_or("expected zod worker pid in control log")?;
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "write-session-temp-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let mut second_text = result_text(&second);
+    if !second_text.contains("session-temp-marker: ") {
+        assert!(
+            second_text.contains("session ended") || second_text.contains("session_end"),
+            "expected session_end before respawn, got: {second_text:?}"
+        );
+        let third = session
+            .call_tool_raw(
+                "repl",
+                json!({
+                    "input": "write-session-temp-marker",
+                    "timeout_ms": 10_000
+                }),
+            )
+            .await?;
+        second_text = result_text(&third);
+    }
+    let marker = extract_prefixed_value(&second_text, "session-temp-marker: ")
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("expected respawned worker temp marker, got: {second_text:?}"))?;
+    assert!(
+        marker.exists(),
+        "expected respawned worker marker to exist before old worker cleanup: {}",
+        marker.display()
+    );
+
+    let exit_result = wait_for_process_exit(old_pid);
+    assert!(
+        marker.exists(),
+        "old worker cleanup removed respawned worker temp marker: {}",
+        marker.display()
+    );
+    session.cancel().await?;
+    exit_result
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_drops_late_raw_stdout_from_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let late_raw_marker = tempdir.path().join("late-raw-marker");
+    let late_raw_marker_env = late_raw_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![("MCP_REPL_ZOD_LATE_RAW_MARKER", late_raw_marker_env.as_str())],
+        Vec::new(),
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-raw-after-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+    wait_for_log_contains(&control_log, "waiting_late_raw_marker")?;
+
+    let control_log_for_thread = control_log.clone();
+    let late_raw_marker_for_thread = late_raw_marker.clone();
+    let marker_writer = std::thread::spawn(move || -> TestResult<()> {
+        wait_for_log_contains(
+            &control_log_for_thread,
+            "input_batch input=sleep 1000\\nfresh-after-respawn",
+        )?;
+        std::fs::write(&late_raw_marker_for_thread, b"go")?;
+        Ok(())
+    });
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "sleep 1000\nfresh-after-respawn",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    marker_writer
+        .join()
+        .map_err(|_| "late raw marker writer panicked")??;
+    assert!(
+        late_raw_marker.exists(),
+        "expected test marker to trigger old worker raw stdout"
+    );
+
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("v5-output: fresh-after-respawn\n"),
+        "expected replacement worker output, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("STALE_RAW_AFTER_SESSION_END"),
+        "old worker raw stdout leaked into replacement reply: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_preserves_image_after_large_hidden_input_echo() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "36000".to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let hidden = "h".repeat(12_000);
+    let input = format!("silent {hidden}\noutput-image-bytes 12000");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "hidden echo image bundle returned an error: {text:?}"
+    );
+    assert!(
+        text.contains("later content omitted"),
+        "expected tight bundle quota to report omitted hidden transcript tail, got: {text:?}"
+    );
+    assert_eq!(
+        result_image_count(&result),
+        1,
+        "expected the later reply-visible image to remain visible, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_records_hidden_echo_omission_before_later_visible_text() -> TestResult<()>
+{
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "14000".to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let hidden = "h".repeat(24_000);
+    let input = format!("silent {hidden}\nvisible-after-omission\noutput-image-bytes 100");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    let events_log = events_log_path(&text)
+        .unwrap_or_else(|| panic!("expected mixed output bundle events.log, got: {text:?}"));
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "hidden echo ordering bundle returned an error: {text:?}"
+    );
+    let omission_row = events
+        .lines()
+        .position(|line| line.contains("output bundle quota reached"))
+        .unwrap_or_else(|| panic!("expected omission row in events.log, got: {events:?}"));
+    let visible_row = events
+        .lines()
+        .position(|line| {
+            text_row_byte_range(line)
+                .and_then(|(start, end)| transcript.get(start..end))
+                .is_some_and(|slice| slice.contains("v5-output: visible-after-omission"))
+        })
+        .unwrap_or_else(|| {
+            panic!("expected a text row for later visible output in events.log, got: {events:?}")
+        });
+    assert!(
+        omission_row < visible_row,
+        "expected omission row before later visible text row, got events={events:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_reports_hidden_echo_dropped_for_later_raw_text() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            (64 * 1024 * 1024).to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let payload = "i".repeat(512 * 1024);
+    let mut input = String::new();
+    for index in 0..127 {
+        input.push_str(&format!("silent {index:03}-{payload}\n"));
+    }
+    input.push_str("repeat-output 600000\n");
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    let transcript_path = disclosed_path(&text, "transcript.txt")
+        .unwrap_or_else(|| panic!("expected text output bundle, got: {text:?}"));
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "raw-text echo eviction bundle returned an error: {text:?}"
+    );
+    assert!(
+        text.contains("later content omitted"),
+        "expected dropped input echoes to be reported, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("ZOD_BEGIN") && transcript.contains("ZOD_END"),
+        "expected later raw text output to survive input echo eviction, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("silent 000-"),
+        "expected the first hidden input echo to be evicted, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_files_bundle_reports_omitted_input_echoes_past_timeline_capacity() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
+        &control_log,
+        Vec::new(),
+        vec![(
+            "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES".to_string(),
+            "1048576".to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let payload = "i".repeat(512 * 1024);
+    let mut input = String::new();
+    for index in 0..140 {
+        input.push_str(&format!("silent {index:03}-{payload}\n"));
+    }
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": input,
+                "timeout_ms": 30_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    let bundle_path = events_log_path(&text)
+        .or_else(|| disclosed_path(&text, "transcript.txt"))
+        .unwrap_or_else(|| panic!("expected input echo output bundle, got: {text:?}"));
+    let bundle_dir = bundle_path
+        .parent()
+        .unwrap_or_else(|| panic!("bundle path missing parent: {bundle_path:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "oversized input echo bundle returned an error: {text:?}"
+    );
+    assert!(
+        text.contains("later content omitted"),
+        "expected omitted input echoes to be reported, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("silent 000-"),
+        "expected files-mode head retention to keep the first input echo, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("silent 139-"),
+        "expected later input echoes past timeline capacity to be omitted, got: {transcript:?}"
+    );
+    Ok(())
+}
+
+fn text_row_byte_range(line: &str) -> Option<(usize, usize)> {
+    let range = line.strip_prefix('T')?.split(" bytes=").nth(1)?;
+    let range = range.split_whitespace().next()?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+#[cfg(target_family = "unix")]
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_session_end_respawn_drops_late_sideband_from_old_worker() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let late_sideband_marker = tempdir.path().join("late-sideband-marker");
+    let late_sideband_marker_env = late_sideband_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![(
+            "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER",
+            late_sideband_marker_env.as_str(),
+        )],
+        Vec::new(),
+    )
+    .await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "session-end-sideband-after-marker",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("v5>") || first_text.contains("[repl] session ended"),
+        "expected first worker prompt or session end, got: {first_text:?}"
+    );
+    wait_for_log_contains(&control_log, "waiting_late_sideband_marker")?;
+
+    let control_log_for_thread = control_log.clone();
+    let late_sideband_marker_for_thread = late_sideband_marker.clone();
+    let marker_writer = std::thread::spawn(move || -> TestResult<()> {
+        wait_for_log_contains(
+            &control_log_for_thread,
+            "input_batch input=sleep 1000\\nfresh-after-sideband-respawn",
+        )?;
+        std::fs::write(&late_sideband_marker_for_thread, b"go")?;
+        Ok(())
+    });
+
+    let second = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "sleep 1000\nfresh-after-sideband-respawn",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    marker_writer
+        .join()
+        .map_err(|_| "late sideband marker writer panicked")??;
+    assert!(
+        late_sideband_marker.exists(),
+        "expected test marker to trigger old worker sideband output"
+    );
+    wait_for_log_contains(&control_log, "late_sideband_output_after_session_end")?;
+
+    let second_text = result_text(&second);
+    assert!(
+        second_text.contains("v5-output: fresh-after-sideband-respawn\n"),
+        "expected replacement worker output, got: {second_text:?}"
+    );
+    assert!(
+        !second_text.contains("STALE_SIDEBAND_AFTER_SESSION_END"),
+        "old worker sideband output leaked into replacement reply: {second_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_stalls()
 -> TestResult<()> {
@@ -388,7 +1995,7 @@ async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_st
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_elided() -> TestResult<()> {
+async fn zod_worker_v5_input_line_is_ordered_before_output_text_and_rendered() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -410,7 +2017,11 @@ async fn zod_worker_v5_input_line_is_ordered_before_output_text_but_elided() -> 
     );
     assert!(
         !text.contains("v5> emit-output-after-input"),
-        "input_line is structural and should not be rendered by default, got: {text:?}"
+        "leading generated input_line echo should be absent, got: {text:?}"
+    );
+    assert!(
+        text.contains("v5> "),
+        "expected worker prompt after output_text, got: {text:?}"
     );
 
     let log = wait_for_log_contains(&control_log, "input_line text=emit-output-after-input\\n")?;
@@ -634,8 +2245,12 @@ async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> Te
         Some(true),
         "input-wait Ctrl-C must remain a non-error control reply, got: {interrupted_text:?}"
     );
+    assert!(
+        !interrupted_text.contains("<<repl status: busy"),
+        "input-wait Ctrl-C must use cached readiness instead of timing out, got: {interrupted_text:?}"
+    );
 
-    let log = read_optional(&control_log);
+    let log = wait_for_log_contains(&control_log, "interrupt")?;
     assert!(
         log.contains("interrupt"),
         "input-wait Ctrl-C must send payload-free sideband interrupt, got log: {log:?}"

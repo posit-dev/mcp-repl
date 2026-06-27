@@ -26,10 +26,16 @@ const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
+const STARTUP_READY_ENV: &str = "MCP_REPL_ZOD_STARTUP_READY";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
+const LATE_RAW_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_RAW_MARKER";
+const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
+const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
+const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
+const LATE_SIDEBAND_AFTER_SESSION_END: &[u8] = b"STALE_SIDEBAND_AFTER_SESSION_END\n";
 
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 static INTERRUPTED_BY_OS: AtomicBool = AtomicBool::new(false);
@@ -49,6 +55,18 @@ fn run_worker(
     writer: IpcWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
+    let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .parse::<u64>()
+                .map_err(io::Error::other)
+        })
+        .transpose()?;
+    append_control_log(
+        control_log_path.as_deref(),
+        &format!("pid {}", std::process::id()),
+    )?;
     let sideband_interrupted = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
 
@@ -68,10 +86,15 @@ fn run_worker(
     if std::env::var_os(STARTUP_PROTOCOL_ERROR_ENV).is_some() {
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
-    writer.send(&WorkerToServer::InputWait {
-        prompt: "v5> ".to_string(),
-    })?;
-    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    if std::env::var_os(STARTUP_READY_ENV).is_some() {
+        writer.send(&WorkerToServer::Ready {})?;
+        append_control_log(control_log_path.as_deref(), "ready")?;
+    } else {
+        writer.send(&WorkerToServer::InputWait {
+            prompt: "v5> ".to_string(),
+        })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+    }
     if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
         let _sideband_reader = sideband_reader;
         let _turn_tx = tx;
@@ -93,6 +116,7 @@ fn run_worker(
         input_line_after_input_wait: false,
         session_end_after_input_wait: false,
         bad_output_after_input_wait: None,
+        ready_after_turn: false,
     };
     while let Ok(message) = rx.recv() {
         match message {
@@ -107,7 +131,13 @@ fn run_worker(
                     return Ok(());
                 }
             }
-            ControlMessage::Interrupt => {}
+            ControlMessage::Interrupt => {
+                if let Some(millis) = delay_ready_after_interrupt_ms {
+                    thread::sleep(Duration::from_millis(millis));
+                    append_control_log(control_log_path.as_deref(), "fresh_ready_after_interrupt")?;
+                    writer.send(&WorkerToServer::Ready {})?;
+                }
+            }
             ControlMessage::Shutdown => {
                 send_session_end(&writer, "shutdown")?;
                 return Ok(());
@@ -148,9 +178,15 @@ fn run_turn(
         state.previous_line_empty = command.is_empty();
     }
 
-    let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
-    writer.send(&WorkerToServer::InputWait { prompt })?;
-    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    if state.ready_after_turn {
+        state.ready_after_turn = false;
+        writer.send(&WorkerToServer::Ready {})?;
+        append_control_log(control_log_path.as_deref(), "ready")?;
+    } else {
+        let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
+        writer.send(&WorkerToServer::InputWait { prompt })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+    }
     emit_deferred_protocol_faults(writer, control_log_path, state)?;
     Ok(false)
 }
@@ -204,6 +240,189 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "emit-stderr-after-input" {
+        output_stderr_text(writer, control_log_path, b"boom\n")?;
+        return Ok(false);
+    }
+
+    if command == "partial-stdout" {
+        output_text(writer, control_log_path, b"partial")?;
+        return Ok(false);
+    }
+
+    if command == "partial-stderr" {
+        output_stderr_text(writer, control_log_path, b"partial")?;
+        return Ok(false);
+    }
+
+    if command == "partial-stderr-utf8-then-late-stderr-after-completion" {
+        output_stderr_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(950));
+            let _ = output_stderr_text(&writer, &control_log_path, b"after\n");
+        });
+        return Ok(false);
+    }
+
+    if command == "partial-stdout-then-newline-stderr" {
+        output_text(writer, control_log_path, b"partial")?;
+        output_stderr_text(writer, control_log_path, b"\nerr\n")?;
+        return Ok(false);
+    }
+
+    if command == "partial-utf8-then-exit" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        send_session_end(writer, "runtime_exit")?;
+        return Ok(true);
+    }
+
+    if command == "split-utf8-interleaved-stderr" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_stderr_text(writer, control_log_path, b"err\n")?;
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
+        return Ok(false);
+    }
+
+    if command == "split-utf8-before-image" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_image(writer, control_log_path, b"img")?;
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
+        return Ok(false);
+    }
+
+    if command == "split-utf8-before-delayed-image" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_image(writer, control_log_path, b"img")?;
+        sleep_for(200, sideband_interrupted, false);
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
+        return Ok(false);
+    }
+
+    if command == "split-utf8-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_image(writer, control_log_path, b"img")?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9, b'\n'], true);
+        });
+        return Ok(false);
+    }
+
+    if command == "split-utf8-then-more-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
+            thread::sleep(Duration::from_millis(30));
+            let _ = output_text_with_continuation(&writer, &control_log_path, b" after\n", false);
+        });
+        return Ok(false);
+    }
+
+    if command == "split-utf8-then-continuous-output-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
+            for _ in 0..150 {
+                thread::sleep(Duration::from_millis(10));
+                let _ = output_text_with_continuation(&writer, &control_log_path, b".", false);
+            }
+        });
+        return Ok(false);
+    }
+
+    if command == "partial-utf8-stderr-then-sleep" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_stderr_text(writer, control_log_path, b"tail-visible\n")?;
+        sleep_for(200, sideband_interrupted, false);
+        return Ok(false);
+    }
+
+    if command == "partial-utf8-then-sleep" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        sleep_for(200, sideband_interrupted, false);
+        return Ok(false);
+    }
+
+    if command == "raw-split-utf8-around-input-wait" {
+        io::stdout().write_all(&[0xC3])?;
+        io::stdout().flush()?;
+        sleep_for(50, sideband_interrupted, false);
+        writer.send(&WorkerToServer::InputWait {
+            prompt: "v5> ".to_string(),
+        })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+        sleep_for(200, sideband_interrupted, false);
+        io::stdout().write_all(&[0xA9, b'\n'])?;
+        io::stdout().flush()?;
+        return Ok(false);
+    }
+
+    if let Some(len) = command.strip_prefix("output-image-bytes ") {
+        let len: usize = parse_millis(len)?.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "output-image-bytes too large")
+        })?;
+        output_image(writer, control_log_path, &vec![b'i'; len])?;
+        return Ok(false);
+    }
+
+    if command == "output-source-image" {
+        output_source_image(writer, control_log_path, b"img", "zod-source")?;
+        return Ok(false);
+    }
+
+    if command == "output-image-update-with-tail" {
+        output_source_image_update(writer, control_log_path, b"updated-img", "zod-source")?;
+        output_text(writer, control_log_path, &vec![b'z'; 2_000])?;
+        return Ok(false);
+    }
+
+    if let Some(len) = command.strip_prefix("repeat-output ") {
+        let len: usize = parse_millis(len)?
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "repeat-output too large"))?;
+        let mut text = String::with_capacity(len.saturating_add(32));
+        text.push_str("ZOD_BEGIN\n");
+        text.push_str(&"z".repeat(len));
+        text.push_str("\nZOD_END\n");
+        output_text(writer, control_log_path, text.as_bytes())?;
+        return Ok(false);
+    }
+
+    if command == "pager-refresh-input-echo" {
+        let mut text = String::with_capacity(10_032);
+        text.push_str("ZOD_REFRESH_BEGIN\n");
+        text.push_str(&"z".repeat(10_000));
+        text.push_str("\nZOD_REFRESH_FIRST_END\n");
+        output_text(writer, control_log_path, text.as_bytes())?;
+        sleep_for(200, sideband_interrupted, false);
+        writer.send(&WorkerToServer::InputLine {
+            prompt: "v5> ".to_string(),
+            text: "refreshed-hidden-echo\n".to_string(),
+        })?;
+        append_control_log(control_log_path.as_deref(), "refresh_pager_input_line")?;
+        output_text(writer, control_log_path, b"ZOD_REFRESH_TAIL\n")?;
+        append_control_log(control_log_path.as_deref(), "refresh_pager_tail")?;
+        return Ok(false);
+    }
+
+    if command.starts_with("silent ") {
+        return Ok(false);
+    }
+
     if command == "output-matching-input-line" {
         output_text(
             writer,
@@ -220,6 +439,55 @@ fn run_command(
 
     if command == "session-end-after-input-wait" {
         state.session_end_after_input_wait = true;
+        return Ok(false);
+    }
+
+    if command == "session-end-park" {
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "park_after_session_end")?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "session-end-raw-after-marker" {
+        ignore_sigterm_for_late_raw_test();
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "waiting_late_raw_marker")?;
+        wait_for_marker(LATE_RAW_MARKER_ENV)?;
+        io::stdout().write_all(LATE_RAW_AFTER_SESSION_END)?;
+        io::stdout().flush()?;
+        append_control_log(
+            control_log_path.as_deref(),
+            "late_raw_stdout_after_session_end",
+        )?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "session-end-sideband-after-marker" {
+        ignore_sigterm_for_late_raw_test();
+        send_session_end(writer, "runtime_exit")?;
+        append_control_log(control_log_path.as_deref(), "waiting_late_sideband_marker")?;
+        wait_for_marker(LATE_SIDEBAND_MARKER_ENV)?;
+        output_text(writer, control_log_path, LATE_SIDEBAND_AFTER_SESSION_END)?;
+        append_control_log(
+            control_log_path.as_deref(),
+            "late_sideband_output_after_session_end",
+        )?;
+        loop {
+            thread::park();
+        }
+    }
+
+    if command == "write-session-temp-marker" {
+        let session_tmpdir =
+            std::env::var("MCP_REPL_R_SESSION_TMPDIR").map_err(io::Error::other)?;
+        let marker = PathBuf::from(session_tmpdir).join("respawn-marker.txt");
+        std::fs::write(&marker, b"respawned worker marker")?;
+        let text = format!("session-temp-marker: {}\n", marker.display());
+        output_text(writer, control_log_path, text.as_bytes())?;
         return Ok(false);
     }
 
@@ -277,6 +545,64 @@ fn output_text(
     writer.output_text("stdout", bytes)
 }
 
+fn output_text_with_continuation(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    is_continuation: bool,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_text")?;
+    writer.output_text_with_continuation("stdout", bytes, is_continuation)
+}
+
+fn output_stderr_text(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_text stderr")?;
+    writer.output_text("stderr", bytes)
+}
+
+fn output_stderr_text_with_continuation(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    is_continuation: bool,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_text stderr")?;
+    writer.output_text_with_continuation("stderr", bytes, is_continuation)
+}
+
+fn output_image(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_image")?;
+    writer.output_image("image/png", bytes)
+}
+
+fn output_source_image(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    source: &str,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_source_image")?;
+    writer.output_image_with_source("image/png", bytes, false, Some(source))
+}
+
+fn output_source_image_update(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    source: &str,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_image_update")?;
+    writer.output_image_with_source("image/png", bytes, true, Some(source))
+}
+
 fn send_session_end(writer: &IpcWriter, reason: &str) -> io::Result<()> {
     writer.send(&WorkerToServer::SessionEnd {
         reason: reason.to_string(),
@@ -309,6 +635,7 @@ struct CommandState {
     input_line_after_input_wait: bool,
     session_end_after_input_wait: bool,
     bad_output_after_input_wait: Option<Duration>,
+    ready_after_turn: bool,
 }
 
 fn start_control_reader(
@@ -394,6 +721,14 @@ enum WorkerToServer {
     OutputText {
         stream: String,
         data_b64: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_continuation: bool,
+    },
+    OutputImage {
+        mime_type: String,
+        data_b64: String,
+        is_update: bool,
+        source: Option<String>,
     },
     InputLine {
         prompt: String,
@@ -402,6 +737,7 @@ enum WorkerToServer {
     InputWait {
         prompt: String,
     },
+    Ready {},
     SessionEnd {
         reason: String,
         message: Option<String>,
@@ -459,11 +795,44 @@ impl IpcWriter {
     }
 
     fn output_text(&self, stream: &str, bytes: &[u8]) -> io::Result<()> {
+        self.output_text_with_continuation(stream, bytes, false)
+    }
+
+    fn output_text_with_continuation(
+        &self,
+        stream: &str,
+        bytes: &[u8],
+        is_continuation: bool,
+    ) -> io::Result<()> {
         self.send(&WorkerToServer::OutputText {
             stream: stream.to_string(),
             data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            is_continuation,
         })
     }
+
+    fn output_image(&self, mime_type: &str, bytes: &[u8]) -> io::Result<()> {
+        self.output_image_with_source(mime_type, bytes, false, None)
+    }
+
+    fn output_image_with_source(
+        &self,
+        mime_type: &str,
+        bytes: &[u8],
+        is_update: bool,
+        source: Option<&str>,
+    ) -> io::Result<()> {
+        self.send(&WorkerToServer::OutputImage {
+            mime_type: mime_type.to_string(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            is_update,
+            source: source.map(str::to_string),
+        })
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 struct IpcTransport {
@@ -564,6 +933,35 @@ fn parse_millis(value: &str) -> io::Result<u64> {
         .parse::<u64>()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
+
+fn wait_for_marker(env_name: &str) -> io::Result<()> {
+    let marker = std::env::var_os(env_name)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, env_name))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if marker.exists() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for {}", marker.display()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn ignore_sigterm_for_late_raw_test() {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+}
+
+#[cfg(not(target_family = "unix"))]
+fn ignore_sigterm_for_late_raw_test() {}
 
 #[cfg(target_family = "unix")]
 fn install_signal_handler() {

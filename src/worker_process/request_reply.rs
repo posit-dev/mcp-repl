@@ -8,7 +8,6 @@ use crate::output_snapshot::{
     SnapshotWithImages, snapshot_after_completion, snapshot_page_with_images,
 };
 use crate::pager;
-use crate::reply_presentation::{drop_echo_only_contents, maybe_trim_echo_prefix};
 use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
 
 use super::request_lifecycle::RequestState;
@@ -34,7 +33,6 @@ impl WorkerManager {
                 prompt: None,
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -45,13 +43,11 @@ impl WorkerManager {
         page_bytes: u64,
     ) -> ReplyWithOffset {
         self.last_detached_prefix_item_count = context.detached_prefix_contents.len();
+        self.output_timeline.seal_utf8_tails();
         let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
         let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
         let mut contents = context.detached_prefix_contents;
         contents.extend(context.reply_prefix_contents);
-        if let Some(echo) = context.input_echo {
-            contents.push(WorkerContent::stdout(echo));
-        }
         let SnapshotWithImages {
             contents: mut page_contents,
             pages_left,
@@ -76,7 +72,6 @@ impl WorkerManager {
                 prompt: None,
                 prompt_variants: None,
             },
-            end_offset,
         }
     }
 
@@ -100,18 +95,15 @@ impl WorkerManager {
                 }
                 let mut contents = context.detached_prefix_contents;
                 contents.extend(context.reply_prefix_contents);
-                let formatted = self.drain_final_formatted_output();
+                let formatted = self.drain_completed_formatted_output(session_end);
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
-                let fallback_input = self.take_input_fallback(&completion);
                 let built = build_completed_reply(
                     contents,
                     is_error,
-                    0,
                     &completion,
                     session_end,
                     CompletionReplyMode::Files {
-                        fallback_input,
                         idle_status_if_empty: false,
                     },
                     self.backend,
@@ -136,7 +128,7 @@ impl WorkerManager {
                 }
 
                 if self.should_settle_output_after_timeout() {
-                    self.settle_output_after_timeout();
+                    self.settle_output_after_timeout(request.remaining_budget());
                 }
                 self.pending_request = true;
                 self.pending_request_started_at = Some(request.started_at);
@@ -149,7 +141,7 @@ impl WorkerManager {
 
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
 
-                Ok(build_timeout_reply(contents, is_error, 0))
+                Ok(build_timeout_reply(contents, is_error))
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error_files(&err, context);
@@ -168,7 +160,6 @@ impl WorkerManager {
         self.last_detached_prefix_item_count = context.detached_prefix_contents.len();
         match self.wait_for_request_completion(request.timeout) {
             Ok(completion) => {
-                let fallback_input_transcript = context.input_transcript.clone();
                 let mut session_end = completion.session_end_seen;
                 if !session_end
                     && let Some(process) = self.process.as_mut()
@@ -179,20 +170,16 @@ impl WorkerManager {
                 if session_end {
                     self.note_session_end(true);
                 }
+                self.output_timeline.seal_utf8_tails();
                 let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
                 let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
                 let mut contents = context.detached_prefix_contents;
                 contents.extend(context.reply_prefix_contents);
-                if let Some(echo) = context.input_echo {
-                    contents.push(WorkerContent::stdout(echo));
-                }
                 let completion_snapshot = snapshot_after_completion(
                     &self.output,
                     context.start_offset,
                     end_offset,
                     first_page_budget,
-                    &completion.echo_events,
-                    completion.prompt_variants.as_deref(),
                 );
                 let saw_stderr = completion_snapshot.saw_stderr;
                 let is_error = context.prefix_is_error || saw_stderr;
@@ -215,24 +202,21 @@ impl WorkerManager {
                 let built = build_completed_reply(
                     contents,
                     is_error,
-                    end_offset,
                     &completion,
                     session_end,
                     CompletionReplyMode::Pager {
                         pager_active: self.pager.is_active(),
-                        fallback_input_transcript,
                     },
                     self.backend,
                 );
                 self.remember_prompt(built.prompt_to_remember.clone());
                 if let Some(pager_prompt) = built.pager_prompt {
-                    self.pager_prompt = pager_prompt;
+                    self.pager_prompt = Some(pager_prompt);
                 }
                 self.guardrail.busy.store(false, Ordering::Relaxed);
                 Ok(built.reply)
             }
             Err(WorkerError::Timeout(_)) => {
-                let fallback_input_transcript = context.input_transcript.clone();
                 if let Some(process) = self.process.as_mut() {
                     match process.is_running() {
                         Ok(true) => {}
@@ -249,13 +233,12 @@ impl WorkerManager {
 
                 self.pending_request = true;
                 self.pending_request_started_at = Some(request.started_at);
+                self.output_timeline
+                    .seal_utf8_tails_blocking_visible_output();
                 let end_offset = self.output.end_offset().unwrap_or(0);
                 let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
                 let mut contents = context.detached_prefix_contents;
                 contents.extend(context.reply_prefix_contents);
-                if let Some(echo) = context.input_echo {
-                    contents.push(WorkerContent::stdout(echo));
-                }
                 let SnapshotWithImages {
                     contents: mut page_contents,
                     pages_left,
@@ -263,10 +246,6 @@ impl WorkerManager {
                     last_range,
                 } = snapshot_page_with_images(&self.output, end_offset, first_page_budget);
                 contents.append(&mut page_contents);
-                maybe_trim_echo_prefix(&mut contents, fallback_input_transcript.as_deref(), true);
-                if let Some(echo) = fallback_input_transcript.as_deref() {
-                    let _ = drop_echo_only_contents(&mut contents, echo);
-                }
 
                 contents.push(timeout_status_content(request.started_at.elapsed()));
 
@@ -284,7 +263,7 @@ impl WorkerManager {
                     last_range,
                 );
 
-                Ok(build_timeout_reply(contents, is_error, end_offset))
+                Ok(build_timeout_reply(contents, is_error))
             }
             Err(err) => {
                 let reply = self.build_reply_from_worker_error_pager(&err, context, page_bytes);

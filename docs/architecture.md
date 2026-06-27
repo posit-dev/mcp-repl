@@ -37,11 +37,12 @@ The repository is organized around a few concrete subsystems rather than deep pa
   Sideband named pipes still carry accepted input, readiness, and worker-owned
   output facts separately from ConPTY traffic.
 - Workers receive request payloads through `input_batch` and complete an input
-  batch with `input_wait` or `session_end`. Follow-up input after `input_wait`
-  starts a fresh `input_batch`; the runtime decides where it is consumed.
+  batch with `input_wait`, `ready`, or `session_end`. Follow-up input after
+  `input_wait` or `ready` starts a fresh `input_batch`; the runtime decides
+  where it is consumed.
 - After `worker_ready`, the worker is not ready for input until its first
-  `input_wait`. The server treats `input_wait` as the single readiness gate,
-  not as prompt classification.
+  `input_wait` or `ready`. The server treats these as readiness gates, not as
+  prompt classification.
 - Worker reset and teardown use the sideband `shutdown` lifecycle message first,
   with stdin close and process termination retained only as bounded fallbacks.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
@@ -55,8 +56,8 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 ### Output, images, and debug surfaces
 
-- `src/pending_output_tape.rs` and `src/output_stream.rs` stage worker text and images until reply sealing.
-- `docs/output_timeline.md` describes how the server reconstructs one visible timeline from stdout/stderr capture plus sideband IPC, and how request completion only gates final-reply cleanup rather than ordering.
+- `src/output_capture.rs` owns the canonical output timeline for raw stdout/stderr bytes, worker IPC text, sideband markers, images, and server notices. `src/pending_output_tape.rs` is a files-mode facade over that timeline, not a separate formatter.
+- `docs/output_timeline.md` describes how the server reconstructs one visible timeline from stdout/stderr capture plus sideband IPC, how projection modes decide echo visibility, and how request completion only gates final-reply presentation rather than ordering.
 - PTY-backed workers may expose one raw terminal output stream rather than
   independent raw stdout and stderr pipes. Worker-owned `output_text` frames
   preserve their declared stream, but raw PTY output can have terminal effects
@@ -64,8 +65,10 @@ The repository is organized around a few concrete subsystems rather than deep pa
   identity.
 - `src/server/response.rs` is the server-owned response finalizer. It separates worker-originated text from server-only notices, creates oversized-output bundle directories with lazily materialized `transcript.txt`, `events.log`, and `images/`, applies bundle retention and cleanup policy, and decides the bounded inline preview at seal time.
 - `src/pager/` implements the pager-mode oversized-output path used by bare CLI defaults and explicit `--oversized-output pager` installs.
-- Longer-term output follow-ons such as per-turn history bundles and a unified resolved-timeline pipeline live in `docs/futurework/per-turn-history-bundles.md` and `docs/futurework/unified-output-timeline-pipeline.md`.
-- `src/debug_logs.rs`, `src/event_log.rs`, and `src/debug_repl.rs` make the runtime legible to agents and humans during investigation.
+- Longer-term output follow-ons such as per-turn history bundles live in `docs/futurework/per-turn-history-bundles.md`.
+- `src/debug_logs.rs`, `src/event_log.rs`, and the dev-only
+  `src/debug_repl.rs` path make the runtime legible to agents and humans
+  during investigation.
 
 ### Validation harnesses
 

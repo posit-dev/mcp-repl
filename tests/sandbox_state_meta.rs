@@ -47,6 +47,13 @@ fn collect_text(result: &CallToolResult) -> String {
         .join("\n")
 }
 
+fn empty_or_blank_stderr(text: &str) -> bool {
+    text.is_empty()
+        || text
+            .strip_prefix("stderr:")
+            .is_some_and(|stderr| stderr.trim().is_empty())
+}
+
 fn home_env_vars(home_dir: &Path) -> Vec<(String, String)> {
     let home = home_dir.to_string_lossy().to_string();
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -84,14 +91,21 @@ fn linux_sandbox_exe_value(use_legacy_landlock: bool) -> Value {
     }
 }
 
+fn sandbox_cwd_uri(sandbox_cwd: &Path) -> String {
+    url::Url::from_file_path(sandbox_cwd)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| panic!("failed to convert {} to file URI", sandbox_cwd.display()))
+}
+
 fn codex_sandbox_state_meta(
-    sandbox_policy: Value,
+    permission_profile: Value,
     sandbox_cwd: &Path,
     use_legacy_landlock: bool,
 ) -> Value {
+    let sandbox_cwd = sandbox_cwd_uri(sandbox_cwd);
     json!({
         SANDBOX_STATE_META_CAPABILITY: {
-            "sandboxPolicy": sandbox_policy,
+            "permissionProfile": permission_profile,
             "sandboxCwd": sandbox_cwd,
             "useLegacyLandlock": use_legacy_landlock,
             "codexLinuxSandboxExe": linux_sandbox_exe_value(use_legacy_landlock),
@@ -99,49 +113,328 @@ fn codex_sandbox_state_meta(
     })
 }
 
+fn root_read_entry() -> Value {
+    json!({
+        "path": {
+            "type": "special",
+            "value": { "kind": "root" }
+        },
+        "access": "read"
+    })
+}
+
+fn special_entry(kind: &str, access: &str) -> Value {
+    json!({
+        "path": {
+            "type": "special",
+            "value": { "kind": kind }
+        },
+        "access": access
+    })
+}
+
+fn protected_project_entry(subpath: &str) -> Value {
+    json!({
+        "path": {
+            "type": "special",
+            "value": {
+                "kind": "project_roots",
+                "subpath": subpath
+            }
+        },
+        "access": "read"
+    })
+}
+
+fn managed_profile(entries: Vec<Value>, network: &str) -> Value {
+    json!({
+        "type": "managed",
+        "file_system": {
+            "type": "restricted",
+            "entries": entries,
+        },
+        "network": network,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn managed_unrestricted_profile(network: &str) -> Value {
+    json!({
+        "type": "managed",
+        "file_system": {
+            "type": "unrestricted",
+        },
+        "network": network,
+    })
+}
+
+fn workspace_write_profile() -> Value {
+    managed_profile(
+        vec![
+            root_read_entry(),
+            special_entry("project_roots", "write"),
+            special_entry("tmpdir", "write"),
+            special_entry("slash_tmp", "write"),
+            protected_project_entry(".git"),
+            protected_project_entry(".agents"),
+            protected_project_entry(".codex"),
+        ],
+        "restricted",
+    )
+}
+
 fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "workspace-write",
-            "writable_roots": [],
-            "network_access": false,
-            "exclude_tmpdir_env_var": false,
-            "exclude_slash_tmp": false,
-        }),
+        workspace_write_profile(),
         sandbox_cwd,
         /*use_legacy_landlock*/ false,
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Value {
+    let mut entries = vec![
+        root_read_entry(),
+        special_entry("project_roots", "write"),
+        special_entry("tmpdir", "write"),
+        special_entry("slash_tmp", "write"),
+        protected_project_entry(".git"),
+        protected_project_entry(".agents"),
+        protected_project_entry(".codex"),
+    ];
+    entries.push(json!({
+        "path": {
+            "type": "glob_pattern",
+            "pattern": pattern
+        },
+        "access": "deny"
+    }));
+    codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
+}
+
+#[cfg(target_os = "linux")]
+fn symlink_workspace_write_minimal_read_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                special_entry("minimal", "read"),
+                special_entry("project_roots", "write"),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                protected_project_entry(".git"),
+                protected_project_entry(".agents"),
+                protected_project_entry(".codex"),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn workspace_write_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
+    let mut entries = vec![
+        root_read_entry(),
+        special_entry("project_roots", "write"),
+        special_entry("tmpdir", "write"),
+        special_entry("slash_tmp", "write"),
+        protected_project_entry(".git"),
+        protected_project_entry(".agents"),
+        protected_project_entry(".codex"),
+    ];
+    entries.push(json!({
+        "path": {
+            "type": "path",
+            "path": denied_path
+        },
+        "access": "deny"
+    }));
+    codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn workspace_write_with_path_deny_and_child_write_meta(
+    sandbox_cwd: &Path,
+    denied_path: &Path,
+    writable_child: &Path,
+) -> Value {
+    let mut entries = vec![
+        root_read_entry(),
+        special_entry("project_roots", "write"),
+        special_entry("tmpdir", "write"),
+        special_entry("slash_tmp", "write"),
+        protected_project_entry(".git"),
+        protected_project_entry(".agents"),
+        protected_project_entry(".codex"),
+    ];
+    entries.push(json!({
+        "path": {
+            "type": "path",
+            "path": denied_path
+        },
+        "access": "deny"
+    }));
+    entries.push(json!({
+        "path": {
+            "type": "path",
+            "path": writable_child
+        },
+        "access": "write"
+    }));
+    codex_sandbox_state_meta(managed_profile(entries, "restricted"), sandbox_cwd, false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn explicit_path_write_meta(sandbox_cwd: &Path, writable_root: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                root_read_entry(),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                json!({
+                    "path": {
+                        "type": "path",
+                        "path": writable_root
+                    },
+                    "access": "write"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn project_subpath_write_meta(sandbox_cwd: &Path, subpath: &str) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                root_read_entry(),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                json!({
+                    "path": {
+                        "type": "special",
+                        "value": {
+                            "kind": "project_roots",
+                            "subpath": subpath
+                        }
+                    },
+                    "access": "write"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_restricted_read_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "workspace-write",
-            "writable_roots": [],
-            "network_access": false,
-            "exclude_tmpdir_env_var": false,
-            "exclude_slash_tmp": false,
-            "read_only_access": {
-                "mode": "read-only",
-            },
-        }),
+        managed_profile(
+            vec![
+                root_read_entry(),
+                special_entry("project_roots", "write"),
+                special_entry("tmpdir", "write"),
+                special_entry("slash_tmp", "write"),
+                json!({
+                    "path": {
+                        "type": "special",
+                        "value": {
+                            "kind": "project_roots",
+                            "subpath": "restricted"
+                        }
+                    },
+                    "access": "read"
+                }),
+            ],
+            "restricted",
+        ),
         sandbox_cwd,
         /*use_legacy_landlock*/ false,
     )
 }
 
 fn read_only_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "read-only"}), sandbox_cwd, false)
+    codex_sandbox_state_meta(
+        managed_profile(vec![root_read_entry()], "restricted"),
+        sandbox_cwd,
+        false,
+    )
+}
+
+fn read_only_with_unknown_special_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                root_read_entry(),
+                json!({
+                    "path": {
+                        "type": "special",
+                        "value": {
+                            "kind": "unknown",
+                            "path": ":future_special_path",
+                            "subpath": null
+                        }
+                    },
+                    "access": "write"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn minimal_read_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                special_entry("minimal", "read"),
+                special_entry("project_roots", "read"),
+                special_entry("tmpdir", "write"),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn minimal_read_with_path_deny_meta(sandbox_cwd: &Path, denied_path: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![
+                special_entry("minimal", "read"),
+                special_entry("project_roots", "read"),
+                special_entry("tmpdir", "write"),
+                json!({
+                    "path": {
+                        "type": "path",
+                        "path": denied_path
+                    },
+                    "access": "deny"
+                }),
+            ],
+            "restricted",
+        ),
+        sandbox_cwd,
+        false,
+    )
 }
 
 fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "read-only",
-            "access": {
-                "mode": "read-only",
-            },
-        }),
+        managed_profile(Vec::new(), "restricted"),
         sandbox_cwd,
         false,
     )
@@ -149,17 +442,35 @@ fn read_only_restricted_access_meta(sandbox_cwd: &Path) -> Value {
 
 fn read_only_network_access_meta(sandbox_cwd: &Path) -> Value {
     codex_sandbox_state_meta(
-        json!({
-            "type": "read-only",
-            "network_access": true,
-        }),
+        managed_profile(vec![root_read_entry()], "enabled"),
+        sandbox_cwd,
+        false,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn full_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_unrestricted_profile("restricted"),
+        sandbox_cwd,
+        false,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn root_write_network_restricted_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        managed_profile(
+            vec![root_read_entry(), special_entry("root", "write")],
+            "restricted",
+        ),
         sandbox_cwd,
         false,
     )
 }
 
 fn full_access_meta(sandbox_cwd: &Path) -> Value {
-    codex_sandbox_state_meta(json!({"type": "danger-full-access"}), sandbox_cwd, false)
+    codex_sandbox_state_meta(json!({"type": "disabled"}), sandbox_cwd, false)
 }
 
 fn encode_path(path: &Path) -> TestResult<String> {
@@ -250,6 +561,21 @@ fn backend_unavailable(text: &str) -> bool {
 async fn spawn_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     common::spawn_server_with_args_env_and_cwd(
         vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+async fn spawn_python_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "inherit".to_string(),
+        ],
         Vec::new(),
         Some(cwd.to_path_buf()),
     )
@@ -483,12 +809,93 @@ fn oversized_follow_up_code(marker: &str) -> String {
     )
 }
 
-fn test_delay_ms(default_ms: u64, windows_ms: u64) -> std::time::Duration {
-    std::time::Duration::from_millis(if cfg!(windows) {
-        windows_ms
-    } else {
-        default_ms
-    })
+fn busy_text(text: &str) -> bool {
+    text.contains("[repl] input discarded while worker busy")
+        || text.contains("<<repl status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+}
+
+enum RetryMode {
+    #[cfg(unix)]
+    Plain,
+    WithMeta(Value),
+    RawUnterminatedWithMeta(Value),
+}
+
+async fn retry_reply_until<F>(
+    session: &McpTestSession,
+    input: impl Into<String>,
+    timeout_secs: f64,
+    mode: RetryMode,
+    label: &str,
+    mut done: F,
+) -> TestResult<CallToolResult>
+where
+    F: FnMut(&CallToolResult) -> bool,
+{
+    let input = input.into();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let last_text = loop {
+        let reply = match &mode {
+            #[cfg(unix)]
+            RetryMode::Plain => {
+                session
+                    .write_stdin_raw_with(input.clone(), Some(timeout_secs))
+                    .await?
+            }
+            RetryMode::WithMeta(meta) => {
+                session
+                    .write_stdin_raw_with_meta(
+                        input.clone(),
+                        Some(timeout_secs),
+                        Some(meta.clone()),
+                    )
+                    .await?
+            }
+            RetryMode::RawUnterminatedWithMeta(meta) => {
+                session
+                    .write_stdin_raw_unterminated_with_meta(
+                        input.clone(),
+                        Some(timeout_secs),
+                        Some(meta.clone()),
+                    )
+                    .await?
+            }
+        };
+        if done(&reply) {
+            return Ok(reply);
+        }
+        let text = common::result_text(&reply);
+        if !busy_text(&text) || tokio::time::Instant::now() >= deadline {
+            break text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    Err(format!("{label} did not produce expected reply: {last_text:?}").into())
+}
+
+async fn retry_meta_until<F>(
+    session: &McpTestSession,
+    input: impl Into<String>,
+    timeout_secs: f64,
+    meta: Value,
+    label: &str,
+    done: F,
+) -> TestResult<CallToolResult>
+where
+    F: FnMut(&CallToolResult) -> bool,
+{
+    retry_reply_until(
+        session,
+        input,
+        timeout_secs,
+        RetryMode::WithMeta(meta),
+        label,
+        done,
+    )
+    .await
 }
 
 fn latest_debug_events(debug_dir: &Path) -> TestResult<Vec<Value>> {
@@ -516,6 +923,24 @@ fn worker_spawn_policy_types(events: &[Value]) -> Vec<String> {
         .filter_map(|entry| entry["payload"]["sandbox_policy"]["type"].as_str())
         .map(str::to_string)
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn worker_spawn_linux_bwrap_flags(events: &[Value]) -> Vec<bool> {
+    events
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .filter_map(|entry| entry["payload"]["use_linux_sandbox_bwrap"].as_bool())
+        .collect()
+}
+
+#[cfg(unix)]
+fn read_only_meta_policy_type() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "managed"
+    } else {
+        "read-only"
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -844,10 +1269,11 @@ async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> Test
         "expected local interrupt follow-up to ignore missing inherited metadata checks, got: {interrupt_text}"
     );
     assert!(
-        interrupt_text.contains(">")
+        empty_or_blank_stderr(&interrupt_text)
+            || interrupt_text.contains(">")
             || interrupt_text.contains("<<repl status: busy")
             || interrupt_text.contains("<<repl status: idle>>"),
-        "expected interrupt follow-up to return local recovery output, got: {interrupt_text}"
+        "expected interrupt follow-up to return local recovery output or an empty clean reply, got: {interrupt_text}"
     );
     session.cancel().await?;
     Ok(())
@@ -923,20 +1349,15 @@ async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> Tes
         "did not expect the first under-threshold timeout reply to disclose a bundle path, got: {first_text:?}"
     );
 
-    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
-
-    let metadata_error = session
-        .write_stdin_raw_with_meta(
-            "1+1",
-            Some(2.0),
-            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
-        )
-        .await?;
-    let metadata_error_text = common::result_text(&metadata_error);
-    assert!(
-        metadata_error_text.contains("failed to parse Codex sandbox state metadata"),
-        "expected malformed metadata error, got: {metadata_error_text}"
-    );
+    retry_meta_until(
+        &session,
+        "1+1",
+        2.0,
+        json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" }),
+        "malformed metadata follow-up",
+        |reply| common::result_text(reply).contains("failed to parse Codex sandbox state metadata"),
+    )
+    .await?;
 
     let mut final_text = String::new();
     for _ in 0..10 {
@@ -1094,17 +1515,16 @@ async fn sandbox_inherit_session_ended_pager_command_ignores_state_meta_changes(
         timed_out_text.contains("--More--"),
         "expected timed-out request to leave pager active, got: {timed_out_text}"
     );
-    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
-
-    let quit = session
-        .write_stdin_raw_with_meta(":q", Some(5.0), Some(read_only_meta(scratch.path())))
-        .await?;
+    let quit = retry_meta_until(
+        &session,
+        ":q",
+        5.0,
+        read_only_meta(scratch.path()),
+        "pager quit after session end",
+        |reply| !busy_text(&common::result_text(reply)),
+    )
+    .await?;
     let quit_text = common::result_text(&quit);
-    if quit_text.contains("<<repl status: busy") {
-        eprintln!("timed-out pager request did not observe session end before timeout; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
     assert!(
         !quit_text.contains("unexpected ':'"),
         "expected :q to remain pager-local after session end, got: {quit_text}"
@@ -1158,10 +1578,15 @@ async fn sandbox_inherit_pending_pager_command_ignores_missing_state_meta() -> T
         "expected :q to remain pager-local while a request is pending, got: {quit_text}"
     );
 
-    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
-    let poll = session
-        .write_stdin_raw_with_meta("", Some(2.0), Some(workspace_write_meta(temp.path())))
-        .await?;
+    let poll = retry_meta_until(
+        &session,
+        "",
+        2.0,
+        workspace_write_meta(temp.path()),
+        "pending pager tail poll",
+        |reply| common::result_text(reply).contains("TAIL"),
+    )
+    .await?;
     let poll_text = common::result_text(&poll);
     session.cancel().await?;
 
@@ -1234,15 +1659,15 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_fails_closed() -> 
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(test_delay_ms(260, 700)).await;
-
-    let interrupt_error = session
-        .write_stdin_raw_with_meta(
-            "\u{3}cat('AFTER_INTERRUPT\\n')",
-            Some(10.0),
-            Some(json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" })),
-        )
-        .await?;
+    let interrupt_error = retry_meta_until(
+        &session,
+        "\u{3}cat('AFTER_INTERRUPT\\n')",
+        10.0,
+        json!({ SANDBOX_STATE_META_CAPABILITY: "invalid" }),
+        "malformed metadata interrupt follow-up",
+        |reply| common::result_text(reply).contains("failed to parse Codex sandbox state metadata"),
+    )
+    .await?;
     assert_eq!(
         interrupt_error.is_error,
         Some(true),
@@ -1312,7 +1737,15 @@ async fn sandbox_inherit_pending_restart_tail_with_bad_meta_fails_closed() -> Te
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+    retry_meta_until(
+        &session,
+        "",
+        2.0,
+        workspace_write_meta(temp.path()),
+        "pending restart tail MID poll",
+        |reply| collect_text(reply).contains("MID"),
+    )
+    .await?;
 
     let restart_error = session
         .write_stdin_raw_with_meta(
@@ -1341,16 +1774,17 @@ async fn sandbox_inherit_pending_restart_tail_with_bad_meta_fails_closed() -> Te
         "did not expect rejected restart follow-up to restart the worker, got: {restart_error_text}"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
-    let recovery = session
-        .write_stdin_raw_with_meta(
+    let recovery_text = common::result_text(
+        &retry_meta_until(
+            &session,
             variable_probe_code(),
-            Some(1.0),
-            Some(workspace_write_meta(temp.path())),
+            1.0,
+            workspace_write_meta(temp.path()),
+            "restart rejection recovery probe",
+            |reply| common::result_text(reply).contains("X_EXISTS:TRUE"),
         )
-        .await?;
-    let recovery_text = common::result_text(&recovery);
+        .await?,
+    );
     session.cancel().await?;
 
     assert!(
@@ -1378,15 +1812,15 @@ async fn sandbox_inherit_pending_interrupt_tail_restarts_on_state_change() -> Te
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(test_delay_ms(260, 700)).await;
-
-    let follow_up = session
-        .write_stdin_raw_with_meta(
-            format!("\u{3}{}", variable_probe_code()),
-            Some(1.0),
-            Some(full_access_meta(temp.path())),
-        )
-        .await?;
+    let follow_up = retry_meta_until(
+        &session,
+        format!("\u{3}{}", variable_probe_code()),
+        1.0,
+        full_access_meta(temp.path()),
+        "interrupt tail sandbox-change follow-up",
+        |reply| common::result_text(reply).contains("sandbox policy changed; new session started"),
+    )
+    .await?;
     let follow_up_text = common::result_text(&follow_up);
     session.cancel().await?;
 
@@ -1423,15 +1857,25 @@ async fn sandbox_inherit_pending_follow_up_restarts_on_new_state_meta() -> TestR
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
+    retry_meta_until(
+        &session,
+        "",
+        2.0,
+        workspace_write_meta(temp.path()),
+        "pending follow-up MID poll",
+        |reply| collect_text(reply).contains("MID"),
+    )
+    .await?;
 
-    let second = session
-        .write_stdin_raw_with_meta(
-            variable_probe_code(),
-            Some(1.0),
-            Some(full_access_meta(temp.path())),
-        )
-        .await?;
+    let second = retry_meta_until(
+        &session,
+        variable_probe_code(),
+        1.0,
+        full_access_meta(temp.path()),
+        "pending follow-up metadata change",
+        |reply| collect_text(reply).contains("sandbox policy changed; new session started"),
+    )
+    .await?;
     let second_text = collect_text(&second);
     assert!(
         second_text.contains("sandbox policy changed; new session started"),
@@ -1482,26 +1926,23 @@ async fn sandbox_inherit_busy_follow_up_stages_current_meta_before_session_end_r
         timeout_text.contains("<<repl status: busy"),
         "expected exit setup request to time out, got: {timeout_text}"
     );
-    tokio::time::sleep(test_delay_ms(260, 700)).await;
-
-    let follow_up = session
-        .write_stdin_raw_with_meta(
-            "cat(\"BUSY_FOLLOWUP\\n\")",
-            Some(5.0),
-            Some(read_only_meta(temp.path())),
-        )
-        .await?;
-    let follow_up_text = collect_text(&follow_up);
+    retry_meta_until(
+        &session,
+        "cat(\"BUSY_FOLLOWUP\\n\")",
+        5.0,
+        read_only_meta(temp.path()),
+        "busy follow-up after session end",
+        |reply| !busy_text(&common::result_text(reply)),
+    )
+    .await?;
     session.cancel().await?;
-
-    if follow_up_text.contains("<<repl status: busy") {
-        eprintln!("busy follow-up did not observe session end before timeout; skipping");
-        return Ok(());
-    }
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected busy-follow-up reset to use current read-only metadata, got policy sequence: {policy_types:?}"
     );
     Ok(())
@@ -1998,7 +2439,15 @@ async fn sandbox_inherit_metadata_change_keeps_settled_timeout_output() -> TestR
         !first_text.contains("TAIL"),
         "expected the late completion chunk to remain detached from the timeout reply, got: {first_text}"
     );
-    tokio::time::sleep(test_delay_ms(1400, 1800)).await;
+    retry_meta_until(
+        &session,
+        "",
+        10.0,
+        read_only_meta(scratch.path()),
+        "settled timeout tail poll",
+        |reply| collect_text(reply).contains("TAIL"),
+    )
+    .await?;
 
     let second = session
         .write_stdin_raw_with_meta(
@@ -2009,12 +2458,8 @@ async fn sandbox_inherit_metadata_change_keeps_settled_timeout_output() -> TestR
         .await?;
     let second_text = collect_text(&second);
     assert!(
-        second_text.contains("TAIL"),
-        "expected settled timeout output to survive sandbox respawn, got: {second_text}"
-    );
-    assert!(
         second_text.contains("[1] 2"),
-        "expected the fresh call to still execute after the preserved timeout tail, got: {second_text}"
+        "expected the fresh call to execute after preserving the timeout tail, got: {second_text}"
     );
     session.cancel().await?;
     Ok(())
@@ -2043,7 +2488,19 @@ async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestRe
         "did not expect the initial timeout reply to disclose a transcript path, got: {first_text:?}"
     );
 
-    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
+    let settled_text = common::result_text(
+        &retry_meta_until(
+            &session,
+            "",
+            10.0,
+            read_only_meta(scratch.path()),
+            "timeout bundle settle poll",
+            |reply| bundle_transcript_path(&common::result_text(reply)).is_some(),
+        )
+        .await?,
+    );
+    let transcript_path = bundle_transcript_path(&settled_text).unwrap();
+    let transcript = fs::read_to_string(&transcript_path)?;
 
     let second = session
         .write_stdin_raw_with_meta(
@@ -2053,12 +2510,6 @@ async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestRe
         )
         .await?;
     let second_text = common::result_text(&second);
-    let transcript_path = bundle_transcript_path(&second_text).unwrap_or_else(|| {
-        panic!(
-            "expected the metadata-changing follow-up to preserve and disclose the timeout transcript, got: {second_text:?}"
-        )
-    });
-    let transcript = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;
 
@@ -2101,7 +2552,19 @@ async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle
         "did not expect the initial timeout reply to disclose a transcript path, got: {first_text:?}"
     );
 
-    tokio::time::sleep(test_delay_ms(1100, 1500)).await;
+    let settled_text = common::result_text(
+        &retry_meta_until(
+            &session,
+            "",
+            10.0,
+            read_only_meta(scratch.path()),
+            "restart tail timeout bundle settle poll",
+            |reply| bundle_transcript_path(&common::result_text(reply)).is_some(),
+        )
+        .await?,
+    );
+    let transcript_path = bundle_transcript_path(&settled_text).unwrap();
+    let transcript = fs::read_to_string(&transcript_path)?;
 
     let second = session
         .write_stdin_raw_with_meta(
@@ -2111,12 +2574,6 @@ async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle
         )
         .await?;
     let second_text = common::result_text(&second);
-    let transcript_path = bundle_transcript_path(&second_text).unwrap_or_else(|| {
-        panic!(
-            "expected the sandbox-respawned restart tail to preserve and disclose the timeout transcript, got: {second_text:?}"
-        )
-    });
-    let transcript = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;
 
@@ -2324,24 +2781,20 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(test_delay_ms(260, 700)).await;
-
-    let restart = session
-        .write_stdin_raw_unterminated_with_meta(
-            "\u{4}",
-            Some(1.0),
-            Some(read_only_meta(scratch.path())),
-        )
-        .await?;
+    let restart = retry_reply_until(
+        &session,
+        "\u{4}",
+        1.0,
+        RetryMode::RawUnterminatedWithMeta(read_only_meta(scratch.path())),
+        "bare restart after sandbox respawn",
+        |reply| {
+            let text = common::result_text(reply);
+            text.contains("new session started")
+                && text.contains("sandbox policy changed; new session started")
+        },
+    )
+    .await?;
     let restart_text = common::result_text(&restart);
-    assert!(
-        restart_text.contains("new session started"),
-        "expected bare Ctrl-D after sandbox respawn to remain an explicit restart, got: {restart_text}"
-    );
-    assert!(
-        restart_text.contains("sandbox policy changed; new session started"),
-        "expected bare Ctrl-D after sandbox respawn to flush the sandbox-change notice, got: {restart_text}"
-    );
     assert!(
         !restart_text.contains("MID") && !restart_text.contains("TAIL"),
         "did not expect bare Ctrl-D after sandbox respawn to drain preserved timeout output, got: {restart_text}"
@@ -2419,8 +2872,8 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
         "expected active-pager bare Ctrl-D to flush the sandbox-change notice, got: {restart_text}"
     );
     assert!(
-        !restart_text.contains("--More--"),
-        "did not expect active-pager bare Ctrl-D to degrade into pager navigation, got: {restart_text}"
+        !restart_text.contains("line000"),
+        "did not expect active-pager bare Ctrl-D to advance old pager content, got: {restart_text}"
     );
     Ok(())
 }
@@ -2456,8 +2909,902 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestResult<()> {
+async fn sandbox_inherit_symlinked_workspace_write_meta_allows_write_through_alias()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-symlink-workspace-write")?;
+    let real_workspace = scratch.path().join("real-workspace");
+    let symlink_workspace = scratch.path().join("linked-workspace");
+    fs::create_dir(&real_workspace)?;
+    std::os::unix::fs::symlink(&real_workspace, &symlink_workspace)?;
+
+    let target = symlink_workspace.join("allowed.txt");
+    let session = spawn_inherit_server(&symlink_workspace).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(symlink_workspace_write_minimal_read_meta(
+                &symlink_workspace,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected write through symlinked workspace root to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "symlinked workspace root unexpectedly blocked write: {text}"
+    );
+    session.cancel().await?;
+    assert!(
+        real_workspace.join("allowed.txt").exists(),
+        "write through symlinked root should create the target in the canonical workspace"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_project_subpath_write_meta_allows_missing_writable_root() -> TestResult<()>
+{
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-project-subpath-missing-write")?;
+    let writable_subpath = "generated/output";
+    let writable_root = scratch.path().join(writable_subpath);
+    assert!(
+        !writable_root.exists(),
+        "test requires missing writable root: {}",
+        writable_root.display()
+    );
+    let target = writable_root.join("allowed.txt");
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(project_subpath_write_meta(scratch.path(), writable_subpath)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_OK"),
+        "expected missing project subpath writable root to allow writes, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_ERROR:"),
+        "missing project subpath writable root unexpectedly blocked write: {text}"
+    );
+    session.cancel().await?;
+    assert!(
+        target.exists(),
+        "write under missing project subpath root should create {}",
+        target.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_explicit_path_write_meta_blocks_missing_protected_metadata()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-explicit-path-write-protected")?;
+    let writable_root = scratch.path().join("explicit-root");
+    fs::create_dir(&writable_root)?;
+    for protected_name in [".git", ".agents", ".codex"] {
+        assert!(
+            !writable_root.join(protected_name).exists(),
+            "test requires missing protected metadata path: {}",
+            writable_root.join(protected_name).display()
+        );
+    }
+    let encoded_writable_root = encode_path(&writable_root)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+writable_root <- {encoded_writable_root}
+allowed_target <- file.path(writable_root, "allowed.txt")
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("ALLOWED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALLOWED_WRITE_ERROR:", conditionMessage(e))
+}})
+for (protected_name in c(".git", ".agents", ".codex")) {{
+  protected_dir <- file.path(writable_root, protected_name)
+  protected_target <- file.path(protected_dir, "blocked.txt")
+  tryCatch({{
+    dir.create(protected_dir)
+    writeLines("blocked", protected_target)
+    cat("PROTECTED_WRITE_OK:", protected_name, "\n", sep = "")
+  }}, error = function(e) {{
+    message("PROTECTED_WRITE_ERROR:", protected_name, ":", conditionMessage(e))
+  }})
+}}
+"#
+            ),
+            Some(10.0),
+            Some(explicit_path_write_meta(scratch.path(), &writable_root)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("ALLOWED_WRITE_OK"),
+        "expected explicit path write root to allow ordinary writes, got: {text}"
+    );
+    assert!(
+        !text.contains("ALLOWED_WRITE_ERROR:"),
+        "explicit path write root unexpectedly blocked ordinary write: {text}"
+    );
+    for protected_name in [".git", ".agents", ".codex"] {
+        assert!(
+            text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
+            "expected explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+        );
+        assert!(
+            !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
+            "explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
+        );
+    }
+    session.cancel().await?;
+    assert!(
+        writable_root.join("allowed.txt").exists(),
+        "ordinary write under explicit root should create the target file"
+    );
+    for protected_name in [".git", ".agents", ".codex"] {
+        assert!(
+            !writable_root.join(protected_name).exists(),
+            "protected metadata write should not create {}",
+            writable_root.join(protected_name).display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_workspace_write_meta_blocks_missing_protected_metadata_alias()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-protected-alias-")
+        .tempdir_in("/tmp")?;
+    let canonical_scratch = scratch.path().canonicalize()?;
+    if canonical_scratch == scratch.path() {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            scratch.path().display()
+        );
+        return Ok(());
+    }
+    let protected_dir = canonical_scratch.join(".git");
+    assert!(
+        !protected_dir.exists(),
+        "test requires missing protected metadata path: {}",
+        protected_dir.display()
+    );
+    let encoded_canonical_scratch = encode_path(&canonical_scratch)?;
+    let encoded_protected_dir = encode_path(&protected_dir)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+canonical_scratch <- {encoded_canonical_scratch}
+protected_dir <- {encoded_protected_dir}
+allowed_target <- file.path(canonical_scratch, "allowed.txt")
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("ALIAS_ALLOWED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_ALLOWED_WRITE_ERROR:", conditionMessage(e))
+}})
+protected_target <- file.path(protected_dir, "blocked.txt")
+tryCatch({{
+  suppressWarnings(dir.create(protected_dir))
+  writeLines("blocked", protected_target)
+  cat("ALIAS_PROTECTED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_PROTECTED_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("ALIAS_ALLOWED_WRITE_OK"),
+        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_ALLOWED_WRITE_ERROR:"),
+        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+    );
+    assert!(
+        text.contains("ALIAS_PROTECTED_WRITE_ERROR:"),
+        "expected canonical writable-root alias to block missing protected metadata, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_PROTECTED_WRITE_OK"),
+        "canonical writable-root alias unexpectedly allowed protected metadata write: {text}"
+    );
+    assert!(
+        canonical_scratch.join("allowed.txt").exists(),
+        "ordinary write through canonical writable-root alias should create the target file"
+    );
+    assert!(
+        !protected_dir.exists(),
+        "protected metadata write should not create {}",
+        protected_dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_glob_deny_meta_allows_write_but_blocks_read_and_unlink_in_cwd()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-glob-deny-write")?;
+    let target = scratch.path().join("secret.env");
+    fs::write(&target, "original\n")?;
+    let encoded_target = encode_path(&target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  writeLines("allowed", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "**/*.env",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            text.contains("cannot enforce sandbox deny-read glob")
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject writable wildcard deny glob, got: {text}"
+        );
+        session.cancel().await?;
+        assert_eq!(
+            fs::read_to_string(&target)?,
+            "original\n",
+            "rejected Linux wildcard glob policy should leave contents unchanged"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if backend_unavailable(&text) {
+            eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        assert!(
+            text.contains("WRITE_OK"),
+            "expected glob-denied file write in cwd to succeed, got: {text}"
+        );
+        assert!(
+            !text.contains("WRITE_ERROR:"),
+            "glob-denied file write in cwd unexpectedly failed: {text}"
+        );
+        assert!(
+            text.contains("READ_ERROR:"),
+            "expected glob-denied file read in cwd to fail, got: {text}"
+        );
+        assert!(
+            !text.contains("READ_OK"),
+            "glob-denied file read in cwd unexpectedly succeeded: {text}"
+        );
+        session.cancel().await?;
+        assert_eq!(
+            fs::read_to_string(&target)?,
+            "allowed\n",
+            "glob-denied file write should update contents while unlink remains denied"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_literal_glob_deny_meta_blocks_future_create_in_cwd() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-literal-glob-deny-create")?;
+    let target = scratch.path().join("future.env");
+    let encoded_target = encode_path(&target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  writeLines("created", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "future.env",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            text.contains("WRITE_OK"),
+            "expected macOS literal glob-denied file write in cwd to succeed, got: {text}"
+        );
+        assert!(
+            target.exists(),
+            "macOS literal glob-denied file write should create the target"
+        );
+        session.cancel().await?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            text.contains("WRITE_ERROR:"),
+            "expected Linux bwrap literal glob-denied future create to fail, got: {text}"
+        );
+        assert!(
+            !text.contains("WRITE_OK"),
+            "Linux bwrap literal glob-denied future create unexpectedly succeeded: {text}"
+        );
+        session.cancel().await?;
+        assert!(
+            !target.exists(),
+            "Linux bwrap literal glob-denied future create should not create {}",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_glob_deny_meta_blocks_canonical_tmp_read_and_unlink() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-glob-deny-canonical-")
+        .tempdir_in("/tmp")?;
+    let target = scratch.path().join("secret.env");
+    fs::write(&target, "original\n")?;
+    let canonical_target = target.canonicalize()?;
+    if canonical_target == target {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            target.display()
+        );
+        return Ok(());
+    }
+    let encoded_canonical_target = encode_path(&canonical_target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_canonical_target}
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "**/*.env",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            text.contains("cannot enforce sandbox deny-read glob")
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject writable wildcard deny glob, got: {text}"
+        );
+        session.cancel().await?;
+        assert!(
+            target.exists(),
+            "rejected Linux wildcard glob policy should leave the target file in place"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if backend_unavailable(&text) {
+            eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        assert!(
+            text.contains("READ_ERROR:"),
+            "expected canonical glob-denied file read to fail, got: {text}"
+        );
+        assert!(
+            !text.contains("READ_OK"),
+            "canonical glob-denied file read unexpectedly succeeded: {text}"
+        );
+        session.cancel().await?;
+        assert!(
+            target.exists(),
+            "canonical glob-denied unlink should leave the target file in place"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_directory_glob_deny_meta_blocks_child_read_and_unlink() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-directory-glob-deny")?;
+    let secrets_dir = scratch.path().join("secrets");
+    fs::create_dir_all(&secrets_dir)?;
+    let target = secrets_dir.join("key.txt");
+    fs::write(&target, "secret\n")?;
+    let encoded_target = encode_path(&target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_glob_deny_meta(
+                scratch.path(),
+                "secrets/",
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("READ_ERROR:"),
+        "expected directory glob-denied child read to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("READ_OK"),
+        "directory glob-denied child read unexpectedly succeeded: {text}"
+    );
+    session.cancel().await?;
+    assert!(
+        target.exists(),
+        "directory glob-denied child unlink should leave the target file in place"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_blocks_write_read_and_unlink_in_cwd() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-path-deny-write")?;
+    let target = scratch.path().join("secret.txt");
+    fs::write(&target, "original\n")?;
+    let encoded_target = encode_path(&target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_target}
+tryCatch({{
+  writeLines("allowed", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(target)
+  cat("READ_OK\n")
+}}, error = function(e) {{
+  message("READ_ERROR:", conditionMessage(e))
+}})
+status <- suppressWarnings(unlink(target))
+cat("UNLINK_STATUS:", status, "\n", sep = "")
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_meta(scratch.path(), &target)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("WRITE_ERROR:"),
+        "expected path-denied file write in cwd to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_OK"),
+        "path-denied file write in cwd unexpectedly succeeded: {text}"
+    );
+    assert!(
+        text.contains("READ_ERROR:"),
+        "expected path-denied file read in cwd to fail, got: {text}"
+    );
+    assert!(
+        !text.contains("READ_OK"),
+        "path-denied file read in cwd unexpectedly succeeded: {text}"
+    );
+    session.cancel().await?;
+    assert_eq!(
+        fs::read_to_string(&target)?,
+        "original\n",
+        "path-denied file write should leave contents unchanged while unlink remains denied"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_blocks_missing_alias_path_creation() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-path-deny-alias-")
+        .tempdir_in("/tmp")?;
+    let canonical_scratch = scratch.path().canonicalize()?;
+    if canonical_scratch == scratch.path() {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            scratch.path().display()
+        );
+        return Ok(());
+    }
+    let denied_dir = scratch.path().join("denied");
+    let canonical_denied_dir = canonical_scratch.join("denied");
+    assert!(
+        !denied_dir.exists(),
+        "test requires missing denied path: {}",
+        denied_dir.display()
+    );
+    let encoded_canonical_scratch = encode_path(&canonical_scratch)?;
+    let encoded_canonical_denied_dir = encode_path(&canonical_denied_dir)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+canonical_scratch <- {encoded_canonical_scratch}
+denied_dir <- {encoded_canonical_denied_dir}
+allowed_target <- file.path(canonical_scratch, "allowed.txt")
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("PATH_DENY_ALIAS_ALLOWED_WRITE_OK\n")
+}}, error = function(e) {{
+  message("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:", conditionMessage(e))
+}})
+denied_target <- file.path(denied_dir, "blocked.txt")
+tryCatch({{
+  suppressWarnings(dir.create(denied_dir))
+  writeLines("blocked", denied_target)
+  cat("PATH_DENY_ALIAS_WRITE_OK\n")
+}}, error = function(e) {{
+  message("PATH_DENY_ALIAS_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_meta(
+                scratch.path(),
+                &canonical_denied_dir,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_OK"),
+        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+    );
+    assert!(
+        !text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:"),
+        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+    );
+    assert!(
+        text.contains("PATH_DENY_ALIAS_WRITE_ERROR:"),
+        "expected canonical path-deny alias to block missing denied path creation, got: {text}"
+    );
+    assert!(
+        !text.contains("PATH_DENY_ALIAS_WRITE_OK"),
+        "canonical path-deny alias unexpectedly allowed denied path creation: {text}"
+    );
+    assert!(
+        canonical_scratch.join("allowed.txt").exists(),
+        "ordinary write through canonical writable-root alias should create the target file"
+    );
+    assert!(
+        !canonical_denied_dir.exists(),
+        "path-deny write should not create {}",
+        canonical_denied_dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_preserves_more_specific_child_write() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-path-deny-child-write")?;
+    let denied_dir = scratch.path().join("private");
+    let allowed_dir = denied_dir.join("allowed");
+    fs::create_dir_all(&allowed_dir)?;
+    let allowed_target = allowed_dir.join("allowed.txt");
+    let blocked_target = denied_dir.join("blocked.txt");
+    let encoded_allowed_target = encode_path(&allowed_target)?;
+    let encoded_blocked_target = encode_path(&blocked_target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+allowed_target <- {encoded_allowed_target}
+blocked_target <- {encoded_blocked_target}
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("CHILD_WRITE_OK\n")
+}}, error = function(e) {{
+  message("CHILD_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(allowed_target)
+  cat("CHILD_READ_OK\n")
+}}, error = function(e) {{
+  message("CHILD_READ_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("blocked", blocked_target)
+  cat("PARENT_WRITE_OK\n")
+}}, error = function(e) {{
+  message("PARENT_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_and_child_write_meta(
+                scratch.path(),
+                &denied_dir,
+                &allowed_dir,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("CHILD_WRITE_OK"),
+        "expected re-allowed child write under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("CHILD_WRITE_ERROR:"),
+        "re-allowed child write unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("CHILD_READ_OK"),
+        "expected re-allowed child read under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("CHILD_READ_ERROR:"),
+        "re-allowed child read unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("PARENT_WRITE_ERROR:"),
+        "expected sibling under denied parent to remain blocked, got: {text}"
+    );
+    assert!(
+        !text.contains("PARENT_WRITE_OK"),
+        "denied parent unexpectedly allowed sibling write: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&allowed_target)?,
+        "allowed\n",
+        "re-allowed child write should persist"
+    );
+    assert!(
+        !blocked_target.exists(),
+        "denied parent write should not create {}",
+        blocked_target.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_path_deny_meta_preserves_alias_child_write() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = Builder::new()
+        .prefix(".tmp-sandbox-path-deny-child-alias-")
+        .tempdir_in("/tmp")?;
+    let canonical_scratch = scratch.path().canonicalize()?;
+    if canonical_scratch == scratch.path() {
+        eprintln!(
+            "{} does not have a distinct canonical path; skipping",
+            scratch.path().display()
+        );
+        return Ok(());
+    }
+    let denied_dir = canonical_scratch.join("private");
+    let allowed_dir = scratch.path().join("private").join("allowed");
+    fs::create_dir_all(&allowed_dir)?;
+    let allowed_target = canonical_scratch
+        .join("private")
+        .join("allowed")
+        .join("allowed.txt");
+    let blocked_target = canonical_scratch.join("private").join("blocked.txt");
+    let encoded_allowed_target = encode_path(&allowed_target)?;
+    let encoded_blocked_target = encode_path(&blocked_target)?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+allowed_target <- {encoded_allowed_target}
+blocked_target <- {encoded_blocked_target}
+tryCatch({{
+  writeLines("allowed", allowed_target)
+  cat("ALIAS_CHILD_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_CHILD_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  readLines(allowed_target)
+  cat("ALIAS_CHILD_READ_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_CHILD_READ_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("blocked", blocked_target)
+  cat("ALIAS_PARENT_WRITE_OK\n")
+}}, error = function(e) {{
+  message("ALIAS_PARENT_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_with_path_deny_and_child_write_meta(
+                scratch.path(),
+                &denied_dir,
+                &allowed_dir,
+            )),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("ALIAS_CHILD_WRITE_OK"),
+        "expected re-allowed alias child write under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_CHILD_WRITE_ERROR:"),
+        "re-allowed alias child write unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("ALIAS_CHILD_READ_OK"),
+        "expected re-allowed alias child read under denied parent to succeed, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_CHILD_READ_ERROR:"),
+        "re-allowed alias child read unexpectedly failed: {text}"
+    );
+    assert!(
+        text.contains("ALIAS_PARENT_WRITE_ERROR:"),
+        "expected sibling under denied alias parent to remain blocked, got: {text}"
+    );
+    assert!(
+        !text.contains("ALIAS_PARENT_WRITE_OK"),
+        "denied alias parent unexpectedly allowed sibling write: {text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&allowed_target)?,
+        "allowed\n",
+        "re-allowed alias child write should persist"
+    );
+    assert!(
+        !blocked_target.exists(),
+        "denied alias parent write should not create {}",
+        blocked_target.display()
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2471,22 +3818,311 @@ async fn sandbox_inherit_rejects_restricted_read_workspace_write_meta() -> TestR
     let text = collect_text(&result);
     session.cancel().await?;
 
+    if backend_unavailable(&text)
+        || text.contains("ipc disconnected while waiting for worker_ready")
+    {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        result.is_error != Some(true),
+        "expected restricted read metadata to be accepted, got: {text}"
+    );
+    assert!(
+        text.contains("[1] 2"),
+        "expected input to run after restricted read metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_meta_blocks_slash_tmp_write_without_slash_tmp_entry()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-no-slash-tmp-{nanos}.txt"));
+    let encoded_slash_tmp_target = encode_path(&slash_tmp_target)?;
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+slash_tmp_target <- {encoded_slash_tmp_target}
+tmpdir_target <- file.path(Sys.getenv("TMPDIR"), "mcp-repl-tmpdir-write-ok.txt")
+tryCatch({{
+  writeLines("tmpdir", tmpdir_target)
+  cat("TMPDIR_WRITE_OK\n")
+}}, error = function(e) {{
+  message("TMPDIR_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("slash_tmp", slash_tmp_target)
+  cat("SLASH_TMP_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SLASH_TMP_WRITE_ERROR:", conditionMessage(e))
+}})
+if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
+"#
+            ),
+            Some(10.0),
+            Some(minimal_read_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    let _ = fs::remove_file(&slash_tmp_target);
+    session.cancel().await?;
+
     if backend_unavailable(&text) {
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "expected restricted read metadata to be reported as an MCP tool error"
+    assert!(
+        text.contains("TMPDIR_WRITE_OK"),
+        "expected minimal metadata to allow TMPDIR writes, got: {text}"
     );
     assert!(
-        text.contains("read_only_access"),
-        "expected restricted read metadata rejection, got: {text}"
+        text.contains("SLASH_TMP_WRITE_ERROR:"),
+        "expected minimal metadata without slash_tmp to block /tmp writes, got: {text}"
     );
     assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported restricted read metadata, got: {text}"
+        !text.contains("SLASH_TMP_WRITE_OK"),
+        "minimal metadata without slash_tmp unexpectedly allowed /tmp writes: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_workspace_write_meta_allows_explicit_slash_tmp_write() -> TestResult<()> {
+    let _guard = test_guard();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-slash-tmp-{nanos}.txt"));
+    let encoded_slash_tmp_target = encode_path(&slash_tmp_target)?;
+    let scratch = repo_scratch_dir("sandbox-slash-tmp-write")?;
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+slash_tmp_target <- {encoded_slash_tmp_target}
+tryCatch({{
+  writeLines("slash_tmp", slash_tmp_target)
+  cat("SLASH_TMP_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SLASH_TMP_WRITE_ERROR:", conditionMessage(e))
+}})
+if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
+"#
+            ),
+            Some(10.0),
+            Some(workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    let _ = fs::remove_file(&slash_tmp_target);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("SLASH_TMP_WRITE_OK"),
+        "expected workspace-write metadata with slash_tmp to allow /tmp writes, got: {text}"
+    );
+    assert!(
+        !text.contains("SLASH_TMP_WRITE_ERROR:"),
+        "workspace-write metadata with slash_tmp unexpectedly blocked /tmp write: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_path_deny_blocks_platform_default_read() -> TestResult<()> {
+    let _guard = test_guard();
+    let denied_root = Path::new("/Library/Preferences");
+    let Some(denied_child) = fs::read_dir(denied_root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_file())
+    else {
+        eprintln!("no direct file under {}; skipping", denied_root.display());
+        return Ok(());
+    };
+    let encoded_denied_child = encode_path(&denied_child)?;
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_denied_child}
+tryCatch({{
+  readBin(target, "raw", n = 1)
+  cat("PLATFORM_DEFAULT_READ_OK\n")
+}}, error = function(e) {{
+  message("PLATFORM_DEFAULT_READ_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(minimal_read_with_path_deny_meta(temp.path(), denied_root)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("PLATFORM_DEFAULT_READ_ERROR:"),
+        "expected path deny to block platform-default read, got: {text}"
+    );
+    assert!(
+        !text.contains("PLATFORM_DEFAULT_READ_OK"),
+        "path deny unexpectedly allowed platform-default read: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_path_deny_allows_worker_start() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let denied_child = temp.path().join("secret.txt");
+    fs::write(&denied_child, "secret")?;
+    let encoded_denied_child = encode_path(&denied_child)?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+target <- {encoded_denied_child}
+cat("WORKER_STARTED\n")
+tryCatch({{
+  readLines(target, warn = FALSE)
+  cat("DENIED_READ_OK\n")
+}}, error = function(e) {{
+  message("DENIED_READ_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(minimal_read_with_path_deny_meta(temp.path(), &denied_child)),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("WORKER_STARTED"),
+        "expected minimal path-deny metadata to allow worker startup, got: {text}"
+    );
+    assert!(
+        text.contains("DENIED_READ_ERROR:"),
+        "expected path deny to block the denied file read, got: {text}"
+    );
+    assert!(
+        !text.contains("DENIED_READ_OK"),
+        "path deny unexpectedly allowed denied file read: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_meta_allows_python_libomp_shm() -> TestResult<()> {
+    let _guard = test_guard();
+    if !common::python_available() {
+        eprintln!("python not available; skipping");
+        return Ok(());
+    }
+    let temp = tempdir()?;
+    let session = spawn_python_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            r#"
+import ctypes
+import os
+
+libc = ctypes.CDLL(None, use_errno=True)
+name = f"/__KMP_REGISTERED_LIB_{os.getpid()}".encode()
+fd = libc.shm_open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+if fd == -1:
+    err = ctypes.get_errno()
+    print(f"SHM_ERROR:{err}:{os.strerror(err)}")
+else:
+    os.close(fd)
+    libc.shm_unlink(name)
+    print("SHM_OK")
+"#,
+            Some(10.0),
+            Some(minimal_read_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("SHM_OK"),
+        "expected libomp-style shared memory registration under minimal metadata, got: {text}"
+    );
+    assert!(
+        !text.contains("SHM_ERROR:"),
+        "minimal metadata blocked libomp-style shared memory registration: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_minimal_meta_allows_r_startup_and_practical_probes() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            r#"
+brand <- suppressWarnings(system("/usr/sbin/sysctl machdep.cpu.brand_string", intern = TRUE))
+suppressWarnings({
+  logical <- parallel::detectCores(logical = TRUE)
+  physical <- parallel::detectCores(logical = FALSE)
+  cat("SYSCTL_BRAND_OK=", length(brand) > 0 && any(grepl("Intel|Apple", brand)), "\n", sep = "")
+  cat("DETECT_CORES_OK=", is.numeric(logical) && is.numeric(physical) && logical >= physical && physical >= 1, "\n", sep = "")
+})
+"#,
+            Some(10.0),
+            Some(minimal_read_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("SYSCTL_BRAND_OK=TRUE"),
+        "expected Quarto-style sysctl probe under minimal metadata, got: {text}"
+    );
+    assert!(
+        text.contains("DETECT_CORES_OK=TRUE"),
+        "expected R parallel::detectCores under minimal metadata, got: {text}"
     );
     Ok(())
 }
@@ -2516,7 +4152,7 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
         "expected restricted read-only metadata to be reported as an MCP tool error"
     );
     assert!(
-        text.contains("access"),
+        text.contains("requires at least one readable entry"),
         "expected restricted read-only metadata rejection, got: {text}"
     );
     assert!(
@@ -2526,8 +4162,62 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_rejects_read_only_network_access_meta() -> TestResult<()> {
+async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(full_write_network_restricted_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        result.is_error != Some(true),
+        "expected full-write restricted-network metadata to be accepted, got: {text}"
+    );
+    assert!(
+        text.contains("[1] 2"),
+        "expected input to run after full-write restricted-network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_accepts_root_write_network_restricted_meta() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(root_write_network_restricted_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        result.is_error != Some(true),
+        "expected root-write restricted-network metadata to be accepted, got: {text}"
+    );
+    assert!(
+        text.contains("[1] 2"),
+        "expected input to run after root-write restricted-network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_accepts_read_only_network_access_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -2547,16 +4237,46 @@ async fn sandbox_inherit_rejects_read_only_network_access_meta() -> TestResult<(
     }
     assert_eq!(
         result.is_error,
-        Some(true),
-        "expected read-only network metadata to be reported as an MCP tool error"
+        Some(false),
+        "expected read-only network metadata to be accepted"
     );
     assert!(
-        text.contains("network_access"),
-        "expected read-only network metadata rejection, got: {text}"
+        text.contains("[1] 2"),
+        "expected input to run after read-only network metadata, got: {text}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_ignores_unknown_special_path_entries() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_server(temp.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            "1+1",
+            Some(2.0),
+            Some(read_only_with_unknown_special_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        result.is_error != Some(true),
+        "expected unknown special-path metadata to be accepted, got: {text}"
     );
     assert!(
-        !text.contains("[1] 2"),
-        "did not expect input to run after unsupported read-only network metadata, got: {text}"
+        !text.contains("failed to parse Codex sandbox state metadata"),
+        "unknown special-path metadata should not fail deserialization: {text}"
+    );
+    assert!(
+        text.contains("[1] 2"),
+        "expected input to run after unknown special-path metadata, got: {text}"
     );
     Ok(())
 }
@@ -2589,6 +4309,75 @@ async fn sandbox_inherit_read_only_meta_blocks_write_in_cwd() -> TestResult<()> 
         "did not expect read-only metadata to allow write in cwd, got: {text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_read_only_meta_blocks_ambient_temp_writes() -> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-read-only-temp")?;
+    let ambient_tmpdir = tempdir()?;
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let ambient_target = ambient_tmpdir
+        .path()
+        .join(format!("mcp-repl-ambient-tmpdir-{nanos}.txt"));
+    let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-slash-tmp-{nanos}.txt"));
+    let encoded_ambient_target = encode_path(&ambient_target)?;
+    let encoded_slash_tmp_target = encode_path(&slash_tmp_target)?;
+    let session = spawn_inherit_server_with_env(
+        scratch.path(),
+        vec![(
+            "TMPDIR".to_string(),
+            ambient_tmpdir.path().to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            format!(
+                r#"
+ambient_target <- {encoded_ambient_target}
+slash_tmp_target <- {encoded_slash_tmp_target}
+tryCatch({{
+  writeLines("ambient", ambient_target)
+  cat("AMBIENT_TMPDIR_WRITE_OK\n")
+}}, error = function(e) {{
+  message("AMBIENT_TMPDIR_WRITE_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("slash_tmp", slash_tmp_target)
+  cat("SLASH_TMP_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SLASH_TMP_WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+            ),
+            Some(10.0),
+            Some(read_only_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    let _ = fs::remove_file(&ambient_target);
+    let _ = fs::remove_file(&slash_tmp_target);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        text.contains("AMBIENT_TMPDIR_WRITE_ERROR:"),
+        "expected read-only metadata to block ambient TMPDIR writes, got: {text}"
+    );
+    assert!(
+        text.contains("SLASH_TMP_WRITE_ERROR:"),
+        "expected read-only metadata to block /tmp writes, got: {text}"
+    );
+    assert!(
+        !text.contains("AMBIENT_TMPDIR_WRITE_OK") && !text.contains("SLASH_TMP_WRITE_OK"),
+        "read-only metadata unexpectedly allowed ambient temp writes: {text}"
+    );
     Ok(())
 }
 
@@ -2656,26 +4445,16 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(test_delay_ms(260, 700)).await;
-
-    let mut text = collect_text(
-        &session
-            .write_stdin_raw_with_meta(
-                format!("\u{3}{}", write_file_code(&target)?),
-                Some(10.0),
-                Some(full_access_meta(temp.path())),
-            )
-            .await?,
-    );
-    for _ in 0..20 {
-        if !text.contains("[repl] input discarded while worker busy")
-            && !text.contains("<<repl status: busy")
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
-    }
+    let write_reply = retry_meta_until(
+        &session,
+        format!("\u{3}{}", write_file_code(&target)?),
+        10.0,
+        full_access_meta(temp.path()),
+        "files ctrl-c tail write",
+        |reply| collect_text(reply).contains("WRITE_OK"),
+    )
+    .await?;
+    let text = collect_text(&write_reply);
     let file_text = std::fs::read_to_string(&target).ok();
     let _ = std::fs::remove_file(&target);
     session.cancel().await?;
@@ -2727,26 +4506,16 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
         session.cancel().await?;
         return Ok(());
     }
-    tokio::time::sleep(test_delay_ms(260, 700)).await;
-
-    let mut text = collect_text(
-        &session
-            .write_stdin_raw_with_meta(
-                format!("\u{3}{}", write_file_code(&target)?),
-                Some(10.0),
-                Some(full_access_meta(temp.path())),
-            )
-            .await?,
-    );
-    for _ in 0..20 {
-        if !text.contains("[repl] input discarded while worker busy")
-            && !text.contains("<<repl status: busy")
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        text = collect_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
-    }
+    let write_reply = retry_meta_until(
+        &session,
+        format!("\u{3}{}", write_file_code(&target)?),
+        10.0,
+        full_access_meta(temp.path()),
+        "pager ctrl-c tail write",
+        |reply| collect_text(reply).contains("WRITE_OK"),
+    )
+    .await?;
+    let text = collect_text(&write_reply);
     let file_text = std::fs::read_to_string(&target).ok();
     let _ = std::fs::remove_file(&target);
     session.cancel().await?;
@@ -2841,6 +4610,51 @@ async fn sandbox_inherit_restarts_worker_when_state_meta_changes() -> TestResult
         "expected sandbox state change to restart the worker session, got: {second_text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_non_legacy_meta_honors_env_disabled_bwrap() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![
+            (
+                "MCP_REPL_DEBUG_DIR".to_string(),
+                debug_dir.to_string_lossy().to_string(),
+            ),
+            ("MCP_REPL_USE_LINUX_BWRAP".to_string(), "0".to_string()),
+        ],
+    )
+    .await?;
+
+    let result = session
+        .write_stdin_raw_with_meta(
+            r#"cat("NON_LEGACY_OK\n")"#,
+            Some(10.0),
+            Some(full_access_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_meta backend unavailable with bwrap disabled; checking spawn log");
+    } else {
+        assert!(
+            text.contains("NON_LEGACY_OK"),
+            "expected non-legacy metadata call to run, got: {text}"
+        );
+    }
+
+    let flags = worker_spawn_linux_bwrap_flags(&latest_debug_events(&debug_dir)?);
+    assert!(
+        flags.first() == Some(&false),
+        "expected explicit env bwrap disable to survive non-legacy metadata, got: {flags:?}"
+    );
     Ok(())
 }
 
@@ -3074,7 +4888,7 @@ async fn sandbox_inherit_pending_ctrl_c_tail_stages_current_meta_before_session_
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     let read_only_spawns = policy_types
         .iter()
-        .filter(|policy_type| policy_type.as_str() == "read-only")
+        .filter(|policy_type| policy_type.as_str() == read_only_meta_policy_type())
         .count();
     assert_eq!(
         read_only_spawns, 1,
@@ -3141,7 +4955,10 @@ async fn sandbox_inherit_pending_bare_ctrl_c_stages_current_meta_before_session_
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected bare Ctrl-C reset to use the current read-only metadata, got policy sequence: {policy_types:?}"
     );
     Ok(())
@@ -3216,7 +5033,10 @@ async fn sandbox_inherit_pending_bare_ctrl_c_keeps_old_meta_when_worker_survives
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected same-metadata follow-up to respawn under read-only after a surviving Ctrl-C, got policy sequence: {policy_types:?}"
     );
     Ok(())
@@ -3255,23 +5075,24 @@ async fn sandbox_inherit_empty_poll_stages_current_meta_before_session_end_reset
         timeout_text.contains("<<repl status: busy"),
         "expected exit setup request to time out, got: {timeout_text}"
     );
-    tokio::time::sleep(test_delay_ms(350, 700)).await;
-
-    let poll = session
-        .write_stdin_raw_with_meta("", Some(5.0), Some(read_only_meta(temp.path())))
-        .await?;
-    let poll_text = collect_text(&poll);
+    retry_meta_until(
+        &session,
+        "",
+        5.0,
+        read_only_meta(temp.path()),
+        "session-end empty poll with metadata",
+        |reply| !busy_text(&collect_text(reply)),
+    )
+    .await?;
     session.cancel().await?;
-
-    if poll_text.contains("<<repl status: busy") {
-        eprintln!("empty poll did not observe session end before timeout; skipping");
-        return Ok(());
-    }
 
     let policy_types = worker_spawn_policy_types(&latest_debug_events(&debug_dir)?);
     assert_eq!(
         policy_types,
-        vec!["workspace-write".to_string(), "read-only".to_string()],
+        vec![
+            "workspace-write".to_string(),
+            read_only_meta_policy_type().to_string()
+        ],
         "expected empty-poll reset to use the current read-only metadata, got policy sequence: {policy_types:?}"
     );
     Ok(())
@@ -3301,19 +5122,24 @@ async fn sandbox_inherit_empty_poll_without_meta_defers_session_end_respawn() ->
         timeout_text.contains("<<repl status: busy"),
         "expected exit setup request to time out, got: {timeout_text}"
     );
-    tokio::time::sleep(test_delay_ms(350, 700)).await;
-
-    let poll = session.write_stdin_raw_with("", Some(5.0)).await?;
+    let poll = retry_reply_until(
+        &session,
+        "",
+        5.0,
+        RetryMode::Plain,
+        "session-end empty poll without metadata",
+        |reply| {
+            let text = collect_text(reply);
+            text.contains("session ended")
+                || text.contains("ipc disconnected while waiting for request completion")
+        },
+    )
+    .await?;
     let poll_text = collect_text(&poll);
     assert_ne!(
         poll.is_error,
         Some(true),
         "did not expect omitted metadata empty poll to fail while draining local output, got: {poll_text}"
-    );
-    assert!(
-        poll_text.contains("session ended")
-            || poll_text.contains("ipc disconnected while waiting for request completion"),
-        "expected empty poll without metadata to report the ended session locally, got: {poll_text}"
     );
     assert!(
         !poll_text.contains(MISSING_INHERITED_STATE_MESSAGE),

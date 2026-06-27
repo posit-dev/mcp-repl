@@ -99,6 +99,7 @@ impl WorkerManager {
         &mut self,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
+        self.output_timeline.seal_utf8_tails();
         let pre_shutdown_end_offset = self
             .process
             .is_some()
@@ -106,6 +107,7 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
+        self.output_timeline.seal_utf8_tails();
         let post_shutdown_end_offset = self.output.end_offset();
         RestartShutdownSnapshot::Pager {
             pre_shutdown_end_offset,

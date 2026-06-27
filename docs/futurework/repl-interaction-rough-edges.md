@@ -35,21 +35,22 @@ Observed behavior:
 
 - A text-only oversized-output bundle produced a correct `transcript.txt` with the expected
   total line count and tail content.
-- The start of the transcript did not include an echoed prompt/input line for the triggering
-  `writeLines(big_lines)` call, even though later prompt lines were present.
+- The start of the transcript did not include request-boundary context for the
+  triggering `writeLines(big_lines)` call, even though later prompt lines were
+  present.
 
 Why this is worth revisiting:
 
 - The bundle is inspectable, but it does not read like a faithful REPL transcript.
-- Missing prompt/input echo at the start of a turn makes bundle inspection weaker for
-  debugging and post-hoc auditing.
+- Missing request boundary context at the start of a turn can make bundle
+  inspection weaker for debugging and post-hoc auditing.
 
 Potential direction:
 
-- Define whether bundle transcripts are intended to be full REPL transcripts or worker-output
-  captures with selective prompt echo.
-- If the intent is transcript fidelity, ensure the first accepted input for a bundled turn is
-  recorded consistently with later echoed prompt lines.
+- Define whether bundle transcripts are intended to be full REPL transcripts or
+  worker-output captures plus explicit request-boundary metadata.
+- If the intent is transcript fidelity, ensure the first accepted input for a
+  bundled turn is represented consistently with later prompt lines.
 
 ### 3. Make busy/discarded-input status less ambiguous
 

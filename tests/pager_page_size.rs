@@ -2,7 +2,18 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use std::sync::OnceLock;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::{Duration, Instant, sleep};
+
+fn test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+async fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    test_mutex().lock().await
+}
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -48,6 +59,7 @@ fn busy_response(text: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_small_page_size() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 80;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
@@ -88,21 +100,21 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
     session.cancel().await?;
 
     let chunks = text_chunks(&result);
-    let first = chunks
-        .iter()
-        .find(|text| !text.contains("--More--") && !text.starts_with("(END"))
-        .copied()
-        .unwrap_or("");
     let expected_echo = "> for (i in 1:50) cat('abcd\\n')\n";
-    let first_without_optional_echo = first.strip_prefix(expected_echo).unwrap_or(first);
+    let first_without_optional_echo = chunks
+        .iter()
+        .filter(|text| !text.contains("--More--") && !text.starts_with("(END"))
+        .map(|text| text.strip_prefix(expected_echo).unwrap_or(text))
+        .find(|text| !text.is_empty())
+        .unwrap_or("");
     assert!(
         !first_without_optional_echo.is_empty(),
-        "expected first page content, got: {first:?}"
+        "expected first page content, got: {chunks:?}"
     );
     assert!(
-        first.len() <= page_bytes as usize,
+        first_without_optional_echo.len() <= page_bytes as usize,
         "first page exceeded page size: {} > {page_bytes}",
-        first.len()
+        first_without_optional_echo.len()
     );
 
     assert!(
@@ -114,7 +126,169 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn generated_input_echo_does_not_count_toward_small_page_size() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
+    let page_bytes = 80;
+    let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+    let mut input = (0..120)
+        .map(|idx| format!("echo_budget_{idx} <- {idx}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    input.push_str("\nfor (i in 1:50) cat('abcd\\n')");
+
+    let mut result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let mut full_text = result_text(&result);
+    if backend_unavailable(&full_text) {
+        eprintln!("pager_page_size backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    if busy_response(&full_text) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            let next = session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?;
+            let text = result_text(&next);
+            if backend_unavailable(&text) {
+                eprintln!("pager_page_size backend unavailable in this environment; skipping");
+                session.cancel().await?;
+                return Ok(());
+            }
+            result = next;
+            full_text = text;
+            if !busy_response(&full_text) {
+                break;
+            }
+        }
+    }
+    assert!(
+        !busy_response(&full_text),
+        "pager_page_size worker remained busy after waiting for completion: {full_text:?}"
+    );
+    session.cancel().await?;
+
+    let chunks = text_chunks(&result);
+    let first = chunks
+        .iter()
+        .filter(|text| !text.contains("--More--") && !text.starts_with("(END"))
+        .find(|text| !text.is_empty())
+        .copied()
+        .unwrap_or("");
+    assert!(
+        !first.is_empty(),
+        "expected first page content, got: {chunks:?}"
+    );
+    assert!(
+        first.contains("abcd\n"),
+        "expected visible output in the first pager page, got: {first:?}"
+    );
+    assert!(
+        !full_text.contains("echo_budget_"),
+        "did not expect generated input echo in the pager response, got: {full_text:?}"
+    );
+    assert!(
+        first.len() <= page_bytes as usize,
+        "first page exceeded page size: {} > {page_bytes}",
+        first.len()
+    );
+    assert!(
+        chunks.iter().any(|text| text.contains("--More--")),
+        "expected pager footer in response"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_input_echo_does_not_delay_follow_up_visible_output() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
+    let page_bytes = 64;
+    let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
+    let input = "cat(paste(rep('A', 70), collapse='')); cat('\\n')\necho_late_hidden <- 123\ncat('TAIL_VISIBLE'); cat(paste(rep('B', 120), collapse='')); cat('\\n')";
+
+    let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
+    let mut first_text = result_text(&result);
+    if backend_unavailable(&first_text) {
+        eprintln!("pager_page_size backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    if busy_response(&first_text) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            let next = session
+                .write_stdin_raw_unterminated_with("", Some(2.0))
+                .await?;
+            let text = result_text(&next);
+            if backend_unavailable(&text) {
+                eprintln!("pager_page_size backend unavailable in this environment; skipping");
+                session.cancel().await?;
+                return Ok(());
+            }
+            first_text = text;
+            if !busy_response(&first_text) {
+                break;
+            }
+        }
+    }
+    assert!(
+        !busy_response(&first_text),
+        "pager_page_size worker remained busy after waiting for completion: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("--More--"),
+        "expected the initial reply to activate pager mode, got: {first_text:?}"
+    );
+
+    let next = session
+        .write_stdin_raw_unterminated_with("", Some(2.0))
+        .await?;
+    let next_text = result_text(&next);
+    let mut follow_up_text = next_text.clone();
+    let mut tail_text = String::new();
+    for _ in 0..8 {
+        let page = session
+            .write_stdin_raw_unterminated_with("", Some(2.0))
+            .await?;
+        let page_text = result_text(&page);
+        follow_up_text.push_str(&page_text);
+        if page_text.contains("TAIL_VISIBLEB") {
+            tail_text = page_text;
+            break;
+        }
+        if !page_text.contains("--More--") {
+            tail_text = page_text;
+            break;
+        }
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        next_text.contains("AAAAAA"),
+        "expected the first follow-up page to finish the leading output line, got: {next_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("echo_late_hidden <- 123")
+            && !follow_up_text.contains("cat('TAIL_VISIBLE')"),
+        "did not expect generated input echoes on follow-up pager pages, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("TAIL_VISIBLEB") || tail_text.contains("TAIL_VISIBLEB"),
+        "expected a later follow-up page to include later visible output, got: {tail_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn respects_configured_large_page_size() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 10_000;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
@@ -165,6 +339,7 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn large_page_size_keeps_pager_mode_instead_of_spilling_to_output_bundle() -> TestResult<()> {
+    let _guard = lock_test_mutex().await;
     let page_bytes = 10_000;
     let session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 

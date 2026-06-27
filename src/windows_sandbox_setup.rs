@@ -1,0 +1,1558 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::ffi::c_void;
+use std::fs;
+use std::io;
+use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::process::Command;
+
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::FWP_E_ALREADY_EXISTS;
+use windows::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
+use windows::Win32::Foundation::FWP_E_NOT_FOUND;
+use windows::Win32::Foundation::HANDLE as WindowsHandle;
+use windows::Win32::Foundation::S_OK;
+use windows::Win32::Foundation::VARIANT_TRUE;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTION_BLOCK;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_ACTRL_MATCH_FILTER;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_BYTE_BLOB;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_FLAG_IS_LOOPBACK;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_VALUE0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_CONDITION_VALUE0_0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_EMPTY;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_EQUAL;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_FLAGS_ANY_SET;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_MATCH_RANGE;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_RANGE_TYPE;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_RANGE0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_SECURITY_DESCRIPTOR_TYPE;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT8;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT16;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_UINT32;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWP_VALUE0_0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ACTION0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_ALE_USER_ID;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_FLAGS;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_PROTOCOL;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_CONDITION_IP_REMOTE_PORT;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_DISPLAY_DATA0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_CONDITION0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_FLAG_PERSISTENT;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_LAYER_ALE_AUTH_CONNECT_V6;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_PROVIDER_FLAG_PERSISTENT;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_PROVIDER0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SESSION0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SUBLAYER_FLAG_PERSISTENT;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SUBLAYER0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineClose0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmEngineOpen0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmFilterDeleteByKey0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmProviderAdd0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmSubLayerAdd0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionAbort0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionBegin0;
+use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
+use windows::Win32::NetworkManagement::WindowsFirewall::INetFwPolicy2;
+use windows::Win32::NetworkManagement::WindowsFirewall::INetFwRule3;
+use windows::Win32::NetworkManagement::WindowsFirewall::INetFwRules;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_ACTION_BLOCK;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_IP_PROTOCOL_ANY;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_IP_PROTOCOL_TCP;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_IP_PROTOCOL_UDP;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_MODIFY_STATE;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_MODIFY_STATE_OK;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_PROFILE2_ALL;
+use windows::Win32::NetworkManagement::WindowsFirewall::NET_FW_RULE_DIR_OUT;
+use windows::Win32::NetworkManagement::WindowsFirewall::NetFwPolicy2;
+use windows::Win32::NetworkManagement::WindowsFirewall::NetFwRule;
+use windows::Win32::System::Com::CLSCTX_INPROC_SERVER;
+use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
+use windows::Win32::System::Com::CoCreateInstance;
+use windows::Win32::System::Com::CoInitializeEx;
+use windows::Win32::System::Com::CoUninitialize;
+use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
+use windows::core::BSTR;
+use windows::core::GUID;
+use windows::core::Interface;
+use windows::core::PCWSTR;
+use windows::core::PWSTR;
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::GetLastError;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::NO_ERROR;
+use windows_sys::Win32::Foundation::SetHandleInformation;
+use windows_sys::Win32::Foundation::WAIT_FAILED;
+use windows_sys::Win32::Security::Authorization::BuildSecurityDescriptorW;
+use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
+use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
+use windows_sys::Win32::Security::Authorization::NO_MULTIPLE_TRUSTEE;
+use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
+use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_USER;
+use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
+use windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG;
+use windows_sys::Win32::Security::Cryptography::BCryptGenRandom;
+use windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB;
+use windows_sys::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN;
+use windows_sys::Win32::Security::Cryptography::CryptProtectData;
+use windows_sys::Win32::Security::Cryptography::CryptUnprotectData;
+use windows_sys::Win32::Security::GetTokenInformation;
+use windows_sys::Win32::Security::NO_INHERITANCE;
+use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+use windows_sys::Win32::Security::TOKEN_ELEVATION;
+use windows_sys::Win32::Security::TOKEN_QUERY;
+use windows_sys::Win32::Security::TokenElevation;
+use windows_sys::Win32::System::Console::GetStdHandle;
+use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
+use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
+use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
+use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::System::Threading::OpenProcessToken;
+use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
+use windows_sys::Win32::System::Threading::STARTUPINFOW;
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+pub const OFFLINE_USERNAME: &str = "McpReplOffline";
+pub const DEFAULT_HTTP_PROXY_PORT: u16 = 39080;
+pub const DEFAULT_SOCKS_PROXY_PORT: u16 = 39081;
+
+const SETUP_VERSION: u32 = 1;
+const SETUP_DIR_NAME: &str = "mcp-repl\\windows-sandbox";
+const SETUP_MARKER_FILE: &str = "setup_marker.json";
+const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+const LOGON_WITHOUT_PROFILE: u32 = 0;
+const LOOPBACK_REMOTE_ADDRESSES: &str = "127.0.0.0/8,::/127";
+const NON_LOOPBACK_REMOTE_ADDRESSES: &str = "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,::,::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
+const OFFLINE_BLOCK_RULE_NAME: &str = "mcp_repl_sandbox_offline_block_outbound";
+const OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME: &str = "mcp_repl_sandbox_offline_block_loopback_tcp";
+const OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME: &str = "mcp_repl_sandbox_offline_block_loopback_udp";
+const OFFLINE_BLOCK_RULE_FRIENDLY: &str = "mcp-repl Offline Sandbox - Block Non-Loopback Outbound";
+const OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY: &str =
+    "mcp-repl Offline Sandbox - Block Loopback TCP Except Proxy";
+const OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY: &str =
+    "mcp-repl Offline Sandbox - Block Loopback UDP";
+const WFP_PROVIDER_KEY: GUID = GUID::from_u128(0x8ac82729_42d4_4e8b_9b01_a894e4193d28);
+const WFP_SUBLAYER_KEY: GUID = GUID::from_u128(0xf748323d_9f16_4436_87f5_572f345b00d3);
+const WFP_LOOPBACK_TCP_V4_FILTER_KEYS: [GUID; 3] = [
+    GUID::from_u128(0x240f37ce_377a_485c_997c_429ec42dca2d),
+    GUID::from_u128(0xfd989251_aa5f_4a53_9fd3_e439d645e0b1),
+    GUID::from_u128(0x4abfee66_3787_449a_8075_ca8114a7e2b0),
+];
+const WFP_LOOPBACK_TCP_V6_FILTER_KEYS: [GUID; 3] = [
+    GUID::from_u128(0xd928cf5d_94e3_4bca_bcbe_2d6fe219c8b4),
+    GUID::from_u128(0x14c05c7f_4422_454f_ba2d_0ee97375d24f),
+    GUID::from_u128(0x59a2e776_cd4c_4486_8dd1_83f9006d6f4a),
+];
+const WFP_LOOPBACK_UDP_V4_FILTER_KEY: GUID =
+    GUID::from_u128(0x301dc9f0_ee73_41ba_bd82_bc086e0212e0);
+const WFP_LOOPBACK_UDP_V6_FILTER_KEY: GUID =
+    GUID::from_u128(0x55bc72e5_ee20_428f_964f_6c3069ea7062);
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+const WFP_SUCCESS: u32 = 0;
+const WFP_E_ALREADY_EXISTS_CODE: u32 = FWP_E_ALREADY_EXISTS.0 as u32;
+const WFP_E_FILTER_NOT_FOUND_CODE: u32 = FWP_E_FILTER_NOT_FOUND.0 as u32;
+const WFP_E_NOT_FOUND_CODE: u32 = FWP_E_NOT_FOUND.0 as u32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsSandboxSetupOptions {
+    pub http_proxy_port: u16,
+    pub socks_proxy_port: u16,
+}
+
+impl Default for WindowsSandboxSetupOptions {
+    fn default() -> Self {
+        Self {
+            http_proxy_port: DEFAULT_HTTP_PROXY_PORT,
+            socks_proxy_port: DEFAULT_SOCKS_PROXY_PORT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsSandboxOfflineSetup {
+    pub username: String,
+    pub user_sid: String,
+    pub http_proxy_port: u16,
+    pub socks_proxy_port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowsSandboxOfflineCredentials {
+    pub setup: WindowsSandboxOfflineSetup,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SetupMarker {
+    version: u32,
+    username: String,
+    user_sid: String,
+    http_proxy_port: u16,
+    socks_proxy_port: u16,
+    password_dpapi_b64: String,
+}
+
+struct BlockRuleSpec<'a> {
+    internal_name: &'a str,
+    friendly_desc: &'a str,
+    protocol: i32,
+    local_user_spec: &'a str,
+    offline_sid: &'a str,
+    remote_addresses: Option<&'a str>,
+    remote_ports: Option<&'a str>,
+}
+
+pub fn parse_setup_args(args: &[String]) -> Result<WindowsSandboxSetupOptions, String> {
+    let mut options = WindowsSandboxSetupOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => {
+                print_setup_usage();
+                std::process::exit(0);
+            }
+            "--http-proxy-port" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --http-proxy-port".to_string())?;
+                options.http_proxy_port = parse_port(value, "--http-proxy-port")?;
+            }
+            arg if arg.starts_with("--http-proxy-port=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                options.http_proxy_port = parse_port(value, "--http-proxy-port")?;
+            }
+            "--socks-proxy-port" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --socks-proxy-port".to_string())?;
+                options.socks_proxy_port = parse_port(value, "--socks-proxy-port")?;
+            }
+            arg if arg.starts_with("--socks-proxy-port=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                options.socks_proxy_port = parse_port(value, "--socks-proxy-port")?;
+            }
+            other => return Err(format!("unknown windows-sandbox setup option: {other}")),
+        }
+        index += 1;
+    }
+    validate_setup_options(&options)?;
+    Ok(options)
+}
+
+pub fn print_setup_usage() {
+    println!(
+        "Usage:\n\
+mcp-repl windows-sandbox setup [--http-proxy-port <port>] [--socks-proxy-port <port>]\n\n\
+Creates or refreshes the Windows offline sandbox account, DPAPI-protected credentials,\n\
+account-scoped firewall rules, and loopback network filters. Run from an elevated\n\
+shell as the user who will run mcp-repl."
+    );
+}
+
+pub fn run_setup(options: WindowsSandboxSetupOptions) -> Result<(), String> {
+    validate_setup_options(&options)?;
+    if !is_process_elevated()? {
+        return Err(
+            "windows sandbox setup must be run from an elevated shell as the user who will run mcp-repl"
+                .to_string(),
+        );
+    }
+
+    let password = match load_offline_credentials() {
+        Ok(credentials) => credentials.password,
+        Err(_) => generate_password()?,
+    };
+    let user_sid = ensure_offline_user(&password)?;
+    ensure_offline_firewall_rules(
+        &user_sid,
+        &[options.http_proxy_port, options.socks_proxy_port],
+    )?;
+    ensure_offline_wfp_loopback_filters(
+        &user_sid,
+        &[options.http_proxy_port, options.socks_proxy_port],
+    )?;
+    write_setup_marker(&SetupMarker {
+        version: SETUP_VERSION,
+        username: OFFLINE_USERNAME.to_string(),
+        user_sid: user_sid.clone(),
+        http_proxy_port: options.http_proxy_port,
+        socks_proxy_port: options.socks_proxy_port,
+        password_dpapi_b64: protect_password(&password)?,
+    })?;
+
+    println!(
+        "Windows sandbox setup complete for {OFFLINE_USERNAME} ({user_sid}); HTTP proxy port {}, SOCKS proxy port {}.",
+        options.http_proxy_port, options.socks_proxy_port
+    );
+    Ok(())
+}
+
+pub fn load_offline_setup() -> Result<WindowsSandboxOfflineSetup, String> {
+    let marker = read_setup_marker()?;
+    validate_marker(&marker)?;
+    Ok(WindowsSandboxOfflineSetup {
+        username: marker.username,
+        user_sid: marker.user_sid,
+        http_proxy_port: marker.http_proxy_port,
+        socks_proxy_port: marker.socks_proxy_port,
+    })
+}
+
+pub fn load_offline_credentials() -> Result<WindowsSandboxOfflineCredentials, String> {
+    let marker = read_setup_marker()?;
+    validate_marker(&marker)?;
+    let password = unprotect_password(&marker.password_dpapi_b64)?;
+    Ok(WindowsSandboxOfflineCredentials {
+        setup: WindowsSandboxOfflineSetup {
+            username: marker.username,
+            user_sid: marker.user_sid,
+            http_proxy_port: marker.http_proxy_port,
+            socks_proxy_port: marker.socks_proxy_port,
+        },
+        password,
+    })
+}
+
+pub fn missing_setup_message() -> String {
+    format!(
+        "Windows proxy-enforced sandbox setup is required. Run from an elevated shell: mcp-repl windows-sandbox setup --http-proxy-port {DEFAULT_HTTP_PROXY_PORT} --socks-proxy-port {DEFAULT_SOCKS_PROXY_PORT}"
+    )
+}
+
+pub fn run_offline_logon_wrapper(child_args: Vec<String>) -> Result<i32, String> {
+    if child_args.is_empty() {
+        return Err("offline logon wrapper requires child arguments".to_string());
+    }
+    let credentials =
+        load_offline_credentials().map_err(|err| format!("{} ({err})", missing_setup_message()))?;
+    create_process_with_offline_logon(&credentials, child_args)
+}
+
+fn parse_port(raw: &str, flag: &str) -> Result<u16, String> {
+    let value = raw
+        .parse::<u16>()
+        .map_err(|_| format!("invalid value for {flag}: {raw}"))?;
+    if value == 0 {
+        return Err(format!("invalid value for {flag}: 0"));
+    }
+    Ok(value)
+}
+
+fn validate_setup_options(options: &WindowsSandboxSetupOptions) -> Result<(), String> {
+    if options.http_proxy_port == options.socks_proxy_port {
+        return Err("HTTP and SOCKS proxy ports must be different".to_string());
+    }
+    Ok(())
+}
+
+fn setup_dir() -> Result<PathBuf, String> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "LOCALAPPDATA is not set; cannot store Windows sandbox setup".to_string())?;
+    Ok(base.join(SETUP_DIR_NAME))
+}
+
+fn setup_marker_path() -> Result<PathBuf, String> {
+    Ok(setup_dir()?.join(SETUP_MARKER_FILE))
+}
+
+fn read_setup_marker() -> Result<SetupMarker, String> {
+    let path = setup_marker_path()?;
+    let text = fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "{} (failed to read '{}': {err})",
+            missing_setup_message(),
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|err| format!("failed to parse Windows sandbox setup marker: {err}"))
+}
+
+fn write_setup_marker(marker: &SetupMarker) -> Result<(), String> {
+    let dir = setup_dir()?;
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create Windows sandbox setup dir: {err}"))?;
+    let path = setup_marker_path()?;
+    let text = serde_json::to_string_pretty(marker)
+        .map_err(|err| format!("failed to serialize Windows sandbox setup marker: {err}"))?;
+    fs::write(&path, text)
+        .map_err(|err| format!("failed to write Windows sandbox setup marker: {err}"))?;
+    Ok(())
+}
+
+fn validate_marker(marker: &SetupMarker) -> Result<(), String> {
+    if marker.version != SETUP_VERSION {
+        return Err(format!(
+            "{} (setup marker version {} is not supported)",
+            missing_setup_message(),
+            marker.version
+        ));
+    }
+    if marker.username != OFFLINE_USERNAME {
+        return Err(format!(
+            "{} (setup marker is for unexpected user {})",
+            missing_setup_message(),
+            marker.username
+        ));
+    }
+    validate_setup_options(&WindowsSandboxSetupOptions {
+        http_proxy_port: marker.http_proxy_port,
+        socks_proxy_port: marker.socks_proxy_port,
+    })
+}
+
+fn generate_password() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(format!(
+            "BCryptGenRandom failed while creating sandbox password with NTSTATUS 0x{status:08x}"
+        ));
+    }
+    Ok(format!(
+        "McpRepl-{}!",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    ))
+}
+
+fn protect_password(password: &str) -> Result<String, String> {
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: password.len() as u32,
+        pbData: password.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "CryptProtectData failed for Windows sandbox password: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    unsafe {
+        let _ = LocalFree(output.pbData as HLOCAL);
+    }
+    Ok(encoded)
+}
+
+fn unprotect_password(encoded: &str) -> Result<String, String> {
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| format!("Windows sandbox password is not valid base64: {err}"))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: encrypted.len() as u32,
+        pbData: encrypted.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "CryptUnprotectData failed for Windows sandbox password: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let password = String::from_utf8(bytes.to_vec())
+        .map_err(|err| format!("Windows sandbox password is not valid UTF-8: {err}"))?;
+    unsafe {
+        let _ = LocalFree(output.pbData as HLOCAL);
+    }
+    Ok(password)
+}
+
+fn is_process_elevated() -> Result<bool, String> {
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(format!(
+                "OpenProcessToken failed while checking elevation: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(format!(
+                "GetTokenInformation(TokenElevation) failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
+
+fn ensure_offline_user(password: &str) -> Result<String, String> {
+    let escaped_password = powershell_single_quote(password);
+    let escaped_name = powershell_single_quote(OFFLINE_USERNAME);
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$name = '{escaped_name}'
+$password = [System.Security.SecureString]::new()
+foreach ($ch in '{escaped_password}'.ToCharArray()) {{ $password.AppendChar($ch) }}
+$password.MakeReadOnly()
+$user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+if ($null -eq $user) {{
+  New-LocalUser -Name $name -Password $password -AccountNeverExpires -UserMayNotChangePassword -Description 'mcp-repl offline sandbox user' | Out-Null
+}} else {{
+  Enable-LocalUser -Name $name
+  Set-LocalUser -Name $name -Password $password
+}}
+try {{ Set-LocalUser -Name $name -PasswordNeverExpires $true }} catch {{ }}
+$user = Get-LocalUser -Name $name
+$user.SID.Value
+"#
+    );
+    let sid = run_powershell_script(&script)?;
+    let sid = sid.trim();
+    if sid.is_empty() || !sid.starts_with("S-1-") {
+        return Err(format!(
+            "failed to resolve SID for {OFFLINE_USERNAME}: {sid:?}"
+        ));
+    }
+    Ok(sid.to_string())
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn run_powershell_script(script: &str) -> Result<String, String> {
+    let mut utf16 = Vec::new();
+    for value in script.encode_utf16() {
+        utf16.extend_from_slice(&value.to_le_bytes());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .output()
+        .map_err(|err| format!("failed to run PowerShell for Windows sandbox setup: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "PowerShell Windows sandbox setup failed with status {}: {}{}",
+            output.status, stdout, stderr
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn ensure_offline_firewall_rules(offline_sid: &str, proxy_ports: &[u16]) -> Result<(), String> {
+    let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        return Err(format!(
+            "CoInitializeEx failed for Windows Firewall COM: {hr:?}"
+        ));
+    }
+
+    let result = unsafe {
+        (|| -> Result<(), String> {
+            let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
+                .map_err(|err| format!("CoCreateInstance NetFwPolicy2 failed: {err:?}"))?;
+            ensure_local_policy_rules_take_effect(&policy)?;
+            let rules = policy
+                .Rules()
+                .map_err(|err| format!("INetFwPolicy2::Rules failed: {err:?}"))?;
+
+            ensure_block_rule(
+                &rules,
+                &BlockRuleSpec {
+                    internal_name: OFFLINE_BLOCK_RULE_NAME,
+                    friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
+                    protocol: NET_FW_IP_PROTOCOL_ANY.0,
+                    local_user_spec: &local_user_spec,
+                    offline_sid,
+                    remote_addresses: Some(NON_LOOPBACK_REMOTE_ADDRESSES),
+                    remote_ports: None,
+                },
+            )?;
+            ensure_block_rule(
+                &rules,
+                &BlockRuleSpec {
+                    internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
+                    friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
+                    protocol: NET_FW_IP_PROTOCOL_UDP.0,
+                    local_user_spec: &local_user_spec,
+                    offline_sid,
+                    remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
+                    remote_ports: None,
+                },
+            )?;
+            let blocked_remote_ports = blocked_loopback_tcp_remote_ports(proxy_ports);
+            ensure_block_rule(
+                &rules,
+                &BlockRuleSpec {
+                    internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
+                    friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
+                    protocol: NET_FW_IP_PROTOCOL_TCP.0,
+                    local_user_spec: &local_user_spec,
+                    offline_sid,
+                    remote_addresses: Some(LOOPBACK_REMOTE_ADDRESSES),
+                    remote_ports: blocked_remote_ports.as_deref(),
+                },
+            )?;
+            Ok(())
+        })()
+    };
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
+unsafe fn ensure_local_policy_rules_take_effect(policy: &INetFwPolicy2) -> Result<(), String> {
+    let mut modify_state = NET_FW_MODIFY_STATE::default();
+    let result = (Interface::vtable(policy).LocalPolicyModifyState)(
+        Interface::as_raw(policy),
+        &mut modify_state,
+    );
+    if result.is_err() {
+        return Err(format!(
+            "INetFwPolicy2::LocalPolicyModifyState failed: {result:?}"
+        ));
+    }
+    if result != S_OK {
+        return Err(format!(
+            "local firewall policy modifications do not apply to every active profile: result={result:?}"
+        ));
+    }
+    if modify_state != NET_FW_MODIFY_STATE_OK {
+        return Err(format!(
+            "local firewall policy modifications will not take effect: LocalPolicyModifyState={modify_state:?}"
+        ));
+    }
+    Ok(())
+}
+
+unsafe fn ensure_block_rule(rules: &INetFwRules, spec: &BlockRuleSpec<'_>) -> Result<(), String> {
+    let name = BSTR::from(spec.internal_name);
+    let rule: INetFwRule3 = match rules.Item(&name) {
+        Ok(existing) => existing
+            .cast()
+            .map_err(|err| format!("cast existing firewall rule to INetFwRule3 failed: {err:?}"))?,
+        Err(_) => {
+            let new_rule: INetFwRule3 = CoCreateInstance(&NetFwRule, None, CLSCTX_INPROC_SERVER)
+                .map_err(|err| format!("CoCreateInstance NetFwRule failed: {err:?}"))?;
+            new_rule
+                .SetName(&name)
+                .map_err(|err| format!("SetName failed: {err:?}"))?;
+            configure_rule(&new_rule, spec)?;
+            rules
+                .Add(&new_rule)
+                .map_err(|err| format!("Rules::Add failed: {err:?}"))?;
+            new_rule
+        }
+    };
+    configure_rule(&rule, spec)
+}
+
+unsafe fn configure_rule(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) -> Result<(), String> {
+    rule.SetDescription(&BSTR::from(spec.friendly_desc))
+        .map_err(|err| format!("SetDescription failed: {err:?}"))?;
+    rule.SetDirection(NET_FW_RULE_DIR_OUT)
+        .map_err(|err| format!("SetDirection failed: {err:?}"))?;
+    rule.SetAction(NET_FW_ACTION_BLOCK)
+        .map_err(|err| format!("SetAction failed: {err:?}"))?;
+    rule.SetEnabled(VARIANT_TRUE)
+        .map_err(|err| format!("SetEnabled failed: {err:?}"))?;
+    rule.SetProfiles(NET_FW_PROFILE2_ALL.0)
+        .map_err(|err| format!("SetProfiles failed: {err:?}"))?;
+    rule.SetProtocol(spec.protocol)
+        .map_err(|err| format!("SetProtocol failed: {err:?}"))?;
+    rule.SetRemoteAddresses(&BSTR::from(spec.remote_addresses.unwrap_or("*")))
+        .map_err(|err| format!("SetRemoteAddresses failed: {err:?}"))?;
+    if let Some(remote_ports) = spec.remote_ports {
+        rule.SetRemotePorts(&BSTR::from(remote_ports))
+            .map_err(|err| format!("SetRemotePorts failed: {err:?}"))?;
+    }
+    rule.SetLocalUserAuthorizedList(&BSTR::from(spec.local_user_spec))
+        .map_err(|err| format!("SetLocalUserAuthorizedList failed: {err:?}"))?;
+
+    let actual = rule
+        .LocalUserAuthorizedList()
+        .map_err(|err| format!("LocalUserAuthorizedList read-back failed: {err:?}"))?
+        .to_string();
+    if !actual.contains(spec.offline_sid) {
+        return Err(format!(
+            "offline firewall rule user scope mismatch: expected SID {}, got {actual}",
+            spec.offline_sid
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_offline_wfp_loopback_filters(
+    offline_sid: &str,
+    proxy_ports: &[u16],
+) -> Result<(), String> {
+    unsafe {
+        let mut user_descriptor = WfpUserSecurityDescriptor::for_sid_string(offline_sid)?;
+        ensure_offline_wfp_loopback_filters_with_user_descriptor(
+            user_descriptor.blob_mut_ptr(),
+            blocked_loopback_tcp_port_ranges(proxy_ports),
+        )
+    }
+}
+
+unsafe fn ensure_offline_wfp_loopback_filters_with_user_descriptor(
+    user_descriptor: *mut FWP_BYTE_BLOB,
+    tcp_ranges: Vec<PortRange>,
+) -> Result<(), String> {
+    let engine = WfpEngine::open()?;
+    wfp_check(
+        FwpmTransactionBegin0(engine.handle, 0),
+        "FwpmTransactionBegin0",
+    )?;
+    let mut committed = false;
+    let result = (|| -> Result<(), String> {
+        ensure_wfp_provider(engine.handle)?;
+        ensure_wfp_sublayer(engine.handle)?;
+        delete_wfp_loopback_filters(engine.handle)?;
+        add_wfp_loopback_filters(engine.handle, user_descriptor, &tcp_ranges)?;
+        wfp_check(
+            FwpmTransactionCommit0(engine.handle),
+            "FwpmTransactionCommit0",
+        )?;
+        committed = true;
+        Ok(())
+    })();
+    if !committed {
+        let _ = FwpmTransactionAbort0(engine.handle);
+    }
+    result
+}
+
+unsafe fn ensure_wfp_provider(engine: WindowsHandle) -> Result<(), String> {
+    let mut provider_name = to_wide("mcp-repl Windows Sandbox");
+    let mut provider_desc = to_wide("mcp-repl offline sandbox network policy");
+    let provider = FWPM_PROVIDER0 {
+        providerKey: WFP_PROVIDER_KEY,
+        displayData: FWPM_DISPLAY_DATA0 {
+            name: PWSTR(provider_name.as_mut_ptr()),
+            description: PWSTR(provider_desc.as_mut_ptr()),
+        },
+        flags: FWPM_PROVIDER_FLAG_PERSISTENT,
+        providerData: Default::default(),
+        serviceName: PWSTR::null(),
+    };
+    let code = FwpmProviderAdd0(engine, &provider, None);
+    if code == WFP_SUCCESS || code == WFP_E_ALREADY_EXISTS_CODE {
+        return Ok(());
+    }
+    Err(wfp_error("FwpmProviderAdd0", code))
+}
+
+unsafe fn ensure_wfp_sublayer(engine: WindowsHandle) -> Result<(), String> {
+    let mut provider_key = WFP_PROVIDER_KEY;
+    let mut sublayer_name = to_wide("mcp-repl Windows Sandbox Loopback");
+    let mut sublayer_desc = to_wide("mcp-repl offline sandbox loopback policy");
+    let sublayer = FWPM_SUBLAYER0 {
+        subLayerKey: WFP_SUBLAYER_KEY,
+        displayData: FWPM_DISPLAY_DATA0 {
+            name: PWSTR(sublayer_name.as_mut_ptr()),
+            description: PWSTR(sublayer_desc.as_mut_ptr()),
+        },
+        flags: FWPM_SUBLAYER_FLAG_PERSISTENT,
+        providerKey: &mut provider_key,
+        providerData: Default::default(),
+        weight: u16::MAX,
+    };
+    let code = FwpmSubLayerAdd0(engine, &sublayer, None);
+    if code == WFP_SUCCESS || code == WFP_E_ALREADY_EXISTS_CODE {
+        return Ok(());
+    }
+    Err(wfp_error("FwpmSubLayerAdd0", code))
+}
+
+unsafe fn delete_wfp_loopback_filters(engine: WindowsHandle) -> Result<(), String> {
+    for key in all_wfp_loopback_filter_keys() {
+        let code = FwpmFilterDeleteByKey0(engine, &key);
+        if code == WFP_SUCCESS
+            || code == WFP_E_FILTER_NOT_FOUND_CODE
+            || code == WFP_E_NOT_FOUND_CODE
+        {
+            continue;
+        }
+        return Err(wfp_error("FwpmFilterDeleteByKey0", code));
+    }
+    Ok(())
+}
+
+unsafe fn add_wfp_loopback_filters(
+    engine: WindowsHandle,
+    user_descriptor: *mut FWP_BYTE_BLOB,
+    tcp_ranges: &[PortRange],
+) -> Result<(), String> {
+    for (index, range) in tcp_ranges.iter().copied().enumerate() {
+        if index >= WFP_LOOPBACK_TCP_V4_FILTER_KEYS.len() {
+            return Err("too many Windows loopback TCP port ranges".to_string());
+        }
+        add_wfp_loopback_filter(
+            engine,
+            WFP_LOOPBACK_TCP_V4_FILTER_KEYS[index],
+            "mcp-repl Offline Sandbox - Block Loopback TCP v4",
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            user_descriptor,
+            IPPROTO_TCP,
+            Some(range),
+        )?;
+        add_wfp_loopback_filter(
+            engine,
+            WFP_LOOPBACK_TCP_V6_FILTER_KEYS[index],
+            "mcp-repl Offline Sandbox - Block Loopback TCP v6",
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            user_descriptor,
+            IPPROTO_TCP,
+            Some(range),
+        )?;
+    }
+    add_wfp_loopback_filter(
+        engine,
+        WFP_LOOPBACK_UDP_V4_FILTER_KEY,
+        "mcp-repl Offline Sandbox - Block Loopback UDP v4",
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        user_descriptor,
+        IPPROTO_UDP,
+        None,
+    )?;
+    add_wfp_loopback_filter(
+        engine,
+        WFP_LOOPBACK_UDP_V6_FILTER_KEY,
+        "mcp-repl Offline Sandbox - Block Loopback UDP v6",
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        user_descriptor,
+        IPPROTO_UDP,
+        None,
+    )?;
+    Ok(())
+}
+
+unsafe fn add_wfp_loopback_filter(
+    engine: WindowsHandle,
+    filter_key: GUID,
+    name: &str,
+    layer_key: GUID,
+    user_descriptor: *mut FWP_BYTE_BLOB,
+    protocol: u8,
+    port_range: Option<PortRange>,
+) -> Result<(), String> {
+    let mut provider_key = WFP_PROVIDER_KEY;
+    let mut display_name = to_wide(name);
+    let mut description = to_wide("mcp-repl offline sandbox loopback block");
+    let mut conditions = vec![
+        wfp_security_descriptor_condition(FWPM_CONDITION_ALE_USER_ID, user_descriptor),
+        wfp_u8_condition(FWPM_CONDITION_IP_PROTOCOL, protocol),
+        wfp_flags_condition(FWP_CONDITION_FLAG_IS_LOOPBACK),
+    ];
+    let mut range = port_range.map(wfp_port_range);
+    if let Some(range) = range.as_mut() {
+        conditions.push(wfp_range_condition(
+            FWPM_CONDITION_IP_REMOTE_PORT,
+            range as *mut FWP_RANGE0,
+        ));
+    }
+
+    let filter = FWPM_FILTER0 {
+        filterKey: filter_key,
+        displayData: FWPM_DISPLAY_DATA0 {
+            name: PWSTR(display_name.as_mut_ptr()),
+            description: PWSTR(description.as_mut_ptr()),
+        },
+        flags: FWPM_FILTER_FLAG_PERSISTENT,
+        providerKey: &mut provider_key,
+        providerData: Default::default(),
+        layerKey: layer_key,
+        subLayerKey: WFP_SUBLAYER_KEY,
+        weight: FWP_VALUE0 {
+            r#type: FWP_EMPTY,
+            Anonymous: Default::default(),
+        },
+        numFilterConditions: conditions.len() as u32,
+        filterCondition: conditions.as_mut_ptr(),
+        action: FWPM_ACTION0 {
+            r#type: FWP_ACTION_BLOCK,
+            Anonymous: Default::default(),
+        },
+        Anonymous: Default::default(),
+        reserved: std::ptr::null_mut(),
+        filterId: 0,
+        effectiveWeight: Default::default(),
+    };
+    wfp_check(
+        FwpmFilterAdd0(engine, &filter, None, None),
+        "FwpmFilterAdd0",
+    )
+}
+
+fn all_wfp_loopback_filter_keys() -> Vec<GUID> {
+    let mut keys = Vec::with_capacity(8);
+    keys.extend(WFP_LOOPBACK_TCP_V4_FILTER_KEYS);
+    keys.extend(WFP_LOOPBACK_TCP_V6_FILTER_KEYS);
+    keys.push(WFP_LOOPBACK_UDP_V4_FILTER_KEY);
+    keys.push(WFP_LOOPBACK_UDP_V6_FILTER_KEY);
+    keys
+}
+
+unsafe fn wfp_security_descriptor_condition(
+    field_key: GUID,
+    sd: *mut FWP_BYTE_BLOB,
+) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: field_key,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_SECURITY_DESCRIPTOR_TYPE,
+            Anonymous: FWP_CONDITION_VALUE0_0 { sd },
+        },
+    }
+}
+
+fn wfp_u8_condition(field_key: GUID, value: u8) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: field_key,
+        matchType: FWP_MATCH_EQUAL,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_UINT8,
+            Anonymous: FWP_CONDITION_VALUE0_0 { uint8: value },
+        },
+    }
+}
+
+fn wfp_flags_condition(flags: u32) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: FWPM_CONDITION_FLAGS,
+        matchType: FWP_MATCH_FLAGS_ANY_SET,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_UINT32,
+            Anonymous: FWP_CONDITION_VALUE0_0 { uint32: flags },
+        },
+    }
+}
+
+unsafe fn wfp_range_condition(field_key: GUID, range: *mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0 {
+    FWPM_FILTER_CONDITION0 {
+        fieldKey: field_key,
+        matchType: FWP_MATCH_RANGE,
+        conditionValue: FWP_CONDITION_VALUE0 {
+            r#type: FWP_RANGE_TYPE,
+            Anonymous: FWP_CONDITION_VALUE0_0 { rangeValue: range },
+        },
+    }
+}
+
+fn wfp_port_range(range: PortRange) -> FWP_RANGE0 {
+    FWP_RANGE0 {
+        valueLow: FWP_VALUE0 {
+            r#type: FWP_UINT16,
+            Anonymous: FWP_VALUE0_0 {
+                uint16: range.start,
+            },
+        },
+        valueHigh: FWP_VALUE0 {
+            r#type: FWP_UINT16,
+            Anonymous: FWP_VALUE0_0 { uint16: range.end },
+        },
+    }
+}
+
+struct WfpUserSecurityDescriptor {
+    descriptor: PSECURITY_DESCRIPTOR,
+    blob: FWP_BYTE_BLOB,
+}
+
+impl WfpUserSecurityDescriptor {
+    unsafe fn for_sid_string(sid: &str) -> Result<Self, String> {
+        let parsed_sid = convert_string_sid_to_sid(sid)?;
+        let result = Self::for_sid(parsed_sid);
+        LocalFree(parsed_sid as HLOCAL);
+        result
+    }
+
+    unsafe fn for_sid(sid: *mut c_void) -> Result<Self, String> {
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: sid as *mut u16,
+        };
+        let access = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FWP_ACTRL_MATCH_FILTER,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: trustee,
+        };
+        let mut descriptor_size = 0;
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let code = BuildSecurityDescriptorW(
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            &access,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut descriptor_size,
+            &mut descriptor,
+        );
+        if code != NO_ERROR {
+            return Err(format!("BuildSecurityDescriptorW failed: {code}"));
+        }
+        if descriptor.is_null() || descriptor_size == 0 {
+            return Err("BuildSecurityDescriptorW returned an empty descriptor".to_string());
+        }
+        Ok(Self {
+            descriptor,
+            blob: FWP_BYTE_BLOB {
+                size: descriptor_size,
+                data: descriptor as *mut u8,
+            },
+        })
+    }
+
+    fn blob_mut_ptr(&mut self) -> *mut FWP_BYTE_BLOB {
+        &mut self.blob
+    }
+}
+
+impl Drop for WfpUserSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.descriptor.is_null() {
+                let _ = LocalFree(self.descriptor as HLOCAL);
+            }
+        }
+    }
+}
+
+unsafe fn convert_string_sid_to_sid(sid: &str) -> Result<*mut c_void, String> {
+    let mut parsed_sid: *mut c_void = std::ptr::null_mut();
+    if ConvertStringSidToSidW(to_wide(sid).as_ptr(), &mut parsed_sid) == 0 {
+        return Err(format!("ConvertStringSidToSidW failed: {}", GetLastError()));
+    }
+    Ok(parsed_sid)
+}
+
+struct WfpEngine {
+    handle: WindowsHandle,
+}
+
+impl WfpEngine {
+    unsafe fn open() -> Result<Self, String> {
+        let mut handle = WindowsHandle::default();
+        let code = FwpmEngineOpen0(
+            PCWSTR::null(),
+            RPC_C_AUTHN_WINNT,
+            None,
+            None::<*const FWPM_SESSION0>,
+            &mut handle,
+        );
+        wfp_check(code, "FwpmEngineOpen0")?;
+        Ok(Self { handle })
+    }
+}
+
+impl Drop for WfpEngine {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FwpmEngineClose0(self.handle);
+        }
+    }
+}
+
+fn wfp_check(code: u32, action: &str) -> Result<(), String> {
+    if code == WFP_SUCCESS {
+        Ok(())
+    } else {
+        Err(wfp_error(action, code))
+    }
+}
+
+fn wfp_error(action: &str, code: u32) -> String {
+    format!("{action} failed: 0x{code:08x}")
+}
+
+pub fn blocked_loopback_tcp_remote_ports(proxy_ports: &[u16]) -> Option<String> {
+    let ranges = blocked_loopback_tcp_port_ranges(proxy_ports);
+    (!ranges.is_empty()).then(|| {
+        ranges
+            .into_iter()
+            .map(|range| port_range_string(u32::from(range.start), u32::from(range.end)))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+pub fn blocked_loopback_tcp_port_ranges(proxy_ports: &[u16]) -> Vec<PortRange> {
+    let mut allowed_ports = proxy_ports
+        .iter()
+        .copied()
+        .filter(|port| *port != 0)
+        .collect::<Vec<_>>();
+    allowed_ports.sort_unstable();
+    allowed_ports.dedup();
+
+    let mut blocked_ranges = Vec::new();
+    let mut start = 1_u32;
+    for port in allowed_ports {
+        let port = u32::from(port);
+        if port < start {
+            continue;
+        }
+        if port > start {
+            blocked_ranges.push(PortRange {
+                start: start as u16,
+                end: (port - 1) as u16,
+            });
+        }
+        start = port + 1;
+    }
+
+    if start <= u32::from(u16::MAX) {
+        blocked_ranges.push(PortRange {
+            start: start as u16,
+            end: u16::MAX,
+        });
+    }
+    blocked_ranges
+}
+
+fn port_range_string(start: u32, end: u32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
+fn create_process_with_offline_logon(
+    credentials: &WindowsSandboxOfflineCredentials,
+    child_args: Vec<String>,
+) -> Result<i32, String> {
+    unsafe {
+        let current_exe = std::env::current_exe()
+            .map_err(|err| format!("failed to resolve current executable: {err}"))?;
+        let cwd = offline_logon_cwd(&child_args)?;
+        let mut argv = vec![current_exe.to_string_lossy().to_string()];
+        argv.extend(child_args);
+        let cmdline = argv
+            .iter()
+            .map(|arg| quote_windows_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut cmdline = to_wide(&cmdline);
+        let app = to_wide(&current_exe);
+        let username = to_wide(&credentials.setup.username);
+        let domain = to_wide(".");
+        let password = to_wide(&credentials.password);
+        let cwd = to_wide(cwd);
+        let env_block = make_env_block(&std::env::vars().collect());
+        let mut startup_info: STARTUPINFOW = std::mem::zeroed();
+        startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        ensure_inheritable_stdio(&mut startup_info)?;
+        let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
+        let ok = CreateProcessWithLogonW(
+            username.as_ptr(),
+            domain.as_ptr(),
+            password.as_ptr(),
+            LOGON_WITHOUT_PROFILE,
+            app.as_ptr(),
+            cmdline.as_mut_ptr(),
+            CREATE_UNICODE_ENVIRONMENT,
+            env_block.as_ptr() as *const c_void,
+            cwd.as_ptr(),
+            &startup_info,
+            &mut proc_info,
+        );
+        if ok == 0 {
+            return Err(format!(
+                "CreateProcessWithLogonW failed for {}: {}",
+                credentials.setup.username,
+                io::Error::last_os_error()
+            ));
+        }
+        let job_handle = create_job_kill_on_close().ok();
+        if let Some(job) = job_handle {
+            let _ = AssignProcessToJobObject(job, proc_info.hProcess);
+        }
+        let wait_status = WaitForSingleObject(proc_info.hProcess, INFINITE);
+        if wait_status == WAIT_FAILED {
+            if let Some(job) = job_handle {
+                CloseHandle(job);
+            }
+            CloseHandle(proc_info.hThread);
+            CloseHandle(proc_info.hProcess);
+            return Err(format!(
+                "WaitForSingleObject failed for offline sandbox wrapper: {}",
+                GetLastError()
+            ));
+        }
+        let mut exit_code = 1u32;
+        if GetExitCodeProcess(proc_info.hProcess, &mut exit_code) == 0 {
+            if let Some(job) = job_handle {
+                CloseHandle(job);
+            }
+            CloseHandle(proc_info.hThread);
+            CloseHandle(proc_info.hProcess);
+            return Err(format!(
+                "GetExitCodeProcess failed for offline sandbox wrapper: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if let Some(job) = job_handle {
+            CloseHandle(job);
+        }
+        CloseHandle(proc_info.hThread);
+        CloseHandle(proc_info.hProcess);
+        Ok(exit_code as i32)
+    }
+}
+
+fn offline_logon_cwd(child_args: &[String]) -> Result<PathBuf, String> {
+    if let Some(path) = sandbox_policy_cwd_arg(child_args) {
+        return Ok(path);
+    }
+    if let Some(path) = std::env::var_os(crate::sandbox::R_SESSION_TMPDIR_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+    Err(format!(
+        "offline logon wrapper requires --sandbox-policy-cwd or {}",
+        crate::sandbox::R_SESSION_TMPDIR_ENV
+    ))
+}
+
+fn sandbox_policy_cwd_arg(args: &[String]) -> Option<PathBuf> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => return None,
+            "--sandbox-policy-cwd" => {
+                return args.get(index + 1).map(PathBuf::from);
+            }
+            arg if arg.starts_with("--sandbox-policy-cwd=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                return Some(PathBuf::from(value));
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+unsafe fn create_job_kill_on_close() -> Result<HANDLE, String> {
+    let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+    if handle.is_null() {
+        return Err("CreateJobObjectW failed for offline sandbox wrapper".to_string());
+    }
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let ok = SetInformationJobObject(
+        handle,
+        JobObjectExtendedLimitInformation,
+        &mut limits as *mut _ as *mut _,
+        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+    );
+    if ok == 0 {
+        CloseHandle(handle);
+        return Err("SetInformationJobObject failed for offline sandbox wrapper".to_string());
+    }
+    Ok(handle)
+}
+
+unsafe fn ensure_inheritable_stdio(startup_info: &mut STARTUPINFOW) -> Result<(), String> {
+    for std_handle_kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let std_handle = GetStdHandle(std_handle_kind);
+        if std_handle.is_null() || std_handle == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "GetStdHandle failed for offline sandbox wrapper: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if SetHandleInformation(std_handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+            return Err(format!(
+                "SetHandleInformation failed for offline sandbox wrapper: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    startup_info.dwFlags |= STARTF_USESTDHANDLES;
+    startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup_info.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup_info.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    Ok(())
+}
+
+fn make_env_block(env: &HashMap<String, String>) -> Vec<u16> {
+    let mut items: Vec<(String, String)> = env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    items.sort_by(|a, b| {
+        a.0.to_uppercase()
+            .cmp(&b.0.to_uppercase())
+            .then(a.0.cmp(&b.0))
+    });
+    let mut wide_env = Vec::new();
+    for (key, value) in items {
+        let mut entry = to_wide(format!("{key}={value}"));
+        entry.pop();
+        wide_env.extend_from_slice(&entry);
+        wide_env.push(0);
+    }
+    wide_env.push(0);
+    wide_env
+}
+
+fn to_wide<S: AsRef<OsStr>>(value: S) -> Vec<u16> {
+    let mut wide: Vec<u16> = value.as_ref().encode_wide().collect();
+    wide.push(0);
+    wide
+}
+
+fn quote_windows_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty()
+        || arg
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '"'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                quoted.push(ch);
+            }
+        }
+    }
+    if backslashes > 0 {
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+    }
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_username_fits_windows_local_account_limit() {
+        assert!(
+            OFFLINE_USERNAME.chars().count() <= 20,
+            "Windows local account names must be 20 characters or fewer"
+        );
+    }
+
+    #[test]
+    fn blocked_loopback_tcp_remote_ports_excludes_proxy_ports() {
+        assert_eq!(
+            blocked_loopback_tcp_remote_ports(&[39080, 39081]).as_deref(),
+            Some("1-39079,39082-65535")
+        );
+    }
+
+    #[test]
+    fn blocked_loopback_tcp_port_ranges_excludes_proxy_ports() {
+        assert_eq!(
+            blocked_loopback_tcp_port_ranges(&[39080, 39081]),
+            vec![
+                PortRange {
+                    start: 1,
+                    end: 39079
+                },
+                PortRange {
+                    start: 39082,
+                    end: u16::MAX
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn blocked_loopback_tcp_port_ranges_handles_edge_ports() {
+        assert_eq!(
+            blocked_loopback_tcp_port_ranges(&[1, u16::MAX]),
+            vec![PortRange {
+                start: 2,
+                end: u16::MAX - 1
+            }]
+        );
+    }
+
+    #[test]
+    fn offline_logon_cwd_prefers_sandbox_policy_cwd_arg() {
+        let args = vec![
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            r"C:\workspace".to_string(),
+            "--".to_string(),
+            "worker.exe".to_string(),
+        ];
+
+        assert_eq!(
+            offline_logon_cwd(&args).expect("offline cwd"),
+            PathBuf::from(r"C:\workspace")
+        );
+    }
+
+    #[test]
+    fn offline_logon_cwd_uses_session_temp_when_policy_cwd_is_missing() {
+        let _guard = ScopedEnvVar::set(
+            crate::sandbox::R_SESSION_TMPDIR_ENV,
+            std::ffi::OsString::from(r"C:\session-temp"),
+        );
+        let args = vec![
+            "--windows-sandbox".to_string(),
+            "--".to_string(),
+            "worker.exe".to_string(),
+        ];
+
+        assert_eq!(
+            offline_logon_cwd(&args).expect("offline cwd"),
+            PathBuf::from(r"C:\session-temp")
+        );
+    }
+
+    #[test]
+    fn setup_arg_parser_accepts_default_ports() {
+        let parsed = parse_setup_args(&[]).expect("default setup args");
+        assert_eq!(parsed.http_proxy_port, DEFAULT_HTTP_PROXY_PORT);
+        assert_eq!(parsed.socks_proxy_port, DEFAULT_SOCKS_PROXY_PORT);
+    }
+
+    #[test]
+    fn setup_arg_parser_rejects_same_ports() {
+        let err = parse_setup_args(&[
+            "--http-proxy-port".to_string(),
+            "39080".to_string(),
+            "--socks-proxy-port".to_string(),
+            "39080".to_string(),
+        ])
+        .expect_err("same ports should fail");
+        assert!(err.contains("must be different"));
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: std::ffi::OsString) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = &self.original {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+}

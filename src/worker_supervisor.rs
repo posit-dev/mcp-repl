@@ -27,14 +27,14 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcEchoEvent, IpcHandle, IpcServer, IpcWaitError, ServerIpcConnection,
+    IpcHandle, IpcInputLineEvent, IpcInputReadiness, IpcServer, IpcWaitError, ServerIpcConnection,
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcOutputImage};
 use crate::output_capture::OutputTimeline;
 use crate::oversized_output::OversizedOutputMode;
-use crate::pending_output_tape::{PendingOutputTape, PendingSidebandKind, PendingTextSource};
+use crate::pending_output_tape::PendingSidebandKind;
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, prepare_worker_command_with_managed_network,
 };
@@ -125,7 +125,6 @@ pub(crate) struct GuardrailShared {
 
 #[derive(Clone)]
 pub(crate) struct LiveOutputCapture {
-    pending_output_tape: Option<PendingOutputTape>,
     output_timeline: OutputTimeline,
     #[cfg(any(test, target_os = "windows"))]
     drop_windows_conpty_startup_noise_before_input: Option<Arc<AtomicBool>>,
@@ -133,13 +132,10 @@ pub(crate) struct LiveOutputCapture {
 
 impl LiveOutputCapture {
     pub(crate) fn new(
-        oversized_output: OversizedOutputMode,
-        pending_output_tape: PendingOutputTape,
+        _oversized_output: OversizedOutputMode,
         output_timeline: OutputTimeline,
     ) -> Self {
         Self {
-            pending_output_tape: matches!(oversized_output, OversizedOutputMode::Files)
-                .then_some(pending_output_tape),
             output_timeline,
             #[cfg(any(test, target_os = "windows"))]
             drop_windows_conpty_startup_noise_before_input: None,
@@ -219,13 +215,6 @@ impl LiveOutputCapture {
                     self.output_timeline
                         .append_text(bytes, false, ContentOrigin::Worker);
                 }
-                if let Some(tape) = &self.pending_output_tape {
-                    if is_output_text {
-                        tape.append_stdout_ipc_bytes(bytes);
-                    } else {
-                        tape.append_stdout_bytes(bytes);
-                    }
-                }
             }
             TextStream::Stderr => {
                 if is_output_text {
@@ -243,13 +232,6 @@ impl LiveOutputCapture {
                         is_continuation,
                     );
                 }
-                if let Some(tape) = &self.pending_output_tape {
-                    if is_output_text {
-                        tape.append_stderr_ipc_bytes(bytes);
-                    } else {
-                        tape.append_stderr_bytes(bytes);
-                    }
-                }
             }
         }
     }
@@ -262,12 +244,6 @@ impl LiveOutputCapture {
                 ContentOrigin::Server,
                 Some(image.readline_results_seen),
             );
-            if let Some(tape) = &self.pending_output_tape {
-                tape.append_stdout_status_event(
-                    PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
-                    image.readline_results_seen,
-                );
-            }
         }
         self.output_timeline.append_image(
             image.id.clone(),
@@ -276,20 +252,16 @@ impl LiveOutputCapture {
             image.is_new,
             image.readline_results_seen,
         );
-        if let Some(tape) = &self.pending_output_tape {
-            tape.append_image(
-                image.id,
-                image.mime_type,
-                image.data,
-                image.is_new,
-                image.readline_results_seen,
-            );
-        }
     }
 
     pub(crate) fn append_sideband(&self, kind: PendingSidebandKind) {
-        if let Some(tape) = &self.pending_output_tape {
-            tape.append_sideband(kind);
+        match kind {
+            PendingSidebandKind::InputWait { .. } => self.output_timeline.append_input_wait(),
+            PendingSidebandKind::ReadlineResult { prompt, line } => {
+                self.output_timeline.append_input_echo(&prompt, &line);
+            }
+            PendingSidebandKind::RequestBoundary => self.output_timeline.append_request_boundary(),
+            PendingSidebandKind::SessionEnd => self.output_timeline.append_session_end(),
         }
     }
 }
@@ -311,6 +283,7 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "windows")]
 pub(crate) const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
 pub(crate) const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
@@ -342,6 +315,13 @@ impl WorkerSupervisor {
         // respawns and wipes/recreates it in place before launch.
         crate::sandbox::prepare_session_temp_dir(&sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = context.prepared_windows_launch.as_ref() {
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
+                prepared_windows_launch,
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(&worker_launch, backend, sandbox_state)
         });
@@ -352,7 +332,7 @@ impl WorkerSupervisor {
         if let Err(err) = wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
             return Err(Self::terminate_spawn_error(process, backend, err));
         }
-        let initial_prompt = match seed_initial_input_wait_from_process(&process) {
+        let initial_prompt = match seed_initial_readiness_from_process(&process) {
             Ok(prompt) => prompt,
             Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
         };
@@ -408,7 +388,7 @@ fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<
     }
 }
 
-fn seed_initial_input_wait_from_process(
+fn seed_initial_readiness_from_process(
     process: &WorkerProcess,
 ) -> Result<Option<InitialWorkerPrompt>, WorkerError> {
     let Some(ipc) = process.ipc_connection() else {
@@ -417,15 +397,16 @@ fn seed_initial_input_wait_from_process(
     if let Some(raw_prompt) = ipc.try_take_prompt() {
         return Ok(Some(InitialWorkerPrompt::Immediate(raw_prompt)));
     }
-    match ipc.wait_for_input_wait(WORKER_READY_TIMEOUT) {
-        Ok(prompt) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
+    match ipc.wait_for_input_readiness(WORKER_READY_TIMEOUT) {
+        Ok(IpcInputReadiness::InputWait(prompt)) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
+        Ok(IpcInputReadiness::Ready) => Ok(None),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
         Err(IpcWaitError::Timeout) => Ok(None),
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
-            "worker session ended before input_wait".to_string(),
+            "worker session ended before startup readiness".to_string(),
         )),
         Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
-            "ipc disconnected while waiting for worker input_wait".to_string(),
+            "ipc disconnected while waiting for worker startup readiness".to_string(),
         )),
     }
 }
@@ -440,12 +421,15 @@ pub(crate) struct WorkerProcess {
     stderr_reader: Option<OutputReader>,
     expected_exit: bool,
     exit_status: Option<std::process::ExitStatus>,
+    finalized: bool,
     #[cfg(target_family = "unix")]
     guardrail_stop: Arc<AtomicBool>,
     #[cfg(target_family = "unix")]
     guardrail_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(target_family = "unix")]
     guardrail_thread_handle: Option<std::thread::Thread>,
+    #[cfg(target_os = "linux")]
+    linux_bwrap_sandboxed: bool,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -666,7 +650,6 @@ impl Drop for WindowsProcess {
 #[derive(Clone)]
 pub(crate) struct WorkerSpawnContext<'a> {
     pub(crate) oversized_output: OversizedOutputMode,
-    pub(crate) pending_output_tape: PendingOutputTape,
     pub(crate) output_timeline: OutputTimeline,
     pub(crate) guardrail: GuardrailShared,
     pub(crate) managed_network_proxy: Option<&'a crate::managed_network::ManagedNetworkProxy>,
@@ -696,6 +679,14 @@ impl OutputReader {
             .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
     }
 
+    fn stop_now_and_join(mut self, panic_message: &'static str) -> Result<(), WorkerError> {
+        self.request_stop();
+        let _ = self.done_rx.recv();
+        self.handle
+            .join()
+            .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
+    }
+
     fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Relaxed);
         #[cfg(target_family = "unix")]
@@ -715,7 +706,6 @@ impl WorkerProcess {
     ) -> Result<Self, WorkerError> {
         let WorkerSpawnContext {
             oversized_output,
-            pending_output_tape,
             output_timeline,
             guardrail,
             managed_network_proxy,
@@ -726,19 +716,28 @@ impl WorkerProcess {
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
+        #[cfg(target_family = "windows")]
+        let mut ipc_server = {
+            if let Some(launch) = prepared_windows_launch.as_ref() {
+                let mut allowed_sids = vec![launch.capability_sid()];
+                if let Some(offline_sid) = launch.offline_user_sid() {
+                    allowed_sids.push(offline_sid);
+                }
+                IpcServer::bind_with_allowed_sids(&allowed_sids)
+            } else {
+                IpcServer::bind()
+            }
+        }
+        .map_err(WorkerError::Io)?;
+        #[cfg(not(target_family = "windows"))]
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
-        let live_output = LiveOutputCapture::new(
-            oversized_output,
-            pending_output_tape.clone(),
-            output_timeline.clone(),
-        );
+        let live_output = LiveOutputCapture::new(oversized_output, output_timeline.clone());
         #[cfg(target_os = "windows")]
         let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
             live_output.with_windows_conpty_startup_noise_filter()
         } else {
             live_output
         };
-        let readline_echo_source = PendingTextSource::Ipc;
         let SpawnedWorker {
             child,
             stdin_tx,
@@ -801,13 +800,12 @@ impl WorkerProcess {
                 on_input_wait: Some(Arc::new(move |prompt: String| {
                     sideband_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
                 })),
-                on_readline_result: {
+                on_input_line: {
                     let sideband_capture = live_output.clone();
-                    Some(Arc::new(move |event: IpcEchoEvent| {
+                    Some(Arc::new(move |event: IpcInputLineEvent| {
                         sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                             prompt: event.prompt,
                             line: event.line,
-                            echo_source: readline_echo_source,
                         });
                     }))
                 },
@@ -837,6 +835,9 @@ impl WorkerProcess {
         #[cfg(target_family = "unix")]
         let (guardrail_stop, guardrail_thread, guardrail_thread_handle) =
             start_memory_guardrail(child.id(), guardrail.clone());
+        #[cfg(target_os = "linux")]
+        let linux_bwrap_sandboxed = sandbox_state.use_linux_sandbox_bwrap
+            && sandbox_state.sandbox_policy.requires_sandbox();
 
         Ok(Self {
             child,
@@ -848,12 +849,15 @@ impl WorkerProcess {
             stderr_reader,
             expected_exit: false,
             exit_status: None,
+            finalized: false,
             #[cfg(target_family = "unix")]
             guardrail_stop,
             #[cfg(target_family = "unix")]
             guardrail_thread: Some(guardrail_thread),
             #[cfg(target_family = "unix")]
             guardrail_thread_handle: Some(guardrail_thread_handle),
+            #[cfg(target_os = "linux")]
+            linux_bwrap_sandboxed,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -1125,20 +1129,12 @@ impl WorkerProcess {
         self.ipc.get()
     }
 
-    pub(crate) fn write_stdin_payload(
-        &mut self,
-        payload: Vec<u8>,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        self.send_stdin_payload(Some(payload), timeout)
-    }
-
     pub(crate) fn note_accepted_input_starting(&self) {
         self.live_output.note_accepted_input_starting();
     }
 
     fn close_stdin(&mut self, timeout: Duration) -> Result<(), WorkerError> {
-        self.send_stdin_payload(None, timeout)
+        send_stdin_command(&self.stdin_tx, None, timeout)
     }
 
     fn request_ipc_shutdown(&self) {
@@ -1150,18 +1146,14 @@ impl WorkerProcess {
         }
     }
 
-    fn send_stdin_payload(
-        &mut self,
-        payload: Option<Vec<u8>>,
-        timeout: Duration,
-    ) -> Result<(), WorkerError> {
-        send_stdin_command(&self.stdin_tx, payload, timeout)
-    }
-
     pub(crate) fn send_interrupt(&mut self) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
+        #[cfg(all(target_family = "unix", not(target_os = "linux")))]
         {
             self.send_signal(libc::SIGINT)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.send_linux_interrupt()
         }
         #[cfg(target_family = "windows")]
         {
@@ -1223,6 +1215,34 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
+    fn send_linux_interrupt(&self) -> Result<(), WorkerError> {
+        if self.linux_bwrap_sandboxed && self.send_linux_bwrap_interrupt_descendants() {
+            return Ok(());
+        }
+        self.send_signal(libc::SIGINT)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_linux_bwrap_interrupt_descendants(&self) -> bool {
+        let root = Pid::from_u32(self.child.id());
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let mut sent = false;
+        for pid in collect_process_tree_pids(&system, root) {
+            if pid == root
+                || linux_pid_is_thread(pid)
+                || linux_pid_exe_basename(pid).is_some_and(|name| name == "bwrap")
+            {
+                continue;
+            }
+            let _ = raw_unix_kill(pid.as_u32() as i32, libc::SIGINT);
+            sent = true;
+        }
+        sent
+    }
+
+    #[cfg(target_family = "unix")]
     fn send_signal(&self, signal: i32) -> Result<(), WorkerError> {
         let pid = self.child.id() as i32;
         let result = raw_unix_kill(-pid, signal);
@@ -1252,16 +1272,19 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
-    fn send_signal_descendants_only(&self, signal: i32) {
+    fn send_signal_descendants_only(&self, signal: i32) -> bool {
         let root = Pid::from_u32(self.child.id());
         let mut system = System::new();
         system.refresh_processes(ProcessesToUpdate::All, true);
+        let mut sent = false;
         for pid in collect_process_tree_pids(&system, root) {
             if pid == root {
                 continue;
             }
             let _ = raw_unix_kill(pid.as_u32() as i32, signal);
+            sent = true;
         }
+        sent
     }
 
     pub(crate) fn note_expected_exit(&mut self) {
@@ -1363,7 +1386,45 @@ impl WorkerProcess {
         self.finalize_terminated_process()
     }
 
+    pub(crate) fn finish_session_end_for_respawn(mut self) -> Result<(), WorkerError> {
+        self.disable_ipc_handlers();
+        if self.exit_status.is_none() {
+            match self.child.try_wait()? {
+                Some(status) => self.exit_status = Some(status),
+                None => {
+                    self.quiesce_raw_output_readers()?;
+                    // The next spawn resets and reuses this stable session temp path.
+                    // The old background reaper must not remove the respawned worker's TMPDIR.
+                    self.session_tmpdir = None;
+                    let _ = thread::Builder::new()
+                        .name("worker-session-end-reaper".to_string())
+                        .spawn(move || {
+                            let _ =
+                                self.shutdown_graceful(WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT);
+                        });
+                    return Ok(());
+                }
+            }
+        }
+        #[cfg(target_family = "unix")]
+        {
+            self.send_signal_descendants_only(libc::SIGKILL);
+        }
+        #[cfg(target_family = "windows")]
+        {
+            self.child.close_job();
+        }
+        self.quiesce_raw_output_readers()?;
+        self.detach_ipc_reader();
+        self.cleanup_session_tmpdir();
+        self.report_denials();
+        Ok(())
+    }
+
     fn finalize_terminated_process(&mut self) -> Result<(), WorkerError> {
+        if self.finalized {
+            return Ok(());
+        }
         #[cfg(target_family = "unix")]
         {
             // Once the root worker is gone, kill any remaining session peers before waiting on
@@ -1381,8 +1442,30 @@ impl WorkerProcess {
             self.child.close_job();
         }
         self.quiesce_output_producers()?;
-        self.cleanup_session_tmpdir();
         self.report_denials();
+        self.finalized = true;
+        Ok(())
+    }
+
+    fn detach_ipc_reader(&mut self) {
+        if let Some(ipc) = self.ipc.get() {
+            ipc.detach_reader_thread();
+        }
+    }
+
+    fn disable_ipc_handlers(&mut self) {
+        if let Some(ipc) = self.ipc.get() {
+            ipc.disable_handlers();
+        }
+    }
+
+    fn quiesce_raw_output_readers(&mut self) -> Result<(), WorkerError> {
+        if let Some(reader) = self.stdout_reader.take() {
+            reader.stop_now_and_join("worker stdout reader thread panicked")?;
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.stop_now_and_join("worker stderr reader thread panicked")?;
+        }
         Ok(())
     }
 
@@ -1406,17 +1489,47 @@ impl WorkerProcess {
         Ok(())
     }
 
-    fn cleanup_session_tmpdir(&self) {
-        let Some(path) = self.session_tmpdir.as_ref() else {
+    fn cleanup_session_tmpdir(&mut self) {
+        let Some(path) = self.session_tmpdir.take() else {
             return;
         };
         if !path.is_absolute() || path.as_path() == std::path::Path::new("/") {
             return;
         }
         cleanup_worker_session_tmpdir(
-            path,
+            &path,
             crate::debug_logs::log_path(crate::diagnostics::WORKER_STARTUP_LOG_FILE_NAME),
         );
+    }
+
+    fn terminate_for_drop(&mut self) {
+        if self.exit_status.is_some() {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.exit_status = Some(status);
+            }
+            Ok(None) | Err(_) => {
+                let _ = self.send_sigkill();
+                if let Ok(status) = self.child.wait() {
+                    self.exit_status = Some(status);
+                }
+            }
+        }
+    }
+
+    fn stop_guardrail(&mut self) {
+        #[cfg(target_family = "unix")]
+        {
+            self.guardrail_stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.guardrail_thread_handle.as_ref() {
+                thread.unpark();
+            }
+            if let Some(handle) = self.guardrail_thread.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1447,7 +1560,6 @@ impl WorkerProcess {
             ipc: IpcHandle::new(),
             live_output: LiveOutputCapture::new(
                 OversizedOutputMode::Files,
-                PendingOutputTape::new(),
                 OutputTimeline::new(Arc::new(crate::output_capture::OutputRing::with_capacity(
                     crate::output_capture::OUTPUT_RING_CAPACITY_BYTES,
                 ))),
@@ -1456,12 +1568,15 @@ impl WorkerProcess {
             stderr_reader: None,
             expected_exit: false,
             exit_status: None,
+            finalized: false,
             #[cfg(target_family = "unix")]
             guardrail_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(target_family = "unix")]
             guardrail_thread: None,
             #[cfg(target_family = "unix")]
             guardrail_thread_handle: None,
+            #[cfg(target_os = "linux")]
+            linux_bwrap_sandboxed: false,
             #[cfg(target_os = "macos")]
             denial_logger: None,
         }
@@ -1520,16 +1635,12 @@ pub(crate) fn cleanup_worker_session_tmpdir(
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        #[cfg(target_family = "unix")]
-        {
-            self.guardrail_stop.store(true, Ordering::Relaxed);
-            if let Some(thread) = self.guardrail_thread_handle.as_ref() {
-                thread.unpark();
-            }
-            if let Some(handle) = self.guardrail_thread.take() {
-                let _ = handle.join();
-            }
+        self.stop_guardrail();
+        if !self.finalized {
+            self.terminate_for_drop();
+            let _ = self.finalize_terminated_process();
         }
+        self.cleanup_session_tmpdir();
     }
 }
 
@@ -1667,6 +1778,31 @@ fn collect_process_tree_pids(system: &System, root: Pid) -> Vec<Pid> {
         }
     }
     pids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_is_thread(pid: Pid) -> bool {
+    let status_path = format!("/proc/{}/status", pid.as_u32());
+    let Ok(status) = std::fs::read_to_string(status_path) else {
+        return false;
+    };
+    for line in status.lines() {
+        let Some(raw_tgid) = line.strip_prefix("Tgid:") else {
+            continue;
+        };
+        let Ok(tgid) = raw_tgid.trim().parse::<u32>() else {
+            return false;
+        };
+        return tgid != pid.as_u32();
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_exe_basename(pid: Pid) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid.as_u32())).ok()?;
+    exe.file_name()
+        .map(|name| name.to_string_lossy().to_string())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1932,15 +2068,28 @@ fn windows_spawn_transport(
     if !matches!(stdin_transport, WorkerStdinTransport::Pty) {
         return stdin_transport;
     }
-    if prepared_args
-        .first()
-        .is_some_and(|arg| arg == "--windows-sandbox")
-    {
+    if windows_prepared_args_start_sandbox_wrapper(prepared_args) {
         command.env(crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV, "1");
         WorkerStdinTransport::Pipe
     } else {
         stdin_transport
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_prepared_args_start_sandbox_wrapper(prepared_args: &[String]) -> bool {
+    if prepared_args
+        .first()
+        .is_some_and(|arg| arg == "--windows-sandbox")
+    {
+        return true;
+    }
+    prepared_args
+        .first()
+        .is_some_and(|arg| arg == "--windows-sandbox-logon-offline")
+        && prepared_args
+            .get(1)
+            .is_some_and(|arg| arg == "--windows-sandbox")
 }
 
 #[cfg(target_family = "unix")]
@@ -2342,11 +2491,8 @@ fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, OutputTextSource,
-    };
-    use crate::output_timeline::{EchoCollapseMode, collapse_echo_with_attribution};
-    use crate::pending_output_tape::{PendingOutputEvent, PendingOutputTape};
+    use crate::output_capture::{OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing};
+    use crate::pending_output_tape::PendingOutputTape;
     use crate::worker_protocol::WorkerContent;
     use base64::Engine as _;
     use std::sync::{Mutex, OnceLock};
@@ -2356,30 +2502,68 @@ mod tests {
         TEST_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
-    fn raw_echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
-        IpcEchoEvent {
-            prompt: prompt.to_string(),
-            line: line.to_string(),
-            source: OutputTextSource::Raw,
-        }
-    }
-
     fn capture_with_ring(
         oversized_output: OversizedOutputMode,
     ) -> (LiveOutputCapture, Arc<OutputRing>, PendingOutputTape) {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
-        let capture = LiveOutputCapture::new(
-            oversized_output,
-            tape.clone(),
-            OutputTimeline::new(output_ring.clone()),
-        );
+        let timeline = OutputTimeline::new(output_ring.clone());
+        let tape = PendingOutputTape::with_timeline(timeline.clone());
+        let capture = LiveOutputCapture::new(oversized_output, timeline);
         (capture, output_ring, tape)
     }
 
     fn ring_bytes(output_ring: &OutputRing) -> Vec<u8> {
         let output_end = output_ring.end_offset();
         output_ring.read_range(0, output_end).bytes
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sandbox_pty_transport_uses_pipe_and_requests_conpty() {
+        let mut command = Command::new("worker.exe");
+        let prepared_args = vec![
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+        ];
+
+        let transport =
+            windows_spawn_transport(&mut command, &prepared_args, WorkerStdinTransport::Pty);
+
+        assert!(matches!(transport, WorkerStdinTransport::Pipe));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().to_string()),
+            Some("1".to_string())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_offline_sandbox_pty_transport_uses_pipe_and_requests_conpty() {
+        let mut command = Command::new("worker.exe");
+        let prepared_args = vec![
+            "--windows-sandbox-logon-offline".to_string(),
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+        ];
+
+        let transport =
+            windows_spawn_transport(&mut command, &prepared_args, WorkerStdinTransport::Pty);
+
+        assert!(matches!(transport, WorkerStdinTransport::Pipe));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().to_string()),
+            Some("1".to_string())
+        );
     }
 
     #[cfg(target_family = "unix")]
@@ -2596,13 +2780,53 @@ mod tests {
         );
     }
 
+    #[cfg(target_family = "unix")]
     #[test]
-    fn pager_output_capture_skips_pending_output_tape() {
+    fn drop_cleans_live_worker_session_tmpdir() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_tmpdir = temp.path().join("session-tmp");
+        std::fs::create_dir_all(&session_tmpdir).expect("create session tmpdir");
+        std::fs::write(session_tmpdir.join("marker"), "temp").expect("write temp marker");
+
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                let _ = libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("spawn child");
+        let pid = child.id();
+        let mut process = WorkerProcess::new_for_test(child);
+        process.session_tmpdir = Some(session_tmpdir.clone());
+
+        drop(process);
+
+        let leaked_tmpdir = session_tmpdir.exists();
+        if leaked_tmpdir {
+            let _ = raw_unix_kill(-(pid as i32), libc::SIGKILL);
+            unsafe {
+                let _ = libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+            }
+            let _ = std::fs::remove_dir_all(&session_tmpdir);
+        }
+        assert!(
+            !leaked_tmpdir,
+            "dropping WorkerProcess should remove the session temp dir"
+        );
+    }
+
+    #[test]
+    fn pager_output_capture_writes_to_shared_timeline() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
         let capture = LiveOutputCapture::new(
             OversizedOutputMode::Pager,
-            tape.clone(),
             OutputTimeline::new(output_ring.clone()),
         );
         capture.append_output_text(b"pager output\n", TextStream::Stdout, false);
@@ -2616,10 +2840,6 @@ mod tests {
         });
         capture.append_sideband(PendingSidebandKind::RequestBoundary);
 
-        assert!(
-            tape.drain_final_snapshot().events.is_empty(),
-            "pager mode should not mirror text, images, or sideband events into the pending tape"
-        );
         let output_end = output_ring.end_offset();
         let output_range = output_ring.read_range(0, output_end);
         assert!(
@@ -2651,10 +2871,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"");
         assert!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents
-                .is_empty(),
+            tape.drain_final_output().contents.is_empty(),
             "raw ConPTY startup toggles should not enter output bundles"
         );
     }
@@ -2668,9 +2885,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
         assert_eq!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents,
+            tape.drain_final_output().contents,
             vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
         );
     }
@@ -2685,9 +2900,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001h\x1b[?1004h");
         assert_eq!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents,
+            tape.drain_final_output().contents,
             vec![WorkerContent::worker_stdout("\u{1b}[?9001h\u{1b}[?1004h")]
         );
     }
@@ -2701,9 +2914,7 @@ mod tests {
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001hvisible\n");
         assert_eq!(
-            tape.drain_final_snapshot()
-                .format_contents_for_reply()
-                .contents,
+            tape.drain_final_output().contents,
             vec![WorkerContent::worker_stdout("\u{1b}[?9001hvisible\n")]
         );
     }
@@ -2735,19 +2946,15 @@ mod tests {
     }
 
     #[test]
-    fn files_output_capture_anchors_update_notice_before_late_echo() {
+    fn files_output_capture_anchors_update_notice_before_late_prompt_shaped_text() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
-        let capture = LiveOutputCapture::new(
-            OversizedOutputMode::Files,
-            tape.clone(),
-            OutputTimeline::new(output_ring),
-        );
+        let timeline = OutputTimeline::new(output_ring);
+        let tape = PendingOutputTape::with_timeline(timeline.clone());
+        let capture = LiveOutputCapture::new(OversizedOutputMode::Files, timeline);
 
         capture.append_sideband(PendingSidebandKind::ReadlineResult {
             prompt: "> ".to_string(),
             line: "lines(4:8, 4:8)\n".to_string(),
-            echo_source: PendingTextSource::Raw,
         });
         capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
@@ -2759,14 +2966,12 @@ mod tests {
         });
         capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
-        let contents = tape
-            .drain_final_snapshot()
-            .format_contents_for_reply()
-            .contents;
+        let contents = tape.drain_final_output().contents;
 
         assert_eq!(
             contents,
             vec![
+                WorkerContent::worker_stdout_transcript_only("> lines(4:8, 4:8)\n"),
                 WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
                 WorkerContent::ContentImage {
                     data: "AA==".to_string(),
@@ -2774,6 +2979,7 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
+                WorkerContent::worker_stdout("> lines(4:8, 4:8)\n"),
             ]
         );
     }
@@ -2781,12 +2987,9 @@ mod tests {
     #[test]
     fn files_ipc_output_text_appends_to_tape_and_timeline_in_ipc_order() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
-        let tape = PendingOutputTape::new();
-        let capture = LiveOutputCapture::new(
-            OversizedOutputMode::Files,
-            tape.clone(),
-            OutputTimeline::new(output_ring.clone()),
-        );
+        let timeline = OutputTimeline::new(output_ring.clone());
+        let tape = PendingOutputTape::with_timeline(timeline.clone());
+        let capture = LiveOutputCapture::new(OversizedOutputMode::Files, timeline);
         let (done_tx, done_rx) = mpsc::channel();
 
         let output_capture = capture.clone();
@@ -2801,11 +3004,10 @@ mod tests {
             on_input_wait: Some(Arc::new(move |prompt| {
                 wait_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
             })),
-            on_readline_result: Some(Arc::new(move |event| {
+            on_input_line: Some(Arc::new(move |event| {
                 result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                     prompt: event.prompt,
                     line: event.line,
-                    echo_source: PendingTextSource::Ipc,
                 });
             })),
             on_output_image: Some(Arc::new(move |image| {
@@ -2871,95 +3073,59 @@ mod tests {
             .recv_timeout(Duration::from_millis(200))
             .expect("server IPC consumed session_end");
 
-        let snapshot = tape.drain_final_snapshot();
-        assert_eq!(snapshot.events.len(), 7);
-        assert!(matches!(
-            &snapshot.events[0],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::InputWait { prompt },
-                ..
-            } if prompt == "> "
-        ));
-        assert!(matches!(
-            &snapshot.events[1],
-            PendingOutputEvent::TextFragment {
-                stream: TextStream::Stdout,
-                origin: ContentOrigin::Worker,
-                bytes,
-                ..
-            } if bytes == b"before\n"
-        ));
-        assert!(matches!(
-            &snapshot.events[2],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::ReadlineResult { prompt, line, .. },
-                ..
-            } if prompt == "> " && line == "plot(1)\n"
-        ));
-        assert!(matches!(
-            &snapshot.events[3],
-            PendingOutputEvent::Image {
-                id,
-                mime_type,
-                readline_results_seen: 1,
-                ..
-            } if id.starts_with("image-") && mime_type == "image/png"
-        ));
-        assert!(matches!(
-            &snapshot.events[4],
-            PendingOutputEvent::TextFragment {
-                stream: TextStream::Stderr,
-                origin: ContentOrigin::Worker,
-                bytes,
-                ..
-            } if bytes == b"err\n"
-        ));
-        assert!(matches!(
-            &snapshot.events[5],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::InputWait { prompt },
-                ..
-            } if prompt == "> "
-        ));
-        assert!(matches!(
-            &snapshot.events[6],
-            PendingOutputEvent::Sideband {
-                kind: PendingSidebandKind::SessionEnd,
-                ..
-            }
-        ));
-
         let end = output_ring.end_offset();
         let range = output_ring.read_range(0, end);
-        assert_eq!(range.bytes, b"before\n\nstderr: err\n");
+        assert_eq!(range.bytes, b"before\nerr\n");
         let image_event = range
             .events
             .iter()
             .find_map(|event| match &event.kind {
-                OutputEventKind::Image {
-                    id,
-                    mime_type,
-                    readline_results_seen,
-                    ..
-                } => Some((event.offset, id, mime_type, readline_results_seen)),
+                OutputEventKind::Image { id, mime_type, .. } => Some((event.offset, id, mime_type)),
                 _ => None,
             })
             .expect("timeline image event");
         assert_eq!(image_event.0, b"before\n".len() as u64);
         assert!(image_event.1.starts_with("image-"));
         assert_eq!(image_event.2, "image/png");
-        assert_eq!(*image_event.3, 1);
+
+        let output = tape.drain_final_output();
+        assert_eq!(output.contents.len(), 4);
+        assert_eq!(output.contents[0], WorkerContent::worker_stdout("before\n"));
+        assert_eq!(
+            output.contents[1],
+            WorkerContent::worker_stdout_transcript_only("> plot(1)\n")
+        );
+        assert!(
+            matches!(
+                &output.contents[2],
+                WorkerContent::ContentImage {
+                    data,
+                    mime_type,
+                    id,
+                    is_new: true,
+                } if data == "AA==" && mime_type == "image/png" && id.starts_with("image-")
+            ),
+            "expected generated image event in output order, got: {:?}",
+            output.contents[2]
+        );
+        assert_eq!(
+            output.contents[3],
+            WorkerContent::worker_stderr("stderr: err\n")
+        );
     }
 
     #[test]
-    fn pager_output_capture_anchors_update_notice_before_late_echo() {
+    fn pager_output_capture_preserves_update_notice_image_and_late_raw_text() {
         let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let capture = LiveOutputCapture::new(
             OversizedOutputMode::Pager,
-            PendingOutputTape::new(),
             OutputTimeline::new(output_ring.clone()),
         );
 
+        capture.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "lines(4:8, 4:8)\n".to_string(),
+        });
         capture.append_image(IpcOutputImage {
             id: "img-1".to_string(),
             data: "AA==".to_string(),
@@ -2971,23 +3137,12 @@ mod tests {
         capture.append_raw_text(b"> lines(4:8, 4:8)\n", TextStream::Stdout);
 
         let end = output_ring.end_offset();
-        let collapsed = collapse_echo_with_attribution(
-            output_ring.read_range(0, end),
-            &[raw_echo_event("> ", "lines(4:8, 4:8)\n")],
-            0,
-            &["> ".to_string()],
-            EchoCollapseMode::CollapseForFinalReply,
-        );
-        let contents = crate::pager::contents_from_collapsed_output(
-            collapsed.bytes,
-            collapsed.events,
-            collapsed.text_spans,
-            end,
-        );
+        let contents = crate::pager::contents_from_output_range(output_ring.read_range(0, end));
 
         assert_eq!(
             contents,
             vec![
+                WorkerContent::worker_stdout_transcript_only("> lines(4:8, 4:8)\n"),
                 WorkerContent::server_stdout(PREVIOUS_IMAGE_UPDATE_NOTICE),
                 WorkerContent::ContentImage {
                     data: "AA==".to_string(),
@@ -2995,6 +3150,7 @@ mod tests {
                     id: "img-1".to_string(),
                     is_new: true,
                 },
+                WorkerContent::worker_stdout("> lines(4:8, 4:8)\n"),
             ]
         );
     }

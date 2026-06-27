@@ -1,0 +1,45 @@
+---
+source: tests/python_snapshots.rs
+expression: rendered
+---
+== session: sys_stdin_followup_without_prompt ==
+-- step 1 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "import sys\nline = sys.stdin.readline().strip()\nprint(\"stdin\", line)\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "<<repl status: waiting for input>>"
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "py_repl",
+  "arguments": {
+    "input": "bravo\n",
+    "timeout_ms": 5000
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "stdin bravo\n"
+    }
+  ]
+}

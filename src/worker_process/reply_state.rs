@@ -1,7 +1,6 @@
 use std::sync::atomic::Ordering;
 
 use crate::completion_reply::{ReplyWithOffset, idle_status_content};
-use crate::output_capture::set_last_reply_marker_offset;
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::FormattedPendingOutput;
 use crate::reply_presentation::{append_prompt_if_missing, normalize_prompt};
@@ -24,22 +23,24 @@ impl WorkerManager {
         let resolved_prompt = if pager_active {
             None
         } else {
-            self.pager_prompt.take()
+            match self.pager_prompt.take() {
+                Some(prompt) => prompt.into_prompt(),
+                None => {
+                    contents.push(WorkerContent::server_stderr(
+                        "[repl] protocol error: missing prompt after pager dismiss",
+                    ));
+                    None
+                }
+            }
         };
         if pager_active {
             *prompt = None;
         } else {
             self.remember_prompt(resolved_prompt.clone());
-            if resolved_prompt.is_none() {
-                contents.push(WorkerContent::server_stderr(
-                    "[repl] protocol error: missing prompt after pager dismiss",
-                ));
-            }
             append_prompt_if_missing(contents, resolved_prompt.clone());
             *prompt = resolved_prompt;
         }
-        let end_offset = self.output.end_offset().unwrap_or(0);
-        Some(ReplyWithOffset { reply, end_offset })
+        Some(ReplyWithOffset { reply })
     }
 
     pub(super) fn guardrail_event_pending(&self) -> bool {
@@ -119,17 +120,11 @@ impl WorkerManager {
     }
 
     pub(super) fn finalize_reply(&self, reply: ReplyWithOffset) -> WorkerReply {
-        if matches!(self.oversized_output, OversizedOutputMode::Pager) {
-            set_last_reply_marker_offset(reply.end_offset);
-        }
         reply.reply
     }
 
     pub(super) fn remember_prompt(&mut self, prompt: Option<String>) {
-        let prompt = normalize_prompt(prompt);
-        if let Some(prompt) = prompt {
-            self.last_prompt = Some(prompt);
-        }
+        self.last_prompt = normalize_prompt(prompt);
     }
 
     pub(super) fn current_prompt_hint(&self) -> Option<String> {
@@ -143,19 +138,28 @@ impl WorkerManager {
     }
 
     pub(super) fn drain_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape.drain_snapshot().format_contents()
+        self.pending_output_tape.drain_output()
     }
 
     pub(super) fn drain_final_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_final_snapshot()
-            .format_contents_for_reply()
+        self.pending_output_tape.drain_final_output()
+    }
+
+    pub(super) fn drain_completed_formatted_output(
+        &self,
+        session_end: bool,
+    ) -> FormattedPendingOutput {
+        if session_end {
+            self.drain_final_formatted_output()
+        } else {
+            // Keep an incomplete raw UTF-8 tail open at input_wait; the next accepted
+            // request seals it before fresh output can merge across requests.
+            self.drain_formatted_output()
+        }
     }
 
     pub(super) fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
-        self.pending_output_tape
-            .drain_sealed_snapshot()
-            .format_contents()
+        self.pending_output_tape.drain_sealed_output()
     }
 
     pub(super) fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
@@ -171,7 +175,6 @@ impl WorkerManager {
                 prompt,
                 prompt_variants: None,
             },
-            end_offset: 0,
         }
     }
 
@@ -188,7 +191,6 @@ impl WorkerManager {
                 prompt,
                 prompt_variants: None,
             },
-            end_offset: self.output.end_offset().unwrap_or(0),
         }
     }
 }

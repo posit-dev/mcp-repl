@@ -1,15 +1,17 @@
-`repl` runs source text in a persistent Python REPL session and returns emitted stdout/stderr and images.
+`repl` runs source text in a persistent Python session and returns emitted stdout/stderr and images.
 
 Arguments:
-- `input` (string): Python source text to send to the persistent REPL session. Send empty input while the pager is active to advance one page.
+- `input` (string): Python source text to run in the persistent session, or stdin text when Python is already waiting for input. Send empty input while the pager is active to advance one page.
 - `timeout_ms` (number, optional): maximum milliseconds to wait before returning.
   Timeout bounds only this response window; it does not cancel backend work.
 
 Python REPL affordances:
 - Session state persists across calls; treat persistence as an iteration aid, not a correctness guarantee.
-- Input is sent to CPython interactive mode line by line, not script or notebook-cell mode; script-like blocks may execute earlier than they would in a file or cell.
-- When a compound block may continue, end the submitted input with two newline characters (`\n\n`) or put `\n\n` before unrelated top-level code.
-- If Python is waiting at the continuation prompt, send a blank line (`\n`) to run a complete block, or send `\u0003` to abandon pending input without resetting the session.
+- At the start of each non-empty call, Python routes the whole payload from current state: if it is waiting for stdin, the payload is stdin; otherwise the payload runs as one complete Python cell with persistent globals. Send multi-line blocks and following top-level code in the same cell call.
+- A final top-level expression is displayed through `sys.displayhook`, so custom display hooks are honored.
+- Incomplete code such as a bare block header reports a normal Python syntax error instead of entering continuation mode.
+- If running code asks for stdin through `input()`, `help()`, `pdb`, `sys.stdin`, or raw stdin APIs, the next non-empty `input` is delivered as stdin bytes for that running code. The whole payload is stdin for that call, including additional lines.
+- Send new Python source in a later call after Python is ready for cell execution; leftover stdin is not promoted to source at the server boundary.
 - While work is still running, concurrent non-empty input is discarded; use empty `input` to poll.
 - Empty `input` polls for more output from a timed-out request or for detached background output while idle. While pager mode is active, empty input advances one page.
 - If a request times out, keep polling with empty `input` until the remaining worker output is drained. New non-empty input is discarded while that timed-out request is still active.

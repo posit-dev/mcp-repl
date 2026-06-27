@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -68,9 +68,30 @@ fn backend_unavailable(stdout: &str, stderr: &str) -> bool {
         || stderr.contains("[repl] error")
 }
 
+fn backend_startup_failed(stderr: &str) -> bool {
+    stderr.contains("Fatal error: cannot create 'R_TempDir'")
+        || stderr.contains("failed to start R session")
+        || stderr.contains("worker protocol error: ipc disconnected while waiting for backend info")
+        || stderr.contains("worker exited with status")
+        || stderr.contains("[repl] error")
+}
+
 fn debug_repl_test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_debug_repl_test_mutex() -> MutexGuard<'static, ()> {
+    match debug_repl_test_mutex().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn debug_repl_args_include_sandbox(args: &[&str]) -> bool {
+    args.iter()
+        .any(|arg| *arg == "--sandbox" || arg.starts_with("--sandbox="))
 }
 
 fn wait_for_prompt_or_idle(
@@ -106,15 +127,17 @@ fn wait_for_prompt_or_idle(
 }
 
 fn assert_debug_repl_starts(extra_args: &[&str]) -> TestResult<()> {
-    let _guard = debug_repl_test_mutex()
-        .lock()
-        .expect("debug repl prompt test mutex poisoned");
+    let _guard = lock_debug_repl_test_mutex();
     let exe = resolve_mcp_repl_path()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--debug-repl");
     cmd.args(extra_args);
     #[cfg(target_os = "macos")]
     if !sandbox_exec_available() {
+        cmd.arg("--sandbox").arg("danger-full-access");
+    }
+    #[cfg(target_os = "windows")]
+    if !debug_repl_args_include_sandbox(extra_args) {
         cmd.arg("--sandbox").arg("danger-full-access");
     }
     let mut child = cmd
@@ -198,10 +221,85 @@ fn debug_repl_inherit_prints_initial_prompt() -> TestResult<()> {
 }
 
 #[test]
+fn python_debug_repl_accepts_prompt_free_startup() -> TestResult<()> {
+    let _guard = lock_debug_repl_test_mutex();
+    let exe = resolve_mcp_repl_path()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--debug-repl").arg("--interpreter").arg("python");
+    #[cfg(target_os = "macos")]
+    if !sandbox_exec_available() {
+        cmd.arg("--sandbox").arg("danger-full-access");
+    }
+    #[cfg(target_os = "windows")]
+    cmd.arg("--sandbox").arg("danger-full-access");
+    let mut child = cmd
+        .env("MCP_REPL_IMAGES", "0")
+        .env("MCP_REPL_PAGER_PAGE_CHARS", "1000000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().ok_or("missing stdout")?;
+    let mut stderr = child.stderr.take().ok_or("missing stderr")?;
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if err_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = Vec::new();
+    let (_saw_prompt, saw_idle) = wait_for_prompt_or_idle(&rx, &mut seen, deadline);
+
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let output = String::from_utf8_lossy(&seen);
+    let mut err_seen = Vec::new();
+    while let Ok(chunk) = err_rx.try_recv() {
+        err_seen.extend_from_slice(&chunk);
+    }
+    let err_output = String::from_utf8_lossy(&err_seen);
+    if backend_startup_failed(&err_output) {
+        eprintln!("debug_repl python backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    assert!(
+        saw_idle && output.contains("<<repl status: idle>>"),
+        "expected Python debug repl to initialize from prompt-free readiness, got: {output:?}, stderr: {err_output:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn debug_repl_files_mode_uses_output_bundle_dir_for_large_output() -> TestResult<()> {
-    let _guard = debug_repl_test_mutex()
-        .lock()
-        .expect("debug repl prompt test mutex poisoned");
+    let _guard = lock_debug_repl_test_mutex();
     let exe = resolve_mcp_repl_path()?;
     let temp = tempdir()?;
     let mut cmd = Command::new(exe);
@@ -212,6 +310,8 @@ fn debug_repl_files_mode_uses_output_bundle_dir_for_large_output() -> TestResult
     if !sandbox_exec_available() {
         cmd.arg("--sandbox").arg("danger-full-access");
     }
+    #[cfg(target_os = "windows")]
+    cmd.arg("--sandbox").arg("danger-full-access");
     let mut child = cmd
         .env("MCP_REPL_IMAGES", "0")
         .env("MCP_REPL_PAGER_PAGE_CHARS", "1000000")

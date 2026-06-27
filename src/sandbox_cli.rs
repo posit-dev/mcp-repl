@@ -81,8 +81,15 @@ enum SandboxValidationMode {
 impl SandboxValidationMode {
     fn from_policy(policy: &SandboxPolicy) -> Self {
         match policy {
-            SandboxPolicy::ReadOnly => Self::ReadOnly,
+            SandboxPolicy::ReadOnly { .. } => Self::ReadOnly,
             SandboxPolicy::WorkspaceWrite { .. } => Self::WorkspaceWrite,
+            SandboxPolicy::Managed { file_system, .. } => {
+                if file_system.has_full_disk_write_access() {
+                    Self::DangerFullAccess
+                } else {
+                    Self::ReadOnly
+                }
+            }
             SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
                 Self::DangerFullAccess
             }
@@ -383,7 +390,9 @@ fn apply_mode(
         }
         SandboxModeArg::ReadOnly => {
             *state = defaults.clone();
-            state.sandbox_policy = SandboxPolicy::ReadOnly;
+            state.sandbox_policy = SandboxPolicy::ReadOnly {
+                network_access: false,
+            };
         }
         SandboxModeArg::WorkspaceWrite => {
             *state = defaults.clone();

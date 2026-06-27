@@ -1,0 +1,15 @@
+---
+source: tests/python_snapshots.rs
+expression: transcript
+---
+== session: sys_stdin_followup_without_prompt ==
+1) py_repl timeout_ms=5000
+>>> import sys
+>>> line = sys.stdin.readline().strip()
+>>> print("stdin", line)
+<<< <<repl status: waiting for input>>
+
+2) py_repl timeout_ms=5000
+>>> bravo
+<<< stdin bravo
+<<<

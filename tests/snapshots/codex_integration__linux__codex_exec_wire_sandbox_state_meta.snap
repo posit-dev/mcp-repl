@@ -1,6 +1,5 @@
 ---
 source: tests/codex_integration.rs
-assertion_line: 2490
 expression: snapshot
 ---
 {
@@ -77,11 +76,7 @@ expression: snapshot
         "content": [
           {
             "type": "text",
-            "text": "WRITE_OK\n"
-          },
-          {
-            "type": "text",
-            "text": "> "
+            "text": "WRITE_OK\n> "
           }
         ],
         "isError": false

@@ -19,7 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "INTERRUPT_READY"
+      "text": "INTERRUPT_READY\n"
     },
     {
       "type": "text",
@@ -43,11 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "interrupt received"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "interrupt received\n> "
     }
   ]
 }
@@ -67,11 +63,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "[1] 2\n> "
     }
   ]
 }

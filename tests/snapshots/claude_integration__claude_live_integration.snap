@@ -23,7 +23,7 @@ expression: rendered
     "name": "mcp__r__repl",
     "input": "cat(\"CLAUDE_MCP_OK\\n\")"
   },
-  "tool_result": "CLAUDE_MCP_OK\n",
+  "tool_result": "CLAUDE_MCP_OK\n> ",
   "final_text": "DONE",
   "result": {
     "subtype": "success",

@@ -19,11 +19,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "Called from: top level "
-    },
-    {
-      "type": "text",
-      "text": "Browse[1]> "
+      "text": "Called from: top level \nBrowse[1]> "
     }
   ]
 }
@@ -63,11 +59,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[1] 2"
-    },
-    {
-      "type": "text",
-      "text": "> "
+      "text": "[1] 2\n> "
     }
   ]
 }

@@ -8,10 +8,9 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 
 use crate::input_state::InputState;
-use crate::output_capture::OutputTextSource;
 
 use super::protocol::{
-    IpcEchoEvent, IpcHandlers, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
+    IpcHandlers, IpcInputLineEvent, IpcOutputImage, IpcOutputText, ServerToWorkerIpcMessage,
     WorkerToServerIpcMessage,
 };
 use super::transport::IpcTransport;
@@ -25,8 +24,9 @@ struct ServerIpcInbox {
     queue: VecDeque<WorkerToServerIpcMessage>,
     startup_message_seen: bool,
     last_prompt: Option<String>,
+    last_prompt_observed_at: Option<Instant>,
     prompt_history: VecDeque<String>,
-    echo_events: VecDeque<IpcEchoEvent>,
+    input_line_events: VecDeque<IpcInputLineEvent>,
     input_state: InputState,
     readline_result_count: usize,
     current_image_id: Option<String>,
@@ -43,6 +43,37 @@ pub struct ServerIpcConnection {
     inbox: Arc<Mutex<ServerIpcInbox>>,
     cvar: Arc<Condvar>,
     reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    handler_gate: Arc<IpcHandlerGate>,
+}
+
+#[derive(Debug)]
+pub enum IpcInputReadiness {
+    InputWait(String),
+    Ready,
+}
+
+struct IpcHandlerGate {
+    enabled: Mutex<bool>,
+}
+
+impl IpcHandlerGate {
+    fn new() -> Self {
+        Self {
+            enabled: Mutex::new(true),
+        }
+    }
+
+    fn dispatch(&self, handler: impl FnOnce()) {
+        let enabled = self.enabled.lock().unwrap();
+        if *enabled {
+            handler();
+        }
+    }
+
+    fn disable(&self) {
+        let mut enabled = self.enabled.lock().unwrap();
+        *enabled = false;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -71,13 +102,15 @@ impl ServerIpcConnection {
         let inbox = Arc::new(Mutex::new(ServerIpcInbox::default()));
         let cvar = Arc::new(Condvar::new());
         let reader_thread = Arc::new(Mutex::new(None));
+        let handler_gate = Arc::new(IpcHandlerGate::new());
 
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
+        let reader_handler_gate = handler_gate.clone();
         let output_text_handler = handlers.on_output_text.clone();
         let output_image_handler = handlers.on_output_image.clone();
         let input_wait_handler = handlers.on_input_wait.clone();
-        let readline_result_handler = handlers.on_readline_result.clone();
+        let input_line_handler = handlers.on_input_line.clone();
         let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
         let writer = OutputCriticalIpcWriter::new(writer);
@@ -143,10 +176,9 @@ impl ServerIpcConnection {
                 }
                 match message {
                     WorkerToServerIpcMessage::InputLine { prompt, text } => {
-                        let echo_event = IpcEchoEvent {
+                        let input_line_event = IpcInputLineEvent {
                             prompt: prompt.clone(),
                             line: text.clone(),
-                            source: OutputTextSource::Ipc,
                         };
                         let mut guard = reader_inbox.lock().unwrap();
                         if let Err(err) = guard.input_state.validate_active_input("input_line") {
@@ -156,23 +188,33 @@ impl ServerIpcConnection {
                         }
                         guard.readline_result_count = guard.readline_result_count.saturating_add(1);
                         push_prompt_history(&mut guard, prompt);
-                        guard.echo_events.push_back(echo_event.clone());
+                        guard.input_line_events.push_back(input_line_event.clone());
                         reader_cvar.notify_all();
                         drop(guard);
-                        if let Some(handler) = readline_result_handler.as_ref() {
-                            handler(echo_event);
+                        if let Some(handler) = input_line_handler.as_ref() {
+                            reader_handler_gate.dispatch(|| handler(input_line_event));
                         }
                     }
                     WorkerToServerIpcMessage::InputWait { prompt } => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        guard.input_state.record_input_wait(Instant::now());
+                        let observed_at = Instant::now();
+                        guard.input_state.record_input_wait(observed_at);
+                        guard.last_prompt_observed_at = Some(observed_at);
                         push_prompt_history(&mut guard, prompt.clone());
                         guard.last_prompt = Some(prompt.clone());
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = input_wait_handler.as_ref() {
-                            handler(prompt);
+                            reader_handler_gate.dispatch(|| handler(prompt));
                         }
+                    }
+                    WorkerToServerIpcMessage::Ready {} => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        guard.input_state.record_ready(Instant::now());
+                        guard.last_prompt = None;
+                        guard.last_prompt_observed_at = None;
+                        guard.prompt_history.clear();
+                        reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::SessionEnd { reason, message } => {
                         if let Err(err) = validate_session_end(reason.as_deref()) {
@@ -189,7 +231,7 @@ impl ServerIpcConnection {
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = session_end_handler.as_ref() {
-                            handler();
+                            reader_handler_gate.dispatch(|| handler());
                         }
                     }
                     WorkerToServerIpcMessage::OutputText {
@@ -210,10 +252,12 @@ impl ServerIpcConnection {
                                 }
                             };
                         if let Some(handler) = output_text_handler.as_ref() {
-                            handler(IpcOutputText {
-                                stream,
-                                bytes,
-                                is_continuation,
+                            reader_handler_gate.dispatch(|| {
+                                handler(IpcOutputText {
+                                    stream,
+                                    bytes,
+                                    is_continuation,
+                                })
                             });
                         } else {
                             let mut guard = reader_inbox.lock().unwrap();
@@ -254,13 +298,15 @@ impl ServerIpcConnection {
                             )
                         };
                         if let Some(handler) = output_image_handler.as_ref() {
-                            handler(IpcOutputImage {
-                                id,
-                                mime_type,
-                                data: data_b64,
-                                is_new,
-                                updates_previous_image,
-                                readline_results_seen,
+                            reader_handler_gate.dispatch(|| {
+                                handler(IpcOutputImage {
+                                    id,
+                                    mime_type,
+                                    data: data_b64,
+                                    is_new,
+                                    updates_previous_image,
+                                    readline_results_seen,
+                                })
                             });
                         } else {
                             let mut guard = reader_inbox.lock().unwrap();
@@ -290,6 +336,7 @@ impl ServerIpcConnection {
             inbox,
             cvar,
             reader_thread,
+            handler_gate,
         })
     }
 
@@ -316,6 +363,14 @@ impl ServerIpcConnection {
         Ok(())
     }
 
+    pub fn detach_reader_thread(&self) {
+        let _ = self.reader_thread.lock().unwrap().take();
+    }
+
+    pub fn disable_handlers(&self) {
+        self.handler_gate.disable();
+    }
+
     #[cfg_attr(
         any(target_family = "unix", target_family = "windows"),
         allow(dead_code)
@@ -323,7 +378,7 @@ impl ServerIpcConnection {
     pub fn begin_request(&self) {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
-        guard.echo_events.clear();
+        guard.input_line_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
     }
@@ -333,7 +388,7 @@ impl ServerIpcConnection {
         let mut guard = self.inbox.lock().unwrap();
         reset_after_completed_request(&mut guard);
         guard.input_state.begin_input()?;
-        guard.echo_events.clear();
+        guard.input_line_events.clear();
         guard.prompt_history.clear();
         guard.protocol_warnings.clear();
         Ok(())
@@ -355,11 +410,12 @@ impl ServerIpcConnection {
             }
             if guard.input_state.ready_for_input() {
                 guard.last_prompt = None;
+                guard.last_prompt_observed_at = None;
                 guard
                     .input_state
                     .begin_input()
                     .map_err(IpcWaitError::Protocol)?;
-                guard.echo_events.clear();
+                guard.input_line_events.clear();
                 guard.prompt_history.clear();
                 guard.protocol_warnings.clear();
                 return Ok(());
@@ -388,14 +444,9 @@ impl ServerIpcConnection {
         guard.prompt_history.drain(..).collect()
     }
 
-    pub fn take_echo_events(&self) -> Vec<IpcEchoEvent> {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.echo_events.drain(..).collect()
-    }
-
-    pub fn pending_echo_event_count(&self) -> usize {
+    pub fn pending_input_line_event_count(&self) -> usize {
         let guard = self.inbox.lock().unwrap();
-        guard.echo_events.len()
+        guard.input_line_events.len()
     }
 
     pub fn take_protocol_warnings(&self) -> Vec<String> {
@@ -477,6 +528,7 @@ impl ServerIpcConnection {
         }
     }
 
+    #[cfg(test)]
     pub fn wait_for_input_wait(&self, timeout: Duration) -> Result<String, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -491,6 +543,7 @@ impl ServerIpcConnection {
                 return Err(IpcWaitError::Disconnected);
             }
             if let Some(prompt) = guard.last_prompt.take() {
+                guard.last_prompt_observed_at = None;
                 return Ok(prompt);
             }
 
@@ -509,7 +562,91 @@ impl ServerIpcConnection {
 
     pub fn try_take_prompt(&self) -> Option<String> {
         let mut guard = self.inbox.lock().unwrap();
+        guard.last_prompt_observed_at = None;
         guard.last_prompt.take()
+    }
+
+    pub fn wait_for_input_readiness(
+        &self,
+        timeout: Duration,
+    ) -> Result<IpcInputReadiness, IpcWaitError> {
+        self.wait_for_input_readiness_after(timeout, None, true)
+    }
+
+    #[cfg(test)]
+    pub fn wait_for_fresh_input_readiness(
+        &self,
+        timeout: Duration,
+        since: Instant,
+    ) -> Result<IpcInputReadiness, IpcWaitError> {
+        self.wait_for_input_readiness_after(timeout, Some(since), false)
+    }
+
+    pub fn wait_for_input_wait_or_fresh_ready(
+        &self,
+        timeout: Duration,
+        since: Instant,
+    ) -> Result<IpcInputReadiness, IpcWaitError> {
+        self.wait_for_input_readiness_after(timeout, Some(since), true)
+    }
+
+    fn wait_for_input_readiness_after(
+        &self,
+        timeout: Duration,
+        since: Option<Instant>,
+        accept_existing_input_wait: bool,
+    ) -> Result<IpcInputReadiness, IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(message) = guard.input_state.take_protocol_error() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+            if let Some(prompt) = guard.last_prompt.as_ref() {
+                let prompt_is_fresh = match since {
+                    Some(since) => guard
+                        .last_prompt_observed_at
+                        .is_some_and(|observed_at| observed_at > since),
+                    None => true,
+                };
+                if prompt_is_fresh || accept_existing_input_wait {
+                    let prompt = prompt.clone();
+                    guard.last_prompt = None;
+                    guard.last_prompt_observed_at = None;
+                    return Ok(IpcInputReadiness::InputWait(prompt));
+                }
+                guard.last_prompt = None;
+                guard.last_prompt_observed_at = None;
+            }
+            let ready = match since {
+                Some(since) => {
+                    guard.input_state.readiness_observed_after(since)
+                        || (accept_existing_input_wait
+                            && guard.input_state.input_wait_readiness_available())
+                }
+                None => guard.input_state.ready_for_input(),
+            };
+            if ready {
+                return Ok(IpcInputReadiness::Ready);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
     }
 
     pub fn wait_for_worker_ready(
@@ -710,6 +847,7 @@ fn reset_after_completed_request(guard: &mut ServerIpcInbox) {
     guard.request_image_id = None;
     guard.request_output_source_image_ids.clear();
     guard.last_prompt = None;
+    guard.last_prompt_observed_at = None;
 }
 
 fn take_worker_ready(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMessage> {
@@ -736,7 +874,7 @@ mod tests {
     use crate::worker_protocol::TextStream;
     use serde_json::json;
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -933,6 +1071,82 @@ mod tests {
         server
             .begin_input()
             .expect("interrupt must not change input_wait readiness");
+    }
+
+    #[test]
+    fn fresh_readiness_wait_ignores_cached_ready() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::Ready {})
+            .expect("send ready");
+        assert!(matches!(
+            server.wait_for_input_readiness(Duration::from_millis(200)),
+            Ok(super::IpcInputReadiness::Ready)
+        ));
+
+        let after_cached_ready = Instant::now();
+        let stale =
+            server.wait_for_fresh_input_readiness(Duration::from_millis(20), after_cached_ready);
+        assert!(
+            matches!(stale, Err(super::IpcWaitError::Timeout)),
+            "fresh readiness wait should ignore cached ready, got: {stale:?}"
+        );
+
+        worker
+            .send(WorkerToServerIpcMessage::Ready {})
+            .expect("send fresh ready");
+        assert!(matches!(
+            server.wait_for_fresh_input_readiness(Duration::from_millis(200), after_cached_ready),
+            Ok(super::IpcInputReadiness::Ready)
+        ));
+
+        let observed_input_wait = Arc::new((Mutex::new(false), Condvar::new()));
+        let handler_observed_input_wait = observed_input_wait.clone();
+        let (server, worker) = test_connection_pair_with_handlers(IpcHandlers {
+            on_input_wait: Some(Arc::new(move |_| {
+                let (lock, cvar) = &*handler_observed_input_wait;
+                *lock.lock().expect("input_wait mutex") = true;
+                cvar.notify_all();
+            })),
+            ..IpcHandlers::default()
+        })
+        .expect("ipc pair");
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "stale> ".to_string(),
+            })
+            .expect("send stale input_wait");
+        let (lock, cvar) = &*observed_input_wait;
+        let observed = lock.lock().expect("input_wait mutex");
+        let observed = cvar
+            .wait_timeout_while(observed, Duration::from_millis(200), |observed| !*observed)
+            .expect("input_wait cvar")
+            .0;
+        assert!(*observed, "server should observe stale input_wait");
+        drop(observed);
+
+        let after_cached_input_wait = Instant::now();
+        let stale = server
+            .wait_for_fresh_input_readiness(Duration::from_millis(20), after_cached_input_wait);
+        assert!(
+            matches!(stale, Err(super::IpcWaitError::Timeout)),
+            "fresh readiness wait should ignore cached input_wait, got: {stale:?}"
+        );
+
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "fresh> ".to_string(),
+            })
+            .expect("send fresh input_wait");
+        assert!(matches!(
+            server.wait_for_fresh_input_readiness(
+                Duration::from_millis(200),
+                after_cached_input_wait
+            ),
+            Ok(super::IpcInputReadiness::InputWait(prompt)) if prompt == "fresh> "
+        ));
     }
 
     #[test]
