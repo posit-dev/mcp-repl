@@ -24,32 +24,43 @@ enum RestartShutdownSnapshot {
     },
 }
 
+#[derive(Clone, Copy)]
+enum RestartShutdown {
+    Sideband,
+    StdinClose,
+}
+
 impl WorkerManager {
     #[cfg(debug_assertions)]
     pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         match self.oversized_output {
-            OversizedOutputMode::Files => self.restart_files(timeout),
-            OversizedOutputMode::Pager => self.restart_pager(timeout),
+            OversizedOutputMode::Files => {
+                self.restart_for_mode(RestartMode::Files, RestartShutdown::Sideband, timeout)
+            }
+            OversizedOutputMode::Pager => {
+                self.restart_for_mode(RestartMode::Pager, RestartShutdown::Sideband, timeout)
+            }
         }
     }
 
     pub(super) fn restart_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        self.restart_for_mode(RestartMode::Files, timeout)
+        self.restart_for_mode(RestartMode::Files, RestartShutdown::StdinClose, timeout)
     }
 
     pub(super) fn restart_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        self.restart_for_mode(RestartMode::Pager, timeout)
+        self.restart_for_mode(RestartMode::Pager, RestartShutdown::StdinClose, timeout)
     }
 
     fn restart_for_mode(
         &mut self,
         mode: RestartMode,
+        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_restart(timeout);
         self.require_inherited_sandbox_state()?;
         self.maybe_emit_pending_server_notice();
-        let snapshot = self.shutdown_existing_worker_for_restart(mode, timeout);
+        let snapshot = self.shutdown_existing_worker_for_restart(mode, shutdown, timeout);
         self.clear_restart_busy_guardrail();
         let reply = self.build_restart_reply_for_mode(snapshot);
         self.finish_restart_for_mode(mode);
@@ -73,16 +84,22 @@ impl WorkerManager {
     fn shutdown_existing_worker_for_restart(
         &mut self,
         mode: RestartMode,
+        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         match mode {
-            RestartMode::Files => self.shutdown_existing_files_worker_for_restart(timeout),
-            RestartMode::Pager => self.shutdown_existing_pager_worker_for_restart(timeout),
+            RestartMode::Files => {
+                self.shutdown_existing_files_worker_for_restart(shutdown, timeout)
+            }
+            RestartMode::Pager => {
+                self.shutdown_existing_pager_worker_for_restart(shutdown, timeout)
+            }
         }
     }
 
     fn shutdown_existing_files_worker_for_restart(
         &mut self,
+        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         let had_process = self.process.is_some();
@@ -90,20 +107,27 @@ impl WorkerManager {
         // more output from an abandoned timed-out request.
         let output = had_process.then(|| self.drain_sealed_formatted_output());
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_for_restart(timeout);
+            let _ = match shutdown {
+                RestartShutdown::Sideband => process.shutdown_graceful(timeout),
+                RestartShutdown::StdinClose => process.shutdown_for_restart(timeout),
+            };
         }
         RestartShutdownSnapshot::Files { output }
     }
 
     fn shutdown_existing_pager_worker_for_restart(
         &mut self,
+        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         self.output_timeline.seal_utf8_tails();
         // Snapshot before shutdown so late old-session output is discarded at reset.
         let end_offset = self.output.end_offset();
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_for_restart(timeout);
+            let _ = match shutdown {
+                RestartShutdown::Sideband => process.shutdown_graceful(timeout),
+                RestartShutdown::StdinClose => process.shutdown_for_restart(timeout),
+            };
         }
         RestartShutdownSnapshot::Pager { end_offset }
     }
