@@ -950,24 +950,11 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
             "repl",
             json!({
                 "input": "partial-utf8-stderr-then-sleep",
-                "timeout_ms": 50
+                "timeout_ms": 300
             }),
         )
         .await?;
     let timeout_text = result_text(&timed_out);
-    let mut drained_text = timeout_text.clone();
-    if !drained_text.contains("\\xC3") || !drained_text.contains("stderr: tail-visible\n") {
-        let follow_up = session
-            .call_tool_raw(
-                "repl",
-                json!({
-                    "input": "",
-                    "timeout_ms": 10_000
-                }),
-            )
-            .await?;
-        drained_text.push_str(&result_text(&follow_up));
-    }
 
     session.cancel().await?;
 
@@ -976,12 +963,12 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
         "expected the delayed UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        drained_text.contains("\\xC3"),
-        "timeout or follow-up poll should flush an incomplete leading UTF-8 tail, got: {drained_text:?}"
+        timeout_text.contains("\\xC3"),
+        "timeout drain should flush an incomplete leading UTF-8 tail, got: {timeout_text:?}"
     );
     assert!(
-        drained_text.contains("stderr: tail-visible\n"),
-        "timeout or follow-up poll should expose later stderr after an incomplete UTF-8 tail, got: {drained_text:?}"
+        timeout_text.contains("stderr: tail-visible\n"),
+        "timeout drain should expose later stderr after an incomplete UTF-8 tail, got: {timeout_text:?}"
     );
 
     Ok(())
