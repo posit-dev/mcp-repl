@@ -1,19 +1,17 @@
-"""Use async chatlas MCP registration with mcp-repl pager mode."""
+"""Register mcp-repl pager mode with async chatlas MCP tools."""
 
 import asyncio
 
 from chatlas import ChatOpenAI
 
+PROMPT = (
+    "Tell me something interesting about the penguins dataset. "
+    "Use the REPL tool to do analysis."
+)
+
 
 async def main() -> None:
-    chat = ChatOpenAI(
-        system_prompt=(
-            "Use the `repl` MCP tool for Python execution. This mcp-repl "
-            "server runs in pager mode. If output opens the pager, send pager "
-            "commands through the tool's `input` argument: empty input or "
-            "`:next` advances, `:/pattern` searches, and `:q` exits."
-        ),
-    )
+    chat = ChatOpenAI()
 
     try:
         await chat.register_mcp_tools_stdio_async(
@@ -30,13 +28,7 @@ async def main() -> None:
             include_tools=["repl"],
         )
 
-        response = await chat.chat_async(
-            "Use the repl tool to print 400 numbered lines in the format "
-            "record-0001 through record-0400. When pager mode starts, search "
-            "the pager for record-0250, then answer with the matching line "
-            "and the pager command that found it.",
-            echo="none",
-        )
+        response = await chat.chat_async(PROMPT, echo="none")
         print(await response.get_content())
     finally:
         await chat.cleanup_mcp_tools()

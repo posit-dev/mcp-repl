@@ -108,8 +108,14 @@ fn examples_folder_documents_chatlas_usage() {
     let readme_path = root.join("examples/README.md");
     let async_pager_path = root.join("examples/chatlas_async_pager_mode.py");
     let async_files_path = root.join("examples/chatlas_async_files_mode.py");
+    let file_tools_path = root.join("examples/chatlas_file_tools.py");
 
-    for path in [&readme_path, &async_pager_path, &async_files_path] {
+    for path in [
+        &readme_path,
+        &async_pager_path,
+        &async_files_path,
+        &file_tools_path,
+    ] {
         assert_exists(path);
     }
     for removed_path in [
@@ -132,6 +138,7 @@ fn examples_folder_documents_chatlas_usage() {
         "chatlas[mcp]",
         "chatlas_async_pager_mode.py",
         "chatlas_async_files_mode.py",
+        "chatlas_file_tools.py",
         "pager mode",
         "overflow files mode",
         "register_mcp_tools_stdio_async",
@@ -139,8 +146,8 @@ fn examples_folder_documents_chatlas_usage() {
         "--oversized-output",
         "list_directory",
         "read_text_file",
-        "start_line",
-        "end_line",
+        "Tell me something interesting about the penguins dataset.",
+        "Use the REPL tool to do analysis.",
         "chat_async",
         "cleanup_mcp_tools",
         "chatlas supports blocking `chat.chat()`",
@@ -167,6 +174,10 @@ fn examples_folder_documents_chatlas_usage() {
         "subprocess over stdio",
         "\"tools/call\"",
         "\"initialize\"",
+        "numbered lines",
+        "record-0001",
+        "bundle-record",
+        "pager commands",
     ] {
         assert!(
             !readme.contains(removed),
@@ -182,6 +193,8 @@ fn examples_folder_documents_chatlas_usage() {
         "include_tools=[\"repl\"]",
         "chat_async",
         "cleanup_mcp_tools",
+        "Tell me something interesting about the penguins dataset.",
+        "Use the REPL tool to do analysis.",
     ] {
         assert!(
             async_pager.contains(required),
@@ -198,20 +211,32 @@ fn examples_folder_documents_chatlas_usage() {
         r#""--interpreter", "python""#,
         "examples/chatlas_async_pager_mode.py",
     );
+    for absent in [
+        "list_directory",
+        "read_text_file",
+        "record-0001",
+        "record-0250",
+        "pager command",
+    ] {
+        assert!(
+            !async_pager.contains(absent),
+            "pager example should not mention {absent}"
+        );
+    }
 
     let async_files = read(&async_files_path);
     for required in [
         "from chatlas import ChatOpenAI",
+        "from chatlas_file_tools import list_directory, read_text_file",
         "register_mcp_tools_stdio_async",
         "command=\"mcp-repl\"",
         "include_tools=[\"repl\"]",
-        "def list_directory",
-        "def read_text_file",
-        "from typing import Optional",
-        "start_line: int = 1",
-        "end_line: Optional[int] = None",
+        "chat.register_tool(list_directory)",
+        "chat.register_tool(read_text_file)",
         "chat_async",
         "cleanup_mcp_tools",
+        "Tell me something interesting about the penguins dataset.",
+        "Use the REPL tool to do analysis.",
     ] {
         assert!(
             async_files.contains(required),
@@ -230,6 +255,38 @@ fn examples_folder_documents_chatlas_usage() {
     );
     assert!(
         !async_files.contains("max_chars"),
+        "read_text_file should not impose a fixed character limit"
+    );
+    for absent in [
+        "def list_directory",
+        "def read_text_file",
+        "from pathlib import Path",
+        "from typing import Optional",
+        "bundle-record",
+        "transcript.txt",
+    ] {
+        assert!(
+            !async_files.contains(absent),
+            "files example should not define or prompt about {absent}"
+        );
+    }
+
+    let file_tools = read(&file_tools_path);
+    for required in [
+        "from pathlib import Path",
+        "from typing import Optional",
+        "def list_directory",
+        "def read_text_file",
+        "start_line: int = 1",
+        "end_line: Optional[int] = None",
+    ] {
+        assert!(
+            file_tools.contains(required),
+            "missing {required} in examples/chatlas_file_tools.py"
+        );
+    }
+    assert!(
+        !file_tools.contains("max_chars"),
         "read_text_file should not impose a fixed character limit"
     );
 }

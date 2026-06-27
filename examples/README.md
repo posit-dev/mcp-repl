@@ -1,8 +1,7 @@
 # chatlas examples
 
 These examples show the chatlas-supported MCP path for `mcp-repl`:
-`register_mcp_tools_stdio_async()`. They focus on the two oversized-output
-modes: pager mode and overflow files mode.
+`register_mcp_tools_stdio_async()`.
 
 ## Prerequisites
 
@@ -29,13 +28,17 @@ runtime.
 
 ## Examples
 
-- `chatlas_async_pager_mode.py`: starts `mcp-repl --oversized-output pager
-  --interpreter python`, asks the model to produce oversized output, then uses
-  pager commands such as search to inspect it.
-- `chatlas_async_files_mode.py`: starts `mcp-repl --oversized-output files
-  --interpreter python`, asks the model to produce output large enough to spill
-  into an output bundle, then gives the model `list_directory` and
-  `read_text_file` tools so it can inspect that bundle.
+- `chatlas_async_pager_mode.py`: registers only the MCP `repl` tool in pager mode
+  with `mcp-repl --oversized-output pager --interpreter python`.
+- `chatlas_async_files_mode.py`: registers the MCP `repl` tool with `mcp-repl
+  --oversized-output files --interpreter python`, plus `list_directory` and
+  `read_text_file` from `chatlas_file_tools.py`.
+
+Both examples ask the same prompt:
+
+```text
+Tell me something interesting about the penguins dataset. Use the REPL tool to do analysis.
+```
 
 Run an async MCP-registration example from this repository:
 
@@ -48,7 +51,7 @@ Both scripts register only the MCP `repl` tool, not `repl_reset`, so the model
 gets the single happy path: run code in the live REPL and summarize the result.
 They call `cleanup_mcp_tools` when the chat finishes.
 
-The files-mode example also registers ordinary chatlas tools:
+The overflow files mode example also registers ordinary chatlas tools:
 
 - `list_directory(path)`: lists direct children of a disclosed output bundle.
 - `read_text_file(path, start_line, end_line)`: reads a UTF-8 text file with
