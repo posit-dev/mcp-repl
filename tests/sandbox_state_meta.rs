@@ -191,6 +191,15 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn legacy_workspace_write_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        workspace_write_profile(),
+        sandbox_cwd,
+        /*use_legacy_landlock*/ true,
+    )
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn workspace_write_with_glob_deny_meta(sandbox_cwd: &Path, pattern: &str) -> Value {
     let mut entries = vec![
@@ -2993,6 +3002,39 @@ async fn sandbox_inherit_project_subpath_write_meta_allows_missing_writable_root
     assert!(
         target.exists(),
         "write under missing project subpath root should create {}",
+        target.display()
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_legacy_landlock_workspace_write_meta_fails_closed_for_metadata_carveouts()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-legacy-landlock-protected")?;
+    for protected_name in [".git", ".agents", ".codex"] {
+        fs::create_dir(scratch.path().join(protected_name))?;
+    }
+    let target = scratch.path().join(".git/deny.txt");
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(legacy_workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("ipc disconnected while waiting for worker_ready"),
+        "expected legacy Landlock workspace-write metadata to fail closed at worker startup, got: {text}"
+    );
+    assert!(
+        !target.exists(),
+        "legacy Landlock failure should happen before worker writes protected metadata {}",
         target.display()
     );
     Ok(())
