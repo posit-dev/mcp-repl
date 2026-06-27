@@ -97,6 +97,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cee35f73844aa3014bb606320a6c1f010249dbdf43342fe54b5a4f6a8ed4b79"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -523,6 +533,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "globset"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "harp"
 version = "0.1.0"
 source = "git+https://github.com/t-kalinowski/ark?rev=43441280f5bb84d9566e8f47f1c6b8614d056340#43441280f5bb84d9566e8f47f1c6b8614d056340"
@@ -912,6 +935,7 @@ dependencies = [
  "base64",
  "blake3",
  "ctor 0.6.3",
+ "globset",
  "harp",
  "htmd",
  "insta",
