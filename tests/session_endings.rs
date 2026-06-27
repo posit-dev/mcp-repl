@@ -34,10 +34,10 @@ async fn snapshots_session_endings() -> TestResult<()> {
 
     snapshot
         .session(
-            "restart_timeout_thirty",
+            "restart_timeout_nonzero",
             mcp_script! {
                 write_stdin("x <- 1", timeout = 10.0);
-                write_stdin_raw_unterminated("\u{4}", timeout = 30.0);
+                write_stdin_raw_unterminated("\u{4}", timeout = 5.0);
                 write_stdin("print(exists(\"x\"))", timeout = 10.0);
             },
         )

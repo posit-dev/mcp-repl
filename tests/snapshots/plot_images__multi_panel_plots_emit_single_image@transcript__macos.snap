@@ -13,7 +13,7 @@ expression: transcript
 ===   par(mfrow = c(2, 1))
 ===   plot(1:10)
 ===   plot(10:1)
-===   grDevices::dev.off()
+===   invisible(grDevices::dev.off())
 
 2) r_repl
 >>> 1+1

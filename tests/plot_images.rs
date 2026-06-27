@@ -341,7 +341,7 @@ fn reference_image_script_lines(name: &str) -> Option<Vec<&'static str>> {
         r#"grDevices::png(filename = Sys.getenv("MCP_REPL_TEST_PNG_DEST"), width = 800, height = 600, res = 96)"#,
     ];
     lines.extend(plot_lines);
-    lines.push("grDevices::dev.off()");
+    lines.push("invisible(grDevices::dev.off())");
     Some(lines)
 }
 
@@ -1062,7 +1062,7 @@ async fn plot_size_option_changes_preserve_par_on_reopened_managed_device() -> T
 async fn plot_size_changes_do_not_resize_user_opened_device() -> TestResult<()> {
     let session = spawn_server_with_files().await?;
 
-    let setup_input = r#"options(console.plot.width = 4, console.plot.height = 3, console.plot.dpi = 100); plot(1:10); grDevices::dev.off()"#;
+    let setup_input = r#"options(console.plot.width = 4, console.plot.height = 3, console.plot.dpi = 100); plot(1:10); invisible(grDevices::dev.off())"#;
     let setup_result = session
         .write_stdin_raw_with(setup_input, Some(30.0))
         .await?;
@@ -1078,7 +1078,7 @@ async fn plot_size_changes_do_not_resize_user_opened_device() -> TestResult<()> 
         result_text(&setup_result)
     );
 
-    let input = r#"path <- tempfile(fileext = ".png"); options(console.plot.width = 6, console.plot.height = 2, console.plot.dpi = 100); grDevices::png(path, width = 5, height = 4, units = "in", res = 100); plot(1:10); size <- dev.size("in"); cat(sprintf("mcp-repl-user-device-size %.1f %.1f\n", size[[1]], size[[2]])); grDevices::dev.off(); unlink(path)"#;
+    let input = r#"path <- tempfile(fileext = ".png"); options(console.plot.width = 6, console.plot.height = 2, console.plot.dpi = 100); grDevices::png(path, width = 5, height = 4, units = "in", res = 100); plot(1:10); size <- dev.size("in"); cat(sprintf("mcp-repl-user-device-size %.1f %.1f\n", size[[1]], size[[2]])); invisible(grDevices::dev.off()); unlink(path)"#;
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
     if any_backend_unavailable(&[&result]) {
         eprintln!("plot_images backend unavailable in this environment; skipping");

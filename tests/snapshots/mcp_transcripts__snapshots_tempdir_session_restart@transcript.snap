@@ -42,7 +42,7 @@ expression: transcript
 <<< ROOT_MARKER_EXISTS=TRUE
 <<< > 
 
-2) r_repl
+2) r_repl timeout_ms=5000
 >>> 
 <<< [repl] new session started
 
@@ -57,7 +57,7 @@ expression: transcript
 <<< TEMPDIR_UNDER_TMPDIR=TRUE
 <<< > 
 
-4) r_repl
+4) r_repl timeout_ms=5000
 >>> 
 <<< [repl] new session started
 

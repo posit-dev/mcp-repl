@@ -6106,11 +6106,16 @@ async fn python_input_releases_gil_while_waiting_for_line() -> TestResult<()> {
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp_dir = tempdir()?;
+    let background_marker = temp_dir.path().join("input-gil-background-ready");
+    let background_marker_literal = path_json_literal(&background_marker, "background marker")?;
 
     let result = session
         .write_stdin_raw_with(
-            r#"
-import sys, threading, time
+            format!(
+                r#"
+import pathlib, sys, threading, time
+background_marker = pathlib.Path({background_marker_literal})
 sys.setswitchinterval(1.0)
 background_seen = None
 answer_seen = None
@@ -6120,6 +6125,7 @@ def background():
     background_started.set()
     time.sleep(0.1)
     background_seen = time.monotonic()
+    background_marker.write_text("ready")
 
 def wait_and_print():
     global answer_seen
@@ -6130,7 +6136,8 @@ def wait_and_print():
 threading.Thread(target=background, daemon=True).start()
 background_started.wait()
 wait_and_print()
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -6141,7 +6148,7 @@ wait_and_print()
     );
     assert!(text.contains("p> "), "expected input prompt, got: {text:?}");
 
-    sleep(Duration::from_millis(500)).await;
+    wait_for_file_text(&background_marker, "ready").await?;
 
     let answer = session.write_stdin_raw_with("ok", Some(5.0)).await?;
     let answer_text = result_text(&answer);
