@@ -83,6 +83,39 @@ fn repl_tool_annotations_mark_local_mutation_without_open_world_access() {
 }
 
 #[test]
+fn repl_tool_schema_keeps_timeout_optional_without_nullable_type() {
+    let router = super::RFilesToolServer::tool_router();
+    let tool = router.get("repl").expect("repl tool should exist");
+    let schema = tool.input_schema.as_ref();
+    let properties = schema
+        .get("properties")
+        .and_then(|value| value.as_object())
+        .expect("repl schema should have properties");
+    let timeout_ms = properties
+        .get("timeout_ms")
+        .and_then(|value| value.as_object())
+        .expect("repl schema should have timeout_ms property");
+    let required = schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .expect("repl schema should declare required fields");
+
+    assert_eq!(timeout_ms.get("type"), Some(&serde_json::json!("integer")));
+    assert_eq!(timeout_ms.get("format"), Some(&serde_json::json!("uint64")));
+    assert!(
+        !timeout_ms.contains_key("default"),
+        "optional timeout_ms should not publish a null default"
+    );
+    assert!(required.iter().any(|value| value.as_str() == Some("input")));
+    assert!(
+        !required
+            .iter()
+            .any(|value| value.as_str() == Some("timeout_ms")),
+        "timeout_ms should be optional by omission from required"
+    );
+}
+
+#[test]
 fn timeout_bundle_reuse_treats_blank_lines_as_fresh_input() {
     assert!(matches!(
         super::response::timeout_bundle_reuse_for_input(""),
