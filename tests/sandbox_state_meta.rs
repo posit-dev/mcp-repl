@@ -2796,14 +2796,14 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         1.0,
         RetryMode::RawUnterminatedWithMeta(read_only_meta(scratch.path())),
         "bare restart after sandbox respawn",
-        |reply| {
-            let text = common::result_text(reply);
-            text.contains("new session started")
-                && text.contains("sandbox policy changed; new session started")
-        },
+        |reply| common::result_text(reply).contains("[repl] new session started"),
     )
     .await?;
     let restart_text = common::result_text(&restart);
+    assert!(
+        !restart_text.contains("sandbox policy changed; new session started"),
+        "did not expect bare Ctrl-D to spawn a replacement worker before restarting, got: {restart_text}"
+    );
     assert!(
         !restart_text.contains("MID") && !restart_text.contains("TAIL"),
         "did not expect bare Ctrl-D after sandbox respawn to drain preserved timeout output, got: {restart_text}"
@@ -2877,8 +2877,8 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
         "expected active-pager bare Ctrl-D to emit the explicit restart reply, got: {restart_text}"
     );
     assert!(
-        restart_text.contains("sandbox policy changed; new session started"),
-        "expected active-pager bare Ctrl-D to flush the sandbox-change notice, got: {restart_text}"
+        !restart_text.contains("sandbox policy changed; new session started"),
+        "did not expect active-pager bare Ctrl-D to spawn a replacement worker before restarting, got: {restart_text}"
     );
     assert!(
         !restart_text.contains("line000"),
@@ -4872,6 +4872,55 @@ async fn sandbox_inherit_ctrl_d_does_not_spawn_worker_just_to_stage_state() -> T
     assert!(
         !saw_spawn,
         "did not expect bare Ctrl-D to spawn a worker just to stage sandbox metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_ctrl_d_changed_meta_does_not_spawn_before_restart() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let first = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let result = session
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
+            Some(read_only_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    assert!(
+        text.contains("new session started"),
+        "expected bare Ctrl-D with changed sandbox metadata to restart the session, got: {text}"
+    );
+    session.cancel().await?;
+
+    let events = latest_debug_events(&debug_dir)?;
+    let spawn_count = events
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .count();
+    assert_eq!(
+        spawn_count, 1,
+        "did not expect bare Ctrl-D to spawn a replacement worker before restarting"
     );
     Ok(())
 }

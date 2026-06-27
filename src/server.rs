@@ -256,9 +256,7 @@ impl SharedServer {
                     split_write_stdin_control_prefix(&raw_input),
                     Some((WriteStdinControlAction::Interrupt, remaining)) if remaining.is_empty()
                 );
-                let needs_initial_state =
-                    restart_control && state.worker.missing_inherited_state_without_worker();
-                if needs_initial_state {
+                if restart_control {
                     (parse_tool_call_sandbox_state(), true)
                 } else if state.worker.pending_request() && bare_interrupt {
                     (
