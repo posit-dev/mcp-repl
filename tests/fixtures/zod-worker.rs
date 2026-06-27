@@ -95,12 +95,14 @@ fn run_worker(
         })?;
         append_control_log(control_log_path.as_deref(), "input_wait")?;
     }
-    if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
+    if let Some(stall_millis) = std::env::var_os(STALL_CONTROL_READER_ENV) {
+        let stall_millis = stall_millis.to_string_lossy().parse::<u64>()?;
         let _sideband_reader = sideband_reader;
         let _turn_tx = tx;
-        loop {
-            thread::park();
-        }
+        append_control_log(control_log_path.as_deref(), "control_reader_stalled")?;
+        thread::sleep(Duration::from_millis(stall_millis));
+        append_control_log(control_log_path.as_deref(), "control_reader_stall_elapsed")?;
+        return Ok(());
     }
 
     start_control_reader(

@@ -323,7 +323,7 @@ async fn spawn_zod_stalled_control_server(
     );
     env.insert(
         "MCP_REPL_ZOD_STALL_CONTROL_READER".to_string(),
-        Value::String("1".to_string()),
+        Value::String("5000".to_string()),
     );
     let spec = json!({
         "executable": zod_worker_path()?,
@@ -1988,6 +1988,11 @@ async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_st
     assert!(
         text.contains("worker response timed out"),
         "expected bounded input_batch write timeout, got: {text:?}"
+    );
+    let log = wait_for_log_contains(&control_log, "control_reader_stalled")?;
+    assert!(
+        !log.contains("input_batch input="),
+        "stalled fixture must not consume the timed-out input batch, got log: {log:?}"
     );
 
     session.cancel().await?;
