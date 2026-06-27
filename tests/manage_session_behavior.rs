@@ -155,6 +155,56 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pager_restart_output_can_be_drained_after_restart_reply() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let input = r#"
+Sys.sleep(0.15)
+for (i in 1:80) cat(sprintf("RESTART_LINE_%03d\n", i))
+flush.console()
+Sys.sleep(1.0)
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("pager restart test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(0.8))
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("pager restart test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        restart_text.contains("--More--"),
+        "expected restart reply to advertise additional pager output, got: {restart_text:?}"
+    );
+
+    let next = session
+        .write_stdin_raw_unterminated_with("", Some(2.0))
+        .await?;
+    let next_text = result_text(&next);
+    session.cancel().await?;
+
+    assert!(
+        next_text.contains("RESTART_LINE_"),
+        "expected follow-up poll to drain restart pager output, got: {next_text:?}"
+    );
+    assert!(
+        next_text.contains("--More--") || next_text.contains("(END"),
+        "expected follow-up poll to use pager state, got: {next_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn restart_while_busy_returns_output_captured_during_graceful_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
