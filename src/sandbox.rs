@@ -3225,12 +3225,31 @@ fn linux_find_bwrap_program() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<String>, String> {
+struct LinuxInnerSeccompCommand {
+    command: Vec<String>,
+    helper_dir: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_build_inner_seccomp_command(
+    args: &LinuxSandboxArgs,
+) -> Result<LinuxInnerSeccompCommand, String> {
     let current_exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let helper_dir = Builder::new()
+        .prefix("mcp-repl-linux-helper-")
+        .tempdir_in(&args.session_temp_dir)
+        .map_err(|err| err.to_string())?;
+    let helper_exe = helper_dir.path().join("codex-linux-sandbox");
+    std::os::unix::fs::symlink(&current_exe, &helper_exe).map_err(|err| {
+        format!(
+            "failed to create Linux sandbox helper link at {}: {err}",
+            helper_exe.to_string_lossy()
+        )
+    })?;
     let policy = sanitize_linux_sandbox_policy(&args.sandbox_policy);
     let policy_json = serde_json::to_string(&policy).map_err(|err| err.to_string())?;
     let mut inner = vec![
-        current_exe.to_string_lossy().to_string(),
+        helper_exe.to_string_lossy().to_string(),
         "--sandbox-policy-cwd".to_string(),
         args.sandbox_policy_cwd.to_string_lossy().to_string(),
         "--session-temp-dir".to_string(),
@@ -3245,7 +3264,10 @@ fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<Stri
             .iter()
             .map(|arg| arg.to_string_lossy().to_string()),
     );
-    Ok(inner)
+    Ok(LinuxInnerSeccompCommand {
+        command: inner,
+        helper_dir,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3281,7 +3303,7 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
             network_mode,
         );
     let bwrap_command = create_linux_bwrap_command_args(
-        inner,
+        inner.command,
         &file_system_policy,
         &args.sandbox_policy_cwd,
         &args.session_temp_dir,
@@ -3292,9 +3314,10 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
         args,
         preserved_files,
         empty_file_source_index: _,
-        preserved_tempdirs,
+        mut preserved_tempdirs,
         synthetic_mount_targets,
     } = bwrap_command;
+    preserved_tempdirs.push(inner.helper_dir);
     make_linux_files_inheritable(&preserved_files)?;
     let synthetic_mount_targets_for_cleanup = synthetic_mount_targets.clone();
     let mut full_command = Vec::with_capacity(1 + args.len());
@@ -6561,6 +6584,48 @@ mod tests {
             !command.args.iter().any(|arg| arg == "--argv0"),
             "bwrap args should work with Ubuntu 22.04 bubblewrap 0.6.1: {:?}",
             command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_inner_bwrap_command_invokes_helper_argv0_path() {
+        let root = Builder::new()
+            .prefix("mcp-repl-inner-helper-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+        let args = LinuxSandboxArgs {
+            sandbox_policy_cwd: root.path().to_path_buf(),
+            session_temp_dir: session_temp_dir.clone(),
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            command: vec![std::ffi::OsString::from("/bin/true")],
+            use_bwrap_sandbox: true,
+            apply_seccomp_then_exec: false,
+            no_proc: false,
+        };
+
+        let inner = linux_build_inner_seccomp_command(&args).expect("inner seccomp command");
+
+        assert_eq!(
+            Path::new(&inner.command[0]).file_name(),
+            Some(std::ffi::OsStr::new("codex-linux-sandbox")),
+            "inner bwrap command must dispatch through the helper argv0 path"
+        );
+        assert!(
+            Path::new(&inner.command[0]).starts_with(&session_temp_dir),
+            "helper argv0 path should live in the bwrap-visible session temp dir: {:?}",
+            inner.command
+        );
+        assert!(
+            Path::new(&inner.command[0]).is_symlink(),
+            "helper argv0 path should be a link to the current executable"
         );
     }
 
