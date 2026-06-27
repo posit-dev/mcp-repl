@@ -4,7 +4,6 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
-use serde_json::json;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tokio::time::{Duration, Instant, sleep};
 
@@ -253,7 +252,7 @@ Sys.sleep(1.0)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_reset_clears_active_pager_when_reply_has_no_overflow() -> TestResult<()> {
+async fn ctrl_d_restart_clears_active_pager_when_reply_has_no_overflow() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = common::spawn_server_with_pager_page_chars(120).await?;
 
@@ -285,7 +284,9 @@ async fn repl_reset_clears_active_pager_when_reply_has_no_overflow() -> TestResu
         "expected initial reply to activate pager, got: {initial_text:?}"
     );
 
-    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
+    let reset = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(5.0))
+        .await?;
     let reset_text = result_text(&reset);
     if backend_unavailable(&reset_text) {
         eprintln!("pager reset test backend unavailable in this environment; skipping");

@@ -2790,6 +2790,7 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         session.cancel().await?;
         return Ok(());
     }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
     let restart = retry_reply_until(
         &session,
         "\u{4}",
@@ -2805,8 +2806,12 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         "did not expect bare Ctrl-D to spawn a replacement worker before restarting, got: {restart_text}"
     );
     assert!(
-        !restart_text.contains("MID") && !restart_text.contains("TAIL"),
-        "did not expect bare Ctrl-D after sandbox respawn to drain preserved timeout output, got: {restart_text}"
+        restart_text.contains("MID"),
+        "expected bare Ctrl-D after sandbox respawn to return already captured output, got: {restart_text}"
+    );
+    assert!(
+        !restart_text.contains("TAIL"),
+        "did not expect bare Ctrl-D after sandbox respawn to wait for later timeout output, got: {restart_text}"
     );
     assert!(
         !restart_text.contains("<<repl status: idle>>"),

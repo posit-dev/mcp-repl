@@ -187,10 +187,10 @@ The exact `repl` tool description depends on the interpreter and
 ### Session control
 
 - **Interrupt**: prefix `repl` input with `\u0003` (SIGINT, best-effort). Session continues.
-- **Reset**: prefix `repl` input with `\u0004` (Ctrl-D / EOF).
-  For `\u0004` with remaining input, the same response includes output
-  captured through bounded old-worker shutdown, fresh-session startup, and
-  evaluating that remaining input under the original call timeout.
+- **Reset**: prefix `repl` input with `\u0004` (Ctrl-D / EOF). Reset
+  captures output the old worker emits during a bounded graceful shutdown
+  window, escalates to forceful termination when that window expires, then runs
+  any remaining input in the fresh session under the original call timeout.
 - **In-band exits**: `EOF`, `quit()`, etc. also work — output is
   returned and the next request runs in a fresh worker.
 
