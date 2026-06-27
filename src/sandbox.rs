@@ -4755,11 +4755,7 @@ fn is_proc_mount_failure(stderr: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_bwrap_proc_probe_quiet_retry_failure(stderr: &str) -> bool {
-    stderr.contains("Can't bind mount /oldroot/")
-        && stderr.contains(" on /newroot/")
-        && (stderr.contains("Unable to mount source on destination: No such file or directory")
-            || stderr
-                .contains("Unable to remount destination with correct flags: Invalid argument"))
+    stderr.contains("bwrap: Can't bind mount /oldroot/") && stderr.contains(" on /newroot/")
 }
 
 #[cfg(target_os = "linux")]
@@ -5949,12 +5945,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bwrap_proc_probe_quiet_retry_detects_old_bind_target_stderr() {
+    fn bwrap_proc_probe_quiet_retry_detects_oldroot_bind_stderr() {
         assert!(is_bwrap_proc_probe_quiet_retry_failure(
-            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-bm2Cuc on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to mount source on destination: No such file or directory"
-        ));
-        assert!(is_bwrap_proc_probe_quiet_retry_failure(
-            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-FlEdOV on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to remount destination with correct flags: Invalid argument"
+            "bwrap: Can't bind mount /oldroot/bind-source on /newroot/workspace/.agents: future bwrap detail"
         ));
         assert!(!is_bwrap_proc_probe_quiet_retry_failure(
             "bwrap: Unable to remount destination with correct flags: Invalid argument"
