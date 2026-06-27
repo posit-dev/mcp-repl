@@ -285,6 +285,10 @@ fn initialize_python(
         if (api.py_is_initialized)() != 0 {
             return Err("embedded Python interpreter was already initialized".to_string());
         }
+        // macOS framework Python uses this during path init to find pyvenv.cfg
+        // for symlinked venv executables.
+        #[cfg(target_os = "macos")]
+        let _pyvenv_launcher = MacosPyvenvLauncherEnv::set(executable);
         api.set_program_name(executable)?;
         api.set_interactive_flags()?;
         (api.py_initialize_ex)(1);
@@ -293,6 +297,36 @@ fn initialize_python(
         let thread_state = (api.py_eval_save_thread)();
         api.install_input_hook(pyos_input_hook)?;
         Ok(thread_state)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacosPyvenvLauncherEnv {
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosPyvenvLauncherEnv {
+    fn set(executable: &Path) -> Self {
+        let previous = std::env::var_os("__PYVENV_LAUNCHER__");
+        unsafe {
+            std::env::set_var("__PYVENV_LAUNCHER__", executable);
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosPyvenvLauncherEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe {
+                std::env::set_var("__PYVENV_LAUNCHER__", value);
+            },
+            None => unsafe {
+                std::env::remove_var("__PYVENV_LAUNCHER__");
+            },
+        }
     }
 }
 

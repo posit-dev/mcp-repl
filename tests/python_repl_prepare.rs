@@ -212,8 +212,17 @@ fn assert_manifest_python_version(text: &str, python_version: Option<&str>) {
     );
 }
 
+#[cfg(unix)]
 fn python_string_literal(path: &Path) -> String {
     serde_json::to_string(&path.to_string_lossy()).unwrap()
+}
+
+#[cfg(unix)]
+fn python_prefix_matches(path: &Path) -> String {
+    format!(
+        "pathlib.Path(sys.prefix).resolve() == pathlib.Path({}).resolve()",
+        python_string_literal(path)
+    )
 }
 
 fn sandbox_cwd_uri(sandbox_cwd: &Path) -> String {
@@ -239,6 +248,7 @@ fn full_access_meta(sandbox_cwd: &Path) -> Value {
     })
 }
 
+#[cfg(unix)]
 fn read_only_meta(sandbox_cwd: &Path) -> Value {
     json!({
         SANDBOX_STATE_META_CAPABILITY: {
@@ -1044,8 +1054,8 @@ async fn repl_prepare_requirement_noop_persists_target_after_ctrl_d_reset() -> T
     let prefix_probe = session
         .write_stdin_raw_with(
             format!(
-                "import sys, numpy\nprint('PREFIX_IS_FIRST:' + str(sys.prefix == {}))\nprint('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
-                python_string_literal(&first_venv)
+                "import pathlib, sys, numpy\nprint('PREFIX_IS_FIRST:' + str({}))\nprint('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
+                python_prefix_matches(&first_venv)
             ),
             Some(5.0),
         )
@@ -1076,9 +1086,9 @@ async fn repl_prepare_requirement_noop_persists_target_after_ctrl_d_reset() -> T
     let respawn_probe = session
         .write_stdin_raw_with(
             format!(
-                "import sys, numpy\nprint('PREFIX_IS_FIRST:' + str(sys.prefix == {}))\nprint('PREFIX_IS_SECOND:' + str(sys.prefix == {}))\nprint('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
-                python_string_literal(&first_venv),
-                python_string_literal(&second_venv)
+                "import pathlib, sys, numpy\nprint('PREFIX_IS_FIRST:' + str({}))\nprint('PREFIX_IS_SECOND:' + str({}))\nprint('NUMPY_OK:' + str(hasattr(numpy, '__version__')))",
+                python_prefix_matches(&first_venv),
+                python_prefix_matches(&second_venv)
             ),
             Some(5.0),
         )
@@ -1650,8 +1660,8 @@ async fn repl_prepare_matching_executable_persists_target_after_ctrl_d_reset() -
     let prefix_probe = session
         .write_stdin_raw_with(
             format!(
-                "import sys; print('PREFIX_IS_FIRST:' + str(sys.prefix == {}))",
-                python_string_literal(&first_venv)
+                "import pathlib, sys; print('PREFIX_IS_FIRST:' + str({}))",
+                python_prefix_matches(&first_venv)
             ),
             Some(5.0),
         )
@@ -1684,9 +1694,9 @@ async fn repl_prepare_matching_executable_persists_target_after_ctrl_d_reset() -
     let respawn_probe = session
         .write_stdin_raw_with(
             format!(
-                "import sys\nprint('PREFIX_IS_FIRST:' + str(sys.prefix == {}))\nprint('PREFIX_IS_SECOND:' + str(sys.prefix == {}))",
-                python_string_literal(&first_venv),
-                python_string_literal(&second_venv)
+                "import pathlib, sys\nprint('PREFIX_IS_FIRST:' + str({}))\nprint('PREFIX_IS_SECOND:' + str({}))",
+                python_prefix_matches(&first_venv),
+                python_prefix_matches(&second_venv)
             ),
             Some(5.0),
         )
