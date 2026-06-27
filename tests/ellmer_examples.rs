@@ -112,6 +112,42 @@ fn assert_example_runs(script: &str, mcp_repl: &Path) -> TestResult<()> {
 }
 
 #[test]
+fn ellmer_helper_config_selects_r_home_explicitly() -> TestResult<()> {
+    let probe = r#"
+source(file.path("examples", "ellmer-mcp-repl-helpers.R"))
+selected_r_home <- normalizePath(R.home(), mustWork = TRUE)
+rscript <- Sys.which("Rscript")
+stopifnot(nzchar(rscript))
+Sys.setenv(MCP_REPL_BINARY = rscript)
+config <- mcp_repl_config(overflow = "pager", r_home = selected_r_home)
+server <- config$mcpServers[["mcp-repl-r"]]
+stopifnot(identical(server$env$R_HOME, selected_r_home))
+"#;
+    let output = Command::new("Rscript")
+        .current_dir(repo_root())
+        .arg("-e")
+        .arg(probe)
+        .output();
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "ellmer helper config should set explicit R_HOME\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("ellmer helper config Rscript not found; skipping");
+        }
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(())
+}
+
+#[test]
 fn ellmer_examples_smoke_when_live_prerequisites_exist() -> TestResult<()> {
     if !live_prerequisites_available() {
         return Ok(());

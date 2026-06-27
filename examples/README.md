@@ -10,10 +10,13 @@ Prerequisites:
 
 - Install `mcp-repl` and make sure `mcp-repl` is on `PATH`, or set
   `MCP_REPL_BINARY` to the command or full path.
+- Select the R installation used by the `mcp-repl` worker. The examples use the
+  current `R.home()` by default, or set `MCP_REPL_R_HOME` to another R home.
 - Install the R packages:
 
 ```r
 install.packages(c("ellmer", "mcptools", "jsonlite", "glue"))
+Sys.setenv(MCP_REPL_R_HOME = R.home())
 ```
 
 - Set credentials for the provider used by `ellmer::chat_openai`:

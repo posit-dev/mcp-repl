@@ -2,9 +2,24 @@
 #
 # install.packages(c("ellmer", "mcptools", "jsonlite", "glue"))
 # Sys.setenv(OPENAI_API_KEY = "...")
+# Sys.setenv(MCP_REPL_R_HOME = R.home())
 
-repl_tools <- function(overflow = c("files", "pager")) {
+default_r_home <- function() {
+  r_home <- Sys.getenv("MCP_REPL_R_HOME")
+  if (!nzchar(r_home)) {
+    r_home <- R.home()
+  }
+  r_home
+}
+
+resolve_r_home <- function(r_home) {
+  stopifnot(is.character(r_home), length(r_home) == 1L, nzchar(r_home), dir.exists(r_home))
+  normalizePath(r_home, winslash = "/", mustWork = TRUE)
+}
+
+mcp_repl_config <- function(overflow = c("files", "pager"), r_home = default_r_home()) {
   overflow <- match.arg(overflow)
+  r_home <- resolve_r_home(r_home)
 
   mcp_repl <- Sys.getenv("MCP_REPL_BINARY")
   if (!nzchar(mcp_repl)) {
@@ -12,22 +27,31 @@ repl_tools <- function(overflow = c("files", "pager")) {
   }
   stopifnot(nzchar(mcp_repl), nzchar(Sys.which(mcp_repl)))
 
+  list(
+    "mcpServers" = list(
+      "mcp-repl-r" = list(
+        "command" = unname(mcp_repl),
+        "args" = list(
+          "--interpreter", "r",
+          "--sandbox", "workspace-write",
+          "--oversized-output", overflow
+        ),
+        "env" = list(
+          "R_HOME" = unname(r_home)
+        )
+      )
+    )
+  )
+}
+
+repl_tools <- function(overflow = c("files", "pager"), r_home = default_r_home()) {
+  overflow <- match.arg(overflow)
+
   # mcptools::mcp_tools() currently takes a config file path, so write a small
   # temporary config and load tools from that.
   config_file <- tempfile("mcp-repl-", fileext = ".json")
   jsonlite::write_json(
-    list(
-      "mcpServers" = list(
-        "mcp-repl-r" = list(
-          "command" = unname(mcp_repl),
-          "args" = list(
-            "--interpreter", "r",
-            "--sandbox", "workspace-write",
-            "--oversized-output", overflow
-          )
-        )
-      )
-    ),
+    mcp_repl_config(overflow = overflow, r_home = r_home),
     config_file,
     auto_unbox = TRUE,
     pretty = TRUE
