@@ -20,8 +20,7 @@ enum RestartShutdownSnapshot {
         output: Option<FormattedPendingOutput>,
     },
     Pager {
-        pre_shutdown_end_offset: Option<u64>,
-        post_shutdown_end_offset: Option<u64>,
+        end_offset: Option<u64>,
     },
 }
 
@@ -86,14 +85,11 @@ impl WorkerManager {
         &mut self,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
-        let output = self
-            .process
-            .is_some()
-            .then(|| self.drain_sealed_formatted_output());
+        let had_process = self.process.is_some();
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(timeout);
-            self.pending_output_tape.clear();
+            let _ = process.shutdown_for_restart(timeout);
         }
+        let output = had_process.then(|| self.drain_sealed_formatted_output());
         RestartShutdownSnapshot::Files { output }
     }
 
@@ -102,19 +98,12 @@ impl WorkerManager {
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         self.output_timeline.seal_utf8_tails();
-        let pre_shutdown_end_offset = self
-            .process
-            .is_some()
-            .then(|| self.output.end_offset().unwrap_or(0));
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(timeout);
+            let _ = process.shutdown_for_restart(timeout);
         }
         self.output_timeline.seal_utf8_tails();
-        let post_shutdown_end_offset = self.output.end_offset();
-        RestartShutdownSnapshot::Pager {
-            pre_shutdown_end_offset,
-            post_shutdown_end_offset,
-        }
+        let end_offset = self.output.end_offset();
+        RestartShutdownSnapshot::Pager { end_offset }
     }
 
     fn clear_restart_busy_guardrail(&self) {
@@ -131,29 +120,22 @@ impl WorkerManager {
                     .build_session_reset_reply_files_from_formatted("new session started", output),
                 None => self.build_session_reset_reply_files("new session started"),
             },
-            RestartShutdownSnapshot::Pager {
-                pre_shutdown_end_offset,
-                post_shutdown_end_offset,
-            } => self.build_restart_reply_pager(pre_shutdown_end_offset, post_shutdown_end_offset),
+            RestartShutdownSnapshot::Pager { end_offset } => {
+                self.build_restart_reply_pager(end_offset)
+            }
         }
     }
 
-    fn build_restart_reply_pager(
-        &mut self,
-        pre_shutdown_end_offset: Option<u64>,
-        post_shutdown_end_offset: Option<u64>,
-    ) -> ReplyWithOffset {
+    fn build_restart_reply_pager(&mut self, end_offset: Option<u64>) -> ReplyWithOffset {
         let page_bytes = pager::resolve_page_bytes(None);
-        match pre_shutdown_end_offset {
+        match end_offset {
             Some(end_offset) => {
                 let reply = self.build_session_reset_reply_pager_to_offset(
                     page_bytes,
                     "new session started",
                     end_offset,
                 );
-                if let Some(end_offset) = post_shutdown_end_offset {
-                    self.output.advance_offset_to(end_offset);
-                }
+                self.output.advance_offset_to(end_offset);
                 reply
             }
             None => self.build_session_reset_reply_pager(page_bytes, "new session started"),

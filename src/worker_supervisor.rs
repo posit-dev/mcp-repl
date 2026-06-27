@@ -1328,7 +1328,15 @@ impl WorkerProcess {
     pub(crate) fn shutdown_graceful(mut self, timeout: Duration) -> Result<(), WorkerError> {
         self.request_ipc_shutdown();
         let _ = self.close_stdin(Duration::from_millis(200));
+        self.finish_timed_shutdown(timeout)
+    }
 
+    pub(crate) fn shutdown_for_restart(mut self, timeout: Duration) -> Result<(), WorkerError> {
+        let _ = self.close_stdin(Duration::from_millis(200));
+        self.finish_timed_shutdown(timeout)
+    }
+
+    fn finish_timed_shutdown(mut self, timeout: Duration) -> Result<(), WorkerError> {
         let start = std::time::Instant::now();
         let timeout_deadline = start + timeout;
         let term_deadline = start + shutdown_term_delay(timeout);
@@ -2410,6 +2418,9 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
         return Duration::from_secs(0);
     }
     let by_fraction = timeout.mul_f64(0.75);
+    if timeout <= Duration::from_secs(10) {
+        return by_fraction;
+    }
     let by_remaining = timeout.saturating_sub(Duration::from_secs(10));
     by_fraction.min(by_remaining)
 }

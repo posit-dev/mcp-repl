@@ -66,8 +66,10 @@ More specifically:
 - Control-prefixed tails such as `Ctrl-C<code>` and `Ctrl-D<code>` run in the
   restarted session when the sandbox changed; the control prefix itself is not
   replayed into the fresh worker.
-- Explicit restarts discard preserved detached output from aborted prior
-  requests instead of carrying it into later unrelated replies.
+- Explicit restarts return worker output already captured before or during the
+  bounded restart shutdown window. They do not wait for a prior request to
+  finish after that window, and they do not carry old output into later
+  unrelated replies.
 - Sandbox metadata is enforced again at the next tool call that actually
   interacts with the worker after pager navigation ends.
 - Missing or malformed metadata still fails closed on calls that need it.

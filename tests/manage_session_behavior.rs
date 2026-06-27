@@ -153,3 +153,54 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_while_busy_returns_output_captured_during_graceful_shutdown() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let input = r#"
+Sys.sleep(0.15)
+cat("DURING_RESTART\n")
+flush.console()
+Sys.sleep(1.0)
+cat("TOO_LATE\n")
+flush.console()
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!(
+            "restart graceful shutdown test backend unavailable in this environment; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(0.8))
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!(
+            "restart graceful shutdown test backend unavailable in this environment; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("DURING_RESTART"),
+        "expected restart to return output captured during graceful shutdown, got: {restart_text:?}"
+    );
+    assert!(
+        !restart_text.contains("TOO_LATE"),
+        "did not expect restart to wait for later output after the graceful window, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart notice, got: {restart_text:?}"
+    );
+    Ok(())
+}
