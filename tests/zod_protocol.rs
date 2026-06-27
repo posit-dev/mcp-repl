@@ -1314,7 +1314,17 @@ async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestRe
 async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let late_stderr_marker = tempdir.path().join("late-stderr-marker");
+    let late_stderr_marker_env = late_stderr_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![(
+            "MCP_REPL_ZOD_LATE_STDERR_MARKER",
+            late_stderr_marker_env.as_str(),
+        )],
+        Vec::new(),
+    )
+    .await?;
 
     let first = session
         .call_tool_raw(
@@ -1331,7 +1341,9 @@ async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> Te
         "completed request should keep an incomplete UTF-8 tail detached, got: {first_text:?}"
     );
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_log_contains(&control_log, "waiting_late_stderr_marker")?;
+    std::fs::write(&late_stderr_marker, b"go")?;
+    wait_for_log_contains(&control_log, "late_stderr_after_completion")?;
 
     let second = session
         .call_tool_raw(
