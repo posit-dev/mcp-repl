@@ -5,6 +5,7 @@ use std::error::Error;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(windows)]
@@ -664,7 +665,7 @@ pub struct McpTestSession {
 }
 
 impl McpTestSession {
-    pub fn server_info(&self) -> Option<&rmcp::model::ServerInfo> {
+    pub fn server_info(&self) -> Option<Arc<rmcp::model::ServerInfo>> {
         self.service.peer_info()
     }
 

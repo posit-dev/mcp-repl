@@ -4850,7 +4850,7 @@ fn linux_install_filesystem_landlock_rules_on_current_thread(
         .map_err(|err| err.to_string())?
         .add_rules(landlock::path_beneath_rules(&["/dev/null"], access_rw))
         .map_err(|err| err.to_string())?
-        .set_no_new_privs(true);
+        .no_new_privs(true);
 
     if !writable_roots.is_empty() {
         ruleset = ruleset
