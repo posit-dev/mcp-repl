@@ -115,7 +115,7 @@ fn assert_example_runs(script: &str, mcp_repl: &Path) -> TestResult<()> {
 fn ellmer_helper_config_selects_r_home_explicitly() -> TestResult<()> {
     let probe = r#"
 source(file.path("examples", "ellmer-mcp-repl-helpers.R"))
-selected_r_home <- normalizePath(R.home(), mustWork = TRUE)
+selected_r_home <- normalizePath(R.home(), winslash = "/", mustWork = TRUE)
 rscript <- Sys.which("Rscript")
 stopifnot(nzchar(rscript))
 Sys.setenv(MCP_REPL_BINARY = rscript)
