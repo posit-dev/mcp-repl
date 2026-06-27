@@ -129,8 +129,10 @@ impl WorkerManager {
     // today that reset reuses the same configured path in place.
     fn prepare_sandbox_state_update(
         &mut self,
-        mut update: SandboxStateUpdate,
+        update: SandboxStateUpdate,
     ) -> Result<PreparedSandboxStateUpdate, WorkerError> {
+        #[cfg(target_os = "linux")]
+        let mut update = update;
         #[cfg(target_os = "linux")]
         self.apply_linux_bwrap_default_override(&mut update);
         let update_for_log = serde_json::to_value(&update)
