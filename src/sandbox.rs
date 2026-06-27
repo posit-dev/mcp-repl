@@ -3661,7 +3661,7 @@ fn linux_bwrap_filesystem_args(
         }
         read_only_subpaths.sort_by_key(|path| linux_path_depth(path));
         for subpath in read_only_subpaths {
-            let allow_missing_protected_metadata_synthesis = mount_root == session_temp_dir;
+            let allow_missing_protected_metadata_synthesis = true;
             append_linux_read_only_subpath_args(
                 &mut command,
                 &subpath,
@@ -3941,15 +3941,13 @@ fn append_linux_missing_read_only_subpath_args(
     allowed_write_paths: &[PathBuf],
     allow_missing_protected_metadata_synthesis: bool,
 ) -> Result<(), String> {
-    if linux_protected_metadata_name(path).is_some() {
-        if allow_missing_protected_metadata_synthesis {
-            append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
-            command
-                .synthetic_mount_targets
-                .push(LinuxSyntheticMountTarget::EmptyDirectory(
-                    path.to_path_buf(),
-                ));
-        }
+    if linux_protected_metadata_name(path).is_some() && allow_missing_protected_metadata_synthesis {
+        append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
+        command
+            .synthetic_mount_targets
+            .push(LinuxSyntheticMountTarget::EmptyDirectory(
+                path.to_path_buf(),
+            ));
         return Ok(());
     }
     if is_within_allowed_write_paths(path, allowed_write_paths) {
@@ -6294,7 +6292,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_bwrap_missing_protected_metadata_under_writable_root_is_not_synthesized() {
+    fn linux_bwrap_missing_protected_metadata_under_writable_root_is_synthesized() {
         let root = Builder::new()
             .prefix("mcp-repl-bwrap-protected-metadata-")
             .tempdir()
@@ -6328,28 +6326,28 @@ mod tests {
         let codex_text = linux_path_to_string(&codex_path);
 
         assert!(
-            !command
+            command
                 .args
                 .windows(2)
                 .any(|args| args[0] == "--dir" && args[1] == codex_text),
-            "missing protected metadata should not create a bwrap mount target: {:?}",
+            "missing protected metadata should create a bwrap mount target: {:?}",
             command.args
         );
         assert!(
-            !command
+            command
                 .args
                 .windows(3)
                 .any(|args| args[0] == "--ro-bind" && args[2] == codex_text),
-            "missing protected metadata should not bind over a missing target: {:?}",
+            "missing protected metadata should bind over the synthetic target: {:?}",
             command.args
         );
         assert!(
-            !command
+            command
                 .synthetic_mount_targets
                 .contains(&LinuxSyntheticMountTarget::EmptyDirectory(
                     codex_path.clone()
                 )),
-            "missing protected metadata should not require host cleanup: {:?}",
+            "missing protected metadata should require host cleanup: {:?}",
             command.synthetic_mount_targets
         );
         assert!(

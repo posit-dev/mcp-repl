@@ -3062,8 +3062,12 @@ for (protected_name in c(".git", ".agents", ".codex")) {{
         );
         for protected_name in [".git", ".agents", ".codex"] {
             assert!(
-                text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
-                "Linux bwrap cannot block missing protected metadata without creating a host placeholder first; got: {text}"
+                text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
+                "expected Linux bwrap explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+            );
+            assert!(
+                !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
+                "Linux bwrap explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
             );
         }
         session.cancel().await?;
@@ -3073,8 +3077,8 @@ for (protected_name in c(".git", ".agents", ".codex")) {{
         );
         for protected_name in [".git", ".agents", ".codex"] {
             assert!(
-                writable_root.join(protected_name).exists(),
-                "Linux bwrap missing protected metadata write should create {} after user code runs",
+                !writable_root.join(protected_name).exists(),
+                "protected metadata write should not create {}",
                 writable_root.join(protected_name).display()
             );
         }
