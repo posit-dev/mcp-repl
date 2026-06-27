@@ -1,10 +1,22 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = [
+#   "chatlas[mcp]",
+# ]
+# ///
+
 """Register mcp-repl files mode with async chatlas MCP tools."""
 
 import asyncio
 
 from chatlas import ChatOpenAI
 
-from chatlas_file_tools import list_directory, read_text_file
+from chatlas_tools import (
+    OverflowMode,
+    list_directory,
+    read_text_file,
+    register_tool_repl,
+)
 
 PROMPT = (
     "Tell me something interesting about the penguins dataset. "
@@ -18,20 +30,7 @@ async def main() -> None:
     chat.register_tool(read_text_file)
 
     try:
-        await chat.register_mcp_tools_stdio_async(
-            name="mcp_repl_files",
-            command="mcp-repl",
-            args=[
-                "--sandbox",
-                "workspace-write",
-                "--oversized-output",
-                "files",
-                "--interpreter",
-                "python",
-            ],
-            include_tools=["repl"],
-        )
-
+        await register_tool_repl(chat, overflow=OverflowMode.FILES)
         response = await chat.chat_async(PROMPT, echo="none")
         print(await response.get_content())
     finally:

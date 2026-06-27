@@ -1,7 +1,33 @@
-"""Ordinary chatlas tools used by the files-mode example."""
+"""Common helpers used by the chatlas examples."""
 
+from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+from chatlas import ChatOpenAI
+
+
+class OverflowMode(str, Enum):
+    PAGER = "pager"
+    FILES = "files"
+
+
+async def register_tool_repl(chat: ChatOpenAI, overflow: OverflowMode) -> None:
+    assert isinstance(overflow, OverflowMode)
+
+    await chat.register_mcp_tools_stdio_async(
+        name=f"mcp_repl_{overflow.value}",
+        command="mcp-repl",
+        args=[
+            "--sandbox",
+            "workspace-write",
+            "--oversized-output",
+            overflow.value,
+            "--interpreter",
+            "python",
+        ],
+        include_tools=["repl"],
+    )
 
 
 def list_directory(path: str) -> str:

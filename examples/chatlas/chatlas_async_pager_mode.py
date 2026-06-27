@@ -1,8 +1,17 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = [
+#   "chatlas[mcp]",
+# ]
+# ///
+
 """Register mcp-repl pager mode with async chatlas MCP tools."""
 
 import asyncio
 
 from chatlas import ChatOpenAI
+
+from chatlas_tools import OverflowMode, register_tool_repl
 
 PROMPT = (
     "Tell me something interesting about the penguins dataset. "
@@ -14,20 +23,7 @@ async def main() -> None:
     chat = ChatOpenAI()
 
     try:
-        await chat.register_mcp_tools_stdio_async(
-            name="mcp_repl_pager",
-            command="mcp-repl",
-            args=[
-                "--sandbox",
-                "workspace-write",
-                "--oversized-output",
-                "pager",
-                "--interpreter",
-                "python",
-            ],
-            include_tools=["repl"],
-        )
-
+        await register_tool_repl(chat, overflow=OverflowMode.PAGER)
         response = await chat.chat_async(PROMPT, echo="none")
         print(await response.get_content())
     finally:
