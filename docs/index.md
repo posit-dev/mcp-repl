@@ -51,6 +51,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/futurework/worker-session-tempdir-rotation.md`: deferred design note on rotating worker tempdir paths per launch so stale temp trees do not block respawn.
 - `docs/futurework/stronger-worker-child-containment.md`: deferred design note on tighter worker descendant containment, especially on Windows.
 - `docs/futurework/stdin-transport-single-owner.md`: historical and deferred design note for keeping managed input batches owned by the worker queue.
+- `docs/futurework/test-helper-classification-consolidation.md`: deferred cleanup note on consolidating duplicated test predicates for backend, busy, and sandbox availability classification.
 - `docs/futurework/repl-interaction-rough-edges.md`: candidate UX polish items observed during live REPL use.
 
 ## Maintenance Rules
