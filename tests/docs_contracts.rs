@@ -107,6 +107,8 @@ fn examples_folder_documents_chatlas_usage() {
     let root = repo_root();
     let readme_path = root.join("examples/README.md");
     let chatlas_readme_path = root.join("examples/chatlas/README.md");
+    let pager_path = root.join("examples/chatlas/chatlas_pager_mode.py");
+    let files_path = root.join("examples/chatlas/chatlas_files_mode.py");
     let async_pager_path = root.join("examples/chatlas/chatlas_async_pager_mode.py");
     let async_files_path = root.join("examples/chatlas/chatlas_async_files_mode.py");
     let tools_path = root.join("examples/chatlas/chatlas_tools.py");
@@ -114,6 +116,8 @@ fn examples_folder_documents_chatlas_usage() {
     for path in [
         &readme_path,
         &chatlas_readme_path,
+        &pager_path,
+        &files_path,
         &async_pager_path,
         &async_files_path,
         &tools_path,
@@ -144,21 +148,38 @@ fn examples_folder_documents_chatlas_usage() {
         "examples/chatlas/README.md should stay concise"
     );
 
-    for path in [&async_pager_path, &async_files_path] {
+    for path in [
+        &pager_path,
+        &files_path,
+        &async_pager_path,
+        &async_files_path,
+    ] {
         let script = read(path);
         assert!(
             script.starts_with("#!/usr/bin/env -S uv run --script\n"),
             "{} should be directly runnable by uv",
             path.display()
         );
+    }
+    for path in [&pager_path, &files_path] {
+        let script = read(path);
+        assert!(
+            script.contains(r#""chatlas""#),
+            "{} should declare its chatlas dependency",
+            path.display()
+        );
+    }
+    for path in [&async_pager_path, &async_files_path] {
+        let script = read(path);
         assert!(
             script.contains(r#""chatlas[mcp]""#),
-            "{} should declare its chatlas MCP dependency",
+            "{} should declare its async chatlas MCP dependency",
             path.display()
         );
     }
 
     let tools = read(&tools_path);
+    assert!(tools.contains("def repl_tools"));
     assert!(tools.contains("async def register_tool_repl"));
     assert!(tools.contains("class OverflowMode(str, Enum)"));
 }
