@@ -3,13 +3,16 @@
 These scripts use `uv run --script`. Install `mcp-repl`, set model
 credentials for `ChatOpenAI`, then run:
 
+The helpers set `MCP_REPL_PYTHON_EXECUTABLE=sys.executable`, so the REPL tool
+uses the same Python installation as the chatlas script.
+
 ```bash
 cargo install --git https://github.com/posit-dev/mcp-repl --locked
 export OPENAI_API_KEY=...
-./examples/chatlas/chatlas_async_pager_mode.py
-./examples/chatlas/chatlas_async_files_mode.py
-./examples/chatlas/chatlas_pager_mode.py
-./examples/chatlas/chatlas_files_mode.py
+uv run --script examples/chatlas/chatlas_async_pager_mode.py
+uv run --script examples/chatlas/chatlas_async_files_mode.py
+uv run --script examples/chatlas/chatlas_pager_mode.py
+uv run --script examples/chatlas/chatlas_files_mode.py
 ```
 
 Both examples ask:

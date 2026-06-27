@@ -147,19 +147,33 @@ fn examples_folder_documents_chatlas_usage() {
         chatlas_readme.lines().count() <= 30,
         "examples/chatlas/README.md should stay concise"
     );
-
-    for path in [
-        &pager_path,
-        &files_path,
-        &async_pager_path,
-        &async_files_path,
+    for script in [
+        "chatlas_async_pager_mode.py",
+        "chatlas_async_files_mode.py",
+        "chatlas_pager_mode.py",
+        "chatlas_files_mode.py",
     ] {
-        let script = read(path);
+        let command = format!("uv run --script examples/chatlas/{script}");
         assert!(
-            script.starts_with("#!/usr/bin/env -S uv run --script\n"),
-            "{} should be directly runnable by uv",
-            path.display()
+            chatlas_readme.contains(&command),
+            "examples/chatlas/README.md should document cross-platform uv invocation: {command}"
         );
+    }
+
+    if !cfg!(windows) {
+        for path in [
+            &pager_path,
+            &files_path,
+            &async_pager_path,
+            &async_files_path,
+        ] {
+            let script = read(path);
+            assert!(
+                script.starts_with("#!/usr/bin/env -S uv run --script\n"),
+                "{} should be directly runnable by uv on Unix",
+                path.display()
+            );
+        }
     }
     for path in [&pager_path, &files_path] {
         let script = read(path);
@@ -182,6 +196,22 @@ fn examples_folder_documents_chatlas_usage() {
     assert!(tools.contains("def repl_tools"));
     assert!(tools.contains("async def register_tool_repl"));
     assert!(tools.contains("class OverflowMode(str, Enum)"));
+    assert!(
+        tools.contains("import sys"),
+        "chatlas tools should inspect the current Python executable"
+    );
+    assert!(
+        tools.contains(r#""MCP_REPL_PYTHON_EXECUTABLE": sys.executable"#),
+        "chatlas MCP tools should pin mcp-repl to the current Python executable"
+    );
+    assert!(
+        tools.contains("transport_kwargs={\"env\": _mcp_repl_env()}"),
+        "async chatlas MCP registration should pass the pinned Python environment"
+    );
+    assert!(
+        tools.contains("env=_mcp_repl_env()"),
+        "sync chatlas MCP client should pass the pinned Python environment"
+    );
 }
 
 #[test]

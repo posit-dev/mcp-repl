@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from enum import Enum
@@ -19,6 +21,14 @@ if TYPE_CHECKING:
 class OverflowMode(str, Enum):
     PAGER = "pager"
     FILES = "files"
+
+
+def _mcp_repl_env() -> dict[str, str]:
+    assert sys.executable
+    return {
+        **os.environ,
+        "MCP_REPL_PYTHON_EXECUTABLE": sys.executable,
+    }
 
 
 async def register_tool_repl(chat: ChatOpenAI, overflow: OverflowMode) -> None:
@@ -36,6 +46,7 @@ async def register_tool_repl(chat: ChatOpenAI, overflow: OverflowMode) -> None:
             "python",
         ],
         include_tools=["repl"],
+        transport_kwargs={"env": _mcp_repl_env()},
     )
 
 
@@ -67,6 +78,7 @@ class _McpReplClient:
             text=True,
             encoding="utf-8",
             bufsize=1,
+            env=_mcp_repl_env(),
         )
         assert self._process.stdin is not None
         assert self._process.stdout is not None
