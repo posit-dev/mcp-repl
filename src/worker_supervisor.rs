@@ -316,6 +316,13 @@ impl WorkerSupervisor {
         // respawns and wipes/recreates it in place before launch.
         crate::sandbox::prepare_session_temp_dir(&sandbox_state.session_temp_dir)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = context.prepared_windows_launch.as_ref() {
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
+                prepared_windows_launch,
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(&worker_launch, backend, sandbox_state)
         });
@@ -438,6 +445,8 @@ pub(crate) struct WorkerProcess {
     guardrail_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(target_family = "unix")]
     guardrail_thread_handle: Option<std::thread::Thread>,
+    #[cfg(target_os = "linux")]
+    linux_bwrap_sandboxed: bool,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -744,6 +753,20 @@ impl WorkerProcess {
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
+        #[cfg(target_family = "windows")]
+        let mut ipc_server = {
+            if let Some(launch) = prepared_windows_launch.as_ref() {
+                let mut allowed_sids = vec![launch.capability_sid()];
+                if let Some(offline_sid) = launch.offline_user_sid() {
+                    allowed_sids.push(offline_sid);
+                }
+                IpcServer::bind_with_allowed_sids(&allowed_sids)
+            } else {
+                IpcServer::bind()
+            }
+        }
+        .map_err(WorkerError::Io)?;
+        #[cfg(not(target_family = "windows"))]
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(oversized_output, output_timeline.clone());
         #[cfg(target_os = "windows")]
@@ -874,6 +897,9 @@ impl WorkerProcess {
         #[cfg(target_family = "unix")]
         let (guardrail_stop, guardrail_thread, guardrail_thread_handle) =
             start_memory_guardrail(child.id(), guardrail.clone());
+        #[cfg(target_os = "linux")]
+        let linux_bwrap_sandboxed = sandbox_state.use_linux_sandbox_bwrap
+            && sandbox_state.sandbox_policy.requires_sandbox();
 
         Ok(Self {
             child,
@@ -892,6 +918,8 @@ impl WorkerProcess {
             guardrail_thread: Some(guardrail_thread),
             #[cfg(target_family = "unix")]
             guardrail_thread_handle: Some(guardrail_thread_handle),
+            #[cfg(target_os = "linux")]
+            linux_bwrap_sandboxed,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -1199,9 +1227,13 @@ impl WorkerProcess {
     }
 
     pub(crate) fn send_interrupt(&mut self) -> Result<(), WorkerError> {
-        #[cfg(target_family = "unix")]
+        #[cfg(all(target_family = "unix", not(target_os = "linux")))]
         {
             self.send_signal(libc::SIGINT)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.send_linux_interrupt()
         }
         #[cfg(target_family = "windows")]
         {
@@ -1263,6 +1295,34 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
+    fn send_linux_interrupt(&self) -> Result<(), WorkerError> {
+        if self.linux_bwrap_sandboxed && self.send_linux_bwrap_interrupt_descendants() {
+            return Ok(());
+        }
+        self.send_signal(libc::SIGINT)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_linux_bwrap_interrupt_descendants(&self) -> bool {
+        let root = Pid::from_u32(self.child.id());
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let mut sent = false;
+        for pid in collect_process_tree_pids(&system, root) {
+            if pid == root
+                || linux_pid_is_thread(pid)
+                || linux_pid_exe_basename(pid).is_some_and(|name| name == "bwrap")
+            {
+                continue;
+            }
+            let _ = raw_unix_kill(pid.as_u32() as i32, libc::SIGINT);
+            sent = true;
+        }
+        sent
+    }
+
+    #[cfg(target_family = "unix")]
     fn send_signal(&self, signal: i32) -> Result<(), WorkerError> {
         let pid = self.child.id() as i32;
         let result = raw_unix_kill(-pid, signal);
@@ -1292,16 +1352,19 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "unix")]
-    fn send_signal_descendants_only(&self, signal: i32) {
+    fn send_signal_descendants_only(&self, signal: i32) -> bool {
         let root = Pid::from_u32(self.child.id());
         let mut system = System::new();
         system.refresh_processes(ProcessesToUpdate::All, true);
+        let mut sent = false;
         for pid in collect_process_tree_pids(&system, root) {
             if pid == root {
                 continue;
             }
             let _ = raw_unix_kill(pid.as_u32() as i32, signal);
+            sent = true;
         }
+        sent
     }
 
     pub(crate) fn note_expected_exit(&mut self) {
@@ -1592,6 +1655,8 @@ impl WorkerProcess {
             guardrail_thread: None,
             #[cfg(target_family = "unix")]
             guardrail_thread_handle: None,
+            #[cfg(target_os = "linux")]
+            linux_bwrap_sandboxed: false,
             #[cfg(target_os = "macos")]
             denial_logger: None,
         }
@@ -1793,6 +1858,31 @@ fn collect_process_tree_pids(system: &System, root: Pid) -> Vec<Pid> {
         }
     }
     pids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_is_thread(pid: Pid) -> bool {
+    let status_path = format!("/proc/{}/status", pid.as_u32());
+    let Ok(status) = std::fs::read_to_string(status_path) else {
+        return false;
+    };
+    for line in status.lines() {
+        let Some(raw_tgid) = line.strip_prefix("Tgid:") else {
+            continue;
+        };
+        let Ok(tgid) = raw_tgid.trim().parse::<u32>() else {
+            return false;
+        };
+        return tgid != pid.as_u32();
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_exe_basename(pid: Pid) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid.as_u32())).ok()?;
+    exe.file_name()
+        .map(|name| name.to_string_lossy().to_string())
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2058,15 +2148,28 @@ fn windows_spawn_transport(
     if !matches!(stdin_transport, WorkerStdinTransport::Pty) {
         return stdin_transport;
     }
-    if prepared_args
-        .first()
-        .is_some_and(|arg| arg == "--windows-sandbox")
-    {
+    if windows_prepared_args_start_sandbox_wrapper(prepared_args) {
         command.env(crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV, "1");
         WorkerStdinTransport::Pipe
     } else {
         stdin_transport
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_prepared_args_start_sandbox_wrapper(prepared_args: &[String]) -> bool {
+    if prepared_args
+        .first()
+        .is_some_and(|arg| arg == "--windows-sandbox")
+    {
+        return true;
+    }
+    prepared_args
+        .first()
+        .is_some_and(|arg| arg == "--windows-sandbox-logon-offline")
+        && prepared_args
+            .get(1)
+            .is_some_and(|arg| arg == "--windows-sandbox")
 }
 
 #[cfg(target_family = "unix")]
@@ -2492,6 +2595,55 @@ mod tests {
     fn ring_bytes(output_ring: &OutputRing) -> Vec<u8> {
         let output_end = output_ring.end_offset();
         output_ring.read_range(0, output_end).bytes
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sandbox_pty_transport_uses_pipe_and_requests_conpty() {
+        let mut command = Command::new("worker.exe");
+        let prepared_args = vec![
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+        ];
+
+        let transport =
+            windows_spawn_transport(&mut command, &prepared_args, WorkerStdinTransport::Pty);
+
+        assert!(matches!(transport, WorkerStdinTransport::Pipe));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().to_string()),
+            Some("1".to_string())
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_offline_sandbox_pty_transport_uses_pipe_and_requests_conpty() {
+        let mut command = Command::new("worker.exe");
+        let prepared_args = vec![
+            "--windows-sandbox-logon-offline".to_string(),
+            "--windows-sandbox".to_string(),
+            "--sandbox-policy-cwd".to_string(),
+            "C:\\workspace".to_string(),
+        ];
+
+        let transport =
+            windows_spawn_transport(&mut command, &prepared_args, WorkerStdinTransport::Pty);
+
+        assert!(matches!(transport, WorkerStdinTransport::Pipe));
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == crate::windows_conpty::WINDOWS_CONPTY_REQUEST_ENV)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().to_string()),
+            Some("1".to_string())
+        );
     }
 
     #[cfg(target_family = "unix")]

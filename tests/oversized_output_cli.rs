@@ -30,9 +30,63 @@ fn help_mentions_oversized_output_flag() -> TestResult<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "expected --help to succeed");
     assert!(
+        stdout.contains("mcp-repl is an MCP server"),
+        "expected --help to explain what mcp-repl is, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Agents should not launch this binary directly"),
+        "expected --help to caution agents about direct launches, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Usage:"),
+        "expected --help to include a Usage section, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Options:"),
+        "expected --help to include an Options section, got: {stdout:?}"
+    );
+    assert!(
         stdout.contains("--oversized-output"),
         "expected --help to mention --oversized-output, got: {stdout:?}"
     );
+    for line in stdout.lines() {
+        assert!(
+            line.len() <= 80,
+            "expected --help lines to fit 80 columns, got {} chars: {line:?}",
+            line.len()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn install_help_is_wrapped_and_sectioned() -> TestResult<()> {
+    let exe = resolve_mcp_repl_path()?;
+    let output = Command::new(exe).args(["install", "--help"]).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "expected install --help to succeed"
+    );
+    assert!(
+        stdout.contains("Register mcp-repl as an MCP server"),
+        "expected install help to explain what install does, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Usage:"),
+        "expected install help to include a Usage section, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Options:"),
+        "expected install help to include an Options section, got: {stdout:?}"
+    );
+    for line in stdout.lines() {
+        assert!(
+            line.len() <= 80,
+            "expected install help lines to fit 80 columns, got {} chars: {line:?}",
+            line.len()
+        );
+    }
     Ok(())
 }
 

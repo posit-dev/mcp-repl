@@ -66,7 +66,9 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - `src/server/response.rs` is the server-owned response finalizer. It separates worker-originated text from server-only notices, creates oversized-output bundle directories with lazily materialized `transcript.txt`, `events.log`, and `images/`, applies bundle retention and cleanup policy, and decides the bounded inline preview at seal time.
 - `src/pager/` implements the pager-mode oversized-output path used by bare CLI defaults and explicit `--oversized-output pager` installs.
 - Longer-term output follow-ons such as per-turn history bundles live in `docs/futurework/per-turn-history-bundles.md`.
-- `src/debug_logs.rs`, `src/event_log.rs`, and `src/debug_repl.rs` make the runtime legible to agents and humans during investigation.
+- `src/debug_logs.rs`, `src/event_log.rs`, and the dev-only
+  `src/debug_repl.rs` path make the runtime legible to agents and humans
+  during investigation.
 
 ### Validation harnesses
 

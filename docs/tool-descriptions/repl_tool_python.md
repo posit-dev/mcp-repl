@@ -16,6 +16,7 @@ Python REPL affordances:
 - Empty `input` polls for more output from a timed-out request or for detached background output while idle.
 - If a request times out, keep polling with empty `input` until the remaining worker output is drained. New non-empty input is discarded while that timed-out request is still active.
 - Large output replies may stay inline when only slightly oversized. Larger overages may be written to a server-owned output bundle directory. The inline reply stays bounded and may show a preview plus the most relevant disclosed path inside that bundle.
+- Files mode expects the model to have filesystem tools to read files and list directories.
 - Bundle files are materialized lazily. Text-only oversized replies disclose `transcript.txt`. Image bundles use `images/` for the latest image aliases and `images/history/` for ordered image history. `events.log` is created only once a bundle needs ordered mixed text+image indexing.
 - `transcript.txt` contains worker-originated REPL text such as prompts, stdout, and rendered stderr text. Ordinary server status lines stay inline and are not written into `transcript.txt`.
 - `events.log`, when present, is the authoritative ordered index for the retained mixed worker-text/image bundle contents. `T` rows point to line and byte ranges in `transcript.txt`. `I` rows point to relative image history paths such as `images/history/001/002.png`. `S` rows are reserved for server-only omission notices when bundle retention drops later content.

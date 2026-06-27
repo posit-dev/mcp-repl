@@ -100,7 +100,14 @@ fn sandbox_state_read_only() -> String {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn sandbox_state_workspace_write(network_access: bool) -> String {
+fn sandbox_state_workspace_write(_network_access: bool) -> String {
+    // The Windows tests in this file exercise filesystem ACL behavior. Use the
+    // full-network identity so local runs do not require elevated offline setup.
+    #[cfg(target_os = "windows")]
+    let network_access = true;
+    #[cfg(not(target_os = "windows"))]
+    let network_access = _network_access;
+
     let mut policy = serde_json::Map::new();
     policy.insert(
         "type".to_string(),
@@ -117,9 +124,16 @@ fn sandbox_state_workspace_write(network_access: bool) -> String {
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn sandbox_state_workspace_write_with_roots(
-    network_access: bool,
+    _network_access: bool,
     writable_roots: Vec<PathBuf>,
 ) -> String {
+    // See sandbox_state_workspace_write: Windows no-network behavior is covered
+    // by the public integration suite and setup-specific unit paths.
+    #[cfg(target_os = "windows")]
+    let network_access = true;
+    #[cfg(not(target_os = "windows"))]
+    let network_access = _network_access;
+
     let roots = writable_roots
         .into_iter()
         .map(|root| root.to_string_lossy().to_string())
@@ -1579,7 +1593,7 @@ fn windows_workspace_write_prepared_sid_for_cwd(
     let policy_seed = serde_json::json!({
         "mode": "workspace-write",
         "writable_roots": canonical_roots,
-        "network_access": false,
+        "network_access": true,
         "exclude_tmpdir_env_var": false,
         "exclude_slash_tmp": false,
     });

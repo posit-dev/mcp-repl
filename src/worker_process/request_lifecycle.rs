@@ -14,16 +14,26 @@ const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
 const OUTPUT_READER_QUIESCE_GRACE: Duration = Duration::from_millis(120);
-const OUTPUT_READER_COMPLETION_STABLE: Duration = if cfg!(target_os = "macos") {
-    Duration::from_millis(80)
-} else {
-    Duration::from_millis(15)
-};
+const OUTPUT_READER_COMPLETION_STABLE: Duration = Duration::from_millis(80);
+const OUTPUT_READER_UTF8_TAIL_SETTLE_MAX: Duration = Duration::from_millis(900);
 const OUTPUT_READER_TIMEOUT_SETTLE_MAX: Duration = Duration::from_millis(900);
+
+#[derive(Clone, Copy)]
+enum RequestOutputOutcome {
+    Completed,
+    TimedOut,
+    Failed,
+}
 
 pub(super) struct RequestState {
     pub(super) timeout: Duration,
     pub(super) started_at: Instant,
+}
+
+impl RequestState {
+    pub(super) fn remaining_budget(&self) -> Duration {
+        (self.started_at + self.timeout).saturating_duration_since(Instant::now())
+    }
 }
 
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
@@ -146,6 +156,7 @@ impl WorkerManager {
             .ipc_connection()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         let start = Instant::now();
+        let deadline = start + timeout;
         let mut result = self.driver.wait_for_completion(timeout, ipc.clone());
         if matches!(
             &result,
@@ -183,15 +194,7 @@ impl WorkerManager {
                 );
             }
         }
-        // Best-effort: after IPC completion, give the output reader threads a brief window to
-        // drain any bytes already written by the worker before we snapshot the ring.
-        let elapsed = start.elapsed();
-        let remaining = timeout.saturating_sub(elapsed);
-        if result.is_ok() {
-            self.pending_output_tape
-                .append_sideband(PendingSidebandKind::RequestBoundary);
-        }
-        self.settle_output_after_completion(remaining);
+        self.finalize_output_after_completion_wait(&result, deadline);
         if result.is_ok()
             && let Some(message) = ipc.take_protocol_error()
         {
@@ -211,12 +214,41 @@ impl WorkerManager {
     }
 
     pub(super) fn settle_output_after_completion(&self, budget: Duration) {
-        let total = budget.min(OUTPUT_READER_QUIESCE_GRACE);
-        if total.is_zero() {
+        self.settle_output_for_request_outcome(
+            RequestOutputOutcome::Completed,
+            Instant::now() + budget,
+        );
+    }
+
+    fn finalize_output_after_completion_wait(
+        &mut self,
+        result: &Result<CompletionInfo, WorkerError>,
+        deadline: Instant,
+    ) {
+        let outcome = match result {
+            Ok(_) => RequestOutputOutcome::Completed,
+            Err(WorkerError::Timeout(_)) => RequestOutputOutcome::TimedOut,
+            Err(_) => RequestOutputOutcome::Failed,
+        };
+        self.settle_output_for_request_outcome(outcome, deadline);
+        if result.is_ok() {
+            self.pending_output_tape
+                .append_sideband(PendingSidebandKind::RequestBoundary);
+        }
+    }
+
+    fn settle_output_for_request_outcome(&self, outcome: RequestOutputOutcome, deadline: Instant) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return;
         }
-        let stable_needed = OUTPUT_READER_COMPLETION_STABLE.min(total);
-        self.settle_output_until_stable(total, stable_needed);
+        let total = remaining.min(OUTPUT_READER_QUIESCE_GRACE);
+        let stable_needed = OUTPUT_READER_COMPLETION_STABLE.min(remaining);
+        let utf8_tail_total = match outcome {
+            RequestOutputOutcome::Completed => remaining.min(OUTPUT_READER_UTF8_TAIL_SETTLE_MAX),
+            RequestOutputOutcome::TimedOut | RequestOutputOutcome::Failed => total,
+        };
+        self.settle_output_until_stable(total, stable_needed, utf8_tail_total);
     }
 
     pub(super) fn wait_for_late_files_output_after_settled_completion(&self, budget: Duration) {
@@ -243,8 +275,11 @@ impl WorkerManager {
         }
     }
 
-    pub(super) fn settle_output_after_timeout(&self) {
-        let total = OUTPUT_READER_TIMEOUT_SETTLE_MAX;
+    pub(super) fn settle_output_after_timeout(&self, budget: Duration) {
+        let total = budget.min(OUTPUT_READER_TIMEOUT_SETTLE_MAX);
+        if total.is_zero() {
+            return;
+        }
         let stable_needed = Duration::from_millis(40);
         let poll = Duration::from_millis(5);
         let start = Instant::now();
@@ -282,10 +317,12 @@ impl WorkerManager {
         )
     }
 
-    fn settle_output_until_stable(&self, total: Duration, stable_needed: Duration) {
-        if total.is_zero() {
-            return;
-        }
+    fn settle_output_until_stable(
+        &self,
+        total: Duration,
+        stable_needed: Duration,
+        utf8_tail_total: Duration,
+    ) {
         let poll = Duration::from_millis(5);
         let start = Instant::now();
         let requires_input_echo = self
@@ -297,28 +334,45 @@ impl WorkerManager {
             OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
             OversizedOutputMode::Pager => self.output.current_progress_seq(),
         };
+        let mut utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
+        let mut saw_utf8_tail_pending = utf8_tail_pending;
         let mut input_echo_ready = !requires_input_echo || self.pending_input_echoes_seen() > 0;
         let mut stable_for = Duration::from_millis(0);
-        while start.elapsed() < total {
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed >= total
+                && (!saw_utf8_tail_pending
+                    || elapsed >= utf8_tail_total
+                    || (!utf8_tail_pending && stable_for >= stable_needed))
+            {
+                return;
+            }
             thread::sleep(poll);
             let now = match self.oversized_output {
                 OversizedOutputMode::Files => self.pending_output_tape.current_seq(),
                 OversizedOutputMode::Pager => self.output.current_progress_seq(),
             };
+            let now_utf8_tail_pending = self.output_timeline.has_unflushable_utf8_tail();
+            saw_utf8_tail_pending |= now_utf8_tail_pending;
             if !input_echo_ready && self.pending_input_echoes_seen() > 0 {
                 input_echo_ready = true;
                 stable_for = Duration::from_millis(0);
                 last = now;
+                utf8_tail_pending = now_utf8_tail_pending;
                 continue;
             }
-            if now == last {
-                stable_for = stable_for.saturating_add(poll);
-                if input_echo_ready && stable_for >= stable_needed {
-                    return;
-                }
-            } else {
+            if now != last || now_utf8_tail_pending != utf8_tail_pending {
                 last = now;
+                utf8_tail_pending = now_utf8_tail_pending;
                 stable_for = Duration::from_millis(0);
+                continue;
+            }
+            if utf8_tail_pending {
+                continue;
+            }
+            stable_for = stable_for.saturating_add(poll);
+            if input_echo_ready && stable_for >= stable_needed {
+                return;
             }
         }
     }
@@ -364,9 +418,9 @@ impl WorkerManager {
         match status {
             Ok(()) => {
                 let mut settled_completion = completion_info_from_ipc(&ipc, false);
+                self.settle_output_after_completion(Duration::from_millis(120));
                 self.pending_output_tape
                     .append_sideband(PendingSidebandKind::RequestBoundary);
-                self.settle_output_after_completion(Duration::from_millis(120));
                 let worker_exited = match self.process.as_mut() {
                     Some(process) => match process.is_running() {
                         Ok(running) => !running,
@@ -405,9 +459,9 @@ impl WorkerManager {
 
     pub(super) fn settle_pending_session_end(&mut self, ipc: &ServerIpcConnection) {
         let settled_completion = completion_info_from_ipc(ipc, true);
+        self.settle_output_after_completion(Duration::from_millis(120));
         self.pending_output_tape
             .append_sideband(PendingSidebandKind::RequestBoundary);
-        self.settle_output_after_completion(Duration::from_millis(120));
         self.note_session_end(true);
         self.clear_pending_request_state();
         self.settled_pending_completion = Some(settled_completion);
@@ -426,5 +480,177 @@ impl WorkerManager {
         self.settled_pending_completion = None;
         self.settled_pending_error = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::sandbox_cli::SandboxCliPlan;
+    use crate::worker_protocol::WorkerContent;
+
+    fn contents_text(contents: &[WorkerContent]) -> String {
+        contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completion_settle_waits_for_incomplete_utf8_tail() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            timeline.append_text(
+                &[0xA9, b'\n'],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(Duration::from_millis(200));
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("é\n"),
+            "completion settle should wait for delayed UTF-8 continuation bytes, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completion settle should not seal split UTF-8 bytes when continuation arrives within the grace window, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn completion_settle_extends_quiesce_while_utf8_tail_is_pending() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(OUTPUT_READER_QUIESCE_GRACE + Duration::from_millis(80));
+            timeline.append_text(
+                &[0xA9, b'\n'],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(OUTPUT_READER_UTF8_TAIL_SETTLE_MAX);
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("é\n"),
+            "completion settle should extend past normal quiesce while UTF-8 tail is pending, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completion settle should not seal split UTF-8 bytes before the extended budget expires, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn completion_settle_does_not_wait_when_budget_is_zero() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            timeline.append_text(
+                &[0xA9, b'\n'],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(Duration::ZERO);
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("\\xC3"),
+            "completion settle should respect a zero budget and leave sealing to final drain, got: {text:?}"
+        );
+        assert!(
+            !text.contains("é"),
+            "completion settle should not wait for UTF-8 continuation bytes after a zero budget, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn completion_settle_keeps_stability_window_after_utf8_recovery() {
+        let manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+
+        manager.pending_output_tape.append_stdout_bytes(&[0xC3]);
+
+        let timeline = manager.output_timeline.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            timeline.append_text(
+                &[0xA9],
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+            thread::sleep(Duration::from_millis(10));
+            timeline.append_text(
+                b" after\n",
+                false,
+                crate::worker_protocol::ContentOrigin::Worker,
+            );
+        });
+
+        manager.settle_output_after_completion(Duration::from_millis(200));
+        let formatted = manager.drain_final_formatted_output();
+
+        handle.join().expect("delayed output writer should finish");
+
+        let text = contents_text(&formatted.contents);
+        assert!(
+            text.contains("é after\n"),
+            "completion settle should keep a stability window after UTF-8 recovery, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completion settle should not seal split UTF-8 bytes when continuation arrives within the tail grace, got: {text:?}"
+        );
     }
 }

@@ -54,6 +54,25 @@ fn repl_tool_descriptions_are_mode_specific() {
 }
 
 #[test]
+fn files_mode_tool_descriptions_mention_filesystem_access() {
+    let r = super::repl_tool_description_for_backend(
+        crate::backend::Backend::R,
+        crate::oversized_output::OversizedOutputMode::Files,
+    );
+    let python = super::repl_tool_description_for_backend(
+        crate::backend::Backend::Python,
+        crate::oversized_output::OversizedOutputMode::Files,
+    );
+
+    for description in [r, python] {
+        assert!(
+            description.contains("filesystem tools to read files and list directories"),
+            "files-mode description should mention filesystem access for bundles: {description}"
+        );
+    }
+}
+
+#[test]
 fn repl_tool_annotations_mark_local_mutation_without_open_world_access() {
     let router = super::RFilesToolServer::tool_router();
     let tool = router.get("repl").expect("repl tool should exist");

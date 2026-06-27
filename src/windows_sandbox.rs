@@ -28,6 +28,7 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
+use crate::windows_sandbox_setup::WindowsSandboxOfflineSetup;
 use windows_sys::Win32::Foundation::CloseHandle;
 #[cfg(test)]
 use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
@@ -92,6 +93,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
+use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
@@ -202,6 +204,7 @@ pub struct PreparedSandboxLaunch {
     sandbox_policy_cwd: PathBuf,
     session_temp_dir: PathBuf,
     capability_sid: String,
+    network_identity: WindowsSandboxNetworkIdentity,
 }
 
 impl PreparedSandboxLaunch {
@@ -209,18 +212,52 @@ impl PreparedSandboxLaunch {
         &self.capability_sid
     }
 
+    pub fn offline_user_sid(&self) -> Option<&str> {
+        match &self.network_identity {
+            WindowsSandboxNetworkIdentity::CurrentUser => None,
+            WindowsSandboxNetworkIdentity::OfflineProxy(setup) => Some(setup.user_sid.as_str()),
+        }
+    }
+
+    pub fn network_identity(&self) -> &WindowsSandboxNetworkIdentity {
+        &self.network_identity
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn matches(
         &self,
         policy: &SandboxPolicy,
         sandbox_policy_cwd: &Path,
         session_temp_dir: &Path,
     ) -> bool {
+        self.matches_with_network_identity(
+            policy,
+            sandbox_policy_cwd,
+            session_temp_dir,
+            &WindowsSandboxNetworkIdentity::CurrentUser,
+        )
+    }
+
+    pub fn matches_with_network_identity(
+        &self,
+        policy: &SandboxPolicy,
+        sandbox_policy_cwd: &Path,
+        session_temp_dir: &Path,
+        network_identity: &WindowsSandboxNetworkIdentity,
+    ) -> bool {
         let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
         self.policy == *policy
             && self.sandbox_policy_cwd == canonical_cwd
             && self.session_temp_dir == canonicalize_or_identity(session_temp_dir)
             && self.capability_sid == stable_cap_sid_string(policy, sandbox_policy_cwd)
+            && &self.network_identity == network_identity
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsSandboxNetworkIdentity {
+    CurrentUser,
+    OfflineProxy(WindowsSandboxOfflineSetup),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,6 +744,10 @@ fn create_prepared_launch_live_marker(
 
 fn acquire_prepared_launch_acl_lock(capability_sid: &str) -> Result<PreparedLaunchAclLock, String> {
     unsafe {
+        crate::event_log::log(
+            "windows_prepared_acl_lock_wait_begin",
+            serde_json::json!({"capability_sid": capability_sid}),
+        );
         let name = to_wide(prepared_launch_acl_lock_name(capability_sid));
         let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if handle.is_null() {
@@ -724,6 +765,10 @@ fn acquire_prepared_launch_acl_lock(capability_sid: &str) -> Result<PreparedLaun
             ));
         }
 
+        crate::event_log::log(
+            "windows_prepared_acl_lock_wait_end",
+            serde_json::json!({"capability_sid": capability_sid, "wait_status": wait}),
+        );
         Ok(PreparedLaunchAclLock { handle })
     }
 }
@@ -733,12 +778,14 @@ fn build_prepared_sandbox_launch(
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
     capability_sid: &str,
+    network_identity: WindowsSandboxNetworkIdentity,
 ) -> PreparedSandboxLaunch {
     PreparedSandboxLaunch {
         policy: policy.clone(),
         sandbox_policy_cwd: canonicalize_or_identity(sandbox_policy_cwd),
         session_temp_dir: canonicalize_or_identity(session_temp_dir),
         capability_sid: capability_sid.to_string(),
+        network_identity,
     }
 }
 
@@ -1151,6 +1198,39 @@ unsafe fn apply_session_temp_launch_acl(
     Ok(guard)
 }
 
+fn offline_identity_read_execute_paths(launch: &PreparedSandboxLaunch) -> HashSet<PathBuf> {
+    let mut read_paths = HashSet::new();
+    read_paths.insert(launch.sandbox_policy_cwd.clone());
+    if let Ok(exe) = std::env::current_exe() {
+        insert_offline_read_path(&mut read_paths, exe);
+    }
+    for env_key in [
+        crate::python_runtime::PYTHON_EXECUTABLE_ENV,
+        "PYTHONHOME",
+        "R_HOME",
+        "R_USER",
+    ] {
+        if let Some(value) = std::env::var_os(env_key) {
+            insert_offline_read_path(&mut read_paths, PathBuf::from(value));
+        }
+    }
+    for env_key in ["PYTHONPATH", "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE"] {
+        if let Some(value) = std::env::var_os(env_key) {
+            for path in std::env::split_paths(&value) {
+                insert_offline_read_path(&mut read_paths, path);
+            }
+        }
+    }
+    read_paths
+}
+
+fn insert_offline_read_path(read_paths: &mut HashSet<PathBuf>, path: PathBuf) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    read_paths.insert(canonicalize_or_identity(&path));
+}
+
 fn canonicalized_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
     let mut canonicalized = paths
         .iter()
@@ -1331,6 +1411,7 @@ unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
         sandbox_policy_cwd,
         session_temp_dir,
         prepared_capability_sid,
+        WindowsSandboxNetworkIdentity::CurrentUser,
     );
     apply_prepared_workspace_acl_state(
         &launch,
@@ -1342,10 +1423,25 @@ unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
     Ok(launch)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn prepare_sandbox_launch(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
+) -> Result<PreparedSandboxLaunch, String> {
+    prepare_sandbox_launch_with_network_identity(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        WindowsSandboxNetworkIdentity::CurrentUser,
+    )
+}
+
+pub fn prepare_sandbox_launch_with_network_identity(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    network_identity: WindowsSandboxNetworkIdentity,
 ) -> Result<PreparedSandboxLaunch, String> {
     #[cfg(test)]
     if let Some(error) = test_support::prepare_sandbox_launch_test_error() {
@@ -1355,13 +1451,32 @@ pub fn prepare_sandbox_launch(
     validate_windows_policy(policy)?;
 
     let cap_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
-    let launch =
-        build_prepared_sandbox_launch(policy, sandbox_policy_cwd, session_temp_dir, &cap_sid);
+    let launch = build_prepared_sandbox_launch(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        &cap_sid,
+        network_identity,
+    );
+    crate::event_log::log(
+        "windows_sandbox_prepare_acl_begin",
+        serde_json::json!({
+            "capability_sid": launch.capability_sid(),
+            "network_identity": match launch.network_identity() {
+                WindowsSandboxNetworkIdentity::CurrentUser => "current-user",
+                WindowsSandboxNetworkIdentity::OfflineProxy(_) => "offline-proxy",
+            },
+        }),
+    );
     let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
 
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        crate::event_log::log(
+            "windows_sandbox_prepare_workspace_acl_begin",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
         let apply_result = apply_prepared_workspace_acl_state(
             &launch,
             psid_capability,
@@ -1369,8 +1484,25 @@ pub fn prepare_sandbox_launch(
             PreparedLaunchAllowScope::RootsOnly,
             PreparedLaunchAllowScope::RootsOnly,
         );
+        if let Err(err) = apply_result {
+            LocalFree(psid_capability as HLOCAL);
+            return Err(err);
+        }
+        crate::event_log::log(
+            "windows_sandbox_prepare_workspace_acl_end",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
+        crate::event_log::log(
+            "windows_sandbox_prepare_offline_acl_begin",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
+        let offline_result = apply_offline_identity_acl_state(&launch, "prepare");
         LocalFree(psid_capability as HLOCAL);
-        apply_result?;
+        offline_result?;
+        crate::event_log::log(
+            "windows_sandbox_prepare_offline_acl_end",
+            serde_json::json!({"capability_sid": launch.capability_sid()}),
+        );
     }
 
     Ok(launch)
@@ -1390,9 +1522,192 @@ pub fn refresh_prepared_sandbox_launch_acl_state(
             PreparedLaunchAllowScope::RootsAndDirectChildren,
             PreparedLaunchAllowScope::RootsAndDirectChildren,
         );
+        if let Err(err) = refresh_result {
+            LocalFree(psid_capability as HLOCAL);
+            return Err(err);
+        }
+        let offline_result = apply_offline_identity_acl_state(launch, "refresh");
         LocalFree(psid_capability as HLOCAL);
-        refresh_result
+        offline_result
     }
+}
+
+unsafe fn apply_offline_identity_acl_state(
+    launch: &PreparedSandboxLaunch,
+    action: &str,
+) -> Result<(), String> {
+    let WindowsSandboxNetworkIdentity::OfflineProxy(setup) = &launch.network_identity else {
+        return Ok(());
+    };
+    let psid_offline = convert_string_sid_to_sid(&setup.user_sid)
+        .ok_or_else(|| "ConvertStringSidToSidW failed for offline sandbox SID".to_string())?;
+    let result = apply_offline_identity_acl_state_with_sid(launch, psid_offline, action);
+    LocalFree(psid_offline as HLOCAL);
+    result
+}
+
+unsafe fn apply_offline_identity_acl_state_with_sid(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+    action: &str,
+) -> Result<(), String> {
+    let mut write_paths = prepared_launch_acl_paths(launch).allow;
+    write_paths.insert(launch.session_temp_dir.clone());
+
+    let mut read_paths = write_paths.clone();
+    read_paths.extend(offline_identity_read_execute_paths(launch));
+    #[cfg(debug_assertions)]
+    read_paths.extend(debug_asset_read_roots());
+
+    let mut traverse_paths = HashSet::new();
+    for path in read_paths.iter().chain(write_paths.iter()) {
+        for ancestor in existing_ancestor_dirs(path) {
+            traverse_paths.insert(ancestor);
+        }
+    }
+    crate::event_log::log(
+        "windows_offline_acl_paths",
+        serde_json::json!({
+            "action": action,
+            "read": canonicalized_paths(&read_paths)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "write": canonicalized_paths(&write_paths)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+            "traverse_count": traverse_paths.len(),
+        }),
+    );
+    for path in traverse_paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "traverse",
+                "path": path.display().to_string(),
+            }),
+        );
+        if let Err(err) = add_read_execute_ace(&path, sid, false) {
+            if is_acl_access_denied(&err) {
+                continue;
+            }
+            return Err(format!(
+                "failed to {action} offline sandbox user traversal ACL on '{}': {err}",
+                path.display()
+            ));
+        }
+    }
+    for path in read_paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "read",
+                "path": path.display().to_string(),
+            }),
+        );
+        add_read_execute_ace(&path, sid, true).map_err(|err| {
+            format!(
+                "failed to {action} offline sandbox user read ACL on '{}': {err}",
+                path.display()
+            )
+        })?;
+    }
+    let write_dac_paths = write_paths.clone();
+    for path in write_paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "write",
+                "path": path.display().to_string(),
+            }),
+        );
+        add_allow_ace(&path, sid).map_err(|err| {
+            format!(
+                "failed to {action} offline sandbox user ACL on '{}': {err}",
+                path.display()
+            )
+        })?;
+    }
+    for path in write_dac_paths {
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        crate::event_log::log(
+            "windows_offline_acl_apply",
+            serde_json::json!({
+                "action": action,
+                "kind": "write-dac",
+                "path": path.display().to_string(),
+            }),
+        );
+        add_write_dac_ace(&path, sid).map_err(|err| {
+            format!(
+                "failed to {action} offline sandbox user DACL permission on '{}': {err}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn existing_ancestor_dirs(path: &Path) -> Vec<PathBuf> {
+    let mut ancestors = Vec::new();
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        if ancestor.parent().is_none() {
+            continue;
+        }
+        if ancestor.is_dir() {
+            ancestors.push(canonicalize_or_identity(ancestor));
+        }
+    }
+    ancestors
+}
+
+fn is_acl_access_denied(err: &str) -> bool {
+    err.contains("GetNamedSecurityInfoW failed: 5")
+        || err.contains("SetNamedSecurityInfoW failed: 5")
+}
+
+#[cfg(debug_assertions)]
+fn debug_asset_read_roots() -> Vec<PathBuf> {
+    let Some(cargo_home) = cargo_home_dir() else {
+        return Vec::new();
+    };
+    [cargo_home.join("git").join("checkouts")]
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .map(|path| canonicalize_or_identity(&path))
+        .collect()
+}
+
+#[cfg(debug_assertions)]
+fn cargo_home_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(path);
+    }
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    Some(home.join(".cargo"))
 }
 
 #[repr(C)]
@@ -1430,7 +1745,10 @@ fn run_sandboxed_command_with_env_map(
 
     unsafe {
         crate::diagnostics::startup_log("windows-sandbox: begin");
-        if should_apply_network_block(policy) {
+        if should_apply_network_block(policy)
+            && env_get_case_insensitive(&env_map, crate::managed_network::PROXY_ACTIVE_ENV_KEY)
+                != Some("1")
+        {
             apply_no_network_to_env(&mut env_map);
         }
         let session_temp_dir = env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV)
@@ -1640,6 +1958,9 @@ fn run_sandboxed_command_with_env_map(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
+            crate::diagnostics::startup_log(format!(
+                "windows-sandbox: conpty child exited {exit_code}"
+            ));
             drop(conpty);
             let _ = output_forwarder.join();
             cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
@@ -2343,6 +2664,159 @@ unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
     add_allow_ace_with_missing_policy(path, sid, true)
 }
 
+unsafe fn add_read_execute_ace(
+    path: &Path,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+    let path_is_dir = path.is_dir();
+    if dacl_has_read_execute_allow_for_sid(dacl, sid, inherit_children && path_is_dir) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = read_execute_access_mask();
+    explicit.grfAccessMode = GRANT_ACCESS;
+    explicit.grfInheritance = if inherit_children && path_is_dir {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    if set_acl_code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !new_dacl.is_null() {
+        LocalFree(new_dacl as HLOCAL);
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if set_security_code != ERROR_SUCCESS {
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(true)
+}
+
+unsafe fn add_write_dac_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+    if dacl_has_write_dac_allow_for_sid(dacl, sid) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = WRITE_DAC;
+    explicit.grfAccessMode = GRANT_ACCESS;
+    explicit.grfInheritance = if path.is_dir() {
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+    } else {
+        0
+    };
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    if set_acl_code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !new_dacl.is_null() {
+        LocalFree(new_dacl as HLOCAL);
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if set_security_code != ERROR_SUCCESS {
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(true)
+}
+
 unsafe fn add_allow_ace_with_missing_policy(
     path: &Path,
     sid: *mut c_void,
@@ -2586,6 +3060,10 @@ fn deny_write_mask() -> u32 {
         | FILE_DELETE_CHILD
 }
 
+fn read_execute_access_mask() -> u32 {
+    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+}
+
 fn allow_direct_access_mask() -> u32 {
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | FILE_DELETE_CHILD
 }
@@ -2645,6 +3123,57 @@ fn inherited_allow_ace_satisfies_requirements(mask: u32, ace_flags: u8) -> bool 
 fn ace_has_container_and_object_inheritance(ace_flags: u8) -> bool {
     (ace_flags & (CONTAINER_INHERIT_ACE as u8)) != 0
         && (ace_flags & (OBJECT_INHERIT_ACE as u8)) != 0
+}
+
+unsafe fn dacl_has_read_execute_allow_for_sid(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    inherit_children: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) == 0
+            || (allowed.Mask & read_execute_access_mask()) != read_execute_access_mask()
+        {
+            continue;
+        }
+        if ace_has_container_and_object_inheritance(header.AceFlags) == inherit_children {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_write_dac_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0 && (allowed.Mask & WRITE_DAC) == WRITE_DAC {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -3441,6 +3970,14 @@ mod tests {
             }
             Self { key, original }
         }
+
+        fn set_os(key: &'static str, value: &OsStr) -> Self {
+            let original = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
     }
 
     impl Drop for ScopedEnvVar {
@@ -3520,6 +4057,64 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn offline_identity_read_paths_include_runtime_path_lists() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        let python_lib = tmp.path().join("python-lib");
+        let r_lib_a = tmp.path().join("r-lib-a");
+        let r_lib_b = tmp.path().join("r-lib-b");
+        for path in [&cwd, &session_temp_dir, &python_lib, &r_lib_a, &r_lib_b] {
+            std::fs::create_dir_all(path).expect("create test dir");
+        }
+
+        let python_paths = std::env::join_paths([python_lib.as_path()]).expect("join python paths");
+        let r_paths =
+            std::env::join_paths([r_lib_a.as_path(), r_lib_b.as_path()]).expect("join R paths");
+        let _pythonpath = ScopedEnvVar::set_os("PYTHONPATH", python_paths.as_os_str());
+        let _r_libs_user = ScopedEnvVar::set_os("R_LIBS_USER", r_paths.as_os_str());
+        let policy = workspace_policy(Vec::new(), false, false);
+        let launch = PreparedSandboxLaunch {
+            capability_sid: stable_cap_sid_string(&policy, &cwd),
+            sandbox_policy_cwd: cwd.clone(),
+            session_temp_dir,
+            policy,
+            network_identity: WindowsSandboxNetworkIdentity::OfflineProxy(
+                WindowsSandboxOfflineSetup {
+                    username: "McpReplOffline".to_string(),
+                    user_sid: "S-1-5-21-1-2-3-1001".to_string(),
+                    http_proxy_port: 39080,
+                    socks_proxy_port: 39081,
+                },
+            ),
+        };
+
+        let read_paths = offline_identity_read_execute_paths(&launch);
+
+        assert!(read_paths.contains(&canonicalize_or_identity(&python_lib)));
+        assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_a)));
+        assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_b)));
+    }
+
+    #[test]
+    fn existing_ancestor_dirs_skips_filesystem_roots() {
+        let tmp = tempdir().expect("tempdir");
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+
+        let ancestors = existing_ancestor_dirs(&nested);
+
+        assert!(!ancestors.is_empty());
+        assert!(
+            ancestors.iter().all(|path| path.parent().is_some()),
+            "filesystem roots should not receive traversal ACLs: {ancestors:?}"
+        );
     }
 
     #[derive(Default)]
@@ -4428,6 +5023,7 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             sandbox_policy_cwd: canonicalize_or_identity(&cwd),
             session_temp_dir: canonicalize_or_identity(&session_temp_dir),
             capability_sid: stable_cap_sid_string(&policy, &cwd),
+            network_identity: WindowsSandboxNetworkIdentity::CurrentUser,
         };
         assert!(
             launch.matches(&policy, &cwd, &session_temp_dir),
@@ -5390,6 +5986,51 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
         mask
     }
 
+    unsafe fn path_has_inheritable_write_dac_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0
+                    && (allowed.Mask & WRITE_DAC) == WRITE_DAC
+                    && ace_has_container_and_object_inheritance(header.AceFlags)
+                {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
     unsafe fn add_custom_allow_ace(
         path: &Path,
         sid: *mut c_void,
@@ -6029,6 +6670,80 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
             );
 
             revoke_ace(&writable_dir, sid);
+            LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn read_execute_ace_does_not_grant_write_or_delete() {
+        let tmp = tempdir().expect("tempdir");
+        let readable_dir = tmp.path().join("readable");
+        std::fs::create_dir_all(&readable_dir).expect("readable dir");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid("S-1-5-21-1-2-3-4")
+                .expect("capability SID should convert");
+            let added =
+                add_read_execute_ace(&readable_dir, sid, true).expect("read ACE should be added");
+            assert!(added, "read ACE should be added on first application");
+
+            let mask = path_explicit_allow_mask(&readable_dir, sid, false);
+            assert_eq!(
+                mask & read_execute_access_mask(),
+                read_execute_access_mask(),
+                "read/execute bits should be present"
+            );
+            assert_eq!(
+                mask & (FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | DELETE
+                    | FILE_DELETE_CHILD),
+                0,
+                "read/execute grants must not include write or delete bits"
+            );
+
+            revoke_ace(&readable_dir, sid);
+            LocalFree(sid as HLOCAL);
+        }
+    }
+
+    #[test]
+    fn write_dac_ace_does_not_grant_file_write_or_delete() {
+        let tmp = tempdir().expect("tempdir");
+        let session_temp = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&session_temp).expect("session temp dir");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid("S-1-5-21-1-2-3-4")
+                .expect("capability SID should convert");
+            let added =
+                add_write_dac_ace(&session_temp, sid).expect("WRITE_DAC ACE should be added");
+            assert!(added, "WRITE_DAC ACE should be added on first application");
+
+            let mask = path_explicit_allow_mask(&session_temp, sid, false);
+            assert_eq!(
+                mask & WRITE_DAC,
+                WRITE_DAC,
+                "WRITE_DAC bit should be present"
+            );
+            assert!(
+                path_has_inheritable_write_dac_ace(&session_temp, sid),
+                "WRITE_DAC grant should inherit to descendants"
+            );
+            assert_eq!(
+                mask & (FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_WRITE_EA
+                    | FILE_WRITE_ATTRIBUTES
+                    | DELETE
+                    | FILE_DELETE_CHILD),
+                0,
+                "WRITE_DAC grant must not include file write or delete bits"
+            );
+
+            revoke_ace(&session_temp, sid);
             LocalFree(sid as HLOCAL);
         }
     }

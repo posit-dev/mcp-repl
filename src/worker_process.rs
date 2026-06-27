@@ -11,10 +11,13 @@ use crate::output_capture::{
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager::Pager;
 use crate::pending_output_tape::PendingOutputTape;
-use crate::sandbox::{SandboxState, SandboxStateUpdate};
+use crate::sandbox::SandboxState;
+#[cfg(any(debug_assertions, test))]
+use crate::sandbox::SandboxStateUpdate;
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::server::response::configured_output_bundle_max_bytes;
 pub(crate) use crate::stdin_payload::{WriteStdinControlAction, split_write_stdin_control_prefix};
+#[cfg(any(debug_assertions, test))]
 use crate::worker_protocol::WorkerReply;
 use crate::worker_supervisor::{GuardrailEvent, GuardrailShared, WorkerProcess};
 
@@ -187,6 +190,7 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
+    #[cfg(any(debug_assertions, test))]
     pub fn new(
         backend: Backend,
         sandbox_plan: SandboxCliPlan,
@@ -301,14 +305,39 @@ impl WorkerManager {
             return Ok(());
         };
 
-        if self
-            .managed_network_proxy
-            .as_ref()
-            .is_some_and(|proxy| proxy.config() == &config)
-        {
+        #[cfg(target_os = "windows")]
+        let offline_setup =
+            crate::windows_sandbox_setup::load_offline_setup().map_err(WorkerError::Sandbox)?;
+
+        if self.managed_network_proxy.as_ref().is_some_and(|proxy| {
+            proxy.config() == &config && {
+                #[cfg(target_os = "windows")]
+                {
+                    proxy.http_addr().port() == offline_setup.http_proxy_port
+                        && proxy.socks_addr().port() == offline_setup.socks_proxy_port
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    true
+                }
+            }
+        }) {
             return Ok(());
         }
 
+        #[cfg(target_os = "windows")]
+        let proxy = crate::managed_network::ManagedNetworkProxy::start_on_loopback_ports(
+            config,
+            offline_setup.http_proxy_port,
+            offline_setup.socks_proxy_port,
+        )
+        .map_err(|err| {
+            WorkerError::Sandbox(format!(
+                "{err}; Windows sandbox setup reserves fixed managed proxy ports {} and {}. Stop the conflicting process or rerun `mcp-repl windows-sandbox setup` with different ports.",
+                offline_setup.http_proxy_port, offline_setup.socks_proxy_port
+            ))
+        })?;
+        #[cfg(not(target_os = "windows"))]
         let proxy = crate::managed_network::ManagedNetworkProxy::start(config)
             .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         crate::event_log::log(
@@ -454,6 +483,7 @@ impl WorkerManager {
         }
     }
 
+    #[cfg(any(debug_assertions, test))]
     pub fn interrupt(
         &mut self,
         timeout: Duration,

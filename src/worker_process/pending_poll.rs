@@ -61,7 +61,7 @@ impl WorkerManager {
         } = if timed_out_elapsed.is_some() {
             self.drain_formatted_output()
         } else {
-            self.drain_final_formatted_output()
+            self.drain_completed_formatted_output(session_end)
         };
         let is_error = saw_stderr;
 
@@ -113,9 +113,10 @@ impl WorkerManager {
             PendingPollState::NoCompletion => (CompletionInfo::empty(), false, None),
         };
         if timed_out_elapsed.is_some() {
-            self.output_timeline.flush_ready_utf8_tails();
+            self.output_timeline
+                .seal_utf8_tails_blocking_visible_output();
         } else if observed_completion {
-            self.output_timeline.flush_utf8_tails();
+            self.output_timeline.seal_utf8_tails();
         }
         if observed_completion {
             end_offset = self.output.end_offset().unwrap_or(end_offset);

@@ -133,7 +133,7 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     assert_eq!(
         String::from_utf8(output.stdout)?,
         format!(
-            "Updated codex MCP config: {}\n",
+            "Updated codex MCP config: {}\nStart a new Codex session to load the updated MCP tools.\n",
             codex_home.join("config.toml").display()
         )
     );
@@ -202,6 +202,229 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     assert!(
         py_has_files_mode,
         "expected python args to include `--oversized-output files`"
+    );
+    let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
+        .as_array()
+        .expect("expected features.code_mode.direct_only_tool_namespaces array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("expected direct-only namespace string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        direct_only,
+        vec!["mcp__r".to_string(), "mcp__python".to_string()]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn install_codex_target_merges_code_mode_visibility_and_unfilters_tools() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    std::fs::write(
+        codex_home.join("config.toml"),
+        r#"[features]
+code_mode = false
+
+[mcp_servers.r]
+command = "/usr/local/bin/old-mcp-repl"
+enabled = false
+enabled_tools = ["other"]
+disabled_tools = ["repl", "other", "repl_reset"]
+
+[mcp_servers.notes]
+command = "/usr/local/bin/notes"
+"#,
+    )?;
+    let exe = resolve_exe()?;
+
+    let output = assert_command_success(
+        Command::new(&exe)
+            .arg("install")
+            .arg("--client")
+            .arg("codex")
+            .arg("--interpreter")
+            .arg("r")
+            .env("CODEX_HOME", &codex_home),
+    )?;
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        format!(
+            "Updated codex MCP config: {}\nStart a new Codex session to load the updated MCP tools.\n",
+            codex_home.join("config.toml").display()
+        )
+    );
+
+    let text = std::fs::read_to_string(codex_home.join("config.toml"))?;
+    let doc = text.parse::<DocumentMut>()?;
+    assert_eq!(
+        doc["features"]["code_mode"]["enabled"].as_bool(),
+        Some(false),
+        "expected existing features.code_mode boolean to move to enabled"
+    );
+    let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
+        .as_array()
+        .expect("expected direct-only namespaces")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("expected direct-only namespace string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(direct_only, vec!["mcp__r".to_string()]);
+
+    assert_eq!(
+        doc["mcp_servers"]["r"]["enabled"].as_bool(),
+        Some(true),
+        "expected installed Codex MCP server to be enabled"
+    );
+    let enabled_tools = doc["mcp_servers"]["r"]["enabled_tools"]
+        .as_array()
+        .expect("expected enabled_tools array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("expected enabled tool string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        enabled_tools,
+        vec![
+            "other".to_string(),
+            "repl".to_string(),
+            "repl_reset".to_string()
+        ]
+    );
+    let disabled_tools = doc["mcp_servers"]["r"]["disabled_tools"]
+        .as_array()
+        .expect("expected disabled_tools array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("expected disabled tool string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(disabled_tools, vec!["other".to_string()]);
+    assert_eq!(
+        doc["mcp_servers"]["notes"]["command"].as_str(),
+        Some("/usr/local/bin/notes"),
+        "expected unrelated MCP servers to remain"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn install_codex_target_merges_inline_features_table() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    std::fs::write(
+        codex_home.join("config.toml"),
+        r#"features = { code_mode = false, use_linux_sandbox_bwrap = false }
+
+[mcp_servers.r]
+command = "/usr/local/bin/old-mcp-repl"
+"#,
+    )?;
+    let exe = resolve_exe()?;
+
+    assert_command_success(
+        Command::new(&exe)
+            .arg("install")
+            .arg("--client")
+            .arg("codex")
+            .arg("--interpreter")
+            .arg("r")
+            .env("CODEX_HOME", &codex_home),
+    )?;
+
+    let text = std::fs::read_to_string(codex_home.join("config.toml"))?;
+    let doc = text.parse::<DocumentMut>()?;
+    assert_eq!(
+        doc["features"]["code_mode"]["enabled"].as_bool(),
+        Some(false),
+        "expected existing inline features.code_mode boolean to move to enabled"
+    );
+    assert_eq!(
+        doc["features"]["use_linux_sandbox_bwrap"].as_bool(),
+        Some(false),
+        "expected unrelated inline features to remain"
+    );
+    let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
+        .as_array()
+        .expect("expected direct-only namespaces")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("expected direct-only namespace string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(direct_only, vec!["mcp__r".to_string()]);
+
+    Ok(())
+}
+
+#[test]
+fn install_codex_target_preserves_existing_direct_only_namespaces() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    std::fs::write(
+        codex_home.join("config.toml"),
+        r#"[features.code_mode]
+enabled = false
+direct_only_tool_namespaces = ["mcp__notes", "mcp__r"]
+"#,
+    )?;
+    let exe = resolve_exe()?;
+
+    assert_command_success(
+        Command::new(&exe)
+            .arg("install")
+            .arg("--client")
+            .arg("codex")
+            .env("CODEX_HOME", &codex_home),
+    )?;
+
+    let text = std::fs::read_to_string(codex_home.join("config.toml"))?;
+    let doc = text.parse::<DocumentMut>()?;
+    assert_eq!(
+        doc["features"]["code_mode"]["enabled"].as_bool(),
+        Some(false)
+    );
+    let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
+        .as_array()
+        .expect("expected direct-only namespaces")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("expected direct-only namespace string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        direct_only,
+        vec![
+            "mcp__notes".to_string(),
+            "mcp__r".to_string(),
+            "mcp__python".to_string()
+        ]
     );
 
     Ok(())

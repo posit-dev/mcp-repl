@@ -298,7 +298,7 @@ impl WorkerManager {
         page_bytes: u64,
     ) -> ReplyWithOffset {
         if !prompt_wait.timed_out {
-            self.output_timeline.flush_utf8_tails();
+            self.output_timeline.seal_utf8_tails();
         }
         let start_offset = self.output.current_offset().unwrap_or(0);
         let mut end_offset = self.output.end_offset().unwrap_or(start_offset);

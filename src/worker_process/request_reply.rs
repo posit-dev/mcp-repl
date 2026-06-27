@@ -43,7 +43,7 @@ impl WorkerManager {
         page_bytes: u64,
     ) -> ReplyWithOffset {
         self.last_detached_prefix_item_count = context.detached_prefix_contents.len();
-        self.output_timeline.flush_utf8_tails();
+        self.output_timeline.seal_utf8_tails();
         let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
         let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
         let mut contents = context.detached_prefix_contents;
@@ -95,7 +95,7 @@ impl WorkerManager {
                 }
                 let mut contents = context.detached_prefix_contents;
                 contents.extend(context.reply_prefix_contents);
-                let formatted = self.drain_final_formatted_output();
+                let formatted = self.drain_completed_formatted_output(session_end);
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
                 let built = build_completed_reply(
@@ -128,7 +128,7 @@ impl WorkerManager {
                 }
 
                 if self.should_settle_output_after_timeout() {
-                    self.settle_output_after_timeout();
+                    self.settle_output_after_timeout(request.remaining_budget());
                 }
                 self.pending_request = true;
                 self.pending_request_started_at = Some(request.started_at);
@@ -170,7 +170,7 @@ impl WorkerManager {
                 if session_end {
                     self.note_session_end(true);
                 }
-                self.output_timeline.flush_utf8_tails();
+                self.output_timeline.seal_utf8_tails();
                 let end_offset = self.output.end_offset().unwrap_or(context.start_offset);
                 let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
                 let mut contents = context.detached_prefix_contents;
@@ -233,7 +233,8 @@ impl WorkerManager {
 
                 self.pending_request = true;
                 self.pending_request_started_at = Some(request.started_at);
-                self.output_timeline.flush_ready_utf8_tails();
+                self.output_timeline
+                    .seal_utf8_tails_blocking_visible_output();
                 let end_offset = self.output.end_offset().unwrap_or(0);
                 let first_page_budget = page_bytes.saturating_sub(context.prefix_bytes);
                 let mut contents = context.detached_prefix_contents;

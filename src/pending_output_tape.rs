@@ -62,7 +62,7 @@ impl PendingOutputTape {
         if bytes.is_empty() {
             return;
         }
-        self.timeline.flush_utf8_tails();
+        self.timeline.seal_utf8_tails();
         if self.timeline.last_text_ends_with_newline() || bytes.starts_with(b"\n") {
             self.timeline
                 .append_text(bytes, false, ContentOrigin::Server);
@@ -114,17 +114,17 @@ impl PendingOutputTape {
     }
 
     pub(crate) fn drain_output(&self) -> FormattedPendingOutput {
-        self.timeline.flush_ready_utf8_tails();
+        self.timeline.seal_utf8_tails_blocking_visible_output();
         self.output.drain_formatted(ProjectionMode::Bundle, false)
     }
 
     pub(crate) fn drain_final_output(&self) -> FormattedPendingOutput {
-        self.timeline.flush_utf8_tails();
+        self.timeline.seal_utf8_tails();
         self.output.drain_formatted(ProjectionMode::Bundle, true)
     }
 
     pub(crate) fn drain_sealed_output(&self) -> FormattedPendingOutput {
-        self.timeline.flush_utf8_tails();
+        self.timeline.seal_utf8_tails();
         self.output.drain_formatted(ProjectionMode::Bundle, true)
     }
 }

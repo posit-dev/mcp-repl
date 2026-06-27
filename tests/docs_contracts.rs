@@ -240,6 +240,7 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
         "ubuntu-22.04",
         "macos-15",
         "windows-2022",
+        "uses: actions/checkout@v5",
         "manylinux: \"2014\"",
         "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
         "mcp-repl-aarch64-apple-darwin.tar.gz",
@@ -310,6 +311,7 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
         ".config/nextest.toml",
         "name: cargo test (windows serial)",
         "run: cargo test -j 1 --quiet -- --test-threads=1",
+        "actions/checkout@v4",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -319,7 +321,7 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
 }
 
 #[test]
-fn release_workflow_defines_tag_only_publishing_contract() {
+fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
     let workflow = read(&repo_root().join(".github/workflows/release.yml"));
 
     for required in [
@@ -327,11 +329,20 @@ fn release_workflow_defines_tag_only_publishing_contract() {
         "tags:",
         "- 'v*.*.*'",
         "- '!v*\\+*'",
+        "workflow_dispatch:",
+        "pypi_backfill_tag:",
+        "Manual PyPI backfill tag",
         "publish-release:",
         "publish-pypi:",
-        "github.ref_type == 'tag'",
+        "if: (github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'workflow_dispatch'",
+        "RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.pypi_backfill_tag || github.ref_name }}",
+        "ref: ${{ env.RELEASE_TAG }}",
         "fetch-depth: 0",
+        "Prepare manual PyPI backfill metadata",
+        "${GITHUB_SHA}:pyproject.toml",
+        "target tag does not contain pyproject.toml",
         "Validate release tag matches Cargo version",
+        "git rev-parse \"refs/tags/${RELEASE_TAG}\" >/dev/null",
         "^v[0-9]+(\\.[0-9]+){2}(-(a|b|rc)[0-9]+)?$",
         "Decide whether this tag should be latest",
         "id: latest_guard",
@@ -369,6 +380,13 @@ fn release_workflow_defines_tag_only_publishing_contract() {
         "name: cargo test",
         "run: cargo test --quiet",
         "MCP_REPL_CODEX_BACKEND: mock",
+        "Release CLI contract",
+        "MCP_REPL_RELEASE_BINARY: target/release/mcp-repl",
+        "MCP_REPL_RELEASE_BINARY: target/release/mcp-repl.exe",
+        "cargo test --test release_cli_contract --quiet",
+        "if: github.event_name == 'push' && github.ref_type == 'tag'",
+        "if: github.event_name == 'push' && github.ref_type == 'tag' && needs.checks.result == 'success'",
+        "if: needs.checks.result == 'success' && ((github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'workflow_dispatch')",
         "-F draft=false",
         "-F prerelease=\"${prerelease_flag}\"",
         "--prerelease",
@@ -381,7 +399,6 @@ fn release_workflow_defines_tag_only_publishing_contract() {
     }
 
     for forbidden in [
-        "workflow_dispatch:",
         "release_tag:",
         "publish-dev:",
         "group: publish-dev",
@@ -403,6 +420,10 @@ fn release_workflow_defines_tag_only_publishing_contract() {
         "steps.release_tag.outputs.latest",
         "manylinux: auto",
         "matrix.manylinux",
+        "Detect Python public API suite",
+        "python_public_api_suite_available",
+        "Detect release CLI contract",
+        "release_cli_contract_available",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -474,10 +495,26 @@ fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
         "manylinux2014",
         "R is optional",
         "No rolling dev release",
-        "No backfill workflow",
+        "Manual PyPI Backfill",
+        "`pypi_backfill_tag`",
+        "existing immutable semver tag",
+        "before the next scheduled release tag",
+        "tags that predate PyPI packaging",
+        "current `pyproject.toml` packaging metadata only",
+        "compiled source still comes from the immutable tag",
+        "does not rerun historical validation checks",
+        "already passed when the tag was created",
+        "builds and smoke-tests the release binary and PyPI wheels",
+        "does not create or update the GitHub release",
+        "version already exists on PyPI",
     ] {
         assert_contains_wrapped_text(&docs, required, "docs/releasing.md");
     }
+
+    assert!(
+        !normalized_whitespace(&docs).contains("runs the normal release matrix"),
+        "manual PyPI backfill docs should not imply historical tags rerun the current validation matrix"
+    );
 }
 
 #[test]

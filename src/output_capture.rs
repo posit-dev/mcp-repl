@@ -162,41 +162,35 @@ impl OutputTimeline {
     }
 
     pub(crate) fn append_input_wait(&self) {
-        let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
-        self.append_pending_locked(pending);
-        self.ring.append_marker_event(OutputEventKind::InputWait);
+        self.append_event(OutputEventKind::InputWait);
     }
 
     pub(crate) fn append_request_boundary(&self) {
-        let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
-        self.append_pending_locked(pending);
-        self.ring
-            .append_marker_event(OutputEventKind::RequestBoundary);
+        self.append_event(OutputEventKind::RequestBoundary);
     }
 
     pub(crate) fn append_session_end(&self) {
-        let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
-        self.append_pending_locked(pending);
-        self.ring.append_marker_event(OutputEventKind::SessionEnd);
+        self.append_event(OutputEventKind::SessionEnd);
     }
 
     pub(crate) fn last_text_ends_with_newline(&self) -> bool {
         self.ring.last_text_ends_with_newline()
     }
 
-    pub(crate) fn flush_utf8_tails(&self) {
+    pub(crate) fn seal_utf8_tails(&self) {
         let mut guard = self.state.lock().unwrap();
         let pending = guard.utf8_tails.drain();
         self.append_pending_locked(pending);
     }
 
-    pub(crate) fn flush_ready_utf8_tails(&self) {
+    pub(crate) fn seal_utf8_tails_blocking_visible_output(&self) {
         let mut guard = self.state.lock().unwrap();
-        let pending = guard.utf8_tails.drain_ready_after_gaps();
+        let pending = guard.utf8_tails.drain_ready_after_visible_gaps();
         self.append_pending_locked(pending);
+    }
+
+    pub(crate) fn has_unflushable_utf8_tail(&self) -> bool {
+        self.state.lock().unwrap().utf8_tails.has_unflushable_tail()
     }
 
     fn append_event(&self, kind: OutputEventKind) {
@@ -238,6 +232,19 @@ struct OutputUtf8Tail {
 enum OutputPendingEntry {
     Text(OutputUtf8Tail),
     Event(OutputEventKind),
+}
+
+impl OutputPendingEntry {
+    fn is_marker_event(&self) -> bool {
+        matches!(
+            self,
+            OutputPendingEntry::Event(
+                OutputEventKind::InputWait
+                    | OutputEventKind::RequestBoundary
+                    | OutputEventKind::SessionEnd
+            )
+        )
+    }
 }
 
 #[derive(Default)]
@@ -349,15 +356,19 @@ impl OutputUtf8Tails {
     ) -> Vec<OutputPendingEntry> {
         let mut ready = self.drain_ready();
         if self.blocked_side_buffer_bytes() > side_buffer_capacity_bytes {
-            ready.extend(self.drain_ready_after_gaps());
+            ready.extend(self.drain_ready_after_visible_gaps());
         }
         ready
     }
 
-    fn drain_ready_after_gaps(&mut self) -> Vec<OutputPendingEntry> {
+    fn drain_ready_after_visible_gaps(&mut self) -> Vec<OutputPendingEntry> {
         let mut ready = Vec::new();
         while !self.entries.is_empty() {
-            let has_later_entries = self.entries.len() > 1;
+            let has_later_visible_entries = self
+                .entries
+                .iter()
+                .skip(1)
+                .any(|entry| !entry.is_marker_event());
             let OutputPendingEntry::Text(front) = &mut self.entries[0] else {
                 ready.push(self.entries.remove(0));
                 continue;
@@ -369,7 +380,7 @@ impl OutputUtf8Tails {
 
             let flushable_len = flushable_prefix_len(&front.bytes);
             if flushable_len == 0 {
-                if has_later_entries {
+                if has_later_visible_entries {
                     front.sealed = true;
                     ready.push(materialize_pending_entry(self.entries.remove(0)));
                     continue;
@@ -388,7 +399,7 @@ impl OutputUtf8Tails {
                 bytes,
                 sealed: true,
             }));
-            if !has_later_entries {
+            if !has_later_visible_entries {
                 break;
             }
         }
@@ -404,6 +415,15 @@ impl OutputUtf8Tails {
         }
         self.entries.iter().skip(1).fold(0usize, |total, entry| {
             total.saturating_add(pending_entry_size_bytes(entry))
+        })
+    }
+
+    fn has_unflushable_tail(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                OutputPendingEntry::Text(entry) if !entry.sealed && !entry.is_flushable()
+            )
         })
     }
 }
@@ -1992,6 +2012,61 @@ mod tests {
                 WorkerContent::ContentImage { id, .. } if id == "plot-1"
             )),
             "expected the boundary image appended after the snapshot to survive"
+        );
+    }
+
+    #[test]
+    fn timeline_reports_unflushable_utf8_tail_until_raw_bytes_complete() {
+        let timeline = OutputTimeline::with_capacity(1024);
+        let output = timeline.buffer();
+        output.start_capture();
+
+        assert!(
+            !timeline.has_unflushable_utf8_tail(),
+            "fresh timeline should not report a pending UTF-8 tail"
+        );
+
+        timeline.append_text(&[0xC3], false, ContentOrigin::Worker);
+
+        assert!(
+            timeline.has_unflushable_utf8_tail(),
+            "split UTF-8 lead byte should stay visible to settle logic while held off-ring"
+        );
+        assert!(
+            !output.has_pending_output(),
+            "incomplete UTF-8 tail should not be materialized before it is completed or sealed"
+        );
+
+        timeline.append_input_wait();
+
+        assert!(
+            timeline.has_unflushable_utf8_tail(),
+            "input_wait markers should not seal an otherwise completable raw UTF-8 tail"
+        );
+
+        timeline.append_text(&[0xA9, b'\n'], false, ContentOrigin::Worker);
+
+        assert!(
+            !timeline.has_unflushable_utf8_tail(),
+            "completed UTF-8 sequence should clear the pending-tail state"
+        );
+
+        let formatted = output.drain_formatted(ProjectionMode::Bundle, true);
+        let text = formatted
+            .contents
+            .iter()
+            .filter_map(|content| match content {
+                WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+                WorkerContent::ContentImage { .. } => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("é\n"),
+            "completed split UTF-8 bytes should render as text, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\\xC3") && !text.contains("\\xA9"),
+            "completed split UTF-8 bytes should not be escaped, got: {text:?}"
         );
     }
 

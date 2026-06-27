@@ -116,6 +116,7 @@ fn run_worker(
         input_line_after_input_wait: false,
         session_end_after_input_wait: false,
         bad_output_after_input_wait: None,
+        ready_after_turn: false,
     };
     while let Ok(message) = rx.recv() {
         match message {
@@ -133,8 +134,8 @@ fn run_worker(
             ControlMessage::Interrupt => {
                 if let Some(millis) = delay_ready_after_interrupt_ms {
                     thread::sleep(Duration::from_millis(millis));
-                    writer.send(&WorkerToServer::Ready {})?;
                     append_control_log(control_log_path.as_deref(), "fresh_ready_after_interrupt")?;
+                    writer.send(&WorkerToServer::Ready {})?;
                 }
             }
             ControlMessage::Shutdown => {
@@ -177,9 +178,15 @@ fn run_turn(
         state.previous_line_empty = command.is_empty();
     }
 
-    let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
-    writer.send(&WorkerToServer::InputWait { prompt })?;
-    append_control_log(control_log_path.as_deref(), "input_wait")?;
+    if state.ready_after_turn {
+        state.ready_after_turn = false;
+        writer.send(&WorkerToServer::Ready {})?;
+        append_control_log(control_log_path.as_deref(), "ready")?;
+    } else {
+        let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
+        writer.send(&WorkerToServer::InputWait { prompt })?;
+        append_control_log(control_log_path.as_deref(), "input_wait")?;
+    }
     emit_deferred_protocol_faults(writer, control_log_path, state)?;
     Ok(false)
 }
@@ -248,6 +255,18 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "partial-stderr-utf8-then-late-stderr-after-completion" {
+        output_stderr_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(950));
+            let _ = output_stderr_text(&writer, &control_log_path, b"after\n");
+        });
+        return Ok(false);
+    }
+
     if command == "partial-stdout-then-newline-stderr" {
         output_text(writer, control_log_path, b"partial")?;
         output_stderr_text(writer, control_log_path, b"\nerr\n")?;
@@ -282,9 +301,58 @@ fn run_command(
         return Ok(false);
     }
 
+    if command == "split-utf8-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        output_image(writer, control_log_path, b"img")?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9, b'\n'], true);
+        });
+        return Ok(false);
+    }
+
+    if command == "split-utf8-then-more-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
+            thread::sleep(Duration::from_millis(30));
+            let _ = output_text_with_continuation(&writer, &control_log_path, b" after\n", false);
+        });
+        return Ok(false);
+    }
+
+    if command == "split-utf8-then-continuous-output-after-completion" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        state.ready_after_turn = true;
+        let writer = writer.clone();
+        let control_log_path = control_log_path.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            let _ = output_text_with_continuation(&writer, &control_log_path, &[0xA9], true);
+            for _ in 0..150 {
+                thread::sleep(Duration::from_millis(10));
+                let _ = output_text_with_continuation(&writer, &control_log_path, b".", false);
+            }
+        });
+        return Ok(false);
+    }
+
     if command == "partial-utf8-stderr-then-sleep" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         output_stderr_text(writer, control_log_path, b"tail-visible\n")?;
+        sleep_for(200, sideband_interrupted, false);
+        return Ok(false);
+    }
+
+    if command == "partial-utf8-then-sleep" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         sleep_for(200, sideband_interrupted, false);
         return Ok(false);
     }
@@ -297,6 +365,7 @@ fn run_command(
             prompt: "v5> ".to_string(),
         })?;
         append_control_log(control_log_path.as_deref(), "input_wait")?;
+        sleep_for(200, sideband_interrupted, false);
         io::stdout().write_all(&[0xA9, b'\n'])?;
         io::stdout().flush()?;
         return Ok(false);
@@ -495,6 +564,16 @@ fn output_stderr_text(
     writer.output_text("stderr", bytes)
 }
 
+fn output_stderr_text_with_continuation(
+    writer: &IpcWriter,
+    control_log_path: &Option<PathBuf>,
+    bytes: &[u8],
+    is_continuation: bool,
+) -> io::Result<()> {
+    append_control_log(control_log_path.as_deref(), "output_text stderr")?;
+    writer.output_text_with_continuation("stderr", bytes, is_continuation)
+}
+
 fn output_image(
     writer: &IpcWriter,
     control_log_path: &Option<PathBuf>,
@@ -556,6 +635,7 @@ struct CommandState {
     input_line_after_input_wait: bool,
     session_end_after_input_wait: bool,
     bad_output_after_input_wait: Option<Duration>,
+    ready_after_turn: bool,
 }
 
 fn start_control_reader(

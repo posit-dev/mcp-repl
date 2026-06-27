@@ -5,16 +5,24 @@ on:
     tags:
       - 'v*.*.*'
       - '!v*\+*'
+  workflow_dispatch:
+    inputs:
+      pypi_backfill_tag:
+        description: "Manual PyPI backfill tag (existing vX.Y.Z or vX.Y.Z-rcN)"
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.pypi_backfill_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   checks:
     name: ${{ matrix.target }}
-    if: github.ref_type == 'tag'
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.pypi_backfill_tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +42,30 @@ jobs:
             artifact_name: release-x86_64-pc-windows-msvc
 
     steps:
+      - name: Validate requested release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}(-(a|b|rc)[0-9]+)?$ ]]; then
+            echo "release tag must be final semver like v0.1.0 or PyPI-compatible prerelease semver like v0.1.0-rc1" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Prepare manual PyPI backfill metadata
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f pyproject.toml ]; then
+            git show "${GITHUB_SHA}:pyproject.toml" > pyproject.toml
+            echo "target tag does not contain pyproject.toml; restored packaging metadata from workflow ref ${GITHUB_SHA}"
+          fi
+          test -f pyproject.toml
 
       - name: Set up Rust (stable)
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -45,6 +76,7 @@ jobs:
           cache-bin: false
 
       - name: Install nightly rustfmt
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: rustup toolchain install nightly --profile minimal --component rustfmt
 
       - name: Set up Python
@@ -57,14 +89,9 @@ jobs:
 
       - name: Validate release tag matches Cargo version
         shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+(\.[0-9]+){2}(-(a|b|rc)[0-9]+)?$ ]]; then
-            echo "release tag must be final semver like v0.1.0 or PyPI-compatible prerelease semver like v0.1.0-rc1" >&2
-            exit 1
-          fi
+          git rev-parse "refs/tags/${RELEASE_TAG}" >/dev/null
           release_version="${RELEASE_TAG#v}"
           cargo_version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
           if [ "${cargo_version}" != "${release_version}" ]; then
@@ -73,25 +100,33 @@ jobs:
           fi
 
       - name: cargo check
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo check
 
       - name: cargo build
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo build
 
+      - name: Windows sandbox setup
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
+        shell: pwsh
+        run: .\target\debug\mcp-repl.exe windows-sandbox setup
+
       - name: Python public API suite
-        if: matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
         run: python3 tests/run_integration_tests.py --binary target/debug/mcp-repl
 
       - name: Python public API suite (windows)
-        if: matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         run: python tests/run_integration_tests.py --binary target/debug/mcp-repl.exe
 
       - name: cargo clippy
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Install Codex CLI
-        if: matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -102,7 +137,7 @@ jobs:
           codex --version
 
       - name: Install Codex CLI (windows)
-        if: matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           npm install -g @openai/codex
@@ -112,11 +147,13 @@ jobs:
           & (Join-Path $npmPrefix "codex.cmd") --version
 
       - name: cargo test
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           MCP_REPL_CODEX_BACKEND: mock
         run: cargo test --quiet -- --test-threads=5
 
       - name: cargo +nightly fmt
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: cargo +nightly fmt --all -- --check
 
       - name: cargo build --release
@@ -132,8 +169,21 @@ jobs:
         run: |
           .\target\release\mcp-repl.exe --help
 
+      - name: Release CLI contract
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
+        env:
+          MCP_REPL_RELEASE_BINARY: target/release/mcp-repl
+        run: cargo test --test release_cli_contract --quiet
+
+      - name: Release CLI contract (windows)
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
+        shell: pwsh
+        env:
+          MCP_REPL_RELEASE_BINARY: target/release/mcp-repl.exe
+        run: cargo test --test release_cli_contract --quiet
+
       - name: Package release archive
-        if: matrix.os != 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os != 'windows-2022'
         shell: bash
         run: |
           set -euo pipefail
@@ -144,7 +194,7 @@ jobs:
           tar -C dist -czf "dist/${{ matrix.asset_name }}" "mcp-repl-${{ matrix.target }}"
 
       - name: Package release archive (windows)
-        if: matrix.os == 'windows-2022'
+        if: github.event_name == 'push' && github.ref_type == 'tag' && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
           $packageDir = "dist/mcp-repl-${{ matrix.target }}"
@@ -197,6 +247,7 @@ jobs:
           .\wheel-smoke\Scripts\mcp-repl.exe --help
 
       - name: Upload packaged artifact
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
@@ -212,7 +263,7 @@ jobs:
 
   publish-release:
     name: publish-release
-    if: github.ref_type == 'tag' && needs.checks.result == 'success'
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.checks.result == 'success'
     needs: checks
     runs-on: ubuntu-22.04
     permissions:
@@ -333,7 +384,7 @@ jobs:
 
   publish-pypi:
     name: publish-pypi
-    if: github.ref_type == 'tag' && needs.checks.result == 'success'
+    if: needs.checks.result == 'success' && ((github.event_name == 'push' && github.ref_type == 'tag') || github.event_name == 'workflow_dispatch')
     needs: checks
     runs-on: ubuntu-22.04
     permissions:

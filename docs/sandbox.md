@@ -25,10 +25,11 @@ may still be logged as the older `read-only`, `workspace-write`,
 `external-sandbox`, or `danger-full-access` shapes for compatibility with the
 existing CLI surface.
 
-`--debug-repl` is the one local-only exception. Because there is no MCP client
-metadata channel in that mode, `mcp-repl --debug-repl --sandbox inherit`
-bootstraps one local inherited snapshot from the current default sandbox state
-before the first worker spawn.
+Debug/dev builds have one local-only exception: `--debug-repl`. Because there
+is no MCP client metadata channel in that mode, `mcp-repl --debug-repl
+--sandbox inherit` bootstraps one local inherited snapshot from the current
+default sandbox state before the first worker spawn. Shipped release binaries
+do not include `--debug-repl`.
 
 For `repl`, inherited sandbox metadata controls the worker session that handles
 the call. When a non-empty tool call would use the worker and the effective
@@ -109,14 +110,14 @@ If you also need R data/config roots, add them explicitly with repeatable
 For Codex `permissionProfile` metadata, writable and readable roots come from
 the profile entries. `mcp-repl` still adds the server-owned per-session temp
 directory as a writable root so the R and Python workers can start.
-When a profile requests `:minimal`, mcp-repl appends restricted
-read-only platform defaults instead of putting those broader system reads in
-the always-on base policy. The local copy also includes R and Python framework
-runtime roots needed by the embedded backends. Debug builds embed harp's R
-module assets so startup does not require a read carve-out for Cargo's source
-checkout. The always-on base policy keeps non-filesystem runtime allowances
-such as Python multiprocessing and the PyTorch/libomp OpenMP registration
-shared-memory carve-out.
+When a Linux profile does not grant full-disk reads, mcp-repl appends
+restricted read-only platform defaults instead of putting those broader system
+reads in the always-on base policy. The local copy also includes R and Python
+framework runtime roots needed by the embedded backends. Debug builds embed
+harp's R module assets so startup does not require a read carve-out for Cargo's
+source checkout. The always-on base policy keeps non-filesystem runtime
+allowances such as Python multiprocessing and the PyTorch/libomp OpenMP
+registration shared-memory carve-out.
 
 Within writable roots, these subpaths are forced read-only when present:
 
@@ -165,24 +166,30 @@ mcp-repl --sandbox workspace-write \
 
 ## Linux behavior
 
-Sandboxing is enforced by a Linux sandbox helper that applies seccomp + Landlock.
+Sandboxing is enforced by the internal Linux sandbox helper. The default path
+uses bubblewrap for the filesystem namespace and then applies seccomp in the
+sandboxed process. Legacy Landlock remains available as an explicit fallback,
+but it cannot enforce restricted-read managed profiles.
 
 - `workspace-write` always includes the per-session temp directory in writable roots.
-- `read-only` is translated to a minimal writable setup for the session temp directory only.
+- `read-only` and Codex managed `:minimal` profiles add only the server-owned
+  session temp directory as writable runtime state.
+- Linux consumes Codex managed filesystem metadata directly: restricted reads,
+  `:minimal`, project-root entries, `:tmpdir`, `:slash_tmp`, deny paths, deny
+  globs, and protected `.git`, `.codex`, and `.agents` metadata paths are
+  rendered into the bubblewrap mount plan.
 - default Linux worker setup disables network unless explicitly enabled.
 - managed domain allowlists are not enforced on Linux yet; configuring allowed
   or denied domains with enabled network access currently fails closed.
 - `mcp-repl` always uses its own internal Linux sandbox launcher; helper
   executable paths provided by an MCP client are ignored.
-- Codex sandbox metadata does not control `mcp-repl`'s optional internal
-  `bwrap` stage. That remains a local best-effort setting.
-
-Optional `bwrap` stage:
-
-- `MCP_REPL_USE_LINUX_BWRAP=1` enables a bubblewrap outer sandbox.
-- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
-- if `bwrap` is requested but worker startup dies before backend info arrives,
-  `mcp-repl` retries once without `bwrap` and continues.
+- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting when the host
+  container does not allow bubblewrap to mount it.
+- if the default bubblewrap path dies before worker readiness, `mcp-repl`
+  retries once with the legacy Landlock path for compatibility.
+- `MCP_REPL_USE_LINUX_BWRAP=0` disables the default bubblewrap path. Codex
+  `useLegacyLandlock: true` inherited metadata has the same effect for that tool
+  call.
 
 ## Windows behavior (experimental)
 
@@ -190,8 +197,28 @@ Optional `bwrap` stage:
 - Python support is not part of the stable Windows surface yet. The embedded
   backend no longer requires a Unix PTY, but Windows support still depends on
   the selected CPython installation exposing a loadable runtime library.
-- managed domain allowlists are not enforced on Windows yet; configuring allowed
-  or denied domains with enabled network access currently fails closed.
+- workspace-write network-restricted and managed-domain Windows sandboxes require one-time
+  elevated setup:
+
+  ```powershell
+  mcp-repl windows-sandbox setup --http-proxy-port 39080 --socks-proxy-port 39081
+  ```
+
+  Setup creates or refreshes the local non-admin `McpReplOffline`
+  account, stores its password with current-user DPAPI protection under
+  `%LOCALAPPDATA%\mcp-repl\windows-sandbox\`, installs outbound firewall
+  block rules scoped to that account SID, and installs persistent loopback
+  WFP filters for the configured proxy-port exceptions.
+- `workspace-write` with `network_access=true` and no managed domain rules keeps
+  the current-user sandbox path and allows network access normally.
+- default `workspace-write` and managed-domain `workspace-write` launches run
+  the Windows wrapper through the offline account. Firewall rules block
+  non-loopback outbound traffic, and WFP filters block direct loopback TCP/UDP
+  traffic except the configured managed proxy TCP ports.
+- when allowed or denied domains are configured on Windows, the server starts
+  the same managed HTTP/SOCKS proxy used on macOS on the fixed setup ports and
+  injects proxy env vars into the worker. Missing setup, stale setup, or occupied
+  fixed proxy ports fail closed with an actionable error.
 - `read-only` and `workspace-write` use a two-stage Windows sandbox model:
   - the parent prepares and reuses stable filesystem ACL state for the effective sandbox policy,
   - the internal Windows sandbox wrapper requires prepared launch state and applies launch-scoped ACLs for the worker run.

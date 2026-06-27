@@ -21,7 +21,7 @@ use crate::sandbox::ManagedNetworkPolicy;
 // ports. Matching is host-only because HTTPS CONNECT does not expose URL paths.
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const LISTENER_IDLE_SLEEP: Duration = Duration::from_millis(20);
-const PROXY_ACTIVE_ENV_KEY: &str = "MCP_REPL_MANAGED_NETWORK_PROXY_ACTIVE";
+pub(crate) const PROXY_ACTIVE_ENV_KEY: &str = "MCP_REPL_MANAGED_NETWORK_PROXY_ACTIVE";
 const DEFAULT_NO_PROXY_VALUE: &str =
     "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16";
 
@@ -192,10 +192,36 @@ pub struct ManagedNetworkProxy {
 }
 
 impl ManagedNetworkProxy {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn start(config: ManagedProxyConfig) -> Result<Self, ManagedNetworkError> {
+        Self::start_with_addrs(
+            config,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn start_on_loopback_ports(
+        config: ManagedProxyConfig,
+        http_port: u16,
+        socks_port: u16,
+    ) -> Result<Self, ManagedNetworkError> {
+        Self::start_with_addrs(
+            config,
+            SocketAddr::from(([127, 0, 0, 1], http_port)),
+            SocketAddr::from(([127, 0, 0, 1], socks_port)),
+        )
+    }
+
+    fn start_with_addrs(
+        config: ManagedProxyConfig,
+        http_bind_addr: SocketAddr,
+        socks_bind_addr: SocketAddr,
+    ) -> Result<Self, ManagedNetworkError> {
         let policy = Arc::new(HostPolicy::new(&config)?);
-        let http_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
-        let socks_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+        let http_listener = TcpListener::bind(http_bind_addr)?;
+        let socks_listener = TcpListener::bind(socks_bind_addr)?;
         let http_addr = http_listener.local_addr()?;
         let socks_addr = socks_listener.local_addr()?;
         http_listener.set_nonblocking(true)?;
@@ -235,6 +261,11 @@ impl ManagedNetworkProxy {
         set_env_keys(env, HTTP_PROXY_ENV_KEYS, &http_proxy_url);
         set_env_keys(env, SOCKS_PROXY_ENV_KEYS, &socks_proxy_url);
         set_env_keys(env, NO_PROXY_ENV_KEYS, DEFAULT_NO_PROXY_VALUE);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn route_local_targets_through_proxy(env: &mut HashMap<String, String>) {
+        set_env_keys(env, NO_PROXY_ENV_KEYS, "");
     }
 }
 
