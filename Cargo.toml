@@ -21,8 +21,8 @@
   htmd = "0.5.4"
   libc = "0.2"
   libloading = "0.9.0"
-  harp = { git = "https://github.com/t-kalinowski/ark", tag = "0.1.222" }
-  libr = { git = "https://github.com/t-kalinowski/ark", tag = "0.1.222" }
+  harp = { git = "https://github.com/t-kalinowski/ark", rev = "6635228e6773f594180de63eceb06f3e0431f1b5" }
+  libr = { git = "https://github.com/t-kalinowski/ark", rev = "6635228e6773f594180de63eceb06f3e0431f1b5" }
   memchr = "2.8.2"
   regex-lite = "0.1"
   # Harp loads embedded R module assets during R startup. In debug builds,

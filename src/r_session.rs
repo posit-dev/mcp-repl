@@ -260,7 +260,7 @@ fn initialize_r(init: &SessionInit) -> Result<(), String> {
     ));
 
     unsafe {
-        harp::R_MAIN_THREAD_ID = Some(thread::current().id());
+        harp::CONSOLE_THREAD_ID = Some(thread::current().id());
         harp::routines::r_register_routines();
     }
     harp::initialize();
@@ -309,7 +309,7 @@ fn setup_r_home() -> Result<PathBuf, String> {
     unsafe {
         std::env::set_var("R_HOME", &home);
     }
-    r_command(|command| {
+    r_command(&path, |command| {
         command.arg("RHOME");
     })
     .map_err(|err| format!("Can't run R: {err}"))?;
@@ -493,7 +493,7 @@ fn configure_r_env_vars(r_home: &Path) {
     }
 
     // Fallback for non-standard R layouts.
-    let result = r_command(|command| {
+    let result = r_command(r_home, |command| {
         command
             .stdin(std::process::Stdio::null())
             .args([
