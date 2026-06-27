@@ -5298,10 +5298,7 @@ icacls $path /inheritance:r /grant:r "${{currentUser}}:(OI)(CI)F" "SYSTEM:(OI)(C
         let _guard = prepare_sandbox_launch_test_mutex()
             .lock()
             .expect("windows sandbox test mutex");
-        let Some(r_home) = harp::command::r_home_setup().ok() else {
-            eprintln!("R_HOME unavailable; skipping");
-            return;
-        };
+        let r_home = harp::command::r_home_setup();
         let r_exe = r_home.join("bin").join("x64").join("R.exe");
         if !r_exe.is_file() {
             eprintln!("Windows R frontend unavailable; skipping");
