@@ -214,7 +214,7 @@ impl SessionState {
 fn initialize_r(init: &SessionInit) -> Result<(), String> {
     let start = std::time::Instant::now();
     prepare_r_home_env();
-    let r_home = r_home_setup().map_err(|err| format!("failed to set up R_HOME: {err}"))?;
+    let r_home = r_home_setup();
     crate::diagnostics::startup_log(format!(
         "r-session: r_home_setup {} ms",
         crate::diagnostics::elapsed_ms(start.elapsed())
@@ -260,7 +260,7 @@ fn initialize_r(init: &SessionInit) -> Result<(), String> {
     ));
 
     unsafe {
-        harp::CONSOLE_THREAD_ID = Some(thread::current().id());
+        harp::R_MAIN_THREAD_ID = Some(thread::current().id());
         harp::routines::r_register_routines();
     }
     harp::initialize();
