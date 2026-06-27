@@ -1823,9 +1823,30 @@ fn configure_embedded_r_runtime_env(env: &mut HashMap<String, String>) {
 #[cfg(target_family = "unix")]
 fn embedded_r_home() -> Option<&'static PathBuf> {
     static R_HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    R_HOME
-        .get_or_init(|| harp::command::r_home_setup().ok())
-        .as_ref()
+    R_HOME.get_or_init(discover_embedded_r_home).as_ref()
+}
+
+#[cfg(target_family = "unix")]
+fn discover_embedded_r_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("R_HOME").filter(|home| !home.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+
+    let output = harp::command::r_command_from_path(|command| {
+        command.arg("RHOME");
+    })
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let home = String::from_utf8(output.stdout).ok()?;
+    let home = home.trim();
+    if home.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(home))
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -4850,7 +4871,7 @@ fn linux_install_filesystem_landlock_rules_on_current_thread(
         .map_err(|err| err.to_string())?
         .add_rules(landlock::path_beneath_rules(&["/dev/null"], access_rw))
         .map_err(|err| err.to_string())?
-        .set_no_new_privs(true);
+        .no_new_privs(true);
 
     if !writable_roots.is_empty() {
         ruleset = ruleset

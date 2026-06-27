@@ -13,7 +13,7 @@ use crate::worker_protocol::TextStream;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
-use harp::command::{r_command, r_home_setup};
+use harp::command::{r_command, r_command_from_path};
 use harp::exec::{RFunction, RFunctionExt};
 use harp::library::RLibraries;
 
@@ -214,7 +214,7 @@ impl SessionState {
 fn initialize_r(init: &SessionInit) -> Result<(), String> {
     let start = std::time::Instant::now();
     prepare_r_home_env();
-    let r_home = r_home_setup().map_err(|err| format!("failed to set up R_HOME: {err}"))?;
+    let r_home = setup_r_home().map_err(|err| format!("failed to set up R_HOME: {err}"))?;
     crate::diagnostics::startup_log(format!(
         "r-session: r_home_setup {} ms",
         crate::diagnostics::elapsed_ms(start.elapsed())
@@ -276,6 +276,45 @@ fn initialize_r(init: &SessionInit) -> Result<(), String> {
         crate::diagnostics::elapsed_ms(start.elapsed())
     ));
     Ok(())
+}
+
+fn setup_r_home() -> Result<PathBuf, String> {
+    let home = match std::env::var("R_HOME") {
+        Ok(home) => home,
+        Err(_) => {
+            let output = r_command_from_path(|command| {
+                command.arg("RHOME");
+            })
+            .map_err(|err| format!("Can't find R or `R_HOME`: {err}"))?;
+
+            String::from_utf8(output.stdout)
+                .map_err(|err| format!("Invalid UTF-8 from R RHOME output: {err}"))?
+                .trim()
+                .to_string()
+        }
+    };
+
+    let path = PathBuf::from(&home);
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "The `R_HOME` path '{}' does not exist.",
+                path.display()
+            ));
+        }
+        Err(err) => return Err(format!("Can't check if `R_HOME` path exists: {err}")),
+    }
+
+    unsafe {
+        std::env::set_var("R_HOME", &home);
+    }
+    r_command(&path, |command| {
+        command.arg("RHOME");
+    })
+    .map_err(|err| format!("Can't run R: {err}"))?;
+
+    Ok(path)
 }
 
 #[cfg(windows)]
@@ -454,7 +493,7 @@ fn configure_r_env_vars(r_home: &Path) {
     }
 
     // Fallback for non-standard R layouts.
-    let result = r_command(|command| {
+    let result = r_command(r_home, |command| {
         command
             .stdin(std::process::Stdio::null())
             .args([

@@ -16,35 +16,35 @@
   path = "tests/fixtures/zod-worker.rs"
 
 [dependencies]
-  ctor = "0.6.3"
+  ctor = "1.0.7"
   base64 = "0.22.1"
-  htmd = "0.5"
+  htmd = "0.5.4"
   libc = "0.2"
-  libloading = "0.8.9"
-  harp = { git = "https://github.com/t-kalinowski/ark", rev = "43441280f5bb84d9566e8f47f1c6b8614d056340" }
-  libr = { git = "https://github.com/t-kalinowski/ark", rev = "43441280f5bb84d9566e8f47f1c6b8614d056340" }
-  memchr = "2.8.0"
+  libloading = "0.9.0"
+  harp = { git = "https://github.com/t-kalinowski/ark", rev = "6635228e6773f594180de63eceb06f3e0431f1b5" }
+  libr = { git = "https://github.com/t-kalinowski/ark", rev = "6635228e6773f594180de63eceb06f3e0431f1b5" }
+  memchr = "2.8.2"
   regex-lite = "0.1"
   # Harp loads embedded R module assets during R startup. In debug builds,
   # rust-embed defaults to reading those assets from Cargo's source checkout,
   # which is outside Codex's `:minimal` read profile.
-  rust-embed = { version = "8.2.0", features = ["debug-embed"] }
-  rmcp = { version = "1.2.0", features = [
+  rust-embed = { version = "8.11.0", features = ["debug-embed"] }
+  rmcp = { version = "1.8.0", features = [
     "client",
     "transport-child-process",
     "transport-io",
   ] }
-  schemars = "1.2"
+  schemars = "1.2.1"
   serde = { version = "1", features = ["derive"] }
   serde_json = "1"
-  sysinfo = "0.38.4"
+  sysinfo = "0.39.5"
   tempfile = "3.27.0"
   tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-  toml_edit = "0.25.5"
+  toml_edit = "0.25.12"
   url = "2.5.8"
 [target.'cfg(target_os = "linux")'.dependencies]
   globset     = "0.4"
-  landlock    = "0.4.4"
+  landlock    = "0.4.5"
   seccompiler = "0.5.0"
 
 [target.'cfg(unix)'.dependencies]
@@ -75,8 +75,8 @@
   ] }
 
 [dev-dependencies]
-  blake3 = "1.8.3"
-  insta = { version = "1.46.3", features = ["yaml"] }
+  blake3 = "1.8.5"
+  insta = { version = "1.48.0", features = ["yaml"] }
   tokio = { version = "1", features = [
     "fs",
     "io-std",

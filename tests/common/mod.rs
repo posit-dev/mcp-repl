@@ -5,6 +5,7 @@ use std::error::Error;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(windows)]
@@ -664,7 +665,7 @@ pub struct McpTestSession {
 }
 
 impl McpTestSession {
-    pub fn server_info(&self) -> Option<&rmcp::model::ServerInfo> {
+    pub fn server_info(&self) -> Option<Arc<rmcp::model::ServerInfo>> {
         self.service.peer_info()
     }
 
@@ -1348,32 +1349,43 @@ fn strip_prompt_prefix(line: &str) -> Option<&str> {
     None
 }
 
+fn behavior_test_sandbox_args() -> Vec<String> {
+    vec!["--sandbox".to_string(), "danger-full-access".to_string()]
+}
+
+fn behavior_test_files_args() -> Vec<String> {
+    let mut args = behavior_test_sandbox_args();
+    args.extend(["--oversized-output".to_string(), "files".to_string()]);
+    args
+}
+
 pub async fn spawn_server() -> TestResult<McpTestSession> {
-    spawn_server_with_args_env(Vec::new(), Vec::new()).await
+    spawn_server_with_args_env(behavior_test_sandbox_args(), Vec::new()).await
 }
 
 pub async fn spawn_server_with_files() -> TestResult<McpTestSession> {
-    spawn_server_with_args(vec!["--oversized-output".to_string(), "files".to_string()]).await
+    spawn_server_with_args(behavior_test_files_args()).await
 }
 
 pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), Vec::new(), page_bytes).await
+    spawn_server_with_args_env_and_pager_page_chars(
+        behavior_test_sandbox_args(),
+        Vec::new(),
+        page_bytes,
+    )
+    .await
 }
 
 pub async fn spawn_server_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env(Vec::new(), env_vars).await
+    spawn_server_with_args_env(behavior_test_sandbox_args(), env_vars).await
 }
 
 pub async fn spawn_server_with_files_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env(
-        vec!["--oversized-output".to_string(), "files".to_string()],
-        env_vars,
-    )
-    .await
+    spawn_server_with_args_env(behavior_test_files_args(), env_vars).await
 }
 
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {

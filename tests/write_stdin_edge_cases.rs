@@ -4,7 +4,6 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
-use rmcp::service::ServiceError;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,20 +45,20 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
-fn assert_invalid_timeout(err: ServiceError) {
-    match err {
-        ServiceError::McpError(error) => {
-            assert!(
-                error.message.contains("timeout_ms")
-                    || error.message.contains("non-negative")
-                    || error.message.contains("expected u64")
-                    || error.message.contains("invalid value"),
-                "unexpected error message: {}",
-                error.message
-            );
-        }
-        other => panic!("expected MCP error, got: {other:?}"),
-    }
+fn assert_invalid_timeout(result: &rmcp::model::CallToolResult) {
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected timeout<0 to be rejected as a tool error, got: {result:?}"
+    );
+    let text = result_text(result);
+    assert!(
+        text.contains("timeout_ms")
+            || text.contains("non-negative")
+            || text.contains("expected u64")
+            || text.contains("invalid value"),
+        "unexpected error message: {text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -116,8 +115,8 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
     let err = session
         .write_stdin_raw_unterminated_with("1+1", Some(-1.0))
         .await
-        .expect_err("expected timeout<0 to be rejected");
-    assert_invalid_timeout(err);
+        .expect("expected timeout<0 rejection result");
+    assert_invalid_timeout(&err);
 
     session.cancel().await?;
     Ok(())

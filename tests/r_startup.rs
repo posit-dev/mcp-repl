@@ -42,6 +42,41 @@ fn is_busy_response(text: &str) -> bool {
         || text.contains("input discarded while worker busy")
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_r_reports_startup_failure_without_worker_panic() -> TestResult<()> {
+    let empty_path = tempfile::tempdir()?;
+    let session = common::spawn_server_with_args_env(
+        vec!["--sandbox".to_string(), "danger-full-access".to_string()],
+        vec![
+            ("PATH".to_string(), empty_path.path().display().to_string()),
+            ("R_HOME".to_string(), "".to_string()),
+        ],
+    )
+    .await?;
+
+    let result = session.write_stdin_raw_with("1 + 1", Some(10.0)).await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("failed to start R session"),
+        "expected controlled R startup failure, got: {text:?}"
+    );
+    assert!(
+        text.contains("failed to set up R_HOME"),
+        "expected R_HOME setup failure detail, got: {text:?}"
+    );
+    assert!(
+        !text.contains("thread 'main'")
+            && !text.contains("panicked at")
+            && !text.contains("worker exited with status")
+            && !text.contains("worker exited with signal"),
+        "missing R should not panic before reporting startup failure, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 fn r_home_env_vars(home_dir: &Path) -> Vec<(String, String)> {
     let home = home_dir.to_string_lossy().to_string();
     #[cfg_attr(not(windows), allow(unused_mut))]
