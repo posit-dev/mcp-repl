@@ -32,4 +32,4 @@ Python REPL affordances:
 - Plot images are returned as image content (for example matplotlib output).
 - Help flows are in-band (`help()`, `dir()`, `pydoc.help`).
 - Debugging works in the REPL, including interactive stops from `breakpoint()` and `pdb.set_trace()`.
-- Control prefixes in `input`: `\u0003` (interrupt) and `\u0004` (Ctrl-D / EOF restart, return output captured during the bounded restart shutdown window, then run remaining input under the original call timeout).
+- Control prefixes in `input`: `\u0003` (interrupt) and `\u0004` (Ctrl-D / EOF restart, return already-captured output, then run remaining input under the original call timeout).

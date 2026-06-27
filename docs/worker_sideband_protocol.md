@@ -92,8 +92,9 @@ capture does not preserve separate stdout/stderr identity. Sideband
 - `{ "type": "shutdown" }`
 - Requests worker shutdown during server teardown and replacement paths that
   need immediate worker-side lifecycle control. Explicit `Ctrl-D` restart does
-  not send this message first; it closes stdin, keeps output capture active
-  during a bounded graceful shutdown window, then escalates if needed.
+  not send this message first; it snapshots already-captured output, closes
+  stdin, waits through a bounded graceful shutdown window, then escalates if
+  needed.
 - Built-in workers currently exit the process after receiving it.
 
 The server emits no other server-to-worker protocol messages in v6.
