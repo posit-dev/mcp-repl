@@ -142,7 +142,7 @@ fn examples_include_ellmer_mcp_repl_starter() {
         "pager",
         "files",
         "glue",
-        "tool_repl",
+        "repl_tools",
         "tool_list_dir",
         "tool_read_file",
     ] {
@@ -155,7 +155,7 @@ fn examples_include_ellmer_mcp_repl_starter() {
     for required in [
         "library(ellmer)",
         r#"source(file.path("examples", "ellmer-mcp-repl-helpers.R"))"#,
-        r#"chat$set_tools(list(tool_repl(overflow = "pager")))"#,
+        r#"chat$set_tools(repl_tools(overflow = "pager"))"#,
         "Tell me something interesting about the penguins dataset.",
         "Use the REPL tool to do analysis.",
         "one or two sentences",
@@ -187,7 +187,7 @@ fn examples_include_ellmer_mcp_repl_starter() {
     for required in [
         "library(ellmer)",
         r#"source(file.path("examples", "ellmer-mcp-repl-helpers.R"))"#,
-        r#"tool_repl(overflow = "files")"#,
+        r#"repl_tools(overflow = "files")"#,
         "tool_read_file()",
         "tool_list_dir()",
         "Tell me something interesting about the penguins dataset.",
@@ -215,7 +215,7 @@ fn examples_include_ellmer_mcp_repl_starter() {
     );
 
     for required in [
-        "tool_repl <- function",
+        "repl_tools <- function",
         "tool_read_file <- function",
         "tool_list_dir <- function",
         r#"install.packages(c("ellmer", "mcptools", "jsonlite", "glue"))"#,
@@ -262,6 +262,14 @@ fn examples_include_ellmer_mcp_repl_starter() {
     assert!(
         !helper_script.contains("iconv("),
         "example helper should avoid production-grade encoding machinery"
+    );
+    assert!(
+        !helper_script.contains("tool_by_name"),
+        "example helper should not keep one-off lookup helpers"
+    );
+    assert!(
+        !helper_script.contains("tool_repl"),
+        "example helper should expose the MCP repl tools as a plural helper"
     );
 }
 

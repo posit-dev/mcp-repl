@@ -15,8 +15,8 @@ chat <- chat_openai(
   ),
   echo = "output"
 )
-chat$set_tools(list(
-  tool_repl(overflow = "files"),
+chat$set_tools(c(
+  repl_tools(overflow = "files"),
   tool_read_file(),
   tool_list_dir()
 ))

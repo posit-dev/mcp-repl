@@ -15,7 +15,7 @@ chat <- chat_openai(
   ),
   echo = "output"
 )
-chat$set_tools(list(tool_repl(overflow = "pager")))
+chat$set_tools(repl_tools(overflow = "pager"))
 
 answer <- chat$chat("Tell me something interesting about the penguins dataset.")
 cat(answer, "\n")

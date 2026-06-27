@@ -3,7 +3,7 @@
 # install.packages(c("ellmer", "mcptools", "jsonlite", "glue"))
 # Sys.setenv(OPENAI_API_KEY = "...")
 
-mcp_repl_tools <- function(overflow = c("files", "pager")) {
+repl_tools <- function(overflow = c("files", "pager")) {
   overflow <- match.arg(overflow)
 
   mcp_repl <- Sys.getenv("MCP_REPL_BINARY")
@@ -37,15 +37,6 @@ mcp_repl_tools <- function(overflow = c("files", "pager")) {
   tool_names <- vapply(tools, function(tool) tool@name, character(1))
   stopifnot("repl" %in% tool_names, "repl_reset" %in% tool_names)
   tools
-}
-
-tool_repl <- function(overflow = c("files", "pager")) {
-  tool_by_name(mcp_repl_tools(overflow), "repl")
-}
-
-tool_by_name <- function(tools, name) {
-  tool_names <- vapply(tools, function(tool) tool@name, character(1))
-  tools[[match(name, tool_names)]]
 }
 
 list_dir <- function(path) {
