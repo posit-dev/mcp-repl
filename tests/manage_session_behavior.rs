@@ -155,7 +155,7 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_restart_output_can_be_drained_after_restart_reply() -> TestResult<()> {
+async fn pager_restart_drops_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = common::spawn_server_with_pager_page_chars(120).await?;
 
@@ -183,8 +183,12 @@ Sys.sleep(1.0)
         return Ok(());
     }
     assert!(
-        restart_text.contains("--More--"),
-        "expected restart reply to advertise additional pager output, got: {restart_text:?}"
+        restart_text.contains("new session started"),
+        "expected restart notice, got: {restart_text:?}"
+    );
+    assert!(
+        !restart_text.contains("RESTART_LINE_"),
+        "did not expect restart reply to wait for pager output produced during shutdown, got: {restart_text:?}"
     );
 
     let next = session
@@ -194,18 +198,14 @@ Sys.sleep(1.0)
     session.cancel().await?;
 
     assert!(
-        next_text.contains("RESTART_LINE_"),
-        "expected follow-up poll to drain restart pager output, got: {next_text:?}"
-    );
-    assert!(
-        next_text.contains("--More--") || next_text.contains("(END"),
-        "expected follow-up poll to use pager state, got: {next_text:?}"
+        !next_text.contains("RESTART_LINE_"),
+        "did not expect shutdown-time pager output to leak into the next reply, got: {next_text:?}"
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_while_busy_returns_output_captured_during_graceful_shutdown() -> TestResult<()> {
+async fn restart_while_busy_drops_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
 
@@ -241,12 +241,12 @@ flush.console()
     session.cancel().await?;
 
     assert!(
-        restart_text.contains("DURING_RESTART"),
-        "expected restart to return output captured during graceful shutdown, got: {restart_text:?}"
+        !restart_text.contains("DURING_RESTART"),
+        "did not expect restart to wait for output produced during shutdown, got: {restart_text:?}"
     );
     assert!(
         !restart_text.contains("TOO_LATE"),
-        "did not expect restart to wait for later output after the graceful window, got: {restart_text:?}"
+        "did not expect restart to include later old-session output, got: {restart_text:?}"
     );
     assert!(
         restart_text.contains("new session started"),

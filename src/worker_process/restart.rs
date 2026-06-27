@@ -86,10 +86,12 @@ impl WorkerManager {
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         let had_process = self.process.is_some();
+        // Snapshot before shutdown so an explicit restart does not wait for
+        // more output from an abandoned timed-out request.
+        let output = had_process.then(|| self.drain_sealed_formatted_output());
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_for_restart(timeout);
         }
-        let output = had_process.then(|| self.drain_sealed_formatted_output());
         RestartShutdownSnapshot::Files { output }
     }
 
@@ -98,11 +100,11 @@ impl WorkerManager {
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         self.output_timeline.seal_utf8_tails();
+        // Snapshot before shutdown so late old-session output is discarded at reset.
+        let end_offset = self.output.end_offset();
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_for_restart(timeout);
         }
-        self.output_timeline.seal_utf8_tails();
-        let end_offset = self.output.end_offset();
         RestartShutdownSnapshot::Pager { end_offset }
     }
 
