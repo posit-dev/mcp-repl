@@ -682,8 +682,8 @@ fn extract_tool_call_rejects_unexpected_mcp_tools() {
                 },
                 {
                     "type": "tool_use",
-                    "id": "toolu_reset",
-                    "name": "mcp__r__repl_reset",
+                    "id": "toolu_unexpected",
+                    "name": "mcp__r__unexpected",
                     "input": {}
                 },
                 {
@@ -701,7 +701,7 @@ fn extract_tool_call_rejects_unexpected_mcp_tools() {
 
     assert!(
         err.to_string()
-            .contains("unexpected Claude tool call: mcp__r__repl_reset"),
+            .contains("unexpected Claude tool call: mcp__r__unexpected"),
         "unexpected error: {err}"
     );
 }

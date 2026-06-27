@@ -85,7 +85,7 @@ the desired long-term contract.
 
 ## Non-Goals
 
-- Changing the public `repl` or `repl_reset` API.
+- Changing the public `repl` API.
 - Reusing worker tempdirs for persistent session history.
 - Solving descendant process containment by itself; that is related but
   separate work.

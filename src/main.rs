@@ -549,9 +549,9 @@ fn top_level_help() -> String {
     let mut help = String::from(
         "\
 mcp-repl is an MCP server that exposes a long-lived R or Python REPL over
-stdio. After an MCP client starts the server, call the `repl` and `repl_reset`
-tools through that client to run code, keep session state, read help, and
-return plots or other output.
+stdio. After an MCP client starts the server, call the `repl` tool through
+that client to run code, keep session state, restart with Ctrl-D / EOF, read
+help, and return plots or other output.
 
 Agents should not launch this binary directly. It powers an MCP tool and
 should be started by the configured harness or MCP client. Run

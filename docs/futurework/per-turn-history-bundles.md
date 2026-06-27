@@ -51,7 +51,6 @@ Count as a new turn:
 - a non-empty top-level `repl(input=...)`
 - a bare top-level `interrupt`
 - a bare top-level `restart`
-- `repl_reset`
 
 Do not count as a new turn:
 
@@ -223,7 +222,7 @@ Public behavior to cover:
 - multiple timeout polls append to one turn and do not create extra turns
 - idle polls do not create turns
 - detached idle output remains non-blocking and is only persisted when attached to a later accepted turn
-- bare `\u0003`, bare `\u0004`, and `repl_reset` each create one new turn
+- bare `\u0003` and bare `\u0004` each create one new turn
 - `\u0003foo` creates one turn, not two
 - `\u0004foo` creates one turn, not two
 - mixed text/image replies always write `events.log` plus image history

@@ -31,7 +31,7 @@ Keep this file short. It is a table of contents, not the full manual.
 
 ## Glossary
 
-- Agent: The model-facing actor using an MCP client to call `repl` or `repl_reset`.
+- Agent: The model-facing actor using an MCP client to call `repl`.
 - MCP client: Codex, Claude, or another app that starts `mcp-repl` over MCP stdio and sends tool calls.
 - Server: The main `mcp-repl` Rust process in MCP server mode. It owns the MCP surface, worker lifecycle, sandbox application, timeout policy, stdout/stderr capture, sideband interpretation, and response finalization.
 - Worker: The child process spawned by the server to run the selected R or Python REPL. It runs inside the effective sandbox and owns the worker-side endpoint of sideband IPC.
@@ -39,7 +39,7 @@ Keep this file short. It is a table of contents, not the full manual.
 - Backend / interpreter: `backend` is the worker-side implementation that presents a selected REPL runtime to the server and MCP client. `interpreter` is the user-facing selector for that presented runtime, currently `r` or `python`; it does not describe the implementation language of the worker binary.
 - Runtime: The live R or Python execution environment inside the worker. This is where client-submitted code via `repl` is evaluated.
 - REPL session: The stateful runtime in the active worker. One session per worker process instance.
-- Tool call: One MCP client invocation of `repl` or `repl_reset`.
+- Tool call: One MCP client invocation of `repl`.
 - Request: The unit of input accepted by the server for the worker to execute. A request may outlive the initial tool call when it times out and later polls drain output.
 - Reply: The MCP tool result returned to the client. Reply finalization is server-owned and may combine worker-originated content with server-only status notices.
 - Poll: An empty `repl` input used to drain pending output, wait again on a previously timed-out request, return idle status, or advance pager mode.

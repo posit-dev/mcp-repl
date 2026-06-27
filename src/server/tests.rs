@@ -37,6 +37,44 @@ fn repl_tool_descriptions_include_language_specific_affordances() {
 }
 
 #[test]
+fn repl_tool_descriptions_explain_reset_and_self_healing() {
+    let descriptions = [
+        super::repl_tool_description_for_backend(
+            crate::backend::Backend::R,
+            crate::oversized_output::OversizedOutputMode::Files,
+        ),
+        super::repl_tool_description_for_backend(
+            crate::backend::Backend::R,
+            crate::oversized_output::OversizedOutputMode::Pager,
+        ),
+        super::repl_tool_description_for_backend(
+            crate::backend::Backend::Python,
+            crate::oversized_output::OversizedOutputMode::Files,
+        ),
+        super::repl_tool_description_for_backend(
+            crate::backend::Backend::Python,
+            crate::oversized_output::OversizedOutputMode::Pager,
+        ),
+    ];
+
+    for description in descriptions {
+        let lower = description.to_lowercase();
+        assert!(
+            lower.contains("ctrl-d") || lower.contains("eof"),
+            "description should explain restart through Ctrl-D/EOF: {description}"
+        );
+        assert!(
+            lower.contains("self-healing"),
+            "description should say the REPL is self-healing: {description}"
+        );
+        assert!(
+            lower.contains("no startup") || lower.contains("no initialization"),
+            "description should say startup or initialization is unnecessary: {description}"
+        );
+    }
+}
+
+#[test]
 fn repl_tool_descriptions_are_mode_specific() {
     let files = super::repl_tool_description_for_backend(
         crate::backend::Backend::R,
@@ -70,6 +108,27 @@ fn files_mode_tool_descriptions_mention_filesystem_access() {
             "files-mode description should mention filesystem access for bundles: {description}"
         );
     }
+}
+
+#[test]
+fn backend_servers_expose_only_repl_tool() {
+    macro_rules! assert_only_repl {
+        ($server_ty:ty) => {
+            let router = <$server_ty>::tool_router();
+            let tool_names = router
+                .list_all()
+                .into_iter()
+                .map(|tool| tool.name.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(tool_names, vec!["repl"]);
+            assert!(router.get("repl_reset").is_none());
+        };
+    }
+
+    assert_only_repl!(super::RFilesToolServer);
+    assert_only_repl!(super::RPagerToolServer);
+    assert_only_repl!(super::PythonFilesToolServer);
+    assert_only_repl!(super::PythonPagerToolServer);
 }
 
 #[test]

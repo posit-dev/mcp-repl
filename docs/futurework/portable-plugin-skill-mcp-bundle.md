@@ -156,7 +156,7 @@ runtime-specific help are useful.
 The first useful skill should also capture the operational guidance that is
 hard to infer from the MCP tool schema alone:
 
-- Use `repl_reset` or `\u0004` when the runtime state is stale.
+- Use `\u0004` through `repl` when the runtime state is stale.
 - Treat plot/image output as first-class but client-rendered: `mcp-repl` returns
   images, while the MCP client decides how visibly to display them.
 - If package installation or web access fails because the REPL sandbox has no

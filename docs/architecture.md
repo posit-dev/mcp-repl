@@ -13,7 +13,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 ### Server and request lifecycle
 
 - `src/server.rs` owns the MCP surface, request handling, timeout model, and worker lifecycle.
-- `src/server/timeouts.rs` and `src/server/response.rs` keep the public `repl`/`repl_reset` behavior stable.
+- `src/server/timeouts.rs` and `src/server/response.rs` keep the public `repl` behavior stable.
 - During steady-state worker requests, the server treats the worker as an opaque
   queued runtime endpoint: `input_batch` carries accepted input over IPC,
   `output_text` and `output_image` sideband frames carry worker-owned output,

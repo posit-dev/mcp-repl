@@ -5,6 +5,7 @@ Arguments:
 - `timeout_ms` (number, optional): Max milliseconds to wait (bounds this call only; doesn't cancel backend work).
 
 Behavior:
+- No startup or initialization call is needed; the REPL is self-healing and starts ready for R code.
 - Session state (variables, loaded packages) persists across calls. Errors don't crash the session.
 - Uses the user's R installation and library paths.
 
@@ -27,4 +28,4 @@ Behavior:
 - Documentation entry points work in-band. Prefer the normal R interfaces such as `?topic`, `help()`, `vignette()`, and `RShowDoc("R-exts")`; the REPL renders their text/HTML output directly instead of launching an external viewer.
 - `?topic`, `help()`, `vignette()`, and `RShowDoc()` render directly into the tool response instead of opening a separate web-browser flow.
 - Debugging works in the REPL, including interactive stops from `browser()`, `debug()`, and `trace()`.
-- Control: `\u0003` in input interrupts; `\u0004` resets the session. If input remains after `\u0004`, the same response includes restart output plus output produced by the remaining input, bounded by the original call timeout.
+- Control: `\u0003` in input interrupts; `\u0004` (Ctrl-D / EOF) restarts the session. If input remains after `\u0004`, the same response includes restart output plus output produced by the remaining input, bounded by the original call timeout.

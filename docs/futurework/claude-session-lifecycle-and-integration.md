@@ -68,7 +68,6 @@ syntax when touched.
 
 ## Current Public Reset Surface
 
-- `repl_reset` explicitly restarts the runtime.
 - `\u0003` interrupts the current runtime request.
 - `\u0004` resets the runtime and runs any remaining input in the fresh
   session.

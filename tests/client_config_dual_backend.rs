@@ -297,14 +297,7 @@ command = "/usr/local/bin/notes"
                 .to_string()
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        enabled_tools,
-        vec![
-            "other".to_string(),
-            "repl".to_string(),
-            "repl_reset".to_string()
-        ]
-    );
+    assert_eq!(enabled_tools, vec!["other".to_string(), "repl".to_string()]);
     let disabled_tools = doc["mcp_servers"]["r"]["disabled_tools"]
         .as_array()
         .expect("expected disabled_tools array")
