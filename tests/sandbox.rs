@@ -1256,6 +1256,56 @@ for (i in seq_along(targets)) {{
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_bwrap_preserves_empty_missing_writable_root_after_exit() -> TestResult<()> {
+    if !linux_bwrap_available() {
+        eprintln!("bwrap unavailable; skipping");
+        return Ok(());
+    }
+    let repo_root = std::env::current_dir()?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let writable_parent = repo_root.join(format!("mcp-repl-bwrap-missing-root-{nanos}"));
+    let writable_root = writable_parent.join("generated").join("output");
+
+    let session = spawn_server_with_sandbox_state_and_env(
+        sandbox_state_workspace_write_with_roots(false, vec![writable_root.clone()]),
+        vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
+    )
+    .await?;
+    let target = writable_root.to_string_lossy().to_string();
+    let code = format!(
+        r#"
+target <- {target:?}
+dir.create(target, recursive = TRUE, showWarnings = FALSE)
+cat("ROOT_EXISTS=", dir.exists(target), "\n", sep = "")
+"#
+    );
+    let result = session.write_stdin_raw_with(&code, Some(10.0)).await?;
+    let text = collect_text(&result);
+    if bwrap_worker_unavailable(&text) {
+        eprintln!("bwrap unavailable in this environment; skipping");
+        session.cancel().await?;
+        let _ = std::fs::remove_dir_all(&writable_parent);
+        return Ok(());
+    }
+    assert!(
+        text.contains("ROOT_EXISTS=TRUE"),
+        "expected worker to observe missing writable root, got: {text}"
+    );
+
+    session.cancel().await?;
+    assert!(
+        writable_root.is_dir(),
+        "empty declared writable root should survive bwrap teardown"
+    );
+    let _ = std::fs::remove_dir_all(&writable_parent);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_blocks_network_access_bwrap() -> TestResult<()> {
     if !linux_bwrap_available() {
         eprintln!("bwrap unavailable; skipping");

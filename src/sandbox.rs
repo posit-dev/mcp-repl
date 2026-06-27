@@ -3854,10 +3854,13 @@ fn prepare_linux_missing_writable_roots(
 
         let mut created_dirs = root
             .ancestors()
+            .skip(1)
             .take_while(|path| *path != first_missing)
             .map(Path::to_path_buf)
             .collect::<Vec<_>>();
-        created_dirs.push(first_missing);
+        if first_missing != root {
+            created_dirs.push(first_missing);
+        }
         created_dirs.reverse();
         command.synthetic_mount_targets.extend(
             created_dirs
@@ -6405,6 +6408,57 @@ mod tests {
         assert!(
             !denied_path.exists(),
             "rejected missing deny target should not be created on the host"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_writable_root_is_not_cleanup_owned() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-missing-writable-root-")
+            .tempdir()
+            .expect("tempdir");
+        let writable_parent = root.path().join("generated");
+        let writable_root = writable_parent.join("output");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: writable_root.clone(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
+                .expect("missing writable root should build bwrap args");
+
+        assert!(
+            writable_root.is_dir(),
+            "missing declared writable root should be materialized"
+        );
+        assert!(
+            !command
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(
+                    writable_root.clone()
+                )),
+            "declared writable root should not be removed by synthetic cleanup: {:?}",
+            command.synthetic_mount_targets
+        );
+        assert!(
+            command
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(writable_parent)),
+            "parent directories synthesized only for bwrap mounting may be cleanup-owned: {:?}",
+            command.synthetic_mount_targets
         );
     }
 
