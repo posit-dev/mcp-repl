@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset};
-#[cfg(any(debug_assertions, test))]
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -31,7 +30,6 @@ enum RestartShutdown {
 }
 
 impl WorkerManager {
-    #[cfg(debug_assertions)]
     pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         match self.oversized_output {
             OversizedOutputMode::Files => {
