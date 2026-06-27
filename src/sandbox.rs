@@ -1271,7 +1271,7 @@ pub fn sandbox_state_update_from_codex_meta(
         sandbox_policy,
         sandbox_cwd: Some(sandbox_cwd),
         #[cfg(target_os = "linux")]
-        use_linux_sandbox_bwrap: use_legacy_landlock.then_some(false),
+        use_linux_sandbox_bwrap: Some(!use_legacy_landlock),
         #[cfg(not(target_os = "linux"))]
         use_linux_sandbox_bwrap: None,
         #[cfg(target_os = "linux")]
@@ -3215,12 +3215,31 @@ fn linux_find_bwrap_program() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<String>, String> {
+struct LinuxInnerSeccompCommand {
+    command: Vec<String>,
+    helper_dir: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_build_inner_seccomp_command(
+    args: &LinuxSandboxArgs,
+) -> Result<LinuxInnerSeccompCommand, String> {
     let current_exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let helper_dir = Builder::new()
+        .prefix("mcp-repl-linux-helper-")
+        .tempdir_in(&args.session_temp_dir)
+        .map_err(|err| err.to_string())?;
+    let helper_exe = helper_dir.path().join("codex-linux-sandbox");
+    std::os::unix::fs::symlink(&current_exe, &helper_exe).map_err(|err| {
+        format!(
+            "failed to create Linux sandbox helper link at {}: {err}",
+            helper_exe.to_string_lossy()
+        )
+    })?;
     let policy = sanitize_linux_sandbox_policy(&args.sandbox_policy);
     let policy_json = serde_json::to_string(&policy).map_err(|err| err.to_string())?;
     let mut inner = vec![
-        current_exe.to_string_lossy().to_string(),
+        helper_exe.to_string_lossy().to_string(),
         "--sandbox-policy-cwd".to_string(),
         args.sandbox_policy_cwd.to_string_lossy().to_string(),
         "--session-temp-dir".to_string(),
@@ -3235,7 +3254,10 @@ fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<Stri
             .iter()
             .map(|arg| arg.to_string_lossy().to_string()),
     );
-    Ok(inner)
+    Ok(LinuxInnerSeccompCommand {
+        command: inner,
+        helper_dir,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3271,7 +3293,7 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
             network_mode,
         );
     let bwrap_command = create_linux_bwrap_command_args(
-        inner,
+        inner.command,
         &file_system_policy,
         &args.sandbox_policy_cwd,
         &args.session_temp_dir,
@@ -3282,9 +3304,10 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
         args,
         preserved_files,
         empty_file_source_index: _,
-        preserved_tempdirs,
+        mut preserved_tempdirs,
         synthetic_mount_targets,
     } = bwrap_command;
+    preserved_tempdirs.push(inner.helper_dir);
     make_linux_files_inheritable(&preserved_files)?;
     let synthetic_mount_targets_for_cleanup = synthetic_mount_targets.clone();
     let mut full_command = Vec::with_capacity(1 + args.len());
@@ -3628,7 +3651,13 @@ fn linux_bwrap_filesystem_args(
         }
         read_only_subpaths.sort_by_key(|path| linux_path_depth(path));
         for subpath in read_only_subpaths {
-            append_linux_read_only_subpath_args(&mut command, &subpath, &allowed_write_paths)?;
+            let allow_missing_protected_metadata_synthesis = true;
+            append_linux_read_only_subpath_args(
+                &mut command,
+                &subpath,
+                &allowed_write_paths,
+                allow_missing_protected_metadata_synthesis,
+            )?;
         }
 
         let mut nested_unreadable_roots = unreadable_roots
@@ -3813,12 +3842,16 @@ fn prepare_linux_missing_writable_roots(
             )
         })?;
 
-        let mut created_dirs = root
-            .ancestors()
-            .take_while(|path| *path != first_missing)
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        created_dirs.push(first_missing);
+        let mut created_dirs = Vec::new();
+        if first_missing != root {
+            created_dirs = root
+                .ancestors()
+                .skip(1)
+                .take_while(|path| *path != first_missing)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>();
+            created_dirs.push(first_missing);
+        }
         created_dirs.reverse();
         command.synthetic_mount_targets.extend(
             created_dirs
@@ -3834,6 +3867,7 @@ fn append_linux_read_only_subpath_args(
     command: &mut LinuxBwrapCommand,
     subpath: &Path,
     allowed_write_paths: &[PathBuf],
+    allow_missing_protected_metadata_synthesis: bool,
 ) -> Result<(), String> {
     if let Some(symlink) = first_writable_symlink_component_in_path(subpath, allowed_write_paths) {
         return Err(format!(
@@ -3850,6 +3884,7 @@ fn append_linux_read_only_subpath_args(
                 command,
                 &first_missing,
                 allowed_write_paths,
+                allow_missing_protected_metadata_synthesis,
             )?;
         }
         return Ok(());
@@ -3895,17 +3930,24 @@ fn append_linux_missing_read_only_subpath_args(
     command: &mut LinuxBwrapCommand,
     path: &Path,
     allowed_write_paths: &[PathBuf],
+    allow_missing_protected_metadata_synthesis: bool,
 ) -> Result<(), String> {
-    if linux_protected_metadata_name(path).is_some() {
+    if linux_protected_metadata_name(path).is_some() && allow_missing_protected_metadata_synthesis {
         append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
         command
             .synthetic_mount_targets
             .push(LinuxSyntheticMountTarget::EmptyDirectory(
                 path.to_path_buf(),
             ));
-    } else {
-        append_linux_empty_file_bind_data_args(command, path, Some("000"), true)?;
+        return Ok(());
     }
+    if is_within_allowed_write_paths(path, allowed_write_paths) {
+        return Err(format!(
+            "cannot enforce sandbox read-only path {} because it does not exist under a writable root with the Linux bubblewrap backend",
+            path.display()
+        ));
+    }
+    append_linux_empty_file_bind_data_args(command, path, Some("000"), true)?;
     Ok(())
 }
 
@@ -4316,7 +4358,10 @@ fn append_linux_unreadable_root_args(
         if let Some(first_missing) = find_first_non_existent_component(unreadable_root)
             && is_within_allowed_write_paths(&first_missing, allowed_write_paths)
         {
-            append_linux_empty_file_bind_data_args(command, &first_missing, Some("000"), true)?;
+            return Err(format!(
+                "cannot enforce sandbox deny-read path {} because it does not exist under a writable root with the Linux bubblewrap backend",
+                first_missing.display()
+            ));
         }
         return Ok(());
     }
@@ -4710,11 +4755,7 @@ fn is_proc_mount_failure(stderr: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_bwrap_proc_probe_quiet_retry_failure(stderr: &str) -> bool {
-    stderr.contains("Can't bind mount /oldroot/")
-        && stderr.contains(" on /newroot/")
-        && (stderr.contains("Unable to mount source on destination: No such file or directory")
-            || stderr
-                .contains("Unable to remount destination with correct flags: Invalid argument"))
+    stderr.contains("bwrap: Can't bind mount /oldroot/") && stderr.contains(" on /newroot/")
 }
 
 #[cfg(target_os = "linux")]
@@ -5904,12 +5945,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bwrap_proc_probe_quiet_retry_detects_old_bind_target_stderr() {
+    fn bwrap_proc_probe_quiet_retry_detects_oldroot_bind_stderr() {
         assert!(is_bwrap_proc_probe_quiet_retry_failure(
-            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-bm2Cuc on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to mount source on destination: No such file or directory"
-        ));
-        assert!(is_bwrap_proc_probe_quiet_retry_failure(
-            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-FlEdOV on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to remount destination with correct flags: Invalid argument"
+            "bwrap: Can't bind mount /oldroot/bind-source on /newroot/workspace/.agents: future bwrap detail"
         ));
         assert!(!is_bwrap_proc_probe_quiet_retry_failure(
             "bwrap: Unable to remount destination with correct flags: Invalid argument"
@@ -6011,6 +6049,34 @@ mod tests {
         assert!(
             err.contains(&writable_root.display().to_string()),
             "error should identify the widened writable root: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_landlock_workspace_write_metadata_carveouts_fail_closed() {
+        let writable_root = PathBuf::from("/tmp/mcp-repl-landlock-legacy-workspace");
+        let session_temp_dir = PathBuf::from("/tmp/mcp-repl-landlock-session");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+            &session_temp_dir,
+        );
+
+        let err = linux_landlock_writable_root_paths(
+            &file_system_policy,
+            &writable_root,
+            &session_temp_dir,
+        )
+        .expect_err("legacy workspace-write should reject protected metadata carveouts");
+
+        assert!(
+            err.contains("read-only carveouts inside writable root"),
+            "unexpected error: {err}"
         );
     }
 
@@ -6202,7 +6268,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_bwrap_missing_protected_metadata_uses_namespace_dir_and_read_only_empty_bind() {
+    fn linux_bwrap_missing_protected_metadata_under_writable_root_is_synthesized() {
         let root = Builder::new()
             .prefix("mcp-repl-bwrap-protected-metadata-")
             .tempdir()
@@ -6234,59 +6300,139 @@ mod tests {
             linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
                 .expect("missing protected metadata should build bwrap args");
         let codex_text = linux_path_to_string(&codex_path);
-        let dir_index = command
-            .args
-            .windows(2)
-            .position(|args| args[0] == "--dir" && args[1] == codex_text)
-            .expect("missing protected metadata should create its mount target inside bwrap");
-        let bind_index = command
-            .args
-            .windows(3)
-            .position(|args| args[0] == "--ro-bind" && args[2] == codex_text)
-            .expect("missing protected metadata should use a read-only empty directory bind");
-        assert!(
-            dir_index < bind_index,
-            "protected metadata mount target must exist before the bind: {:?}",
-            command.args
-        );
-        let bind_args = command
-            .args
-            .windows(3)
-            .find(|args| args[0] == "--ro-bind" && args[2] == codex_text)
-            .expect("missing protected metadata should use a read-only empty directory bind");
-        let source_path = PathBuf::from(&bind_args[1]);
 
         assert!(
-            !codex_path.exists(),
-            "missing protected metadata target should be created inside bwrap, not on the host"
+            command
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--dir" && args[1] == codex_text),
+            "missing protected metadata should create a bwrap mount target: {:?}",
+            command.args
         );
         assert!(
             command
-                .preserved_tempdirs
-                .iter()
-                .any(|tempdir| tempdir.path() == source_path),
-            "directory bind should reference a preserved empty source directory"
+                .args
+                .windows(3)
+                .any(|args| args[0] == "--ro-bind" && args[2] == codex_text),
+            "missing protected metadata should bind over the synthetic target: {:?}",
+            command.args
+        );
+        assert!(
+            command
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(
+                    codex_path.clone()
+                )),
+            "missing protected metadata should require host cleanup: {:?}",
+            command.synthetic_mount_targets
+        );
+        assert!(
+            !codex_path.exists(),
+            "missing protected metadata target should not be created on the host"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_deny_path_under_writable_root_fails_closed() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-missing-deny-")
+            .tempdir()
+            .expect("tempdir");
+        for protected_name in PROTECTED_METADATA_SUBPATHS {
+            std::fs::create_dir(root.path().join(protected_name)).expect("metadata dir");
+        }
+        let denied_path = root.path().join("secret.txt");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: denied_path.clone(),
+                },
+                access: FileSystemAccessMode::Deny,
+            },
+        ]);
+
+        let err = match linux_bwrap_filesystem_args(
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+        ) {
+            Ok(_) => panic!("missing deny path under writable root should fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("cannot enforce sandbox deny-read path")
+                && err.contains("does not exist under a writable root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !denied_path.exists(),
+            "rejected missing deny target should not be created on the host"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_writable_root_is_not_cleanup_owned() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-missing-writable-root-")
+            .tempdir()
+            .expect("tempdir");
+        let writable_parent = root.path().join("generated");
+        let writable_root = writable_parent.join("output");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: writable_root.clone(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
+                .expect("missing writable root should build bwrap args");
+
+        assert!(
+            writable_root.is_dir(),
+            "missing declared writable root should be materialized"
         );
         assert!(
             !command
-                .args
-                .windows(2)
-                .any(|args| args[0] == "--remount-ro" && args[1] == codex_text),
-            "missing protected metadata should not require tmpfs remount-ro: {:?}",
-            command.args
-        );
-        let protected_target = LinuxSyntheticMountTarget::EmptyDirectory(codex_path.clone());
-        assert!(
-            command.synthetic_mount_targets.contains(&protected_target),
-            "missing protected metadata target should be cleaned up after bwrap exits: {:?}",
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(
+                    writable_root.clone()
+                )),
+            "declared writable root should not be removed by synthetic cleanup: {:?}",
             command.synthetic_mount_targets
         );
         assert!(
             command
-                .preserved_tempdirs
-                .iter()
-                .all(|tempdir| !tempdir.path().starts_with(root.path())),
-            "empty bind sources must stay outside sandbox writable roots"
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(writable_parent)),
+            "parent directories synthesized only for bwrap mounting may be cleanup-owned: {:?}",
+            command.synthetic_mount_targets
         );
     }
 
@@ -6466,6 +6612,48 @@ mod tests {
             !command.args.iter().any(|arg| arg == "--argv0"),
             "bwrap args should work with Ubuntu 22.04 bubblewrap 0.6.1: {:?}",
             command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_inner_bwrap_command_invokes_helper_argv0_path() {
+        let root = Builder::new()
+            .prefix("mcp-repl-inner-helper-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+        let args = LinuxSandboxArgs {
+            sandbox_policy_cwd: root.path().to_path_buf(),
+            session_temp_dir: session_temp_dir.clone(),
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            command: vec![std::ffi::OsString::from("/bin/true")],
+            use_bwrap_sandbox: true,
+            apply_seccomp_then_exec: false,
+            no_proc: false,
+        };
+
+        let inner = linux_build_inner_seccomp_command(&args).expect("inner seccomp command");
+
+        assert_eq!(
+            Path::new(&inner.command[0]).file_name(),
+            Some(std::ffi::OsStr::new("codex-linux-sandbox")),
+            "inner bwrap command must dispatch through the helper argv0 path"
+        );
+        assert!(
+            Path::new(&inner.command[0]).starts_with(&session_temp_dir),
+            "helper argv0 path should live in the bwrap-visible session temp dir: {:?}",
+            inner.command
+        );
+        assert!(
+            Path::new(&inner.command[0]).is_symlink(),
+            "helper argv0 path should be a link to the current executable"
         );
     }
 
@@ -6800,7 +6988,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(update.use_legacy_landlock, Some(false));
         #[cfg(target_os = "linux")]
-        assert!(update.use_linux_sandbox_bwrap.is_none());
+        assert_eq!(update.use_linux_sandbox_bwrap, Some(true));
         #[cfg(not(target_os = "linux"))]
         assert!(update.use_linux_sandbox_bwrap.is_none());
     }
@@ -6829,11 +7017,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn codex_sandbox_state_meta_non_legacy_preserves_disabled_linux_bwrap() {
+    fn codex_sandbox_state_meta_non_legacy_reenables_linux_bwrap_after_legacy() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
         let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
             .expect("absolute sandbox cwd should convert to file URI")
             .to_string();
+        let legacy_update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": true,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("legacy Codex sandbox metadata");
         let non_legacy_update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
                 "type": "disabled"
@@ -6844,15 +7041,21 @@ mod tests {
         }))
         .expect("non-legacy Codex sandbox metadata");
         let mut state = SandboxState {
-            use_linux_sandbox_bwrap: false,
+            use_linux_sandbox_bwrap: true,
             ..SandboxState::default()
         };
+
+        state.apply_update(legacy_update);
+        assert!(
+            !state.use_linux_sandbox_bwrap,
+            "legacy Codex metadata should disable Linux bwrap"
+        );
 
         state.apply_update(non_legacy_update);
 
         assert!(
-            !state.use_linux_sandbox_bwrap,
-            "non-legacy Codex metadata should not override an explicitly disabled Linux bwrap default"
+            state.use_linux_sandbox_bwrap,
+            "non-legacy Codex metadata should re-enable Linux bwrap after legacy metadata clears"
         );
     }
 
@@ -7052,7 +7255,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn codex_permission_profile_meta_accepts_minimal_read_policy() {
+    fn codex_permission_profile_minimal_read_includes_seatbelt_platform_defaults() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-minimal-read");
         let update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
@@ -7087,6 +7290,26 @@ mod tests {
         assert!(
             !update.sandbox_policy.has_full_disk_read_access(),
             "minimal read policy must not be flattened to full read access"
+        );
+
+        let state = SandboxState {
+            sandbox_policy: update.sandbox_policy,
+            sandbox_cwd: update.sandbox_cwd.expect("sandbox cwd"),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("seatbelt command should prepare");
+        let policy = prepared
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .expect("seatbelt policy argument");
+
+        assert!(
+            policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
+            "expected minimal profile seatbelt policy to include platform defaults: {policy}"
         );
     }
 
@@ -7181,7 +7404,7 @@ mod tests {
 
         assert!(
             policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
-            "expected restricted profile seatbelt policy to include platform defaults: {policy}"
+            "expected project-root read profile to include platform defaults: {policy}"
         );
     }
 

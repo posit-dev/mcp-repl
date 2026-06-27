@@ -630,7 +630,6 @@ mod tests {
                 false,
                 crate::worker_protocol::ContentOrigin::Worker,
             );
-            thread::sleep(Duration::from_millis(10));
             timeline.append_text(
                 b" after\n",
                 false,

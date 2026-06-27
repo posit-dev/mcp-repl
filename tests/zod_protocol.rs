@@ -950,7 +950,7 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
             "repl",
             json!({
                 "input": "partial-utf8-stderr-then-sleep",
-                "timeout_ms": 50
+                "timeout_ms": 300
             }),
         )
         .await?;

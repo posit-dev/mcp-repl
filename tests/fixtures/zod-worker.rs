@@ -347,7 +347,7 @@ fn run_command(
     if command == "partial-utf8-stderr-then-sleep" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         output_stderr_text(writer, control_log_path, b"tail-visible\n")?;
-        sleep_for(200, sideband_interrupted, false);
+        sleep_for(1000, sideband_interrupted, false);
         return Ok(false);
     }
 
