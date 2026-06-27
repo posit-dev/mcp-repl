@@ -388,16 +388,6 @@ impl FileSystemSandboxPolicy {
     #[cfg(target_os = "macos")]
     fn include_platform_defaults(&self) -> bool {
         !self.has_full_disk_read_access()
-            && matches!(self.kind, FileSystemSandboxKind::Restricted)
-            && self.entries.iter().any(|entry| {
-                entry.access.can_read()
-                    && matches!(
-                        &entry.path,
-                        FileSystemPath::Special {
-                            value: FileSystemSpecialPath::Minimal,
-                        }
-                    )
-            })
     }
 
     #[cfg(target_os = "linux")]
@@ -7380,7 +7370,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn codex_permission_profile_project_read_excludes_seatbelt_platform_defaults() {
+    fn codex_permission_profile_project_read_includes_seatbelt_platform_defaults() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-project-read");
         let update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
@@ -7427,8 +7417,8 @@ mod tests {
             .expect("seatbelt policy argument");
 
         assert!(
-            !policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
-            "project-root read profile should not include platform defaults: {policy}"
+            policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
+            "expected project-root read profile to include platform defaults: {policy}"
         );
     }
 
