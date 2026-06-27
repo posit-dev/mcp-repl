@@ -25,7 +25,7 @@ Sys.setenv(OPENAI_API_KEY = "...")
 ## Pager Overflow
 
 [`examples/ellmer-mcp-repl.R`](ellmer-mcp-repl.R) starts `mcp-repl` with
-`--oversized-output pager` and registers the MCP `repl` tools on an `ellmer`
+`--oversized-output pager` and registers `tool_repl(overflow = "pager")` on an `ellmer`
 chat.
 
 Run it with:
@@ -38,10 +38,11 @@ Rscript examples/ellmer-mcp-repl.R
 
 [`examples/ellmer-mcp-repl-files.R`](ellmer-mcp-repl-files.R) uses
 `--oversized-output files`. Large replies may return an output bundle path. The
-example adds two ordinary `ellmer` tools:
+example registers `tool_repl(overflow = "files")` plus two ordinary `ellmer`
+tools:
 
-- `list_directory(path)`: list files in the bundle.
-- `read_text_file(path, start_line, max_lines)`: read a line-numbered window
+- `tool_list_dir()`: provides `list_dir(path)` to list files in the bundle.
+- `tool_read_file()`: provides `read_file(path, start_line, max_lines)` to read a line-numbered window
   from `transcript.txt` or `events.log`.
 
 Run it with:

@@ -121,11 +121,11 @@ fn examples_include_ellmer_mcp_repl_starter() {
     let files_script = read(&files_script_path);
 
     assert!(
-        pager_script.lines().count() <= 45,
+        pager_script.lines().count() <= 25,
         "pager starter should stay short and didactic"
     );
     assert!(
-        files_script.lines().count() <= 55,
+        files_script.lines().count() <= 30,
         "files starter should stay short and didactic"
     );
     assert!(
@@ -142,9 +142,9 @@ fn examples_include_ellmer_mcp_repl_starter() {
         "pager",
         "files",
         "glue",
-        "list_directory",
-        "read_text_file",
-        "readLines",
+        "tool_repl",
+        "tool_list_dir",
+        "tool_read_file",
     ] {
         assert!(
             readme.contains(required),
@@ -155,9 +155,10 @@ fn examples_include_ellmer_mcp_repl_starter() {
     for required in [
         "library(ellmer)",
         r#"source(file.path("examples", "ellmer-mcp-repl-helpers.R"))"#,
-        r#"mcp_repl_tools("pager")"#,
-        "chat$set_tools(tools)",
-        "readLines",
+        r#"chat$set_tools(list(tool_repl(overflow = "pager")))"#,
+        "Tell me something interesting about the penguins dataset.",
+        "Use the REPL tool to do analysis.",
+        "one or two sentences",
         "chat$chat(",
     ] {
         assert!(
@@ -174,16 +175,24 @@ fn examples_include_ellmer_mcp_repl_starter() {
         !pager_script.contains(r#""--oversized-output", "files""#),
         "pager example should not require a separate file-reading tool for output bundles"
     );
+    assert!(
+        !pager_script.contains("mcp-repl ready"),
+        "pager example should not include a separate readiness probe"
+    );
+    assert!(
+        !pager_script.contains("average mpg"),
+        "pager example should use the penguins prompt"
+    );
 
     for required in [
         "library(ellmer)",
         r#"source(file.path("examples", "ellmer-mcp-repl-helpers.R"))"#,
-        r#"mcp_repl_tools("files")"#,
-        "bundle_tools()",
-        "chat$set_tools(c(tools, bundle_tools()))",
-        "transcript.txt",
-        "events.log",
-        "start_line",
+        r#"tool_repl(overflow = "files")"#,
+        "tool_read_file()",
+        "tool_list_dir()",
+        "Tell me something interesting about the penguins dataset.",
+        "Use the REPL tool to do analysis.",
+        "one or two sentences",
         "chat$chat(",
     ] {
         assert!(
@@ -196,10 +205,19 @@ fn examples_include_ellmer_mcp_repl_starter() {
         !files_script.contains("--vanilla"),
         "examples must not tell users to run R with --vanilla"
     );
+    assert!(
+        !files_script.contains("mcp-repl ready"),
+        "files example should not include a separate readiness probe"
+    );
+    assert!(
+        !files_script.contains("print 2000 numbered lines"),
+        "files example should use the penguins prompt"
+    );
 
     for required in [
-        "mcp_repl_tools <- function",
-        "bundle_tools <- function",
+        "tool_repl <- function",
+        "tool_read_file <- function",
+        "tool_list_dir <- function",
         r#"install.packages(c("ellmer", "mcptools", "jsonlite", "glue"))"#,
         r#"Sys.which("mcp-repl")"#,
         "MCP_REPL_BINARY",
@@ -210,11 +228,11 @@ fn examples_include_ellmer_mcp_repl_starter() {
         r#""--sandbox""#,
         r#""workspace-write""#,
         r#""--oversized-output""#,
-        "oversized_output",
+        "overflow",
         "mcp_tools() currently takes a config file path",
         "mcptools::mcp_tools(config = config_file)",
-        "read_text_file",
-        "list_directory",
+        "read_file",
+        "list_dir",
         "type       size path",
         "start_line = 1L",
         "max_lines = 100L",

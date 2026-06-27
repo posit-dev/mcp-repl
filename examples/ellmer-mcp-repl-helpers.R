@@ -3,8 +3,8 @@
 # install.packages(c("ellmer", "mcptools", "jsonlite", "glue"))
 # Sys.setenv(OPENAI_API_KEY = "...")
 
-mcp_repl_tools <- function(oversized_output = c("files", "pager")) {
-  oversized_output <- match.arg(oversized_output)
+mcp_repl_tools <- function(overflow = c("files", "pager")) {
+  overflow <- match.arg(overflow)
 
   mcp_repl <- Sys.getenv("MCP_REPL_BINARY")
   if (!nzchar(mcp_repl)) {
@@ -23,7 +23,7 @@ mcp_repl_tools <- function(oversized_output = c("files", "pager")) {
           "args" = list(
             "--interpreter", "r",
             "--sandbox", "workspace-write",
-            "--oversized-output", oversized_output
+            "--oversized-output", overflow
           )
         )
       )
@@ -39,12 +39,16 @@ mcp_repl_tools <- function(oversized_output = c("files", "pager")) {
   tools
 }
 
+tool_repl <- function(overflow = c("files", "pager")) {
+  tool_by_name(mcp_repl_tools(overflow), "repl")
+}
+
 tool_by_name <- function(tools, name) {
   tool_names <- vapply(tools, function(tool) tool@name, character(1))
   tools[[match(name, tool_names)]]
 }
 
-list_directory <- function(path) {
+list_dir <- function(path) {
   stopifnot(is.character(path), length(path) == 1L, dir.exists(path))
 
   entries <- list.files(path, all.files = TRUE, no.. = TRUE, full.names = TRUE)
@@ -59,7 +63,7 @@ list_directory <- function(path) {
   paste(c("type       size path", rows), collapse = "\n")
 }
 
-read_text_file <- function(path, start_line = 1L, max_lines = 100L) {
+read_file <- function(path, start_line = 1L, max_lines = 100L) {
   stopifnot(is.character(path), length(path) == 1L, file.exists(path))
   stopifnot(is.numeric(start_line), start_line >= 1)
   stopifnot(is.numeric(max_lines), max_lines > 0)
@@ -79,33 +83,34 @@ read_text_file <- function(path, start_line = 1L, max_lines = 100L) {
   as.character(text)
 }
 
-bundle_tools <- function() {
-  list(
-    ellmer::tool(
-      list_directory,
-      name = "list_directory",
-      description = "List the files in an mcp-repl output bundle directory.",
-      arguments = list(
-        path = ellmer::type_string("Path to the output bundle directory.")
-      )
+tool_list_dir <- function() {
+  ellmer::tool(
+    list_dir,
+    name = "list_dir",
+    description = "List the files in an mcp-repl output bundle directory.",
+    arguments = list(
+      path = ellmer::type_string("Path to the output bundle directory.")
+    )
+  )
+}
+
+tool_read_file <- function() {
+  ellmer::tool(
+    read_file,
+    name = "read_file",
+    description = paste(
+      "Read a text file by line number.",
+      "Use this for transcript.txt or events.log from an mcp-repl output bundle."
     ),
-    ellmer::tool(
-      read_text_file,
-      name = "read_text_file",
-      description = paste(
-        "Read a text file by line number.",
-        "Use this for transcript.txt or events.log from an mcp-repl output bundle."
+    arguments = list(
+      path = ellmer::type_string("Path to transcript.txt or events.log."),
+      start_line = ellmer::type_integer(
+        "First 1-based line number to read.",
+        required = FALSE
       ),
-      arguments = list(
-        path = ellmer::type_string("Path to transcript.txt or events.log."),
-        start_line = ellmer::type_integer(
-          "First 1-based line number to read.",
-          required = FALSE
-        ),
-        max_lines = ellmer::type_integer(
-          "Maximum number of lines to read.",
-          required = FALSE
-        )
+      max_lines = ellmer::type_integer(
+        "Maximum number of lines to read.",
+        required = FALSE
       )
     )
   )

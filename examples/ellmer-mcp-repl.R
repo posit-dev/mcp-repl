@@ -8,21 +8,14 @@ source(file.path("examples", "ellmer-mcp-repl-helpers.R"))
 
 stopifnot(nzchar(Sys.getenv("OPENAI_API_KEY")))
 
-tools <- mcp_repl_tools("pager")
-repl <- tool_by_name(tools, "repl")
-print(repl(input = "cat('mcp-repl ready\\n')\n", timeout_ms = 10000))
-
 chat <- chat_openai(
   system_prompt = paste(
-    "You can use the repl tool to run R code in a persistent mcp-repl session.",
-    "Use R functions such as readLines() or read.csv() to read workspace files.",
-    "Keep final answers concise."
+    "Use the REPL tool to do analysis.",
+    "Answer in one or two sentences."
   ),
   echo = "output"
 )
-chat$set_tools(tools)
+chat$set_tools(list(tool_repl(overflow = "pager")))
 
-answer <- chat$chat(
-  "Use the R REPL to compute the average mpg in the built-in mtcars data."
-)
+answer <- chat$chat("Tell me something interesting about the penguins dataset.")
 cat(answer, "\n")
