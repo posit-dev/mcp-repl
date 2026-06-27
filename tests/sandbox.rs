@@ -1256,7 +1256,7 @@ for (i in seq_along(targets)) {{
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_bwrap_preserves_empty_missing_writable_root_after_exit() -> TestResult<()> {
+async fn sandbox_bwrap_preserves_existing_missing_root_parent_after_exit() -> TestResult<()> {
     if !linux_bwrap_available() {
         eprintln!("bwrap unavailable; skipping");
         return Ok(());
@@ -1267,7 +1267,8 @@ async fn sandbox_bwrap_preserves_empty_missing_writable_root_after_exit() -> Tes
         .unwrap_or_default()
         .as_nanos();
     let writable_parent = repo_root.join(format!("mcp-repl-bwrap-missing-root-{nanos}"));
-    let writable_root = writable_parent.join("generated").join("output");
+    std::fs::create_dir_all(&writable_parent)?;
+    let writable_root = writable_parent.join("output");
 
     let session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.clone()]),
@@ -1280,6 +1281,7 @@ async fn sandbox_bwrap_preserves_empty_missing_writable_root_after_exit() -> Tes
 target <- {target:?}
 dir.create(target, recursive = TRUE, showWarnings = FALSE)
 cat("ROOT_EXISTS=", dir.exists(target), "\n", sep = "")
+unlink(target, recursive = TRUE)
 "#
     );
     let result = session.write_stdin_raw_with(&code, Some(10.0)).await?;
@@ -1297,8 +1299,8 @@ cat("ROOT_EXISTS=", dir.exists(target), "\n", sep = "")
 
     session.cancel().await?;
     assert!(
-        writable_root.is_dir(),
-        "empty declared writable root should survive bwrap teardown"
+        writable_parent.is_dir(),
+        "pre-existing writable root parent should survive bwrap teardown"
     );
     let _ = std::fs::remove_dir_all(&writable_parent);
     Ok(())

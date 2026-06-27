@@ -3842,13 +3842,14 @@ fn prepare_linux_missing_writable_roots(
             )
         })?;
 
-        let mut created_dirs = root
-            .ancestors()
-            .skip(1)
-            .take_while(|path| *path != first_missing)
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
+        let mut created_dirs = Vec::new();
         if first_missing != root {
+            created_dirs = root
+                .ancestors()
+                .skip(1)
+                .take_while(|path| *path != first_missing)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>();
             created_dirs.push(first_missing);
         }
         created_dirs.reverse();
