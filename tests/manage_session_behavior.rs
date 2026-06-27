@@ -160,18 +160,28 @@ async fn pager_restart_drops_output_captured_during_shutdown() -> TestResult<()>
     let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let input = r#"
-Sys.sleep(0.15)
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
 for (i in 1:80) cat(sprintf("RESTART_LINE_%03d\n", i))
 flush.console()
 Sys.sleep(1.0)
 "#;
-    let timeout = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
     let timeout_text = result_text(&timeout);
     if backend_unavailable(&timeout_text) {
         eprintln!("pager restart test backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+    assert!(
+        !timeout_text.contains("RESTART_LINE_"),
+        "did not expect restart-only output before Ctrl-D closes stdin, got: {timeout_text:?}"
+    );
 
     let restart = session
         .write_stdin_raw_unterminated_with("\u{4}", Some(0.8))
@@ -210,14 +220,16 @@ async fn restart_while_busy_drops_output_captured_during_shutdown() -> TestResul
     let session = spawn_manage_session().await?;
 
     let input = r#"
-Sys.sleep(0.15)
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
 cat("DURING_RESTART\n")
 flush.console()
 Sys.sleep(1.0)
 cat("TOO_LATE\n")
 flush.console()
 "#;
-    let timeout = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
     let timeout_text = result_text(&timeout);
     if backend_unavailable(&timeout_text) {
         eprintln!(
@@ -226,6 +238,14 @@ flush.console()
         session.cancel().await?;
         return Ok(());
     }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+    assert!(
+        !timeout_text.contains("DURING_RESTART"),
+        "did not expect restart-only output before Ctrl-D closes stdin, got: {timeout_text:?}"
+    );
 
     let restart = session
         .write_stdin_raw_unterminated_with("\u{4}", Some(0.8))
