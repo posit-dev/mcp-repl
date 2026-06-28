@@ -355,7 +355,10 @@ async fn python_discovery_keeps_venv_probe_inside_sandbox() -> TestResult<()> {
         eprintln!("explicit Python executable set; skipping discovery sandbox coverage test");
         return Ok(());
     }
-    assert!(common::sandbox_exec_available(), "sandbox unavailable");
+    if !common::sandbox_exec_available() {
+        eprintln!("sandbox unavailable; skipping discovery sandbox coverage test");
+        return Ok(());
+    }
 
     let _guard = lock_test_mutex();
     let real_python = real_python_executable()?;

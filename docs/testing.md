@@ -33,7 +33,7 @@ This file is the entrypoint for deciding how to verify a change.
 Build the binary first, then run the Python suite:
 
 ```sh
-cargo build
+env RUSTFLAGS=-Dwarnings cargo build
 python3 tests/run_integration_tests.py --binary target/debug/mcp-repl
 ```
 
@@ -134,14 +134,19 @@ remains local because provider authentication is unavailable in CI.
 
 ## Full Verification Before Replying
 
+Rust compiler warnings are errors in local verification and CI. Run Cargo
+compile steps with `RUSTFLAGS=-Dwarnings`, including the release build, so
+release-only warnings fail before a PR is merged.
+
 If you modify code, run:
 
-- `cargo check`
-- `cargo build`
+- `env RUSTFLAGS=-Dwarnings cargo check`
+- `env RUSTFLAGS=-Dwarnings cargo build`
 - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --quiet`
+- `env RUSTFLAGS=-Dwarnings cargo test --quiet`
 - `cargo +nightly fmt`
+- `env RUSTFLAGS=-Dwarnings cargo build --release --locked`
 
 For docs-only changes, run the narrow validation that covers the edited docs.
 For agent-facing docs, that is usually:

@@ -176,7 +176,7 @@ fn readme_documents_release_install_contract() {
     for required in [
         "pipx install posit-mcp-repl",
         "uv tool install posit-mcp-repl",
-        "uvx --from posit-mcp-repl mcp-repl",
+        "uvx posit-mcp-repl",
         "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.sh",
         "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.ps1",
         "https://github.com/posit-dev/mcp-repl/releases/latest",
@@ -212,6 +212,7 @@ fn readme_documents_release_install_contract() {
 #[test]
 fn pyproject_defines_pypi_binary_package() {
     let pyproject = read(&repo_root().join("pyproject.toml"));
+    let cargo_toml = read(&repo_root().join("Cargo.toml"));
 
     for required in [
         "[build-system]",
@@ -222,6 +223,7 @@ fn pyproject_defines_pypi_binary_package() {
         "readme = \"README.md\"",
         "license = \"Apache-2.0\"",
         "bindings = \"bin\"",
+        "features = [\"pypi-alias\"]",
         "strip = true",
     ] {
         assert!(
@@ -229,6 +231,41 @@ fn pyproject_defines_pypi_binary_package() {
             "missing {required} in pyproject.toml"
         );
     }
+
+    let cargo_doc = cargo_toml
+        .parse::<toml_edit::DocumentMut>()
+        .expect("Cargo.toml should parse as TOML");
+    let bins = cargo_doc["bin"]
+        .as_array_of_tables()
+        .expect("Cargo.toml should define binary targets");
+
+    let mcp_repl = bins
+        .iter()
+        .find(|bin| bin.get("name").and_then(|value| value.as_str()) == Some("mcp-repl"))
+        .expect("missing mcp-repl binary target in Cargo.toml");
+    assert_eq!(
+        mcp_repl.get("path").and_then(|value| value.as_str()),
+        Some("src/main.rs")
+    );
+
+    let pypi_alias = bins
+        .iter()
+        .find(|bin| bin.get("name").and_then(|value| value.as_str()) == Some("posit-mcp-repl"))
+        .expect("missing posit-mcp-repl binary target in Cargo.toml");
+    assert_eq!(
+        pypi_alias.get("path").and_then(|value| value.as_str()),
+        Some("src/bin/posit-mcp-repl.rs")
+    );
+    let required_features = pypi_alias
+        .get("required-features")
+        .and_then(|value| value.as_array())
+        .expect("posit-mcp-repl should require the pypi-alias feature");
+    assert!(
+        required_features
+            .iter()
+            .any(|feature| feature.as_str() == Some("pypi-alias")),
+        "posit-mcp-repl should require the pypi-alias feature"
+    );
 }
 
 #[test]
@@ -249,6 +286,8 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
         "maturin-version: v1.11.5",
         "Build PyPI wheel (linux)",
         "Build PyPI wheel (non-linux)",
+        "./wheel-smoke/bin/posit-mcp-repl --help",
+        r".\wheel-smoke\Scripts\posit-mcp-repl.exe --help",
         "matrix.os == 'ubuntu-22.04'",
         "matrix.os != 'ubuntu-22.04'",
         "Smoke test PyPI wheel",
@@ -321,6 +360,39 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
 }
 
 #[test]
+fn ci_and_local_checks_deny_rustc_warnings() {
+    let root = repo_root();
+    let ci_workflow = read(&root.join(".github/workflows/ci.yml"));
+    let release_workflow = read(&root.join(".github/workflows/release.yml"));
+    let testing_docs = read(&root.join("docs/testing.md"));
+    let agent_docs = read(&root.join("AGENTS.md"));
+
+    for (path, workflow) in [
+        (".github/workflows/ci.yml", &ci_workflow),
+        (".github/workflows/release.yml", &release_workflow),
+    ] {
+        assert!(
+            workflow.contains("RUSTFLAGS: -Dwarnings"),
+            "{path} should deny rustc warnings across Cargo checks"
+        );
+        assert!(
+            !workflow.contains("rustflags: \"\""),
+            "{path} should not disable setup-rust-toolchain warning denial"
+        );
+    }
+
+    for required in [
+        "Rust compiler warnings are errors in local verification and CI.",
+        "`env RUSTFLAGS=-Dwarnings cargo check`",
+        "`env RUSTFLAGS=-Dwarnings cargo build`",
+        "`env RUSTFLAGS=-Dwarnings cargo build --release --locked`",
+    ] {
+        assert_contains_wrapped_text(&testing_docs, required, "docs/testing.md");
+        assert_contains_wrapped_text(&agent_docs, required, "AGENTS.md");
+    }
+}
+
+#[test]
 fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
     let workflow = read(&repo_root().join(".github/workflows/release.yml"));
 
@@ -362,6 +434,8 @@ fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
         "maturin-version: v1.11.5",
         "Build PyPI wheel (linux)",
         "Build PyPI wheel (non-linux)",
+        "./wheel-smoke/bin/posit-mcp-repl --help",
+        r".\wheel-smoke\Scripts\posit-mcp-repl.exe --help",
         "matrix.os == 'ubuntu-22.04'",
         "matrix.os != 'ubuntu-22.04'",
         "Smoke test PyPI wheel",
@@ -491,6 +565,7 @@ fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
         "Environment: `pypi`",
         "Package: `posit-mcp-repl`",
         "Wheel-only",
+        "`posit-mcp-repl` command alias",
         "sdist",
         "manylinux2014",
         "R is optional",
