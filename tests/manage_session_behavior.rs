@@ -4,6 +4,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use serde_json::json;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tokio::time::{Duration, Instant, sleep};
 
