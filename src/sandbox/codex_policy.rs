@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,7 @@ pub enum FileSystemAccessMode {
 }
 
 impl FileSystemAccessMode {
+    #[cfg(target_os = "linux")]
     fn can_read(self) -> bool {
         !matches!(self, FileSystemAccessMode::Deny)
     }
@@ -98,12 +100,14 @@ pub struct FileSystemSandboxPolicy {
     pub entries: Vec<FileSystemSandboxEntry>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WritableRoot {
     pub root: PathBuf,
     pub read_only_subpaths: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedEntry {
     path: PathBuf,
@@ -213,6 +217,7 @@ impl FileSystemSandboxPolicy {
         Self::restricted(entries)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn has_full_disk_read_access(&self) -> bool {
         match self.kind {
             FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => true,
@@ -233,6 +238,7 @@ impl FileSystemSandboxPolicy {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn include_platform_defaults(&self) -> bool {
         !self.has_full_disk_read_access()
             && matches!(self.kind, FileSystemSandboxKind::Restricted)
@@ -246,6 +252,7 @@ impl FileSystemSandboxPolicy {
             })
     }
 
+    #[cfg(target_os = "linux")]
     pub fn get_readable_roots_with_cwd(&self, cwd: &Path) -> Vec<PathBuf> {
         if self.has_full_disk_read_access() {
             return Vec::new();
@@ -261,6 +268,7 @@ impl FileSystemSandboxPolicy {
         )
     }
 
+    #[cfg(target_os = "linux")]
     pub fn get_writable_roots_with_cwd(&self, cwd: &Path) -> Vec<WritableRoot> {
         if self.has_full_disk_write_access() {
             return Vec::new();
@@ -296,6 +304,7 @@ impl FileSystemSandboxPolicy {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn get_unreadable_roots_with_cwd(&self, cwd: &Path) -> Vec<PathBuf> {
         if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
             return Vec::new();
@@ -310,10 +319,12 @@ impl FileSystemSandboxPolicy {
         )
     }
 
+    #[cfg(target_os = "linux")]
     pub fn can_read_path_with_cwd(&self, path: &Path, cwd: &Path) -> bool {
         self.resolve_access_with_cwd(path, cwd).can_read()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn can_write_path_with_cwd(&self, path: &Path, cwd: &Path) -> bool {
         if !self.resolve_access_with_cwd(path, cwd).can_write() {
             return false;
@@ -324,6 +335,7 @@ impl FileSystemSandboxPolicy {
         !self.metadata_write_denied(path, cwd)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn with_additional_writable_root(mut self, root: PathBuf) -> Self {
         if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
             return self;
@@ -407,6 +419,7 @@ impl FileSystemSandboxPolicy {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn resolve_access_with_cwd(&self, path: &Path, cwd: &Path) -> FileSystemAccessMode {
         match self.kind {
             FileSystemSandboxKind::Unrestricted | FileSystemSandboxKind::ExternalSandbox => {
@@ -424,6 +437,7 @@ impl FileSystemSandboxPolicy {
             .unwrap_or(FileSystemAccessMode::Deny)
     }
 
+    #[cfg(target_os = "linux")]
     fn resolved_entries_with_cwd(&self, cwd: &Path) -> Vec<ResolvedEntry> {
         self.entries
             .iter()
@@ -448,6 +462,7 @@ impl FileSystemSandboxPolicy {
             })
     }
 
+    #[cfg(target_os = "linux")]
     fn has_denied_read_restrictions(&self) -> bool {
         matches!(self.kind, FileSystemSandboxKind::Restricted)
             && self
@@ -471,6 +486,7 @@ impl FileSystemSandboxPolicy {
             })
     }
 
+    #[cfg(target_os = "linux")]
     fn metadata_write_denied(&self, path: &Path, cwd: &Path) -> bool {
         let target = resolve_path_against_cwd(path, cwd);
         self.resolved_entries_with_cwd(cwd)
@@ -584,6 +600,7 @@ impl PermissionProfile {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn to_runtime_permissions(&self) -> (FileSystemSandboxPolicy, NetworkSandboxPolicy) {
         (
             self.file_system_sandbox_policy(),
@@ -610,11 +627,13 @@ impl PermissionProfile {
         self.network_sandbox_policy().is_enabled()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn has_full_disk_write_access(&self) -> bool {
         self.file_system_sandbox_policy()
             .has_full_disk_write_access()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn requires_managed_sandbox(&self) -> bool {
         match self {
             Self::Disabled => false,
@@ -625,6 +644,7 @@ impl PermissionProfile {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn with_additional_writable_root(self, root: PathBuf) -> Self {
         match self {
             Self::Managed {
@@ -690,6 +710,7 @@ impl From<NetworkAccess> for NetworkSandboxPolicy {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_entry_path(path: &FileSystemPath, cwd: &Path) -> Option<PathBuf> {
     match path {
         FileSystemPath::Special {
@@ -739,6 +760,7 @@ fn default_read_only_subpaths_for_writable_root(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn resolved_entry_precedence(left: &ResolvedEntry, right: &ResolvedEntry) -> Ordering {
     left.path
         .components()

@@ -17,10 +17,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
 mod codex_policy;
-pub use codex_policy::{
-    FileSystemSandboxPolicy, NetworkSandboxPolicy, PermissionProfile,
-    normalize_permission_profile_paths,
-};
+#[cfg(target_os = "linux")]
+pub use codex_policy::{FileSystemSandboxPolicy, NetworkSandboxPolicy};
+pub use codex_policy::{PermissionProfile, normalize_permission_profile_paths};
 
 pub const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
 pub const MANAGED_ALLOWED_DOMAINS_ENV_KEY: &str = "MCP_REPL_ALLOWED_DOMAINS";
