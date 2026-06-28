@@ -378,6 +378,60 @@ flush.console()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn restart_tail_output_is_included_in_same_response() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let input = r#"
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
+cat("DURING_RESTART\n")
+flush.console()
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("restart tail response test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}cat(\"TAIL_DONE\\n\"); flush.console()", Some(5.0))
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("restart tail response test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("DURING_RESTART"),
+        "expected restart reply to include output captured before tail input, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart reply to include the fresh-session notice, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("TAIL_DONE"),
+        "expected Ctrl-D tail output in the same response, got: {restart_text:?}"
+    );
+    assert!(
+        !restart_text.contains("<<repl status: busy"),
+        "did not expect the completed Ctrl-D tail to require a follow-up poll, got: {restart_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn restart_tail_uses_remaining_timeout_budget() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
