@@ -156,6 +156,39 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn restart_while_busy_not_reading_stdin_returns_promptly() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let _ = session
+        .write_stdin_raw_with("x <- 1; Sys.sleep(30)", Some(0.1))
+        .await?;
+
+    let start = Instant::now();
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(3.0))
+        .await?;
+    let elapsed = start.elapsed();
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("prompt restart test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart notice, got: {restart_text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "expected busy restart to return promptly, elapsed={elapsed:?}, got: {restart_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pager_restart_drops_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = common::spawn_server_with_pager_page_chars(120).await?;

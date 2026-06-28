@@ -283,6 +283,7 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_RESTART_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "windows")]
 pub(crate) const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
@@ -1333,7 +1334,7 @@ impl WorkerProcess {
 
     pub(crate) fn shutdown_for_restart(mut self, timeout: Duration) -> Result<(), WorkerError> {
         let _ = self.close_stdin(Duration::from_millis(200));
-        self.finish_timed_shutdown(timeout)
+        self.finish_timed_shutdown(timeout.min(WORKER_RESTART_SHUTDOWN_TIMEOUT))
     }
 
     fn finish_timed_shutdown(mut self, timeout: Duration) -> Result<(), WorkerError> {
