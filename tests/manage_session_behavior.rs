@@ -188,7 +188,7 @@ async fn restart_while_busy_not_reading_stdin_returns_promptly() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_restart_drops_output_captured_during_shutdown() -> TestResult<()> {
+async fn pager_restart_preserves_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = common::spawn_server_with_pager_page_chars(120).await?;
 
@@ -230,8 +230,8 @@ Sys.sleep(1.0)
         "expected restart notice, got: {restart_text:?}"
     );
     assert!(
-        !restart_text.contains("RESTART_LINE_"),
-        "did not expect restart reply to wait for pager output produced during shutdown, got: {restart_text:?}"
+        restart_text.contains("RESTART_LINE_"),
+        "expected restart reply to include pager output captured during shutdown, got: {restart_text:?}"
     );
 
     let next = session
@@ -241,8 +241,8 @@ Sys.sleep(1.0)
     session.cancel().await?;
 
     assert!(
-        !next_text.contains("RESTART_LINE_"),
-        "did not expect shutdown-time pager output to leak into the next reply, got: {next_text:?}"
+        next_text.contains("RESTART_LINE_"),
+        "expected follow-up poll to continue paging shutdown output captured during restart, got: {next_text:?}"
     );
     Ok(())
 }
@@ -314,7 +314,7 @@ async fn ctrl_d_restart_clears_active_pager_when_reply_has_no_overflow() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_while_busy_drops_output_captured_during_shutdown() -> TestResult<()> {
+async fn restart_while_busy_returns_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
 
@@ -360,8 +360,8 @@ flush.console()
     session.cancel().await?;
 
     assert!(
-        !restart_text.contains("DURING_RESTART"),
-        "did not expect restart to wait for output produced during shutdown, got: {restart_text:?}"
+        restart_text.contains("DURING_RESTART"),
+        "expected restart to return output captured during shutdown, got: {restart_text:?}"
     );
     assert!(
         !restart_text.contains("TOO_LATE"),
@@ -375,7 +375,7 @@ flush.console()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_tail_excludes_output_captured_during_shutdown() -> TestResult<()> {
+async fn restart_tail_includes_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
 
@@ -410,8 +410,8 @@ flush.console()
     session.cancel().await?;
 
     assert!(
-        !restart_text.contains("DURING_RESTART"),
-        "did not expect Ctrl-D tail to include old-worker shutdown output, got: {restart_text:?}"
+        restart_text.contains("DURING_RESTART"),
+        "expected Ctrl-D tail to include old-worker shutdown output captured during shutdown, got: {restart_text:?}"
     );
     assert!(
         restart_text.contains("new session started"),
@@ -468,8 +468,8 @@ Sys.sleep(1.0)
     session.cancel().await?;
 
     assert!(
-        !restart_text.contains("DURING_RESTART"),
-        "did not expect Ctrl-D tail to include old-worker shutdown output, got: {restart_text:?}"
+        restart_text.contains("DURING_RESTART"),
+        "expected Ctrl-D tail to include old-worker shutdown output captured during shutdown, got: {restart_text:?}"
     );
     assert!(
         restart_text.contains("<<repl status: busy"),

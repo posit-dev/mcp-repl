@@ -4892,7 +4892,7 @@ else:
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_ctrl_d_tail_excludes_old_worker_shutdown_output() -> TestResult<()> {
+async fn python_ctrl_d_tail_includes_old_worker_shutdown_output() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -4924,8 +4924,8 @@ print('OLD_WORKER_SHUTDOWN_TAIL_VISIBLE')
         "expected Ctrl-D tail to run in the fresh session, got: {reset_text:?}"
     );
     assert!(
-        !reset_text.contains("OLD_WORKER_SHUTDOWN_TAIL_VISIBLE"),
-        "Ctrl-D tail should not include old-worker shutdown output, got: {reset_text:?}"
+        reset_text.contains("OLD_WORKER_SHUTDOWN_TAIL_VISIBLE"),
+        "expected Ctrl-D tail to include old-worker shutdown output captured during shutdown, got: {reset_text:?}"
     );
     Ok(())
 }
