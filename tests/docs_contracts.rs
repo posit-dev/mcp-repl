@@ -321,6 +321,39 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
 }
 
 #[test]
+fn ci_and_local_checks_deny_rustc_warnings() {
+    let root = repo_root();
+    let ci_workflow = read(&root.join(".github/workflows/ci.yml"));
+    let release_workflow = read(&root.join(".github/workflows/release.yml"));
+    let testing_docs = read(&root.join("docs/testing.md"));
+    let agent_docs = read(&root.join("AGENTS.md"));
+
+    for (path, workflow) in [
+        (".github/workflows/ci.yml", &ci_workflow),
+        (".github/workflows/release.yml", &release_workflow),
+    ] {
+        assert!(
+            workflow.contains("RUSTFLAGS: -Dwarnings"),
+            "{path} should deny rustc warnings across Cargo checks"
+        );
+        assert!(
+            !workflow.contains("rustflags: \"\""),
+            "{path} should not disable setup-rust-toolchain warning denial"
+        );
+    }
+
+    for required in [
+        "Rust compiler warnings are errors in local verification and CI.",
+        "`env RUSTFLAGS=-Dwarnings cargo check`",
+        "`env RUSTFLAGS=-Dwarnings cargo build`",
+        "`env RUSTFLAGS=-Dwarnings cargo build --release --locked`",
+    ] {
+        assert_contains_wrapped_text(&testing_docs, required, "docs/testing.md");
+        assert_contains_wrapped_text(&agent_docs, required, "AGENTS.md");
+    }
+}
+
+#[test]
 fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
     let workflow = read(&repo_root().join(".github/workflows/release.yml"));
 

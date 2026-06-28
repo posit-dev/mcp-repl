@@ -23,6 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.pypi_backfill_tag || github.ref_name }}
+      RUSTFLAGS: -Dwarnings
     strategy:
       fail-fast: false
       matrix:
@@ -72,7 +73,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-          rustflags: ""
+          rustflags: -Dwarnings
           cache-bin: false
 
       - name: Install nightly rustfmt
