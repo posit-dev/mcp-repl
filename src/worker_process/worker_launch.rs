@@ -115,6 +115,13 @@ impl WorkerManager {
         err: &WorkerError,
         preserve_pager: bool,
     ) -> bool {
+        if self
+            .sandbox_state
+            .managed_network_policy
+            .has_domain_restrictions()
+        {
+            return false;
+        }
         if !self.sandbox_state.use_linux_sandbox_bwrap || !linux_sandbox_startup_retryable(err) {
             return false;
         }
@@ -399,6 +406,45 @@ mod tests {
         assert!(
             text.contains("continuing without bwrap"),
             "expected fallback notice in visible output, got: {text:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_startup_retry_is_disabled_for_managed_domains() {
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.sandbox_state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        };
+        manager.sandbox_state.use_linux_sandbox_bwrap = true;
+        manager.sandbox_state.managed_network_policy.allowed_domains =
+            vec!["example.com".to_string()];
+        manager.sandbox_defaults.use_linux_sandbox_bwrap = true;
+
+        let retry = manager.maybe_retry_spawn_without_linux_bwrap(
+            &WorkerError::Protocol("ipc disconnected while waiting for backend info".to_string()),
+            false,
+        );
+
+        assert!(
+            !retry,
+            "managed domains must fail closed instead of falling back"
+        );
+        assert!(
+            manager.sandbox_state.use_linux_sandbox_bwrap,
+            "fallback must not disable bwrap for managed-domain enforcement"
+        );
+        assert!(
+            manager.sandbox_defaults.use_linux_sandbox_bwrap,
+            "fallback must not mutate defaults for managed-domain enforcement"
         );
     }
 

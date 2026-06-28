@@ -195,6 +195,8 @@ fn sandbox_backend_unavailable(text: &str) -> bool {
         || text.contains("unable to initialize the JIT")
         || text.contains("libR.so: cannot open shared object file")
         || text.contains("options(\"defaultPackages\") was not found")
+        || (text.contains("read-only carveouts inside writable root")
+            && text.contains("legacy Linux Landlock filesystem backend"))
         || text.contains("worker protocol error: ipc disconnected while waiting for backend info")
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
