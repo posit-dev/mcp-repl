@@ -359,7 +359,12 @@ mod unix_impl {
             .into());
         }
 
-        assert_exec_output_contains_tool_call(&stdout, "r", "repl", MOCK_TOOL_INPUT)?;
+        if let Err(err) =
+            assert_exec_output_contains_tool_call(&stdout, "r", "repl", MOCK_TOOL_INPUT)
+        {
+            let last_request = mock_server.last_request().await;
+            return Err(format!("{err}\nlast_request: {last_request:?}").into());
+        }
         if !outputs.iter().any(|out| out.contains("CODEX_MOCK_MCP_OK")) {
             let request_paths = mock_server.request_paths().await;
             let last_request = mock_server.last_request().await;
@@ -2607,6 +2612,8 @@ tryCatch({
         next_call_ordinal: usize,
         pending_call_id: Option<String>,
         pending_call_ordinal: Option<usize>,
+        pending_tool_search_call_id: Option<String>,
+        pending_tool_search_tool_args: Option<String>,
     }
 
     impl MockResponsesServer {
@@ -2655,6 +2662,8 @@ tryCatch({
                 next_call_ordinal: 1,
                 pending_call_id: None,
                 pending_call_ordinal: None,
+                pending_tool_search_call_id: None,
+                pending_tool_search_tool_args: None,
             }));
             let state_clone = Arc::clone(&state);
             tokio::spawn(async move {
@@ -2866,19 +2875,30 @@ tryCatch({
             );
         }
 
+        if let Some(call_id) = state.pending_tool_search_call_id.as_deref()
+            && has_tool_search_output(body, call_id)
+        {
+            let tool_args = state
+                .pending_tool_search_tool_args
+                .take()
+                .expect("pending tool search must keep scripted tool arguments");
+            state.pending_tool_search_call_id = None;
+            return queue_deferred_tool_call(state, tool_args);
+        }
+
         if has_user_message(body)
             && let Some(tool_args) = state.first_user_turn_tool_args.take()
         {
-            return queue_tool_call(body, state, tool_args);
+            return queue_tool_call_or_search(body, state, tool_args);
         }
 
         if has_user_marker(body, WORKSPACE_WRITE_MARKER) {
-            return queue_tool_call(body, state, state.workspace_write_tool_args.clone());
+            return queue_tool_call_or_search(body, state, state.workspace_write_tool_args.clone());
         }
         if has_user_marker(body, FULL_ACCESS_MARKER)
             && let Some(tool_args) = state.full_access_tool_args.clone()
         {
-            return queue_tool_call(body, state, tool_args);
+            return queue_tool_call_or_search(body, state, tool_args);
         }
         response_body_with_items(vec![message_item("ready")], "resp-ready")
     }
@@ -2889,20 +2909,68 @@ tryCatch({
         namespace: Option<String>,
     }
 
+    fn queue_tool_call_or_search(
+        request: &Value,
+        state: &mut MockState,
+        tool_args: String,
+    ) -> String {
+        if resolve_visible_tool_call_spec(request, &state.tool_name).is_some() {
+            return queue_tool_call(request, state, tool_args);
+        }
+        if request_has_tool_search(request) {
+            return queue_tool_search_call(state, tool_args);
+        }
+        queue_tool_call(request, state, tool_args)
+    }
+
     fn queue_tool_call(request: &Value, state: &mut MockState, tool_args: String) -> String {
+        let tool_call =
+            resolve_visible_tool_call_spec(request, &state.tool_name).unwrap_or_else(|| {
+                MockToolCallSpec {
+                    name: state.tool_name.clone(),
+                    namespace: None,
+                }
+            });
+        queue_tool_call_with_spec(state, tool_args, tool_call)
+    }
+
+    fn queue_deferred_tool_call(state: &mut MockState, tool_args: String) -> String {
+        let tool_call = split_legacy_tool_name(&state.tool_name).map_or_else(
+            || MockToolCallSpec {
+                name: state.tool_name.clone(),
+                namespace: None,
+            },
+            |(namespace, name)| MockToolCallSpec {
+                name: name.to_string(),
+                namespace: Some(namespace.to_string()),
+            },
+        );
+        queue_tool_call_with_spec(state, tool_args, tool_call)
+    }
+
+    fn queue_tool_call_with_spec(
+        state: &mut MockState,
+        tool_args: String,
+        tool_call: MockToolCallSpec,
+    ) -> String {
         let ordinal = state.next_call_ordinal;
         state.next_call_ordinal += 1;
         let call_id = format!("call-{ordinal}");
         state.pending_call_id = Some(call_id.clone());
         state.pending_call_ordinal = Some(ordinal);
-        let tool_call =
-            resolve_tool_call_spec(request, &state.tool_name).unwrap_or_else(|| MockToolCallSpec {
-                name: state.tool_name.clone(),
-                namespace: None,
-            });
         response_body_with_items(
             vec![function_call_item(&tool_call, &call_id, &tool_args)],
             &format!("resp-call-{ordinal}"),
+        )
+    }
+
+    fn queue_tool_search_call(state: &mut MockState, tool_args: String) -> String {
+        let call_id = format!("tool-search-{}", state.next_call_ordinal);
+        state.pending_tool_search_call_id = Some(call_id.clone());
+        state.pending_tool_search_tool_args = Some(tool_args);
+        response_body_with_items(
+            vec![tool_search_call_item(&call_id, &state.tool_name)],
+            &format!("resp-search-{}", state.next_call_ordinal),
         )
     }
 
@@ -2936,6 +3004,26 @@ tryCatch({
         item
     }
 
+    fn tool_search_call_item(call_id: &str, tool_name: &str) -> Value {
+        serde_json::json!({
+            "type": "tool_search_call",
+            "call_id": call_id,
+            "execution": "client",
+            "arguments": {
+                "query": tool_name.replace("__", " "),
+                "limit": 8,
+            },
+        })
+    }
+
+    fn resolve_visible_tool_call_spec(
+        request: &Value,
+        legacy_tool_name: &str,
+    ) -> Option<MockToolCallSpec> {
+        resolve_tool_call_spec(request, legacy_tool_name)
+            .or_else(|| resolve_legacy_function_tool_call_spec(request, legacy_tool_name))
+    }
+
     fn resolve_tool_call_spec(request: &Value, legacy_tool_name: &str) -> Option<MockToolCallSpec> {
         let (namespace, name) = split_legacy_tool_name(legacy_tool_name)?;
         let tools = request.get("tools")?.as_array()?;
@@ -2956,6 +3044,23 @@ tryCatch({
             name: name.to_string(),
             namespace: Some(namespace.to_string()),
         })
+    }
+
+    fn resolve_legacy_function_tool_call_spec(
+        request: &Value,
+        legacy_tool_name: &str,
+    ) -> Option<MockToolCallSpec> {
+        let tools = request.get("tools")?.as_array()?;
+        tools
+            .iter()
+            .any(|tool| {
+                tool.get("type").and_then(Value::as_str) == Some("function")
+                    && tool.get("name").and_then(Value::as_str) == Some(legacy_tool_name)
+            })
+            .then(|| MockToolCallSpec {
+                name: legacy_tool_name.to_string(),
+                namespace: None,
+            })
     }
 
     fn split_legacy_tool_name(legacy_tool_name: &str) -> Option<(&str, &str)> {
@@ -3001,6 +3106,15 @@ tryCatch({
             .unwrap_or(false)
     }
 
+    fn request_has_tool_search(body: &Value) -> bool {
+        let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+            return false;
+        };
+        tools
+            .iter()
+            .any(|tool| tool.get("type").and_then(Value::as_str) == Some("tool_search"))
+    }
+
     fn has_user_message(body: &Value) -> bool {
         let Some(items) = body.get("input").and_then(Value::as_array) else {
             return false;
@@ -3017,6 +3131,16 @@ tryCatch({
         };
         items.iter().any(|item| {
             item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })
+    }
+
+    fn has_tool_search_output(body: &Value, call_id: &str) -> bool {
+        let Some(items) = body.get("input").and_then(Value::as_array) else {
+            return false;
+        };
+        items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("tool_search_output")
                 && item.get("call_id").and_then(Value::as_str) == Some(call_id)
         })
     }
