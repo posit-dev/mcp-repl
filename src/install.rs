@@ -14,7 +14,8 @@ const CODEX_TOOL_TIMEOUT_COMMENT: &str =
 const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy metadata sent by Codex on each tool call.\n# mcp-repl fails closed if the tool call omits or malforms that metadata.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
-const MCP_REPL_TOOL_NAMES: &[&str] = &["repl", "repl_reset"];
+const MCP_REPL_TOOL_NAMES: &[&str] = &["repl"];
+const LEGACY_MCP_REPL_TOOL_NAMES: &[&str] = &["repl_reset"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -452,8 +453,18 @@ fn ensure_codex_mcp_server_tools_unfiltered(
         &format!("mcp_servers.{server_name}.enabled_tools"),
     )?;
     remove_values_from_existing_toml_string_array(
+        &mut doc["mcp_servers"][server_name]["enabled_tools"],
+        LEGACY_MCP_REPL_TOOL_NAMES,
+        &format!("mcp_servers.{server_name}.enabled_tools"),
+    )?;
+    remove_values_from_existing_toml_string_array(
         &mut doc["mcp_servers"][server_name]["disabled_tools"],
         MCP_REPL_TOOL_NAMES,
+        &format!("mcp_servers.{server_name}.disabled_tools"),
+    )?;
+    remove_values_from_existing_toml_string_array(
+        &mut doc["mcp_servers"][server_name]["disabled_tools"],
+        LEGACY_MCP_REPL_TOOL_NAMES,
         &format!("mcp_servers.{server_name}.disabled_tools"),
     )
 }

@@ -136,6 +136,7 @@ impl WorkerManager {
         let started_at = Instant::now();
         let worker_deadline = started_at + worker_timeout;
         let server_deadline = started_at + server_timeout;
+        let has_tail = !plan.tail.is_empty();
 
         let control_reply = match (mode, plan.action, plan.stage_interrupt_after_session_end) {
             (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) => {
@@ -174,7 +175,7 @@ impl WorkerManager {
             )?;
             self.maybe_reset_after_session_end();
         }
-        if plan.tail.is_empty() {
+        if !has_tail {
             return Ok(Some(control_reply));
         }
 

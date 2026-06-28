@@ -116,13 +116,6 @@ impl SharedServer {
         .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
-    fn sandbox_state_update_for_tool_call(
-        &self,
-        meta: &Meta,
-    ) -> Result<Option<SandboxStateUpdate>, WorkerError> {
-        Self::sandbox_state_update_for_tool_call_meta(self.accepts_sandbox_state_meta(), meta)
-    }
-
     fn sandbox_state_update_for_tool_call_meta(
         accepts_sandbox_state_meta: bool,
         meta: &Meta,
@@ -171,17 +164,6 @@ impl SharedServer {
         state
             .worker
             .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
-    }
-
-    fn stage_tool_call_sandbox_state_for_reset(
-        state: &mut ServerState,
-        update: Option<SandboxStateUpdate>,
-    ) -> Result<(), WorkerError> {
-        let Some(update) = update else {
-            return Ok(());
-        };
-
-        state.worker.stage_sandbox_state_update(update)
     }
 
     /// Executes one `repl` call and immediately finalizes the visible reply on the server side.
@@ -274,9 +256,7 @@ impl SharedServer {
                     split_write_stdin_control_prefix(&raw_input),
                     Some((WriteStdinControlAction::Interrupt, remaining)) if remaining.is_empty()
                 );
-                let needs_initial_state =
-                    restart_control && state.worker.missing_inherited_state_without_worker();
-                if needs_initial_state {
+                if restart_control {
                     (parse_tool_call_sandbox_state(), true)
                 } else if state.worker.pending_request() && bare_interrupt {
                     (
@@ -586,58 +566,6 @@ macro_rules! define_backend_tool_server {
                 let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
                 self.shared.run_write_input(input, timeout, meta).await
             }
-
-            #[doc = include_str!("../docs/tool-descriptions/repl_reset_tool.md")]
-            #[tool(
-                name = "repl_reset",
-                annotations(
-                    read_only_hint = false,
-                    destructive_hint = false,
-                    open_world_hint = false
-                )
-            )]
-            async fn repl_reset(
-                &self,
-                meta: Meta,
-                _params: Parameters<ReplResetArgs>,
-            ) -> Result<CallToolResult, McpError> {
-                let timeout = parse_timeout(None, "repl_reset", false)?;
-                let worker_timeout = apply_tool_call_margin(timeout);
-                let sandbox_state_update = self.shared.sandbox_state_update_for_tool_call(&meta);
-                let result = self
-                    .shared
-                    .run_state(move |state| {
-                        let sandbox_state_result = match &sandbox_state_update {
-                            Ok(update) => SharedServer::stage_tool_call_sandbox_state_for_reset(
-                                state,
-                                update.clone(),
-                            ),
-                            Err(WorkerError::Sandbox(message)) => {
-                                Err(WorkerError::Sandbox(message.clone()))
-                            }
-                            Err(err) => Err(WorkerError::Sandbox(err.to_string())),
-                        };
-                        if let Err(err) = sandbox_state_result {
-                            let mut result = state.response.finalize_local_error(err, true);
-                            strip_text_stream_meta(&mut result);
-                            return result;
-                        }
-                        let result = state.worker.restart(worker_timeout);
-                        let pending_request_after = state.worker.pending_request();
-                        let mut result = finalize_visible_reply(
-                            state,
-                            result,
-                            pending_request_after,
-                            TimeoutBundleReuse::None,
-                            0,
-                            true,
-                        );
-                        strip_text_stream_meta(&mut result);
-                        result
-                    })
-                    .await?;
-                Ok(result)
-            }
         }
 
         #[tool_handler(router = self.logged_tool_router())]
@@ -697,10 +625,6 @@ struct ReplArgs {
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
-
-#[derive(Deserialize, JsonSchema, Default)]
-#[serde(deny_unknown_fields)]
-struct ReplResetArgs {}
 
 fn resolve_timeout_ms(
     timeout_ms: Option<u64>,

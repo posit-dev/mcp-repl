@@ -179,7 +179,6 @@ See `docs/sandbox.md` for precise behavior.
 ## MCP surface
 
 - `repl` → `{ "input": "1+1\n", "timeout_ms": 10000 }`
-- `repl_reset` → `{}`
 
 The exact `repl` tool description depends on the interpreter and
 `--oversized-output` mode. Per-tool guides live in
@@ -188,10 +187,12 @@ The exact `repl` tool description depends on the interpreter and
 ### Session control
 
 - **Interrupt**: prefix `repl` input with `\u0003` (SIGINT, best-effort). Session continues.
-- **Reset**: call `repl_reset`, or prefix input with `\u0004` (Ctrl-D).
-  For `\u0004` with remaining input, the same response includes output
-  captured through bounded old-worker shutdown, fresh-session startup, and
-  evaluating that remaining input under the original call timeout.
+- **Reset**: prefix `repl` input with `\u0004` (Ctrl-D / EOF). Reset
+  closes stdin, waits through a bounded graceful shutdown window, escalates to
+  forceful termination when that window expires, then starts a fresh session.
+  The same reply includes old-worker output captured through that window,
+  followed by any remaining input's fresh-session output under the original call
+  timeout.
 - **In-band exits**: `EOF`, `quit()`, etc. also work — output is
   returned and the next request runs in a fresh worker.
 

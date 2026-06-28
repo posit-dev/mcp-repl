@@ -670,43 +670,6 @@ fn assert_arg_pair(args: &[String], flag: &str, expected: &str) -> TestResult<()
 }
 
 #[test]
-fn extract_tool_call_rejects_unexpected_mcp_tools() {
-    let events = vec![serde_json::json!({
-        "message": {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "toolu_search",
-                    "name": "ToolSearch",
-                    "input": { "query": "mcp__r__repl" }
-                },
-                {
-                    "type": "tool_use",
-                    "id": "toolu_reset",
-                    "name": "mcp__r__repl_reset",
-                    "input": {}
-                },
-                {
-                    "type": "tool_use",
-                    "id": "toolu_repl",
-                    "name": "mcp__r__repl",
-                    "input": { "input": TOOL_INPUT }
-                }
-            ]
-        }
-    })];
-
-    let err = extract_tool_call(&events)
-        .expect_err("expected unexpected MCP tool uses to fail the Claude contract");
-
-    assert!(
-        err.to_string()
-            .contains("unexpected Claude tool call: mcp__r__repl_reset"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn parse_snapshot_skips_tool_search_tool_results() -> TestResult<()> {
     let events = serde_json::json!([
         {

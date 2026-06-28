@@ -90,10 +90,12 @@ capture does not preserve separate stdout/stderr identity. Sideband
 
 `shutdown`
 - `{ "type": "shutdown" }`
-- Requests worker shutdown during server teardown, `repl_reset`, and replacement
-  paths that need immediate worker-side lifecycle control. Explicit `Ctrl-D`
-  restarts do not send this message first; they close stdin, keep output capture
-  active during a bounded graceful shutdown window, then escalate if needed.
+- Requests worker shutdown during server teardown and replacement paths that
+  need immediate worker-side lifecycle control. Explicit restarts do not send
+  this message first; they close stdin, wait through a bounded graceful shutdown
+  window, then escalate if needed. Restart replies include output captured
+  through that window, followed by fresh-session tail output when the same input
+  contains text after `Ctrl-D`.
 - Built-in workers currently exit the process after receiving it.
 
 The server emits no other server-to-worker protocol messages in v6.

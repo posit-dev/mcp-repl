@@ -101,5 +101,5 @@ capability value it already received, not on the selected backend.
 
 - Removing the R/Python interpreter selector.
 - Redesigning the sideband protocol in this item.
-- Changing the public `repl` or `repl_reset` tool contract before the boundary
-  cleanup is designed.
+- Changing the public `repl` tool contract before the boundary cleanup is
+  designed.

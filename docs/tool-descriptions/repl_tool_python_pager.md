@@ -6,6 +6,7 @@ Arguments:
   Timeout bounds only this response window; it does not cancel backend work.
 
 Python REPL affordances:
+- No startup or initialization call is needed; the REPL is self-healing and starts ready for Python code.
 - Session state persists across calls; treat persistence as an iteration aid, not a correctness guarantee.
 - At the start of each non-empty call, Python routes the whole payload from current state: if it is waiting for stdin, the payload is stdin; otherwise the payload runs as one complete Python cell with persistent globals. Send multi-line blocks and following top-level code in the same cell call.
 - A final top-level expression is displayed through `sys.displayhook`, so custom display hooks are honored.
@@ -27,4 +28,4 @@ Python REPL affordances:
 - Plot images are returned as image content (for example matplotlib output).
 - Help flows are in-band (`help()`, `dir()`, `pydoc.help`).
 - Debugging works in the REPL, including interactive stops from `breakpoint()` and `pdb.set_trace()`.
-- Control prefixes in `input`: `\u0003` (interrupt) and `\u0004` (reset; if input remains after `\u0004`, the same response includes restart output plus output produced by the remaining input, bounded by the original call timeout).
+- Control prefixes in `input`: `\u0003` (interrupt) and `\u0004` (Ctrl-D / EOF restart). If input remains after `\u0004`, the same reply includes bounded-shutdown output followed by fresh-session output under the original call timeout.

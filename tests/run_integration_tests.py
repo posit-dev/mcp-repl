@@ -236,9 +236,6 @@ class McpStdioClient:
             arguments["timeout_ms"] = timeout_ms
         return self.call_tool("repl", arguments)
 
-    def repl_reset(self) -> dict[str, Any]:
-        return self.call_tool("repl_reset", {})
-
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -897,7 +894,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     )
 
 
-def r_reset_clears_state(client: McpStdioClient) -> None:
+def r_ctrl_d_clears_state(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
         tool_result(text("> ")),
@@ -905,11 +902,11 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
         "set variable repl",
     )
 
-    reset = client.repl_reset()
+    reset = client.repl("\u0004", timeout_ms=30000)
     assert_identical(
         tool_result(text("[repl] new session started")),
         reset,
-        "repl_reset",
+        "ctrl-d reset repl",
     )
 
     after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
@@ -1379,7 +1376,7 @@ def python_suite_case(
     )
 
 
-CASES: dict[str, SuiteCase] = {
+CANONICAL_CASES: dict[str, SuiteCase] = {
     "python-busy-discards-input": python_suite_case(python_busy_discards_input),
     "python-console-basic": python_suite_case(python_console_basic),
     "r-console-basic": r_suite_case(r_console_basic),
@@ -1426,7 +1423,7 @@ CASES: dict[str, SuiteCase] = {
         server_args=("--sandbox", "read-only"),
         server_cwd=Path("target/test-scratch/run-integration-tests/r-read-only-sandbox"),
     ),
-    "r-reset-clears-state": r_suite_case(r_reset_clears_state),
+    "r-ctrl-d-clears-state": r_suite_case(r_ctrl_d_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
     "r-write-stdin-bundles-huge-assignment-input-echoes": r_suite_case(
         r_write_stdin_files_bundle_includes_huge_assignment_input_echoes,
@@ -1467,6 +1464,15 @@ CASES: dict[str, SuiteCase] = {
             "target/test-scratch/run-integration-tests/r-workspace-write-network-blocked"
         ),
     ),
+}
+
+CASE_ALIASES: dict[str, str] = {
+    "r-reset-clears-state": "r-ctrl-d-clears-state",
+}
+
+CASES: dict[str, SuiteCase] = {
+    **CANONICAL_CASES,
+    **{alias: CANONICAL_CASES[target] for alias, target in CASE_ALIASES.items()},
 }
 
 
@@ -1517,7 +1523,7 @@ def main(argv: Sequence[str]) -> int:
         return 2
     binary = resolve_binary_path(args.binary)
 
-    selected = args.case or sorted(CASES)
+    selected = args.case or sorted(CANONICAL_CASES)
     failures = 0
     for case_name in selected:
         case = CASES[case_name]

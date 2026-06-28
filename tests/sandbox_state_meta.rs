@@ -1139,21 +1139,21 @@ async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_empty_repl_after_reset_uses_staged_state_meta() -> TestResult<()> {
+async fn sandbox_inherit_empty_repl_after_ctrl_d_uses_staged_state_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
     let reset = session
-        .call_tool_raw_with_meta(
-            "repl_reset",
-            json!({}),
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
             Some(workspace_write_meta(temp.path())),
         )
         .await?;
     let reset_text = collect_text(&reset);
     assert!(
         reset_text.contains("new session started"),
-        "expected repl_reset with sandbox metadata to succeed, got: {reset_text}"
+        "expected Ctrl-D with sandbox metadata to succeed, got: {reset_text}"
     );
 
     let result = session
@@ -2790,23 +2790,28 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         session.cancel().await?;
         return Ok(());
     }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
     let restart = retry_reply_until(
         &session,
         "\u{4}",
         1.0,
         RetryMode::RawUnterminatedWithMeta(read_only_meta(scratch.path())),
         "bare restart after sandbox respawn",
-        |reply| {
-            let text = common::result_text(reply);
-            text.contains("new session started")
-                && text.contains("sandbox policy changed; new session started")
-        },
+        |reply| common::result_text(reply).contains("[repl] new session started"),
     )
     .await?;
     let restart_text = common::result_text(&restart);
     assert!(
-        !restart_text.contains("MID") && !restart_text.contains("TAIL"),
-        "did not expect bare Ctrl-D after sandbox respawn to drain preserved timeout output, got: {restart_text}"
+        !restart_text.contains("sandbox policy changed; new session started"),
+        "did not expect bare Ctrl-D to spawn a replacement worker before restarting, got: {restart_text}"
+    );
+    assert!(
+        restart_text.contains("MID"),
+        "expected bare Ctrl-D after sandbox respawn to return already captured output, got: {restart_text}"
+    );
+    assert!(
+        !restart_text.contains("TAIL"),
+        "did not expect bare Ctrl-D after sandbox respawn to wait for later timeout output, got: {restart_text}"
     );
     assert!(
         !restart_text.contains("<<repl status: idle>>"),
@@ -2877,8 +2882,8 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
         "expected active-pager bare Ctrl-D to emit the explicit restart reply, got: {restart_text}"
     );
     assert!(
-        restart_text.contains("sandbox policy changed; new session started"),
-        "expected active-pager bare Ctrl-D to flush the sandbox-change notice, got: {restart_text}"
+        !restart_text.contains("sandbox policy changed; new session started"),
+        "did not expect active-pager bare Ctrl-D to spawn a replacement worker before restarting, got: {restart_text}"
     );
     assert!(
         !restart_text.contains("line000"),
@@ -4781,11 +4786,13 @@ async fn sandbox_inherit_non_legacy_meta_honors_env_disabled_bwrap() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<()> {
+async fn sandbox_inherit_without_state_meta_fails_on_ctrl_d() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
-    let result = session.call_tool_raw("repl_reset", json!({})).await?;
+    let result = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(2.0))
+        .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
@@ -4799,7 +4806,7 @@ async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<
     assert_eq!(
         result.is_error,
         Some(true),
-        "expected repl_reset without required metadata to set isError, got: {:?}",
+        "expected Ctrl-D without required metadata to set isError, got: {:?}",
         result.is_error
     );
     session.cancel().await?;
@@ -4807,14 +4814,14 @@ async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_repl_reset_uses_state_meta() -> TestResult<()> {
+async fn sandbox_inherit_ctrl_d_uses_state_meta() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
     let result = session
-        .call_tool_raw_with_meta(
-            "repl_reset",
-            json!({}),
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
             Some(workspace_write_meta(temp.path())),
         )
         .await?;
@@ -4826,51 +4833,9 @@ async fn sandbox_inherit_repl_reset_uses_state_meta() -> TestResult<()> {
     }
     assert!(
         text.contains("new session started"),
-        "expected repl_reset with sandbox metadata to succeed, got: {text}"
+        "expected Ctrl-D with sandbox metadata to succeed, got: {text}"
     );
     session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_repl_reset_does_not_spawn_worker_just_to_stage_state() -> TestResult<()> {
-    let _guard = test_guard();
-    let temp = tempdir()?;
-    let debug_dir = temp.path().join("debug");
-    let session = spawn_inherit_server_with_env(
-        temp.path(),
-        vec![(
-            "MCP_REPL_DEBUG_DIR".to_string(),
-            debug_dir.to_string_lossy().to_string(),
-        )],
-    )
-    .await?;
-    let result = session
-        .call_tool_raw_with_meta(
-            "repl_reset",
-            json!({}),
-            Some(workspace_write_meta(temp.path())),
-        )
-        .await?;
-    let text = collect_text(&result);
-    assert!(
-        text.contains("new session started"),
-        "expected repl_reset with sandbox metadata to succeed, got: {text}"
-    );
-    session.cancel().await?;
-
-    let events = latest_debug_events(&debug_dir)?;
-    let saw_restart = events
-        .iter()
-        .any(|entry| entry["event"] == "worker_restart_begin");
-    assert!(saw_restart, "expected repl_reset to emit a restart event");
-    let saw_spawn = events
-        .iter()
-        .any(|entry| entry["event"] == "worker_spawn_begin");
-    assert!(
-        !saw_spawn,
-        "did not expect repl_reset to spawn a worker just to stage sandbox metadata"
-    );
     Ok(())
 }
 
@@ -4912,6 +4877,55 @@ async fn sandbox_inherit_ctrl_d_does_not_spawn_worker_just_to_stage_state() -> T
     assert!(
         !saw_spawn,
         "did not expect bare Ctrl-D to spawn a worker just to stage sandbox metadata"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_ctrl_d_changed_meta_does_not_spawn_before_restart() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let first = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let result = session
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
+            Some(read_only_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    assert!(
+        text.contains("new session started"),
+        "expected bare Ctrl-D with changed sandbox metadata to restart the session, got: {text}"
+    );
+    session.cancel().await?;
+
+    let events = latest_debug_events(&debug_dir)?;
+    let spawn_count = events
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .count();
+    assert_eq!(
+        spawn_count, 1,
+        "did not expect bare Ctrl-D to spawn a replacement worker before restarting"
     );
     Ok(())
 }

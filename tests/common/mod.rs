@@ -430,7 +430,6 @@ impl TestBackend {
 fn normalize_tool_name_for_request(tool: &str) -> &str {
     match tool {
         "r_repl" | "py_repl" => "repl",
-        "r_repl_reset" | "py_repl_reset" => "repl_reset",
         _ => tool,
     }
 }

@@ -35,7 +35,6 @@ such as sandbox state details without duplicating the rest of the document.
 
 - `src/server.rs` selects one of four `include_str!` descriptions for `repl`.
 - The descriptions live under `docs/tool-descriptions/`.
-- `repl_reset` already has its own separate fixed document.
 
 The current approach is explicit and compile-time friendly, but it is not the
 best long-term authoring model.
@@ -75,8 +74,8 @@ enough as long as:
 - Prefer fail-fast rendering over fallback chains or silent omissions.
 - Do not make the rendered description depend on unstable process state beyond
   the explicit runtime fields we choose to expose.
-- Keep `repl_reset` separate unless the same composition mechanism clearly helps
-  there too.
+- Keep session restart guidance in the `repl` description because Ctrl-D / EOF
+  is part of the single public tool surface.
 
 ## Possible Follow-On Slice
 
@@ -92,6 +91,6 @@ enough as long as:
 
 ## Non-Goals
 
-- Redesigning the `repl` or `repl_reset` tool schema.
+- Redesigning the `repl` tool schema.
 - Turning tool descriptions into a generic dynamic-content subsystem.
 - Adding user-configurable arbitrary template logic.
