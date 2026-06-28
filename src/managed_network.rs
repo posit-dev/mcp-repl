@@ -10,7 +10,13 @@ use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -50,6 +56,14 @@ const HTTP_PROXY_ENV_KEYS: &[&str] = &[
 ];
 const SOCKS_PROXY_ENV_KEYS: &[&str] = &["ALL_PROXY", "all_proxy", "FTP_PROXY", "ftp_proxy"];
 const NO_PROXY_ENV_KEYS: &[&str] = &["NO_PROXY", "no_proxy", "npm_config_noproxy"];
+#[cfg(target_os = "linux")]
+pub(crate) const LINUX_MANAGED_NETWORK_HTTP_BRIDGE_PORT: u16 = 39080;
+#[cfg(target_os = "linux")]
+pub(crate) const LINUX_MANAGED_NETWORK_SOCKS_BRIDGE_PORT: u16 = 39081;
+#[cfg(target_os = "linux")]
+const LINUX_MANAGED_NETWORK_HTTP_SOCKET_NAME: &str = "mn-http.sock";
+#[cfg(target_os = "linux")]
+const LINUX_MANAGED_NETWORK_SOCKS_SOCKET_NAME: &str = "mn-socks.sock";
 
 #[derive(Debug)]
 pub enum ManagedNetworkError {
@@ -189,6 +203,22 @@ pub struct ManagedNetworkProxy {
     socks_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     listener_threads: Vec<thread::JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    linux_relay: Mutex<Option<LinuxManagedNetworkRelay>>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinuxManagedNetworkBridgeConfig {
+    pub(crate) http_socket: PathBuf,
+    pub(crate) socks_socket: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxManagedNetworkRelay {
+    config: LinuxManagedNetworkBridgeConfig,
+    shutdown: Arc<AtomicBool>,
+    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl ManagedNetworkProxy {
@@ -239,6 +269,8 @@ impl ManagedNetworkProxy {
             socks_addr,
             shutdown,
             listener_threads,
+            #[cfg(target_os = "linux")]
+            linux_relay: Mutex::new(None),
         })
     }
 
@@ -254,6 +286,7 @@ impl ManagedNetworkProxy {
         self.socks_addr
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn apply_to_env(&self, env: &mut HashMap<String, String>) {
         let http_proxy_url = format!("http://{}", self.http_addr);
         let socks_proxy_url = format!("socks5h://{}", self.socks_addr);
@@ -261,6 +294,65 @@ impl ManagedNetworkProxy {
         set_env_keys(env, HTTP_PROXY_ENV_KEYS, &http_proxy_url);
         set_env_keys(env, SOCKS_PROXY_ENV_KEYS, &socks_proxy_url);
         set_env_keys(env, NO_PROXY_ENV_KEYS, DEFAULT_NO_PROXY_VALUE);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn apply_linux_bridge_to_env(
+        &self,
+        env: &mut HashMap<String, String>,
+        session_temp_dir: &Path,
+    ) -> Result<LinuxManagedNetworkBridgeConfig, ManagedNetworkError> {
+        let bridge = self.ensure_linux_relay(session_temp_dir)?;
+        env.insert(PROXY_ACTIVE_ENV_KEY.to_string(), "1".to_string());
+        set_env_keys(
+            env,
+            HTTP_PROXY_ENV_KEYS,
+            &format!("http://127.0.0.1:{LINUX_MANAGED_NETWORK_HTTP_BRIDGE_PORT}"),
+        );
+        set_env_keys(
+            env,
+            SOCKS_PROXY_ENV_KEYS,
+            &format!("socks5h://127.0.0.1:{LINUX_MANAGED_NETWORK_SOCKS_BRIDGE_PORT}"),
+        );
+        if self.config.allow_local_binding {
+            set_env_keys(env, NO_PROXY_ENV_KEYS, "");
+        } else {
+            set_env_keys(env, NO_PROXY_ENV_KEYS, DEFAULT_NO_PROXY_VALUE);
+        }
+        Ok(bridge)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ensure_linux_relay(
+        &self,
+        session_temp_dir: &Path,
+    ) -> Result<LinuxManagedNetworkBridgeConfig, ManagedNetworkError> {
+        let mut relay = self
+            .linux_relay
+            .lock()
+            .map_err(|_| io::Error::other("managed network relay mutex poisoned"))?;
+        let expected = LinuxManagedNetworkBridgeConfig {
+            http_socket: session_temp_dir.join(LINUX_MANAGED_NETWORK_HTTP_SOCKET_NAME),
+            socks_socket: session_temp_dir.join(LINUX_MANAGED_NETWORK_SOCKS_SOCKET_NAME),
+        };
+        let needs_new = relay.as_ref().is_none_or(|existing| {
+            existing.config != expected
+                || !existing.config.http_socket.exists()
+                || !existing.config.socks_socket.exists()
+        });
+        if needs_new {
+            *relay = None;
+            *relay = Some(LinuxManagedNetworkRelay::start(
+                expected,
+                self.http_addr,
+                self.socks_addr,
+            )?);
+        }
+        Ok(relay
+            .as_ref()
+            .expect("relay should exist after start")
+            .config
+            .clone())
     }
 
     #[cfg(target_os = "windows")]
@@ -271,6 +363,10 @@ impl ManagedNetworkProxy {
 
 impl Drop for ManagedNetworkProxy {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Ok(mut relay) = self.linux_relay.lock() {
+            *relay = None;
+        }
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.http_addr);
         let _ = TcpStream::connect(self.socks_addr);
@@ -278,6 +374,105 @@ impl Drop for ManagedNetworkProxy {
             let _ = handle.join();
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxManagedNetworkRelay {
+    fn start(
+        config: LinuxManagedNetworkBridgeConfig,
+        http_addr: SocketAddr,
+        socks_addr: SocketAddr,
+    ) -> Result<Self, ManagedNetworkError> {
+        if let Some(parent) = config.http_socket.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        remove_stale_unix_socket(&config.http_socket)?;
+        remove_stale_unix_socket(&config.socks_socket)?;
+        let http_listener = UnixListener::bind(&config.http_socket)?;
+        let socks_listener = UnixListener::bind(&config.socks_socket)?;
+        http_listener.set_nonblocking(true)?;
+        socks_listener.set_nonblocking(true)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let threads = vec![
+            spawn_unix_relay_listener(http_listener, http_addr, Arc::clone(&shutdown)),
+            spawn_unix_relay_listener(socks_listener, socks_addr, Arc::clone(&shutdown)),
+        ];
+
+        Ok(Self {
+            config,
+            shutdown,
+            threads,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxManagedNetworkRelay {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&self.config.http_socket);
+        let _ = UnixStream::connect(&self.config.socks_socket);
+        for handle in self.threads.drain(..) {
+            let _ = handle.join();
+        }
+        let _ = std::fs::remove_file(&self.config.http_socket);
+        let _ = std::fs::remove_file(&self.config.socks_socket);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_stale_unix_socket(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_unix_relay_listener(
+    listener: UnixListener,
+    upstream_addr: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while !shutdown.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    thread::spawn(move || handle_unix_relay_client(stream, upstream_addr));
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(LISTENER_IDLE_SLEEP);
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn handle_unix_relay_client(client: UnixStream, upstream_addr: SocketAddr) {
+    let Ok(upstream) = TcpStream::connect(upstream_addr) else {
+        return;
+    };
+    let _ = proxy_unix_to_tcp(client, upstream);
+}
+
+#[cfg(target_os = "linux")]
+fn proxy_unix_to_tcp(client: UnixStream, upstream: TcpStream) -> io::Result<()> {
+    let mut client_read = client.try_clone()?;
+    let mut upstream_write = upstream.try_clone()?;
+    let client_to_upstream = thread::spawn(move || {
+        let _ = io::copy(&mut client_read, &mut upstream_write);
+        let _ = upstream_write.shutdown(Shutdown::Write);
+    });
+
+    let mut upstream_read = upstream;
+    let mut client_write = client;
+    let result = io::copy(&mut upstream_read, &mut client_write);
+    let _ = client_write.shutdown(Shutdown::Write);
+    let _ = client_to_upstream.join();
+    result.map(|_| ())
 }
 
 fn set_env_keys(env: &mut HashMap<String, String>, keys: &[&str], value: &str) {
@@ -867,6 +1062,8 @@ fn proxy_bidirectional(client: TcpStream, upstream: TcpStream) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn validate_domain_pattern_rejects_exact_url() {
@@ -1056,6 +1253,64 @@ mod tests {
 
         assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
         assert!(response.ends_with("ok"), "{response}");
+        origin_thread.join().expect("origin thread");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unix_socket_relay_forwards_bytes_to_managed_proxy() {
+        let origin = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("origin");
+        let origin_addr = origin.local_addr().expect("origin address");
+        let origin_thread = thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("origin accept");
+            let request = read_http_header(&mut stream).expect("request header");
+            let request = String::from_utf8(request).expect("request utf8");
+            assert!(
+                request.starts_with("GET /relay HTTP/1.1\r\n"),
+                "proxy should receive traffic forwarded through the Unix relay: {request}"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nrelayed",
+                )
+                .expect("origin response");
+        });
+        let proxy = ManagedNetworkProxy::start(ManagedProxyConfig {
+            allowed_domains: vec!["127.0.0.1".to_string()],
+            denied_domains: Vec::new(),
+            allow_local_binding: true,
+        })
+        .expect("proxy");
+        let temp = tempfile::Builder::new()
+            .prefix("mcp-repl-linux-relay-")
+            .tempdir()
+            .expect("tempdir");
+        let mut env = HashMap::new();
+        let bridge = proxy
+            .apply_linux_bridge_to_env(&mut env, temp.path())
+            .expect("Linux relay sockets");
+
+        let mut client = UnixStream::connect(&bridge.http_socket).expect("connect HTTP relay");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{}/relay HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                    origin_addr.port(),
+                    origin_addr.port()
+                )
+                .as_bytes(),
+            )
+            .expect("relay request");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finish relay request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("relay response");
+
+        assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.ends_with("relayed"), "{response}");
         origin_thread.join().expect("origin thread");
     }
 

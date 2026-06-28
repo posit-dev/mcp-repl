@@ -69,10 +69,16 @@ pub(super) fn managed_network_proxy_config_for_state(
             "managed network domain restrictions require built-in sandbox enforcement".to_string(),
         ));
     }
-    if !(cfg!(target_os = "macos") || cfg!(target_os = "windows")) {
+    #[cfg(target_os = "linux")]
+    if !state.use_linux_sandbox_bwrap {
         return Err(WorkerError::Sandbox(
-            "managed network domain restrictions are currently supported only on macOS and Windows"
-                .to_string(),
+            "Linux managed network domain restrictions require bubblewrap; set features.use_linux_sandbox_bwrap=true and useLegacyLandlock=false".to_string(),
+        ));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        return Err(WorkerError::Sandbox(
+            "managed network domain restrictions are currently supported only on macOS, Windows, and Linux with bubblewrap".to_string(),
         ));
     }
     ManagedProxyConfig::from_policy(&state.managed_network_policy)
@@ -264,6 +270,8 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::oversized_output::OversizedOutputMode;
+    #[cfg(target_os = "linux")]
+    use crate::sandbox::ManagedNetworkPolicy;
     use crate::sandbox::SandboxPolicy;
     use crate::sandbox_cli::{
         SandboxCliOperation, SandboxConfigOperation, SandboxModeArg,
@@ -271,6 +279,60 @@ mod tests {
     };
     use crate::worker_process::test_support::cwd_test_mutex;
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_managed_domain_policy_returns_proxy_config() {
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            managed_network_policy: ManagedNetworkPolicy {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: false,
+            },
+            use_linux_sandbox_bwrap: true,
+            ..SandboxState::default()
+        };
+
+        let config = managed_network_proxy_config_for_state(&state)
+            .expect("Linux bwrap managed domains should be supported")
+            .expect("managed domains should start a proxy");
+
+        assert_eq!(config.allowed_domains, vec!["example.com"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_managed_domain_policy_rejects_bwrap_disabled() {
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            managed_network_policy: ManagedNetworkPolicy {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: false,
+            },
+            use_linux_sandbox_bwrap: false,
+            ..SandboxState::default()
+        };
+
+        let err = managed_network_proxy_config_for_state(&state)
+            .expect_err("Linux managed domains should require bwrap");
+
+        assert!(
+            matches!(err, WorkerError::Sandbox(ref message) if message.contains("Linux managed network domain restrictions require bubblewrap")),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn inherit_ending_invalid_plan_fails_during_startup_validation() {

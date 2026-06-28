@@ -91,6 +91,43 @@ class LoopbackServer:
                 return
 
 
+class HttpLoopbackServer(LoopbackServer):
+    def __enter__(self) -> HttpLoopbackServer:
+        super().__enter__()
+        if self.port in (39080, 39081):
+            self.__exit__(None, None, None)
+            raise SuiteSkip(
+                f"loopback server selected reserved managed-network port {self.port}"
+            )
+        return self
+
+    def _serve(self) -> None:
+        listener = self.listener
+        assert listener is not None
+        while not self.stop_event.is_set():
+            try:
+                conn, _addr = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(2.0)
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    request += chunk
+                body = b"ok"
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                )
+
+
 def collect_stderr(stream: Any, sink: list[str]) -> None:
     for raw in iter(stream.readline, b""):
         sink.append(raw.decode("utf-8", errors="replace").rstrip())
@@ -852,6 +889,62 @@ def python_busy_discards_input(client: McpStdioClient) -> None:
     )
 
 
+def python_linux_managed_network_domain_allowlist(client: McpStdioClient) -> None:
+    with HttpLoopbackServer() as server:
+        received = client.repl(
+            dedent(
+                f"""
+                import socket
+                import urllib.request
+
+                port = {server.port}
+
+                try:
+                    body = urllib.request.urlopen(
+                        f"http://localhost:{{port}}/allowed",
+                        timeout=5,
+                    ).read().decode()
+                    print("PROXY_OK:" + body)
+                except Exception as exc:
+                    print("PROXY_ERROR:" + type(exc).__name__ + ":" + str(exc))
+
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+                        sock.sendall(b"GET /direct HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n")
+                        print("DIRECT_OK:" + repr(sock.recv(16)))
+                except Exception as exc:
+                    print("DIRECT_ERROR:" + type(exc).__name__ + ":" + str(exc))
+
+                try:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{{port}}/denied",
+                        timeout=5,
+                    ).read()
+                    print("DENIED_OK")
+                except Exception as exc:
+                    print("DENIED_ERROR:" + type(exc).__name__ + ":" + str(exc))
+                """
+            ),
+            timeout_ms=30000,
+        )
+    received_text = require_success(received, "Linux managed network allowlist repl")
+    if "PROXY_OK:ok" not in received_text or "PROXY_ERROR:" in received_text:
+        raise SuiteFailure(
+            "expected allowlisted localhost request to succeed through the proxy, "
+            f"got: {received_text!r}"
+        )
+    if "DIRECT_ERROR:" not in received_text or "DIRECT_OK:" in received_text:
+        raise SuiteFailure(
+            "expected direct worker socket connection to fail in the isolated namespace, "
+            f"got: {received_text!r}"
+        )
+    if "DENIED_ERROR:" not in received_text or "DENIED_OK" in received_text:
+        raise SuiteFailure(
+            "expected disallowed host request to fail through the managed proxy, "
+            f"got: {received_text!r}"
+        )
+
+
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
@@ -1379,6 +1472,23 @@ def python_suite_case(
 CANONICAL_CASES: dict[str, SuiteCase] = {
     "python-busy-discards-input": python_suite_case(python_busy_discards_input),
     "python-console-basic": python_suite_case(python_console_basic),
+    "python-linux-managed-network-domain-allowlist": python_suite_case(
+        python_linux_managed_network_domain_allowlist,
+        server_args=(
+            "--sandbox",
+            "workspace-write",
+            "--config",
+            "sandbox_workspace_write.network_access=true",
+            "--config",
+            'permissions.network.allowed_domains=["localhost"]',
+            "--config",
+            "permissions.network.allow_local_binding=true",
+        ),
+        server_cwd=Path(
+            "target/test-scratch/run-integration-tests/python-linux-managed-network-domain-allowlist"
+        ),
+        platforms=("linux",),
+    ),
     "r-console-basic": r_suite_case(r_console_basic),
     "r-full-access-sandbox": r_suite_case(
         r_full_access_sandbox,

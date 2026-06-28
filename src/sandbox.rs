@@ -12,6 +12,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;
@@ -1918,11 +1920,27 @@ pub fn prepare_worker_command_with_managed_network(
             "0".to_string()
         },
     );
+    #[cfg(not(target_os = "linux"))]
     if let Some(proxy) = managed_network_proxy {
         proxy.apply_to_env(&mut env);
     }
 
     ensure_session_temp_dir(&state.session_temp_dir)?;
+    #[cfg(target_os = "linux")]
+    let linux_managed_network_bridge = if let Some(proxy) = managed_network_proxy {
+        if !state.use_linux_sandbox_bwrap {
+            return Err(SandboxError::LinuxSandbox(
+                "Linux managed network domain restrictions require bubblewrap; set features.use_linux_sandbox_bwrap=true and useLegacyLandlock=false".to_string(),
+            ));
+        }
+        Some(
+            proxy
+                .apply_linux_bridge_to_env(&mut env, &state.session_temp_dir)
+                .map_err(|err| SandboxError::LinuxSandbox(err.to_string()))?,
+        )
+    } else {
+        None
+    };
     {
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
@@ -2023,6 +2041,7 @@ pub fn prepare_worker_command_with_managed_network(
             &state.session_temp_dir,
             state.use_linux_sandbox_bwrap,
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
+            linux_managed_network_bridge.as_ref(),
         );
         let sandbox_program =
             std::env::current_exe().map_err(|err| SandboxError::LinuxSandbox(err.to_string()))?;
@@ -2087,6 +2106,7 @@ fn create_linux_sandbox_command_args(
     session_temp_dir: &Path,
     use_bwrap_sandbox: bool,
     no_proc: bool,
+    managed_network_bridge: Option<&crate::managed_network::LinuxManagedNetworkBridgeConfig>,
 ) -> Vec<String> {
     let sandbox_policy_cwd = sandbox_policy_cwd.to_string_lossy().to_string();
     let session_temp_dir = session_temp_dir.to_string_lossy().to_string();
@@ -2106,6 +2126,12 @@ fn create_linux_sandbox_command_args(
     }
     if no_proc {
         linux_cmd.push("--no-proc".to_string());
+    }
+    if let Some(bridge) = managed_network_bridge {
+        linux_cmd.push("--managed-network-http-socket".to_string());
+        linux_cmd.push(bridge.http_socket.to_string_lossy().to_string());
+        linux_cmd.push("--managed-network-socks-socket".to_string());
+        linux_cmd.push(bridge.socks_socket.to_string_lossy().to_string());
     }
     linux_cmd.extend(["--".to_string()]);
     linux_cmd.extend(command);
@@ -3111,17 +3137,33 @@ struct LinuxSandboxArgs {
     use_bwrap_sandbox: bool,
     apply_seccomp_then_exec: bool,
     no_proc: bool,
+    managed_network_bridge: Option<LinuxManagedNetworkBridgeArgs>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxManagedNetworkBridgeArgs {
+    http_socket: PathBuf,
+    socks_socket: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
 fn linux_sandbox_main_impl() -> Result<(), String> {
     let args = linux_sandbox_parse_args()?;
     if args.apply_seccomp_then_exec {
+        if let Some(bridge) = args.managed_network_bridge.as_ref() {
+            start_linux_managed_network_bridge_children(bridge)?;
+        }
+        let network_seccomp_mode = linux_network_seccomp_mode_for_policy(
+            &args.sandbox_policy,
+            args.managed_network_bridge.is_some(),
+        );
         linux_apply_sandbox_policy_to_current_thread(
             &args.sandbox_policy,
             &args.sandbox_policy_cwd,
             &args.session_temp_dir,
             false,
+            network_seccomp_mode,
         )?;
         linux_execvp(args.command)?;
         return Ok(());
@@ -3135,6 +3177,7 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
         &args.sandbox_policy_cwd,
         &args.session_temp_dir,
         true,
+        linux_network_seccomp_mode_for_policy(&args.sandbox_policy, false),
     )?;
     linux_execvp(args.command)?;
     Ok(())
@@ -3149,6 +3192,8 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
     let mut use_bwrap_sandbox = false;
     let mut apply_seccomp_then_exec = false;
     let mut no_proc = false;
+    let mut managed_network_http_socket: Option<PathBuf> = None;
+    let mut managed_network_socks_socket: Option<PathBuf> = None;
 
     let mut args = std::env::args_os().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -3162,6 +3207,20 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
         }
         if arg == "--no-proc" {
             no_proc = true;
+            continue;
+        }
+        if arg == "--managed-network-http-socket" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --managed-network-http-socket".to_string())?;
+            managed_network_http_socket = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg == "--managed-network-socks-socket" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --managed-network-socks-socket".to_string())?;
+            managed_network_socks_socket = Some(PathBuf::from(value));
             continue;
         }
         if arg == "--sandbox-policy-cwd" {
@@ -3206,6 +3265,19 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
     }
+    let managed_network_bridge = match (managed_network_http_socket, managed_network_socks_socket) {
+        (Some(http_socket), Some(socks_socket)) => Some(LinuxManagedNetworkBridgeArgs {
+            http_socket,
+            socks_socket,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "Linux managed network bridge requires both HTTP and SOCKS socket paths"
+                    .to_string(),
+            );
+        }
+    };
 
     Ok(LinuxSandboxArgs {
         sandbox_policy_cwd,
@@ -3215,7 +3287,217 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
         use_bwrap_sandbox,
         apply_seccomp_then_exec,
         no_proc,
+        managed_network_bridge,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_managed_network_bridge_children(
+    bridge: &LinuxManagedNetworkBridgeArgs,
+) -> Result<(), String> {
+    let http_pid = start_linux_managed_network_bridge_child(
+        &bridge.http_socket,
+        crate::managed_network::LINUX_MANAGED_NETWORK_HTTP_BRIDGE_PORT,
+        "HTTP",
+    )?;
+
+    match start_linux_managed_network_bridge_child(
+        &bridge.socks_socket,
+        crate::managed_network::LINUX_MANAGED_NETWORK_SOCKS_BRIDGE_PORT,
+        "SOCKS",
+    ) {
+        Ok(_socks_pid) => Ok(()),
+        Err(err) => {
+            linux_terminate_child(http_pid);
+            Err(err)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_managed_network_bridge_child(
+    socket_path: &Path,
+    port: u16,
+    label: &'static str,
+) -> Result<libc::pid_t, String> {
+    let mut ready_pipe = [-1; 2];
+    if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "failed to create {label} managed network bridge readiness pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        linux_close_fd(ready_pipe[0]);
+        linux_close_fd(ready_pipe[1]);
+        return Err(format!(
+            "failed to fork {label} managed network bridge child: {err}"
+        ));
+    }
+
+    if pid == 0 {
+        linux_close_fd(ready_pipe[0]);
+        linux_managed_network_bridge_child_main(socket_path, port, label, ready_pipe[1]);
+    }
+
+    linux_close_fd(ready_pipe[1]);
+    let readiness = read_linux_managed_network_bridge_readiness(ready_pipe[0], pid, label);
+    linux_close_fd(ready_pipe[0]);
+    readiness.map(|()| pid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_managed_network_bridge_readiness(
+    fd: libc::c_int,
+    pid: libc::pid_t,
+    label: &str,
+) -> Result<(), String> {
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
+        if read == 1 {
+            break;
+        }
+        if read == 0 {
+            linux_wait_for_bridge_child(pid);
+            return Err(format!(
+                "{label} managed network bridge exited before signaling readiness"
+            ));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        linux_terminate_child(pid);
+        return Err(format!(
+            "failed to read {label} managed network bridge readiness: {err}"
+        ));
+    }
+
+    if byte[0] == 1 {
+        Ok(())
+    } else {
+        linux_wait_for_bridge_child(pid);
+        Err(format!("{label} managed network bridge failed to start"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_managed_network_bridge_child_main(
+    socket_path: &Path,
+    port: u16,
+    label: &str,
+    ready_fd: libc::c_int,
+) -> ! {
+    let _ = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+    if unsafe { libc::getppid() } == 1 {
+        unsafe { libc::_exit(1) };
+    }
+
+    let result = linux_run_managed_network_bridge_child(socket_path, port, ready_fd);
+    if let Err(err) = result {
+        eprintln!("codex-linux-sandbox: {label} managed network bridge failed: {err}");
+        let _ = linux_write_managed_network_bridge_ready(ready_fd, false);
+        linux_close_fd(ready_fd);
+        unsafe { libc::_exit(1) };
+    }
+    unsafe { libc::_exit(0) };
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_managed_network_bridge_child(
+    socket_path: &Path,
+    port: u16,
+    ready_fd: libc::c_int,
+) -> Result<(), String> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .map_err(|err| format!("failed to bind 127.0.0.1:{port}: {err}"))?;
+    listener
+        .set_nonblocking(false)
+        .map_err(|err| err.to_string())?;
+    linux_write_managed_network_bridge_ready(ready_fd, true).map_err(|err| err.to_string())?;
+    linux_close_fd(ready_fd);
+
+    loop {
+        let (client, _) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        let socket_path = socket_path.to_path_buf();
+        std::thread::spawn(move || linux_bridge_tcp_client_to_unix_socket(client, socket_path));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bridge_tcp_client_to_unix_socket(client: std::net::TcpStream, socket_path: PathBuf) {
+    let Ok(upstream) = UnixStream::connect(socket_path) else {
+        return;
+    };
+    let _ = linux_proxy_tcp_to_unix(client, upstream);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proxy_tcp_to_unix(
+    client: std::net::TcpStream,
+    upstream: UnixStream,
+) -> std::io::Result<()> {
+    let mut client_read = client.try_clone()?;
+    let mut upstream_write = upstream.try_clone()?;
+    let client_to_upstream = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut upstream_write);
+        let _ = upstream_write.shutdown(std::net::Shutdown::Write);
+    });
+
+    let mut upstream_read = upstream;
+    let mut client_write = client;
+    let result = std::io::copy(&mut upstream_read, &mut client_write);
+    let _ = client_write.shutdown(std::net::Shutdown::Write);
+    let _ = client_to_upstream.join();
+    result.map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_write_managed_network_bridge_ready(fd: libc::c_int, ready: bool) -> std::io::Result<()> {
+    let byte = [u8::from(ready)];
+    loop {
+        let written = unsafe { libc::write(fd, byte.as_ptr().cast(), byte.len()) };
+        if written == 1 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_close_fd(fd: libc::c_int) {
+    if fd >= 0 {
+        let _ = unsafe { libc::close(fd) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_terminate_child(pid: libc::pid_t) {
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+    linux_wait_for_bridge_child(pid);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_wait_for_bridge_child(pid: libc::pid_t) {
+    let mut status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid || result < 0 {
+            return;
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3268,8 +3550,9 @@ fn linux_build_inner_seccomp_command(
         "--sandbox-policy".to_string(),
         policy_json,
         "--apply-seccomp-then-exec".to_string(),
-        "--".to_string(),
     ];
+    append_linux_managed_network_bridge_args(&mut inner, args.managed_network_bridge.as_ref());
+    inner.push("--".to_string());
     inner.extend(
         args.command
             .iter()
@@ -3279,6 +3562,20 @@ fn linux_build_inner_seccomp_command(
         command: inner,
         helper_dir,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_managed_network_bridge_args(
+    args: &mut Vec<String>,
+    bridge: Option<&LinuxManagedNetworkBridgeArgs>,
+) {
+    let Some(bridge) = bridge else {
+        return;
+    };
+    args.push("--managed-network-http-socket".to_string());
+    args.push(bridge.http_socket.to_string_lossy().to_string());
+    args.push("--managed-network-socks-socket".to_string());
+    args.push(bridge.socks_socket.to_string_lossy().to_string());
 }
 
 #[cfg(target_os = "linux")]
@@ -3304,7 +3601,8 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
     let inner = linux_build_inner_seccomp_command(&args)?;
     let file_system_policy =
         linux_effective_file_system_policy(&args.sandbox_policy, &args.session_temp_dir);
-    let network_mode = linux_bwrap_network_mode(&args.sandbox_policy);
+    let network_mode =
+        linux_bwrap_network_mode(&args.sandbox_policy, args.managed_network_bridge.is_some());
     let mount_proc = !args.no_proc
         && linux_bwrap_supports_proc_mount(
             bwrap_program.as_path(),
@@ -3355,18 +3653,27 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
 enum LinuxBwrapNetworkMode {
     FullAccess,
     Isolated,
+    IsolatedProxyRouted,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxBwrapNetworkMode {
     fn should_unshare_network(self) -> bool {
-        matches!(self, LinuxBwrapNetworkMode::Isolated)
+        matches!(
+            self,
+            LinuxBwrapNetworkMode::Isolated | LinuxBwrapNetworkMode::IsolatedProxyRouted
+        )
     }
 }
 
 #[cfg(target_os = "linux")]
-fn linux_bwrap_network_mode(policy: &SandboxPolicy) -> LinuxBwrapNetworkMode {
-    if policy.has_full_network_access() {
+fn linux_bwrap_network_mode(
+    policy: &SandboxPolicy,
+    managed_network_bridge: bool,
+) -> LinuxBwrapNetworkMode {
+    if managed_network_bridge {
+        LinuxBwrapNetworkMode::IsolatedProxyRouted
+    } else if policy.has_full_network_access() {
         LinuxBwrapNetworkMode::FullAccess
     } else {
         LinuxBwrapNetworkMode::Isolated
@@ -4787,17 +5094,15 @@ fn linux_apply_sandbox_policy_to_current_thread(
     cwd: &Path,
     session_temp_dir: &Path,
     apply_landlock_fs: bool,
+    network_seccomp_mode: Option<LinuxNetworkSeccompMode>,
 ) -> Result<(), String> {
     let file_system_policy = linux_effective_file_system_policy(sandbox_policy, session_temp_dir);
-    if !file_system_policy.has_full_disk_write_access() || !sandbox_policy.has_full_network_access()
-    {
+    if !file_system_policy.has_full_disk_write_access() || network_seccomp_mode.is_some() {
         linux_set_no_new_privs()?;
     }
 
-    if !sandbox_policy.has_full_network_access() {
-        linux_install_network_seccomp_filter_on_current_thread(
-            LinuxNetworkSeccompMode::Restricted,
-        )?;
+    if let Some(mode) = network_seccomp_mode {
+        linux_install_network_seccomp_filter_on_current_thread(mode)?;
     }
 
     if apply_landlock_fs && !file_system_policy.has_full_disk_write_access() {
@@ -4813,6 +5118,20 @@ fn linux_apply_sandbox_policy_to_current_thread(
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_network_seccomp_mode_for_policy(
+    sandbox_policy: &SandboxPolicy,
+    managed_network_bridge: bool,
+) -> Option<LinuxNetworkSeccompMode> {
+    if managed_network_bridge {
+        Some(LinuxNetworkSeccompMode::ProxyRouted)
+    } else if sandbox_policy.has_full_network_access() {
+        None
+    } else {
+        Some(LinuxNetworkSeccompMode::Restricted)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5959,6 +6278,112 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn prepare_worker_command_with_linux_managed_proxy_uses_namespace_bridge() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: true,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-linux-proxy-test-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = tmp.path().join("session");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: session_temp_dir.clone(),
+            use_linux_sandbox_bwrap: true,
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+        state.managed_network_policy.allow_local_binding = true;
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("/bin/echo"),
+            vec!["ok".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+
+        assert_eq!(
+            prepared.env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:39080")
+        );
+        assert_eq!(
+            prepared.env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:39080")
+        );
+        assert_eq!(
+            prepared.env.get("ALL_PROXY").map(String::as_str),
+            Some("socks5h://127.0.0.1:39081")
+        );
+        assert_eq!(prepared.env.get("NO_PROXY").map(String::as_str), Some(""));
+        assert_eq!(prepared.env.get("no_proxy").map(String::as_str), Some(""));
+        assert_eq!(
+            prepared.env.get("npm_config_noproxy").map(String::as_str),
+            Some("")
+        );
+
+        let http_socket_index = prepared
+            .args
+            .iter()
+            .position(|arg| arg == "--managed-network-http-socket")
+            .expect("HTTP relay socket arg");
+        let socks_socket_index = prepared
+            .args
+            .iter()
+            .position(|arg| arg == "--managed-network-socks-socket")
+            .expect("SOCKS relay socket arg");
+        assert!(
+            Path::new(&prepared.args[http_socket_index + 1]).starts_with(&session_temp_dir),
+            "HTTP relay socket should live under session temp: {:?}",
+            prepared.args
+        );
+        assert!(
+            Path::new(&prepared.args[socks_socket_index + 1]).starts_with(&session_temp_dir),
+            "SOCKS relay socket should live under session temp: {:?}",
+            prepared.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proxy_routed_bwrap_mode_unshares_network() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-proxy-routed-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::workspace_write(&[], false, false);
+
+        let command = create_linux_bwrap_command_args(
+            vec!["/bin/true".to_string()],
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+            false,
+            LinuxBwrapNetworkMode::IsolatedProxyRouted,
+        )
+        .expect("proxy-routed bwrap command should build");
+
+        assert!(
+            command.args.iter().any(|arg| arg == "--unshare-net"),
+            "proxy-routed bwrap mode must isolate direct egress: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn proc_mount_failure_detects_expected_stderr() {
         assert!(is_proc_mount_failure(
             "bwrap: Can't mount proc on /newroot/proc: Invalid argument"
@@ -6692,6 +7117,7 @@ mod tests {
             use_bwrap_sandbox: true,
             apply_seccomp_then_exec: false,
             no_proc: false,
+            managed_network_bridge: None,
         };
 
         let inner = linux_build_inner_seccomp_command(&args).expect("inner seccomp command");
