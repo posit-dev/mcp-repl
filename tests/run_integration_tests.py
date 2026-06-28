@@ -945,9 +945,9 @@ def python_linux_managed_network_domain_allowlist(client: McpStdioClient) -> Non
             timeout_ms=30000,
         )
     received_text = require_success(received, "Linux managed network allowlist repl")
-    if "UNIX_OK:ping" not in received_text or "UNIX_ERROR:" in received_text:
+    if "UNIX_ERROR:" not in received_text or "UNIX_OK:" in received_text:
         raise SuiteFailure(
-            "expected Unix-domain sockets to remain available in managed network mode, "
+            "expected Unix-domain sockets to be unavailable in managed network mode, "
             f"got: {received_text!r}"
         )
     if "PROXY_OK:ok" not in received_text or "PROXY_ERROR:" in received_text:
