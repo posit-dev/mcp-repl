@@ -95,7 +95,7 @@ fn cargo_install_default_binary_surface_is_mcp_repl_only() -> TestResult<()> {
     let targets = package["targets"]
         .as_array()
         .expect("expected package targets");
-    let bin_names = targets
+    let default_bin_names = targets
         .iter()
         .filter(|target| {
             target["kind"]
@@ -103,14 +103,37 @@ fn cargo_install_default_binary_surface_is_mcp_repl_only() -> TestResult<()> {
                 .expect("expected target kind array")
                 .iter()
                 .any(|kind| kind.as_str() == Some("bin"))
+                && match target
+                    .get("required-features")
+                    .and_then(|features| features.as_array())
+                {
+                    Some(features) => features.is_empty(),
+                    None => true,
+                }
         })
         .map(|target| target["name"].as_str().expect("expected target name"))
         .collect::<Vec<_>>();
 
     assert_eq!(
-        bin_names,
+        default_bin_names,
         vec!["mcp-repl"],
         "cargo install should expose only the mcp-repl binary target"
+    );
+
+    let pypi_alias = targets
+        .iter()
+        .find(|target| target["name"].as_str() == Some("posit-mcp-repl"))
+        .expect("expected posit-mcp-repl binary target");
+    let pypi_alias_required_features = pypi_alias["required-features"]
+        .as_array()
+        .expect("expected posit-mcp-repl required features")
+        .iter()
+        .map(|feature| feature.as_str().expect("expected feature name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pypi_alias_required_features,
+        vec!["pypi-alias"],
+        "posit-mcp-repl should be gated to the PyPI wheel build"
     );
 
     Ok(())

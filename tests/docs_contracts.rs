@@ -176,7 +176,7 @@ fn readme_documents_release_install_contract() {
     for required in [
         "pipx install posit-mcp-repl",
         "uv tool install posit-mcp-repl",
-        "uvx --from posit-mcp-repl mcp-repl",
+        "uvx posit-mcp-repl",
         "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.sh",
         "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.ps1",
         "https://github.com/posit-dev/mcp-repl/releases/latest",
@@ -212,6 +212,7 @@ fn readme_documents_release_install_contract() {
 #[test]
 fn pyproject_defines_pypi_binary_package() {
     let pyproject = read(&repo_root().join("pyproject.toml"));
+    let cargo_toml = read(&repo_root().join("Cargo.toml"));
 
     for required in [
         "[build-system]",
@@ -222,11 +223,22 @@ fn pyproject_defines_pypi_binary_package() {
         "readme = \"README.md\"",
         "license = \"Apache-2.0\"",
         "bindings = \"bin\"",
+        "features = [\"pypi-alias\"]",
         "strip = true",
     ] {
         assert!(
             pyproject.contains(required),
             "missing {required} in pyproject.toml"
+        );
+    }
+
+    for required in [
+        "[[bin]]\n  name = \"mcp-repl\"\n  path = \"src/main.rs\"",
+        "[[bin]]\n  name = \"posit-mcp-repl\"\n  path = \"src/bin/posit-mcp-repl.rs\"\n  required-features = [\"pypi-alias\"]",
+    ] {
+        assert!(
+            cargo_toml.contains(required),
+            "missing {required} in Cargo.toml"
         );
     }
 }
@@ -249,6 +261,8 @@ fn ci_workflow_validates_release_packaging_without_publishing() {
         "maturin-version: v1.11.5",
         "Build PyPI wheel (linux)",
         "Build PyPI wheel (non-linux)",
+        "./wheel-smoke/bin/posit-mcp-repl --help",
+        r".\wheel-smoke\Scripts\posit-mcp-repl.exe --help",
         "matrix.os == 'ubuntu-22.04'",
         "matrix.os != 'ubuntu-22.04'",
         "Smoke test PyPI wheel",
@@ -362,6 +376,8 @@ fn release_workflow_defines_tag_and_manual_pypi_publishing_contract() {
         "maturin-version: v1.11.5",
         "Build PyPI wheel (linux)",
         "Build PyPI wheel (non-linux)",
+        "./wheel-smoke/bin/posit-mcp-repl --help",
+        r".\wheel-smoke\Scripts\posit-mcp-repl.exe --help",
         "matrix.os == 'ubuntu-22.04'",
         "matrix.os != 'ubuntu-22.04'",
         "Smoke test PyPI wheel",
@@ -491,6 +507,7 @@ fn releasing_docs_define_checklist_and_wheel_only_pypi_policy() {
         "Environment: `pypi`",
         "Package: `posit-mcp-repl`",
         "Wheel-only",
+        "`posit-mcp-repl` command alias",
         "sdist",
         "manylinux2014",
         "R is optional",
