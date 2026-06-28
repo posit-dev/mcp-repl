@@ -5606,6 +5606,15 @@ mod tests {
             .expect("linux bwrap env lock poisoned")
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn skip_when_loopback_sockets_are_unavailable(test_name: &str) -> bool {
+        if crate::managed_network::loopback_sockets_available_for_tests() {
+            return false;
+        }
+        eprintln!("{test_name}: loopback sockets unavailable in this sandbox; skipping");
+        true
+    }
+
     #[test]
     fn session_temp_dir_rejects_outside_system_tmp() {
         #[cfg(target_os = "windows")]
@@ -5807,6 +5816,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn prepare_worker_command_with_managed_proxy_injects_proxy_env_and_seatbelt_ports() {
+        if skip_when_loopback_sockets_are_unavailable(
+            "prepare_worker_command_with_managed_proxy_injects_proxy_env_and_seatbelt_ports",
+        ) {
+            return;
+        }
         let proxy = crate::managed_network::ManagedNetworkProxy::start(
             crate::managed_network::ManagedProxyConfig {
                 allowed_domains: vec!["example.com".to_string()],
@@ -5865,6 +5879,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn prepare_worker_command_with_managed_proxy_uses_session_temp_home() {
+        if skip_when_loopback_sockets_are_unavailable(
+            "prepare_worker_command_with_managed_proxy_uses_session_temp_home",
+        ) {
+            return;
+        }
         let proxy = crate::managed_network::ManagedNetworkProxy::start(
             crate::managed_network::ManagedProxyConfig {
                 allowed_domains: vec!["example.com".to_string()],
@@ -5916,6 +5935,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn prepare_worker_command_with_managed_proxy_routes_local_targets_through_proxy() {
+        if skip_when_loopback_sockets_are_unavailable(
+            "prepare_worker_command_with_managed_proxy_routes_local_targets_through_proxy",
+        ) {
+            return;
+        }
         let proxy = crate::managed_network::ManagedNetworkProxy::start(
             crate::managed_network::ManagedProxyConfig {
                 allowed_domains: vec!["example.com".to_string()],
