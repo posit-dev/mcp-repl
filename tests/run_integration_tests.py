@@ -1376,7 +1376,7 @@ def python_suite_case(
     )
 
 
-CASES: dict[str, SuiteCase] = {
+CANONICAL_CASES: dict[str, SuiteCase] = {
     "python-busy-discards-input": python_suite_case(python_busy_discards_input),
     "python-console-basic": python_suite_case(python_console_basic),
     "r-console-basic": r_suite_case(r_console_basic),
@@ -1466,6 +1466,15 @@ CASES: dict[str, SuiteCase] = {
     ),
 }
 
+CASE_ALIASES: dict[str, str] = {
+    "r-reset-clears-state": "r-ctrl-d-clears-state",
+}
+
+CASES: dict[str, SuiteCase] = {
+    **CANONICAL_CASES,
+    **{alias: CANONICAL_CASES[target] for alias, target in CASE_ALIASES.items()},
+}
+
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1514,7 +1523,7 @@ def main(argv: Sequence[str]) -> int:
         return 2
     binary = resolve_binary_path(args.binary)
 
-    selected = args.case or sorted(CASES)
+    selected = args.case or sorted(CANONICAL_CASES)
     failures = 0
     for case_name in selected:
         case = CASES[case_name]
