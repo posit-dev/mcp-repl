@@ -136,6 +136,7 @@ impl WorkerManager {
         let started_at = Instant::now();
         let worker_deadline = started_at + worker_timeout;
         let server_deadline = started_at + server_timeout;
+        let has_tail = !plan.tail.is_empty();
 
         let control_reply = match (mode, plan.action, plan.stage_interrupt_after_session_end) {
             (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) => {
@@ -148,7 +149,7 @@ impl WorkerManager {
                     options.suppress_session_end_reset,
                 ),
             (WriteStdinMode::Files, WriteStdinControlAction::Restart, _) => {
-                self.restart_files(remaining_until(worker_deadline))
+                self.restart_files(remaining_until(worker_deadline), has_tail)
             }
             (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) => {
                 self.interrupt_pager(remaining_until(worker_deadline), None, true)
@@ -160,7 +161,7 @@ impl WorkerManager {
                     options.suppress_session_end_reset,
                 ),
             (WriteStdinMode::Pager, WriteStdinControlAction::Restart, _) => {
-                self.restart_pager(remaining_until(worker_deadline))
+                self.restart_pager(remaining_until(worker_deadline), has_tail)
             }
         }?;
 
@@ -174,7 +175,7 @@ impl WorkerManager {
             )?;
             self.maybe_reset_after_session_end();
         }
-        if plan.tail.is_empty() {
+        if !has_tail {
             return Ok(Some(control_reply));
         }
 

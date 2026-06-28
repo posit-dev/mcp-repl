@@ -26,7 +26,7 @@ enum RestartShutdownSnapshot {
 #[derive(Clone, Copy)]
 enum RestartShutdown {
     Sideband,
-    StdinClose,
+    StdinClose { include_shutdown_output: bool },
 }
 
 impl WorkerManager {
@@ -41,12 +41,32 @@ impl WorkerManager {
         }
     }
 
-    pub(super) fn restart_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        self.restart_for_mode(RestartMode::Files, RestartShutdown::StdinClose, timeout)
+    pub(super) fn restart_files(
+        &mut self,
+        timeout: Duration,
+        include_shutdown_output: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.restart_for_mode(
+            RestartMode::Files,
+            RestartShutdown::StdinClose {
+                include_shutdown_output,
+            },
+            timeout,
+        )
     }
 
-    pub(super) fn restart_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        self.restart_for_mode(RestartMode::Pager, RestartShutdown::StdinClose, timeout)
+    pub(super) fn restart_pager(
+        &mut self,
+        timeout: Duration,
+        include_shutdown_output: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.restart_for_mode(
+            RestartMode::Pager,
+            RestartShutdown::StdinClose {
+                include_shutdown_output,
+            },
+            timeout,
+        )
     }
 
     fn restart_for_mode(
@@ -102,14 +122,20 @@ impl WorkerManager {
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         let had_process = self.process.is_some();
-        // Snapshot before shutdown so an explicit restart does not wait for
-        // more output from an abandoned timed-out request.
-        let output = had_process.then(|| self.drain_sealed_formatted_output());
+        let include_shutdown_output = shutdown.includes_shutdown_output();
+        let mut output = if had_process && !include_shutdown_output {
+            Some(self.drain_sealed_formatted_output())
+        } else {
+            None
+        };
         if let Some(process) = self.process.take() {
             let _ = match shutdown {
                 RestartShutdown::Sideband => process.shutdown_graceful(timeout),
-                RestartShutdown::StdinClose => process.shutdown_for_restart(timeout),
+                RestartShutdown::StdinClose { .. } => process.shutdown_for_restart(timeout),
             };
+        }
+        if had_process && include_shutdown_output {
+            output = Some(self.drain_sealed_formatted_output());
         }
         RestartShutdownSnapshot::Files { output }
     }
@@ -119,14 +145,21 @@ impl WorkerManager {
         shutdown: RestartShutdown,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
-        self.output_timeline.seal_utf8_tails();
-        // Snapshot before shutdown so late old-session output is discarded at reset.
-        let end_offset = self.output.end_offset();
+        let include_shutdown_output = shutdown.includes_shutdown_output();
+        let mut end_offset = None;
+        if !include_shutdown_output {
+            self.output_timeline.seal_utf8_tails();
+            end_offset = self.output.end_offset();
+        }
         if let Some(process) = self.process.take() {
             let _ = match shutdown {
                 RestartShutdown::Sideband => process.shutdown_graceful(timeout),
-                RestartShutdown::StdinClose => process.shutdown_for_restart(timeout),
+                RestartShutdown::StdinClose { .. } => process.shutdown_for_restart(timeout),
             };
+        }
+        if include_shutdown_output {
+            self.output_timeline.seal_utf8_tails();
+            end_offset = self.output.end_offset();
         }
         RestartShutdownSnapshot::Pager { end_offset }
     }
@@ -186,6 +219,17 @@ impl WorkerManager {
             }
         }
         self.note_respawn_during_write();
+    }
+}
+
+impl RestartShutdown {
+    fn includes_shutdown_output(self) -> bool {
+        matches!(
+            self,
+            RestartShutdown::StdinClose {
+                include_shutdown_output: true
+            }
+        )
     }
 }
 
