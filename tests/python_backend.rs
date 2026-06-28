@@ -4900,13 +4900,26 @@ async fn python_ctrl_d_tail_includes_old_worker_shutdown_output() -> TestResult<
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let tempdir = tempdir()?;
+    let release_path = tempdir.path().join("release-old-worker-output");
+    let emitted_path = tempdir.path().join("old-worker-output-emitted");
+    let release_literal = path_json_literal(&release_path, "release marker")?;
+    let emitted_literal = path_json_literal(&emitted_path, "emitted marker")?;
 
     let running = session
         .write_stdin_raw_with(
-            r#"import time
-time.sleep(0.3)
+            format!(
+                r#"import pathlib, sys, time
+_release = pathlib.Path({release_literal})
+_emitted = pathlib.Path({emitted_literal})
+while not _release.exists():
+    time.sleep(0.01)
 print('OLD_WORKER_SHUTDOWN_TAIL_VISIBLE')
-"#,
+sys.stdout.flush()
+_emitted.write_text('done')
+time.sleep(30)
+"#
+            ),
             Some(0.05),
         )
         .await?;
@@ -4915,6 +4928,19 @@ print('OLD_WORKER_SHUTDOWN_TAIL_VISIBLE')
         is_busy_response(&running_text),
         "expected first request to be busy before reset tail, got: {running_text:?}"
     );
+
+    fs::write(&release_path, "go")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !emitted_path.exists() {
+        if Instant::now() >= deadline {
+            session.cancel().await?;
+            return Err(format!(
+                "old worker did not emit restart-captured output before deadline; first reply: {running_text:?}"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 
     let reset = session
         .write_stdin_raw_with("\u{4}print('FRESH_RESET_TAIL_VISIBLE')", Some(5.0))
@@ -4928,7 +4954,7 @@ print('OLD_WORKER_SHUTDOWN_TAIL_VISIBLE')
     );
     assert!(
         reset_text.contains("OLD_WORKER_SHUTDOWN_TAIL_VISIBLE"),
-        "expected Ctrl-D tail to include old-worker shutdown output captured during shutdown, got: {reset_text:?}"
+        "expected Ctrl-D tail to include old-worker output captured while shutting down the pending request, got: {reset_text:?}"
     );
     Ok(())
 }
