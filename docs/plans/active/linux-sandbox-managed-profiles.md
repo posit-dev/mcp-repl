@@ -14,7 +14,7 @@
 ## Status
 
 - State: active
-- Last updated: 2026-06-26
+- Last updated: 2026-06-28
 - Current phase: follow-up scoping
 
 ## Current Direction
@@ -29,6 +29,8 @@
   semantics from inherited sandbox metadata.
 - Linux should support restricted reads, `:minimal`, project-root subpaths,
   temp special paths, deny paths, deny globs, and protected metadata roots.
+- Linux managed-domain allowlists are enforced on the bubblewrap path through a
+  namespace-local bridge to the server-owned managed proxy.
 - A future slice can add a bundled bubblewrap binary; the current repository only has system `bwrap` available.
 
 ## Phase Status
@@ -46,17 +48,17 @@
   executable input. `mcp-repl` continues to launch its own helper.
 - Missing or malformed inherited sandbox metadata remains fail-closed.
 - Managed filesystem profiles should not be rejected on Linux merely because they cannot be projected to legacy `workspace-write`.
+- Managed-domain allowlists require bubblewrap on Linux and must not fall back
+  to legacy Landlock.
 
 ## Open Questions
 
 - Whether to vendor or bundle bubblewrap later so Linux parity does not depend on system `bwrap`.
-- Whether managed-network domain allowlists should be fully proxy-routed on Linux in this slice or remain a follow-up after filesystem parity.
 
 ## Next Safe Slice
 
-- Pick one follow-up capability and keep it narrow: bundled `bwrap`, Linux
-  managed-network proxy routing, protected-create monitoring, or explicit
-  feature probes for older `bwrap`.
+- Pick one follow-up capability and keep it narrow: bundled `bwrap`,
+  protected-create monitoring, or explicit feature probes for older `bwrap`.
 
 ## Stop Conditions
 
@@ -76,11 +78,15 @@
 - 2026-06-26: Synthetic bubblewrap parent mount targets are non-writable, so a writable session temp child does not imply ambient `/tmp` writes.
 - 2026-06-26: Linux bwrap-backed R interrupts target sandbox descendants instead of the bwrap monitor, preserving persistent REPL interrupt behavior.
 - 2026-06-26: Full required verification passed for this slice: `cargo check`, `cargo build`, integration runner, clippy with warnings denied, `cargo test --quiet`, and `cargo +nightly fmt`.
+- 2026-06-28: Completed Linux managed-domain proxy routing on the bwrap path.
+  The worker stays in an isolated network namespace, proxy-aware traffic routes
+  through namespace-local bridge ports and session-temp Unix relay sockets to
+  the server-owned proxy, and bwrap startup fallback is disabled when managed
+  domains are configured.
 
 ## Remaining Follow-ups
 
 - Vendor or bundle bubblewrap so Linux parity does not depend on a system `bwrap`.
-- Add Linux managed-network proxy routing for domain allowlists instead of the current fail-closed behavior.
 - Add protected-create monitoring for missing protected metadata paths. This
   slice masks and cleans synthetic metadata mount targets, but it does not yet
   run the full inotify-based create monitor.

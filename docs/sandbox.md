@@ -180,17 +180,28 @@ but it cannot enforce restricted-read managed profiles.
   globs, and protected `.git`, `.codex`, and `.agents` metadata paths are
   rendered into the bubblewrap mount plan.
 - default Linux worker setup disables network unless explicitly enabled.
-- managed domain allowlists are not enforced on Linux yet; configuring allowed
-  or denied domains with enabled network access currently fails closed.
+- managed domain allowlists are supported only on the bubblewrap path. With
+  `network_access=true` and allowed or denied domains configured, `mcp-repl`
+  starts the server-owned managed proxy, creates HTTP and SOCKS Unix relay
+  sockets under the session temp directory, and starts bridge children inside
+  the bubblewrap network namespace on `127.0.0.1:39080` and
+  `127.0.0.1:39081`.
+- Linux managed-domain workers get proxy env vars pointing at those
+  namespace-local bridge ports. The server-owned proxy remains the only
+  component that dials upstream and enforces the domain policy.
+- managed-domain Linux sandboxes still use `--unshare-net`; direct worker
+  egress remains isolated even though proxy-aware tools can reach allowlisted
+  hosts through the bridge.
 - `mcp-repl` always uses its own internal Linux sandbox launcher; helper
   executable paths provided by an MCP client are ignored.
 - `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting and the paired PID
   namespace when the host container does not allow bubblewrap to mount `/proc`.
 - if the default bubblewrap path dies before worker readiness, `mcp-repl`
-  retries once with the legacy Landlock path for compatibility.
+  retries once with the legacy Landlock path for compatibility unless managed
+  domains are configured. Managed-domain Linux launches fail closed instead.
 - `MCP_REPL_USE_LINUX_BWRAP=0` disables the default bubblewrap path. Codex
   `useLegacyLandlock: true` inherited metadata has the same effect for that tool
-  call.
+  call. Both settings are incompatible with Linux managed-domain allowlists.
 
 ## Windows behavior (experimental)
 
