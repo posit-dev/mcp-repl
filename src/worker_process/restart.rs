@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset};
-use crate::oversized_output::OversizedOutputMode;
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
 use crate::worker_protocol::WorkerReply;
@@ -23,42 +22,24 @@ enum RestartShutdownSnapshot {
     },
 }
 
-#[derive(Clone, Copy)]
-enum RestartShutdown {
-    Sideband,
-    StdinClose,
-}
-
 impl WorkerManager {
-    pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        match self.oversized_output {
-            OversizedOutputMode::Files => {
-                self.restart_for_mode(RestartMode::Files, RestartShutdown::Sideband, timeout)
-            }
-            OversizedOutputMode::Pager => {
-                self.restart_for_mode(RestartMode::Pager, RestartShutdown::Sideband, timeout)
-            }
-        }
-    }
-
     pub(super) fn restart_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        self.restart_for_mode(RestartMode::Files, RestartShutdown::StdinClose, timeout)
+        self.restart_for_mode(RestartMode::Files, timeout)
     }
 
     pub(super) fn restart_pager(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
-        self.restart_for_mode(RestartMode::Pager, RestartShutdown::StdinClose, timeout)
+        self.restart_for_mode(RestartMode::Pager, timeout)
     }
 
     fn restart_for_mode(
         &mut self,
         mode: RestartMode,
-        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_restart(timeout);
         self.require_inherited_sandbox_state()?;
         self.maybe_emit_pending_server_notice();
-        let snapshot = self.shutdown_existing_worker_for_restart(mode, shutdown, timeout);
+        let snapshot = self.shutdown_existing_worker_for_restart(mode, timeout);
         self.clear_restart_busy_guardrail();
         self.clear_stale_pager_before_restart_reply(mode);
         let reply = self.build_restart_reply_for_mode(snapshot);
@@ -83,30 +64,21 @@ impl WorkerManager {
     fn shutdown_existing_worker_for_restart(
         &mut self,
         mode: RestartMode,
-        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         match mode {
-            RestartMode::Files => {
-                self.shutdown_existing_files_worker_for_restart(shutdown, timeout)
-            }
-            RestartMode::Pager => {
-                self.shutdown_existing_pager_worker_for_restart(shutdown, timeout)
-            }
+            RestartMode::Files => self.shutdown_existing_files_worker_for_restart(timeout),
+            RestartMode::Pager => self.shutdown_existing_pager_worker_for_restart(timeout),
         }
     }
 
     fn shutdown_existing_files_worker_for_restart(
         &mut self,
-        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         let had_process = self.process.is_some();
         if let Some(process) = self.process.take() {
-            let _ = match shutdown {
-                RestartShutdown::Sideband => process.shutdown_graceful(timeout),
-                RestartShutdown::StdinClose => process.shutdown_for_restart(timeout),
-            };
+            let _ = process.shutdown_for_restart(timeout);
         }
         let output = had_process.then(|| self.drain_sealed_formatted_output());
         RestartShutdownSnapshot::Files { output }
@@ -114,15 +86,11 @@ impl WorkerManager {
 
     fn shutdown_existing_pager_worker_for_restart(
         &mut self,
-        shutdown: RestartShutdown,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         self.output_timeline.seal_utf8_tails();
         if let Some(process) = self.process.take() {
-            let _ = match shutdown {
-                RestartShutdown::Sideband => process.shutdown_graceful(timeout),
-                RestartShutdown::StdinClose => process.shutdown_for_restart(timeout),
-            };
+            let _ = process.shutdown_for_restart(timeout);
         }
         self.output_timeline.seal_utf8_tails();
         let end_offset = self.output.end_offset();
@@ -191,11 +159,12 @@ impl WorkerManager {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::oversized_output::OversizedOutputMode;
     use crate::sandbox_cli::SandboxCliPlan;
     use crate::worker_process::WriteStdinOptions;
     use crate::worker_process::output_state::PrefixCapture;
     use crate::worker_process::test_support::contents_text;
-    use crate::worker_protocol::WorkerContent;
+    use crate::worker_protocol::{WorkerContent, WorkerReply};
 
     #[test]
     fn bare_restart_flushes_queued_sandbox_change_notice() {

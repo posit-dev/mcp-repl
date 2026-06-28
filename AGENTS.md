@@ -5,16 +5,18 @@ Keep this file short. It is a table of contents, not the full manual.
 ## Immediate Rules
 
 - If you modified code, run all required checks before replying:
-  - `cargo check`
-  - `cargo build`
+  - `env RUSTFLAGS=-Dwarnings cargo check`
+  - `env RUSTFLAGS=-Dwarnings cargo build`
   - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
   - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `cargo test --quiet`
+  - `env RUSTFLAGS=-Dwarnings cargo test --quiet`
   - `cargo +nightly fmt`
+  - `env RUSTFLAGS=-Dwarnings cargo build --release --locked`
 - For docs-only changes, run the narrow docs validation that covers the edited
   files, usually `cargo test --test docs_contracts`.
 - When changing Codex backend selection or CI real-client wiring, also run:
   - `MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1`
+- Rust compiler warnings are errors in local verification and CI.
 - Treat all clippy warnings as failures. Do not leave warning cleanup for later.
 - Never pass `--vanilla` to `R` or `Rscript` unless the user explicitly asks for it.
 

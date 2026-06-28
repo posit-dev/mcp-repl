@@ -13,6 +13,8 @@ jobs:
   checks:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -Dwarnings
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +41,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-          rustflags: ""
+          rustflags: -Dwarnings
           cache-bin: false
 
       - name: Install nightly rustfmt

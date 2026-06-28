@@ -88,7 +88,12 @@ pub(crate) fn run(
             continue;
         }
         if is_exact_command(&line, "RESTART") {
-            let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT);
+            let reply = worker.write_stdin(
+                "\u{4}".to_string(),
+                DEFAULT_WRITE_STDIN_TIMEOUT,
+                server_timeout,
+                WriteStdinOptions::default(),
+            );
             render_visible_reply(
                 response.as_mut(),
                 reply,
