@@ -895,9 +895,26 @@ def python_linux_managed_network_domain_allowlist(client: McpStdioClient) -> Non
             dedent(
                 f"""
                 import socket
+                import tempfile
                 import urllib.request
+                from pathlib import Path
 
                 port = {server.port}
+
+                try:
+                    with tempfile.TemporaryDirectory() as unix_socket_dir:
+                        unix_socket_path = str(Path(unix_socket_dir) / "ipc.sock")
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                            listener.bind(unix_socket_path)
+                            listener.listen(1)
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                                client.connect(unix_socket_path)
+                                conn, _addr = listener.accept()
+                                with conn:
+                                    client.sendall(b"ping")
+                                    print("UNIX_OK:" + conn.recv(4).decode())
+                except Exception as exc:
+                    print("UNIX_ERROR:" + type(exc).__name__ + ":" + str(exc))
 
                 try:
                     body = urllib.request.urlopen(
@@ -928,6 +945,11 @@ def python_linux_managed_network_domain_allowlist(client: McpStdioClient) -> Non
             timeout_ms=30000,
         )
     received_text = require_success(received, "Linux managed network allowlist repl")
+    if "UNIX_OK:ping" not in received_text or "UNIX_ERROR:" in received_text:
+        raise SuiteFailure(
+            "expected Unix-domain sockets to remain available in managed network mode, "
+            f"got: {received_text!r}"
+        )
     if "PROXY_OK:ok" not in received_text or "PROXY_ERROR:" in received_text:
         raise SuiteFailure(
             "expected allowlisted localhost request to succeed through the proxy, "

@@ -5269,7 +5269,14 @@ fn linux_install_network_seccomp_filter_on_current_thread(
             rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
         }
         LinuxNetworkSeccompMode::ProxyRouted => {
-            let deny_non_ip_socket = SeccompRule::new(vec![
+            let deny_unmanaged_socket_domain = SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Ne,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(|err| err.to_string())?,
                 SeccompCondition::new(
                     0,
                     SeccompCmpArgLen::Dword,
@@ -5296,7 +5303,7 @@ fn linux_install_network_seccomp_filter_on_current_thread(
                 .map_err(|err| err.to_string())?,
             ])
             .map_err(|err| err.to_string())?;
-            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
+            rules.insert(libc::SYS_socket, vec![deny_unmanaged_socket_domain]);
             rules.insert(libc::SYS_socketpair, vec![deny_non_unix_socketpair]);
         }
     }
