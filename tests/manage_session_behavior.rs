@@ -189,7 +189,7 @@ async fn restart_while_busy_not_reading_stdin_returns_promptly() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_restart_drops_output_captured_during_shutdown() -> TestResult<()> {
+async fn pager_restart_preserves_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = common::spawn_server_with_pager_page_chars(120).await?;
 
@@ -231,8 +231,12 @@ Sys.sleep(1.0)
         "expected restart notice, got: {restart_text:?}"
     );
     assert!(
-        !restart_text.contains("RESTART_LINE_"),
-        "did not expect restart reply to wait for pager output produced during shutdown, got: {restart_text:?}"
+        restart_text.contains("RESTART_LINE_"),
+        "expected restart reply to include pager output produced during shutdown, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("--More--"),
+        "expected restart reply to preserve pager state for shutdown output, got: {restart_text:?}"
     );
 
     let next = session
@@ -242,8 +246,8 @@ Sys.sleep(1.0)
     session.cancel().await?;
 
     assert!(
-        !next_text.contains("RESTART_LINE_"),
-        "did not expect shutdown-time pager output to leak into the next reply, got: {next_text:?}"
+        next_text.contains("RESTART_LINE_"),
+        "expected follow-up poll to drain restart pager output, got: {next_text:?}"
     );
     Ok(())
 }
@@ -313,7 +317,7 @@ async fn repl_reset_clears_active_pager_when_reply_has_no_overflow() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_while_busy_drops_output_captured_during_shutdown() -> TestResult<()> {
+async fn restart_while_busy_returns_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
 
@@ -359,8 +363,8 @@ flush.console()
     session.cancel().await?;
 
     assert!(
-        !restart_text.contains("DURING_RESTART"),
-        "did not expect restart to wait for output produced during shutdown, got: {restart_text:?}"
+        restart_text.contains("DURING_RESTART"),
+        "expected restart to return output produced during shutdown, got: {restart_text:?}"
     );
     assert!(
         !restart_text.contains("TOO_LATE"),
@@ -369,6 +373,60 @@ flush.console()
     assert!(
         restart_text.contains("new session started"),
         "expected restart notice, got: {restart_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_tail_uses_remaining_timeout_budget() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let input = r#"
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
+cat("DURING_RESTART\n")
+flush.console()
+Sys.sleep(1.0)
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("restart tail timeout test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+
+    let restart = session
+        .write_stdin_raw_unterminated_with(
+            "\u{4}Sys.sleep(0.45); cat(\"TAIL_DONE\\n\"); flush.console()",
+            Some(0.7),
+        )
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("restart tail timeout test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("DURING_RESTART"),
+        "expected restart reply to include output captured before tail input, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("<<repl status: busy"),
+        "expected tail input to time out against the original Ctrl-D call budget, got: {restart_text:?}"
+    );
+    assert!(
+        !restart_text.contains("TAIL_DONE"),
+        "did not expect tail input to receive a fresh timeout budget, got: {restart_text:?}"
     );
     Ok(())
 }
