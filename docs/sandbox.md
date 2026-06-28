@@ -184,8 +184,8 @@ but it cannot enforce restricted-read managed profiles.
   or denied domains with enabled network access currently fails closed.
 - `mcp-repl` always uses its own internal Linux sandbox launcher; helper
   executable paths provided by an MCP client are ignored.
-- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting when the host
-  container does not allow bubblewrap to mount it.
+- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting and the paired PID
+  namespace when the host container does not allow bubblewrap to mount `/proc`.
 - if the default bubblewrap path dies before worker readiness, `mcp-repl`
   retries once with the legacy Landlock path for compatibility.
 - `MCP_REPL_USE_LINUX_BWRAP=0` disables the default bubblewrap path. Codex
