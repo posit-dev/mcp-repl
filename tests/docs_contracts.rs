@@ -232,15 +232,40 @@ fn pyproject_defines_pypi_binary_package() {
         );
     }
 
-    for required in [
-        "[[bin]]\n  name = \"mcp-repl\"\n  path = \"src/main.rs\"",
-        "[[bin]]\n  name = \"posit-mcp-repl\"\n  path = \"src/bin/posit-mcp-repl.rs\"\n  required-features = [\"pypi-alias\"]",
-    ] {
-        assert!(
-            cargo_toml.contains(required),
-            "missing {required} in Cargo.toml"
-        );
-    }
+    let cargo_doc = cargo_toml
+        .parse::<toml_edit::DocumentMut>()
+        .expect("Cargo.toml should parse as TOML");
+    let bins = cargo_doc["bin"]
+        .as_array_of_tables()
+        .expect("Cargo.toml should define binary targets");
+
+    let mcp_repl = bins
+        .iter()
+        .find(|bin| bin.get("name").and_then(|value| value.as_str()) == Some("mcp-repl"))
+        .expect("missing mcp-repl binary target in Cargo.toml");
+    assert_eq!(
+        mcp_repl.get("path").and_then(|value| value.as_str()),
+        Some("src/main.rs")
+    );
+
+    let pypi_alias = bins
+        .iter()
+        .find(|bin| bin.get("name").and_then(|value| value.as_str()) == Some("posit-mcp-repl"))
+        .expect("missing posit-mcp-repl binary target in Cargo.toml");
+    assert_eq!(
+        pypi_alias.get("path").and_then(|value| value.as_str()),
+        Some("src/bin/posit-mcp-repl.rs")
+    );
+    let required_features = pypi_alias
+        .get("required-features")
+        .and_then(|value| value.as_array())
+        .expect("posit-mcp-repl should require the pypi-alias feature");
+    assert!(
+        required_features
+            .iter()
+            .any(|feature| feature.as_str() == Some("pypi-alias")),
+        "posit-mcp-repl should require the pypi-alias feature"
+    );
 }
 
 #[test]
