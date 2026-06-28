@@ -234,6 +234,7 @@ jobs:
           python3 -m venv wheel-smoke
           ./wheel-smoke/bin/python -m pip install --disable-pip-version-check "$wheel_path"
           ./wheel-smoke/bin/mcp-repl --help
+          ./wheel-smoke/bin/posit-mcp-repl --help
 
       - name: Smoke test PyPI wheel (windows)
         if: matrix.os == 'windows-2022'
@@ -246,6 +247,7 @@ jobs:
           python -m venv wheel-smoke
           .\wheel-smoke\Scripts\python.exe -m pip install --disable-pip-version-check $wheel.FullName
           .\wheel-smoke\Scripts\mcp-repl.exe --help
+          .\wheel-smoke\Scripts\posit-mcp-repl.exe --help
 
       - name: Upload packaged artifact
         if: github.event_name == 'push' && github.ref_type == 'tag'

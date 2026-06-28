@@ -62,9 +62,10 @@ Before the first publish, configure a PyPI Trusted Publisher for:
 ## PyPI Artifacts
 
 PyPI publishing is Wheel-only. Wheels include the compiled `mcp-repl`
-executable and do not bundle R or Python runtimes. R is optional: it is not
-required to build the wheel, install the package, or use Python-backed
-`mcp-repl` sessions. Users need R only when they choose the R interpreter.
+executable and a `posit-mcp-repl` command alias for `uvx`; they do not bundle R
+or Python runtimes. R is optional: it is not required to build the wheel,
+install the package, or use Python-backed `mcp-repl` sessions. Users need R only
+when they choose the R interpreter.
 
 The Linux PyPI wheel is built with manylinux2014. This keeps the wheel usable on
 older supported Linux distributions without tying PyPI installs to the GitHub

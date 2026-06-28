@@ -11,6 +11,11 @@
   name = "mcp-repl"
   path = "src/main.rs"
 
+[[bin]]
+  name = "posit-mcp-repl"
+  path = "src/bin/posit-mcp-repl.rs"
+  required-features = ["pypi-alias"]
+
 [[example]]
   name = "zod-worker"
   path = "tests/fixtures/zod-worker.rs"
@@ -92,6 +97,7 @@
 
 [features]
   echo-heuristics = []
+  pypi-alias     = []
 
 [profile.dev.package]
   insta.opt-level   = 3

@@ -36,14 +36,14 @@ you or the model reset.
 ### 1. Install
 
 Install from PyPI. The package is named `posit-mcp-repl` and exposes the
-`mcp-repl` executable:
+`mcp-repl` executable, plus a `posit-mcp-repl` alias for `uvx`:
 
 ```sh
 pipx install posit-mcp-repl
 # or
 uv tool install posit-mcp-repl
 # one-off
-uvx --from posit-mcp-repl mcp-repl --help
+uvx posit-mcp-repl --help
 ```
 
 Or install via `cargo` (needs the [Rust toolchain](https://rustup.rs)):
