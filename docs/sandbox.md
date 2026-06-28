@@ -66,8 +66,9 @@ More specifically:
 - Control-prefixed tails such as `Ctrl-C<code>` and `Ctrl-D<code>` run in the
   restarted session when the sandbox changed; the control prefix itself is not
   replayed into the fresh worker.
-- Explicit restarts discard preserved detached output from aborted prior
-  requests instead of carrying it into later unrelated replies.
+- Explicit restarts return worker output captured through bounded old-worker
+  shutdown. They do not wait for a prior request to finish after that window,
+  and they do not carry old output into later unrelated replies.
 - Sandbox metadata is enforced again at the next tool call that actually
   interacts with the worker after pager navigation ends.
 - Missing or malformed metadata still fails closed on calls that need it.
@@ -183,8 +184,8 @@ but it cannot enforce restricted-read managed profiles.
   or denied domains with enabled network access currently fails closed.
 - `mcp-repl` always uses its own internal Linux sandbox launcher; helper
   executable paths provided by an MCP client are ignored.
-- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting when the host
-  container does not allow bubblewrap to mount it.
+- `MCP_REPL_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting and the paired PID
+  namespace when the host container does not allow bubblewrap to mount `/proc`.
 - if the default bubblewrap path dies before worker readiness, `mcp-repl`
   retries once with the legacy Landlock path for compatibility.
 - `MCP_REPL_USE_LINUX_BWRAP=0` disables the default bubblewrap path. Codex

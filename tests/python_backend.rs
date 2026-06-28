@@ -41,6 +41,34 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn path_json_literal(path: &Path, label: &str) -> TestResult<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("{label} path must be valid utf-8"))?;
+    Ok(serde_json::to_string(path)?)
+}
+
+async fn poll_until_contains(
+    session: &common::McpTestSession,
+    mut text: String,
+    expected: &str,
+    context: &str,
+    timeout: Duration,
+) -> TestResult<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline && !text.contains(expected) {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        text.push_str(&result_text(&poll));
+    }
+    if !text.contains(expected) {
+        return Err(format!("expected {context}, got: {text:?}").into());
+    }
+    Ok(text)
+}
+
 fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
     let end = text
         .find("transcript.txt")?
@@ -2086,18 +2114,25 @@ async fn python_detached_raw_stdin_read_followup_completes() -> TestResult<()> {
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp_dir = tempdir()?;
+    let release_path = temp_dir.path().join("release-detached-raw-reader");
+    let release_path_literal = path_json_literal(&release_path, "raw reader release")?;
 
     let first = session
         .write_stdin_raw_with(
-            r#"import os, threading, time
+            format!(
+                r#"import os, pathlib, threading, time
+release_path = pathlib.Path({release_path_literal})
 def read_later():
-    time.sleep(0.2)
+    while not release_path.exists():
+        time.sleep(0.01)
     print("DETACHED_RAW_THREAD_WAITING", flush=True)
     data = os.read(0, 5)
     print("DETACHED_RAW_THREAD_READ", data.decode("utf-8"), flush=True)
 threading.Thread(target=read_later, daemon=True).start()
 print("DETACHED_RAW_MAIN_DONE", flush=True)
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -2106,20 +2141,20 @@ print("DETACHED_RAW_MAIN_DONE", flush=True)
         first_text.contains("DETACHED_RAW_MAIN_DONE"),
         "expected main cell to finish before detached raw stdin read, got: {first_text:?}"
     );
-
-    let wait_deadline = Instant::now() + Duration::from_secs(5);
-    let mut wait_text = String::new();
-    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_THREAD_WAITING") {
-        sleep(Duration::from_millis(50)).await;
-        let poll = session
-            .write_stdin_raw_unterminated_with("", Some(1.0))
-            .await?;
-        wait_text.push_str(&result_text(&poll));
-    }
     assert!(
-        wait_text.contains("DETACHED_RAW_THREAD_WAITING"),
-        "expected detached raw stdin reader to start before follow-up input, got: {wait_text:?}"
+        !first_text.contains("DETACHED_RAW_THREAD_WAITING"),
+        "detached raw stdin read should wait for the explicit release gate, got: {first_text:?}"
     );
+
+    fs::write(&release_path, "go")?;
+    let _wait_text = poll_until_contains(
+        &session,
+        String::new(),
+        "DETACHED_RAW_THREAD_WAITING",
+        "detached raw stdin reader to start before follow-up input",
+        Duration::from_secs(5),
+    )
+    .await?;
 
     let second = tokio::time::timeout(
         Duration::from_secs(3),
@@ -2163,19 +2198,26 @@ async fn python_detached_raw_stdin_reads_consume_one_answer_turn() -> TestResult
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp_dir = tempdir()?;
+    let release_path = temp_dir.path().join("release-detached-raw-pair-reader");
+    let release_path_literal = path_json_literal(&release_path, "raw pair reader release")?;
 
     let first = session
         .write_stdin_raw_with(
-            r#"import os, threading, time
+            format!(
+                r#"import os, pathlib, threading, time
+release_path = pathlib.Path({release_path_literal})
 def read_later():
-    time.sleep(0.2)
+    while not release_path.exists():
+        time.sleep(0.01)
     print("DETACHED_RAW_PAIR_WAITING", flush=True)
     first = os.read(0, 2)
     second = os.read(0, 2)
     print("DETACHED_RAW_PAIR_READ", first.decode("utf-8"), second.decode("utf-8"), flush=True)
 threading.Thread(target=read_later, daemon=True).start()
 print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -2184,20 +2226,20 @@ print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
         first_text.contains("DETACHED_RAW_PAIR_MAIN_DONE"),
         "expected main cell to finish before detached raw stdin reads, got: {first_text:?}"
     );
-
-    let wait_deadline = Instant::now() + Duration::from_secs(5);
-    let mut wait_text = String::new();
-    while Instant::now() < wait_deadline && !wait_text.contains("DETACHED_RAW_PAIR_WAITING") {
-        sleep(Duration::from_millis(50)).await;
-        let poll = session
-            .write_stdin_raw_unterminated_with("", Some(1.0))
-            .await?;
-        wait_text.push_str(&result_text(&poll));
-    }
     assert!(
-        wait_text.contains("DETACHED_RAW_PAIR_WAITING"),
-        "expected detached raw stdin reader to start before follow-up input, got: {wait_text:?}"
+        !first_text.contains("DETACHED_RAW_PAIR_WAITING"),
+        "detached raw stdin pair should wait for the explicit release gate, got: {first_text:?}"
     );
+
+    fs::write(&release_path, "go")?;
+    let _wait_text = poll_until_contains(
+        &session,
+        String::new(),
+        "DETACHED_RAW_PAIR_WAITING",
+        "detached raw stdin reader to start before follow-up input",
+        Duration::from_secs(5),
+    )
+    .await?;
 
     let answer = session
         .write_stdin_raw_unterminated_with("abcd", Some(1.0))
@@ -6064,11 +6106,16 @@ async fn python_input_releases_gil_while_waiting_for_line() -> TestResult<()> {
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp_dir = tempdir()?;
+    let background_marker = temp_dir.path().join("input-gil-background-ready");
+    let background_marker_literal = path_json_literal(&background_marker, "background marker")?;
 
     let result = session
         .write_stdin_raw_with(
-            r#"
-import sys, threading, time
+            format!(
+                r#"
+import pathlib, sys, threading, time
+background_marker = pathlib.Path({background_marker_literal})
 sys.setswitchinterval(1.0)
 background_seen = None
 answer_seen = None
@@ -6078,6 +6125,7 @@ def background():
     background_started.set()
     time.sleep(0.1)
     background_seen = time.monotonic()
+    background_marker.write_text("ready")
 
 def wait_and_print():
     global answer_seen
@@ -6088,7 +6136,8 @@ def wait_and_print():
 threading.Thread(target=background, daemon=True).start()
 background_started.wait()
 wait_and_print()
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -6099,7 +6148,7 @@ wait_and_print()
     );
     assert!(text.contains("p> "), "expected input prompt, got: {text:?}");
 
-    sleep(Duration::from_millis(500)).await;
+    wait_for_file_text(&background_marker, "ready").await?;
 
     let answer = session.write_stdin_raw_with("ok", Some(5.0)).await?;
     let answer_text = result_text(&answer);
@@ -6130,11 +6179,18 @@ async fn python_background_input_after_cell_return_completes_answer_turn() -> Te
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp_dir = tempdir()?;
+    let release_path = temp_dir
+        .path()
+        .join("release-background-input-after-cell-return");
+    let release_path_literal = path_json_literal(&release_path, "background input release")?;
 
     let result = session
         .write_stdin_raw_with(
-            r#"
-import threading, time
+            format!(
+                r#"
+import pathlib, threading, time
+release_path = pathlib.Path({release_path_literal})
 background_answer = None
 background_waiting = threading.Event()
 
@@ -6146,9 +6202,11 @@ def background():
 
 threading.Thread(target=background, daemon=True).start()
 background_waiting.wait()
-time.sleep(0.2)
+while not release_path.exists():
+    time.sleep(0.01)
 print('CELL_RETURNED')
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -6162,19 +6220,15 @@ print('CELL_RETURNED')
         "expected background input prompt, got: {setup_text:?}"
     );
 
-    let mut settled_text = setup_text.clone();
-    let settle_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < settle_deadline && !settled_text.contains("CELL_RETURNED") {
-        sleep(Duration::from_millis(50)).await;
-        let poll = session
-            .write_stdin_raw_unterminated_with("", Some(1.0))
-            .await?;
-        settled_text.push_str(&result_text(&poll));
-    }
-    assert!(
-        settled_text.contains("CELL_RETURNED"),
-        "expected foreground cell to return while background input stayed live, got: {settled_text:?}"
-    );
+    fs::write(&release_path, "go")?;
+    let settled_text = poll_until_contains(
+        &session,
+        setup_text.clone(),
+        "CELL_RETURNED",
+        "foreground cell to return while background input stayed live",
+        Duration::from_secs(5),
+    )
+    .await?;
     assert!(
         settled_text.contains("bg> "),
         "expected background input prompt to remain visible after foreground cell return, got: {settled_text:?}"
@@ -6201,11 +6255,19 @@ async fn python_background_input_consumes_buffered_lines_from_one_answer_turn() 
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp_dir = tempdir()?;
+    let release_path = temp_dir
+        .path()
+        .join("release-background-input-buffered-lines");
+    let release_path_literal =
+        path_json_literal(&release_path, "background buffered input release")?;
 
     let result = session
         .write_stdin_raw_with(
-            r#"
-import threading, time
+            format!(
+                r#"
+import pathlib, threading, time
+release_path = pathlib.Path({release_path_literal})
 background_waiting = threading.Event()
 
 def background():
@@ -6216,9 +6278,11 @@ def background():
 
 threading.Thread(target=background, daemon=True).start()
 background_waiting.wait()
-time.sleep(0.2)
+while not release_path.exists():
+    time.sleep(0.01)
 print('CELL_RETURNED')
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -6232,7 +6296,15 @@ print('CELL_RETURNED')
         "expected first background input prompt, got: {setup_text:?}"
     );
 
-    sleep(Duration::from_millis(500)).await;
+    fs::write(&release_path, "go")?;
+    let _settled_text = poll_until_contains(
+        &session,
+        setup_text,
+        "CELL_RETURNED",
+        "foreground cell to return before the buffered answer turn",
+        Duration::from_secs(5),
+    )
+    .await?;
 
     let answer = session.write_stdin_raw_with("one\ntwo", Some(1.0)).await?;
     let mut answer_text = result_text(&answer);
@@ -6259,11 +6331,19 @@ async fn python_background_input_discards_extra_answer_lines_before_next_cell() 
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
+    let temp_dir = tempdir()?;
+    let release_path = temp_dir
+        .path()
+        .join("release-background-input-discard-extra");
+    let release_path_literal =
+        path_json_literal(&release_path, "background input discard release")?;
 
     let result = session
         .write_stdin_raw_with(
-            r#"
-import threading, time
+            format!(
+                r#"
+import pathlib, threading, time
+release_path = pathlib.Path({release_path_literal})
 background_waiting = threading.Event()
 
 def background():
@@ -6273,9 +6353,11 @@ def background():
 
 threading.Thread(target=background, daemon=True).start()
 background_waiting.wait()
-time.sleep(0.2)
+while not release_path.exists():
+    time.sleep(0.01)
 print('CELL_RETURNED')
-"#,
+"#
+            ),
             Some(5.0),
         )
         .await?;
@@ -6289,7 +6371,15 @@ print('CELL_RETURNED')
         "expected background input prompt, got: {setup_text:?}"
     );
 
-    sleep(Duration::from_millis(500)).await;
+    fs::write(&release_path, "go")?;
+    let _settled_text = poll_until_contains(
+        &session,
+        setup_text,
+        "CELL_RETURNED",
+        "foreground cell to return before the extra-line answer turn",
+        Duration::from_secs(5),
+    )
+    .await?;
 
     let answer = session.write_stdin_raw_with("one\ntwo", Some(1.0)).await?;
     let answer_text = result_text(&answer);

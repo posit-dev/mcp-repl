@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::oversized_output::OversizedOutputMode;
 use crate::pager;
@@ -133,31 +133,34 @@ impl WorkerManager {
         if plan.stage_before_control {
             self.stage_deferred_sandbox_state_update(plan.staged_sandbox_state_update.take())?;
         }
+        let started_at = Instant::now();
+        let worker_deadline = started_at + worker_timeout;
+        let server_deadline = started_at + server_timeout;
 
         let control_reply = match (mode, plan.action, plan.stage_interrupt_after_session_end) {
             (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) => {
-                self.interrupt_files(worker_timeout, None, true)
+                self.interrupt_files(remaining_until(worker_deadline), None, true)
             }
             (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, false) => self
                 .interrupt_files(
-                    worker_timeout,
+                    remaining_until(worker_deadline),
                     plan.tail_sandbox_state_update.clone(),
                     options.suppress_session_end_reset,
                 ),
             (WriteStdinMode::Files, WriteStdinControlAction::Restart, _) => {
-                self.restart_files(worker_timeout)
+                self.restart_files(remaining_until(worker_deadline))
             }
             (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) => {
-                self.interrupt_pager(worker_timeout, None, true)
+                self.interrupt_pager(remaining_until(worker_deadline), None, true)
             }
             (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, false) => self
                 .interrupt_pager(
-                    worker_timeout,
+                    remaining_until(worker_deadline),
                     plan.tail_sandbox_state_update.clone(),
                     options.suppress_session_end_reset,
                 ),
             (WriteStdinMode::Pager, WriteStdinControlAction::Restart, _) => {
-                self.restart_pager(worker_timeout)
+                self.restart_pager(remaining_until(worker_deadline))
             }
         }?;
 
@@ -177,17 +180,19 @@ impl WorkerManager {
 
         let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);
         let tail_options = options.control_tail(plan.tail_sandbox_state_update);
+        let tail_worker_timeout = remaining_until(worker_deadline);
+        let tail_server_timeout = remaining_until(server_deadline);
         let remaining_reply = match mode {
             WriteStdinMode::Files => self.write_stdin_files(
                 plan.tail.to_string(),
-                worker_timeout,
-                server_timeout,
+                tail_worker_timeout,
+                tail_server_timeout,
                 tail_options,
             ),
             WriteStdinMode::Pager => self.write_stdin_pager(
                 plan.tail.to_string(),
-                worker_timeout,
-                server_timeout,
+                tail_worker_timeout,
+                tail_server_timeout,
                 tail_options,
             ),
         }?;
@@ -423,6 +428,10 @@ fn prefixed_worker_reply_item_count(prefix: &WorkerReply) -> usize {
     } else {
         contents.len()
     }
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 #[cfg(test)]

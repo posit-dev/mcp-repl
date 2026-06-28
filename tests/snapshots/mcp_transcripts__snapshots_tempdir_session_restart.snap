@@ -28,7 +28,8 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0004"
+    "input": "\u0004",
+    "timeout_ms": 5000
   }
 }
 response:
@@ -67,7 +68,8 @@ call:
 {
   "tool": "r_repl",
   "arguments": {
-    "input": "\u0004"
+    "input": "\u0004",
+    "timeout_ms": 5000
   }
 }
 response:

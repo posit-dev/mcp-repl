@@ -64,7 +64,7 @@ response:
   ]
 }
 
-== session: restart_timeout_thirty ==
+== session: restart_timeout_nonzero ==
 -- step 1 --
 call:
 {
@@ -91,7 +91,7 @@ call:
   "tool": "r_repl",
   "arguments": {
     "input": "\u0004",
-    "timeout_ms": 30000
+    "timeout_ms": 5000
   }
 }
 response:

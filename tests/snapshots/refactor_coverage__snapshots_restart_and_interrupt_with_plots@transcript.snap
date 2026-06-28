@@ -18,7 +18,7 @@ expression: transcript
 <<< plots_done
 <<< > 
 
-3) r_repl
+3) r_repl timeout_ms=5000
 >>> 
 <<< [repl] new session started
 

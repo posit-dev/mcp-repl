@@ -43,8 +43,11 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - After `worker_ready`, the worker is not ready for input until its first
   `input_wait` or `ready`. The server treats these as readiness gates, not as
   prompt classification.
-- Worker reset and teardown use the sideband `shutdown` lifecycle message first,
-  with stdin close and process termination retained only as bounded fallbacks.
+- Server teardown and `repl_reset` use the sideband `shutdown` lifecycle
+  message first. For explicit `Ctrl-D` restarts, the server closes stdin, keeps
+  output capture active through a bounded graceful window, then escalates to
+  process termination if needed. A `Ctrl-D` tail runs in the fresh session under
+  the original tool-call timeout.
 - The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
 - R-specific behavior lives in `src/r_session.rs`, `src/r_controls.rs`, `src/r_graphics.rs`, and `src/r_htmd.rs`.
 - Python-specific behavior lives in `src/python_ffi.rs`, `src/python_session.rs`, `src/python_worker.rs`, and `python/embedded.py`. Python worker mode dynamically loads CPython only after the worker has selected the Python backend, so R worker mode does not load Python. On Unix, Python may still use PTY-backed process stdio for terminal behavior, but managed input batches are served from the worker queue; direct stdin consumers are not a server completion contract.

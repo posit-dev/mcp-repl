@@ -90,7 +90,10 @@ capture does not preserve separate stdout/stderr identity. Sideband
 
 `shutdown`
 - `{ "type": "shutdown" }`
-- Requests worker shutdown during reset, replacement, or server teardown.
+- Requests worker shutdown during server teardown, `repl_reset`, and replacement
+  paths that need immediate worker-side lifecycle control. Explicit `Ctrl-D`
+  restarts do not send this message first; they close stdin, keep output capture
+  active during a bounded graceful shutdown window, then escalate if needed.
 - Built-in workers currently exit the process after receiving it.
 
 The server emits no other server-to-worker protocol messages in v6.
@@ -196,7 +199,9 @@ queue feeds runtime input callbacks and managed stdin surfaces. The sideband IPC
 reader runs independently from the runtime thread. It receives `input_batch`,
 `interrupt`, and `shutdown`, mutates worker-owned queue/session state, and wakes
 the runtime when needed. The runtime thread consumes queued input only when the
-runtime calls its managed input boundary.
+runtime calls its managed input boundary. A `shutdown` message exits built-in
+workers, so explicit restart uses process stdin close plus bounded termination
+instead of sending `shutdown` first.
 
 For R, the managed input boundary is R's embedded `ReadConsole` callback,
 installed through `Rstart.ReadConsole` on Windows and `ptr_R_ReadConsole` on

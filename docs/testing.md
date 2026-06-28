@@ -76,6 +76,21 @@ Do not opt Rust test targets out of Cargo discovery in anticipation of a future
 Python migration; migrate a scenario only when the Rust coverage is deleted or
 reduced in the same change that adds equivalent external coverage.
 
+## Quiet/Fast Iteration
+
+Use focused test targets while iterating, then run the full verification set
+before sending a change for review. Prefer one of these forms:
+
+```sh
+cargo test --quiet --test zod_protocol zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail
+python3 tests/run_integration_tests.py --binary target/debug/mcp-repl --case r-reset-clears-state
+```
+
+Successful Rust test runs should stay quiet. The shared test harness captures
+server stderr from spawned test servers and keeps it available to tests through
+`McpTestSession::server_stderr_text()` instead of inheriting expected
+negative-path diagnostics into passing logs.
+
 ## Real Client Integrations
 
 CI installs Codex before the Rust suite. The Codex CI integration does not

@@ -16,12 +16,12 @@ expression: transcript
 <<< [1] FALSE
 <<< > 
 
-== session: restart_timeout_thirty ==
+== session: restart_timeout_nonzero ==
 1) r_repl timeout_ms=10000
 >>> x <- 1
 <<< > 
 
-2) r_repl timeout_ms=30000
+2) r_repl timeout_ms=5000
 >>> 
 <<< [repl] new session started
 

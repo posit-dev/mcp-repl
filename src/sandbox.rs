@@ -3441,8 +3441,10 @@ fn create_linux_bwrap_command_args(
         "--die-with-parent".to_string(),
         "--new-session".to_string(),
         "--unshare-user".to_string(),
-        "--unshare-pid".to_string(),
     ];
+    if mount_proc {
+        bwrap_args.push("--unshare-pid".to_string());
+    }
     let mut bwrap_command =
         linux_bwrap_filesystem_args(file_system_policy, sandbox_policy_cwd, session_temp_dir)?;
     bwrap_args.append(&mut bwrap_command.args);
@@ -6632,6 +6634,38 @@ mod tests {
         assert!(
             !command.args.iter().any(|arg| arg == "--argv0"),
             "bwrap args should work with Ubuntu 22.04 bubblewrap 0.6.1: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_no_proc_does_not_unshare_pid_namespace() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-no-proc-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::workspace_write(&[], false, false);
+
+        let command = create_linux_bwrap_command_args(
+            vec!["/bin/true".to_string()],
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+            false,
+            LinuxBwrapNetworkMode::FullAccess,
+        )
+        .expect("no-proc bwrap command should build");
+
+        assert!(
+            !command.args.iter().any(|arg| arg == "--unshare-pid"),
+            "no-proc bwrap should not create a PID namespace with the host /proc view: {:?}",
+            command.args
+        );
+        assert!(
+            !command.args.iter().any(|arg| arg == "--proc"),
+            "test setup should build no-proc bwrap args: {:?}",
             command.args
         );
     }

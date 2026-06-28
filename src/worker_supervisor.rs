@@ -283,6 +283,7 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_RESTART_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "windows")]
 pub(crate) const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
@@ -1328,7 +1329,15 @@ impl WorkerProcess {
     pub(crate) fn shutdown_graceful(mut self, timeout: Duration) -> Result<(), WorkerError> {
         self.request_ipc_shutdown();
         let _ = self.close_stdin(Duration::from_millis(200));
+        self.finish_timed_shutdown(timeout)
+    }
 
+    pub(crate) fn shutdown_for_restart(mut self, timeout: Duration) -> Result<(), WorkerError> {
+        let _ = self.close_stdin(Duration::from_millis(200));
+        self.finish_timed_shutdown(timeout.min(WORKER_RESTART_SHUTDOWN_TIMEOUT))
+    }
+
+    fn finish_timed_shutdown(mut self, timeout: Duration) -> Result<(), WorkerError> {
         let start = std::time::Instant::now();
         let timeout_deadline = start + timeout;
         let term_deadline = start + shutdown_term_delay(timeout);
@@ -2410,6 +2419,9 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
         return Duration::from_secs(0);
     }
     let by_fraction = timeout.mul_f64(0.75);
+    if timeout <= Duration::from_secs(10) {
+        return by_fraction;
+    }
     let by_remaining = timeout.saturating_sub(Duration::from_secs(10));
     by_fraction.min(by_remaining)
 }
