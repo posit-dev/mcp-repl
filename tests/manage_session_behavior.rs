@@ -4,6 +4,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use serde_json::json;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tokio::time::{Duration, Instant, sleep};
 
@@ -210,6 +211,70 @@ Sys.sleep(1.0)
     assert!(
         !next_text.contains("RESTART_LINE_"),
         "did not expect shutdown-time pager output to leak into the next reply, got: {next_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repl_reset_clears_active_pager_when_reply_has_no_overflow() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:80) cat(sprintf(\"STALE_PAGER_%03d\\n\", i))",
+            Some(30.0),
+        )
+        .await?;
+    let initial = common::wait_until_not_busy(
+        &mut session,
+        initial,
+        Duration::from_millis(100),
+        Duration::from_secs(60),
+    )
+    .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager reset test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("STALE_PAGER_"),
+        "expected initial reply to include stale-marker output, got: {initial_text:?}"
+    );
+    assert!(
+        initial_text.contains("--More--"),
+        "expected initial reply to activate pager, got: {initial_text:?}"
+    );
+
+    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
+    let reset_text = result_text(&reset);
+    if backend_unavailable(&reset_text) {
+        eprintln!("pager reset test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        reset_text.contains("new session started"),
+        "expected reset notice, got: {reset_text:?}"
+    );
+    assert!(
+        !reset_text.contains("STALE_PAGER_"),
+        "did not expect stale pager output in reset reply, got: {reset_text:?}"
+    );
+
+    let next = session.write_stdin_raw_with(":next", Some(5.0)).await?;
+    let next_text = result_text(&next);
+    session.cancel().await?;
+
+    assert!(
+        !next_text.contains("STALE_PAGER_"),
+        "did not expect stale pager output after reset, got: {next_text:?}"
+    );
+    assert!(
+        !next_text.contains("--More--"),
+        "did not expect :next to keep controlling a pre-reset pager, got: {next_text:?}"
     );
     Ok(())
 }

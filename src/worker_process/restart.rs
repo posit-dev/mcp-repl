@@ -60,6 +60,7 @@ impl WorkerManager {
         self.maybe_emit_pending_server_notice();
         let snapshot = self.shutdown_existing_worker_for_restart(mode, shutdown, timeout);
         self.clear_restart_busy_guardrail();
+        self.clear_stale_pager_before_restart_reply(mode);
         let reply = self.build_restart_reply_for_mode(snapshot);
         self.finish_restart_for_mode(mode);
         Self::end_restart_ok();
@@ -132,6 +133,12 @@ impl WorkerManager {
 
     fn clear_restart_busy_guardrail(&self) {
         self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+
+    fn clear_stale_pager_before_restart_reply(&mut self, mode: RestartMode) {
+        if let RestartMode::Pager = mode {
+            self.pager = pager::Pager::default();
+        }
     }
 
     fn build_restart_reply_for_mode(
