@@ -149,7 +149,7 @@ impl WorkerManager {
                     options.suppress_session_end_reset,
                 ),
             (WriteStdinMode::Files, WriteStdinControlAction::Restart, _) => {
-                self.restart_files(remaining_until(worker_deadline), has_tail)
+                self.restart_files(remaining_until(worker_deadline), false)
             }
             (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) => {
                 self.interrupt_pager(remaining_until(worker_deadline), None, true)
@@ -161,7 +161,7 @@ impl WorkerManager {
                     options.suppress_session_end_reset,
                 ),
             (WriteStdinMode::Pager, WriteStdinControlAction::Restart, _) => {
-                self.restart_pager(remaining_until(worker_deadline), has_tail)
+                self.restart_pager(remaining_until(worker_deadline), false)
             }
         }?;
 

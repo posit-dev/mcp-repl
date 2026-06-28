@@ -4892,6 +4892,45 @@ else:
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_ctrl_d_tail_excludes_old_worker_shutdown_output() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let running = session
+        .write_stdin_raw_with(
+            r#"import time
+time.sleep(0.3)
+print('OLD_WORKER_SHUTDOWN_TAIL_VISIBLE')
+"#,
+            Some(0.05),
+        )
+        .await?;
+    let running_text = result_text(&running);
+    assert!(
+        is_busy_response(&running_text),
+        "expected first request to be busy before reset tail, got: {running_text:?}"
+    );
+
+    let reset = session
+        .write_stdin_raw_with("\u{4}print('FRESH_RESET_TAIL_VISIBLE')", Some(5.0))
+        .await?;
+    let reset_text = result_text(&reset);
+    session.cancel().await?;
+
+    assert!(
+        reset_text.contains("FRESH_RESET_TAIL_VISIBLE"),
+        "expected Ctrl-D tail to run in the fresh session, got: {reset_text:?}"
+    );
+    assert!(
+        !reset_text.contains("OLD_WORKER_SHUTDOWN_TAIL_VISIBLE"),
+        "Ctrl-D tail should not include old-worker shutdown output, got: {reset_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_poll_reports_empty_input_prompt_after_timeout() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {

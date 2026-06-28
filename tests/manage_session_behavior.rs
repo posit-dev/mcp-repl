@@ -375,7 +375,7 @@ flush.console()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_tail_output_is_included_in_same_response() -> TestResult<()> {
+async fn restart_tail_excludes_output_captured_during_shutdown() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let session = spawn_manage_session().await?;
 
@@ -410,8 +410,8 @@ flush.console()
     session.cancel().await?;
 
     assert!(
-        restart_text.contains("DURING_RESTART"),
-        "expected restart reply to include output captured before tail input, got: {restart_text:?}"
+        !restart_text.contains("DURING_RESTART"),
+        "did not expect Ctrl-D tail to include old-worker shutdown output, got: {restart_text:?}"
     );
     assert!(
         restart_text.contains("new session started"),
@@ -468,8 +468,8 @@ Sys.sleep(1.0)
     session.cancel().await?;
 
     assert!(
-        restart_text.contains("DURING_RESTART"),
-        "expected restart reply to include output captured before tail input, got: {restart_text:?}"
+        !restart_text.contains("DURING_RESTART"),
+        "did not expect Ctrl-D tail to include old-worker shutdown output, got: {restart_text:?}"
     );
     assert!(
         restart_text.contains("<<repl status: busy"),
