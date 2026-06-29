@@ -675,7 +675,7 @@ impl DetachedHolderProbe {
 }
 
 #[cfg(unix)]
-struct BackgroundIpcHolderProbe {
+struct BackgroundIpcLeakProbe {
     _dir: tempfile::TempDir,
     ready_path: PathBuf,
     release_path: PathBuf,
@@ -683,27 +683,30 @@ struct BackgroundIpcHolderProbe {
 }
 
 #[cfg(unix)]
-impl BackgroundIpcHolderProbe {
+impl BackgroundIpcLeakProbe {
     fn new() -> TestResult<Self> {
         let dir = tempdir()?;
         Ok(Self {
-            ready_path: dir.path().join("holder-ready"),
-            release_path: dir.path().join("holder-release"),
-            exited_path: dir.path().join("holder-exited"),
+            ready_path: dir.path().join("probe-ready"),
+            release_path: dir.path().join("probe-release"),
+            exited_path: dir.path().join("probe-exited"),
             _dir: dir,
         })
     }
 
     fn ready_literal(&self) -> TestResult<String> {
-        path_literal(&self.ready_path, "background IPC holder ready marker")
+        path_literal(&self.ready_path, "background IPC leak probe ready marker")
     }
 
     fn release_literal(&self) -> TestResult<String> {
-        path_literal(&self.release_path, "background IPC holder release marker")
+        path_literal(
+            &self.release_path,
+            "background IPC leak probe release marker",
+        )
     }
 
     fn exited_literal(&self) -> TestResult<String> {
-        path_literal(&self.exited_path, "background IPC holder exited marker")
+        path_literal(&self.exited_path, "background IPC leak probe exited marker")
     }
 
     async fn wait_for_ready(&self) -> TestResult<()> {
@@ -712,17 +715,17 @@ impl BackgroundIpcHolderProbe {
         while Instant::now() < deadline {
             if self.exited_path.exists() {
                 return Err(format!(
-                    "background IPC holder exited before ready: {}",
+                    "background IPC leak probe exited before ready: {}",
                     self.exited_path.display()
                 )
                 .into());
             }
             if self.ready_path.exists() {
-                match self.holder_pid() {
+                match self.probe_pid() {
                     Ok(pid) if process_is_alive(pid) => return Ok(()),
                     Ok(pid) => {
                         return Err(format!(
-                            "background IPC holder was killed before ready completed: pid {pid}, ready marker {}",
+                            "background IPC leak probe was killed before ready completed: pid {pid}, ready marker {}",
                             self.ready_path.display()
                         )
                         .into());
@@ -739,7 +742,7 @@ impl BackgroundIpcHolderProbe {
             .map(|err| format!("; last ready marker read error: {err}"))
             .unwrap_or_default();
         Err(format!(
-            "background IPC holder never started: {}{suffix}",
+            "background IPC leak probe never started: {}{suffix}",
             self.ready_path.display()
         )
         .into())
@@ -748,23 +751,23 @@ impl BackgroundIpcHolderProbe {
     fn assert_running_before_release(&self, context: &str) -> TestResult<()> {
         if !self.ready_path.exists() {
             return Err(format!(
-                "{context}: background IPC holder never started: {}",
+                "{context}: background IPC leak probe never started: {}",
                 self.ready_path.display()
             )
             .into());
         }
         if self.exited_path.exists() {
             return Err(format!(
-                "{context}: background IPC holder exited before release: {}",
+                "{context}: background IPC leak probe exited before release: {}",
                 self.exited_path.display()
             )
             .into());
         }
 
-        let pid = self.holder_pid()?;
+        let pid = self.probe_pid()?;
         if !process_is_alive(pid) {
             return Err(format!(
-                "{context}: background IPC holder was killed before release: pid {pid}, ready marker {}",
+                "{context}: background IPC leak probe was killed before release: pid {pid}, ready marker {}",
                 self.ready_path.display()
             )
             .into());
@@ -773,7 +776,7 @@ impl BackgroundIpcHolderProbe {
     }
 
     async fn release_and_wait_for_exit(&self) -> TestResult<()> {
-        let was_alive_before_release = self.holder_alive().unwrap_or(false);
+        let was_alive_before_release = self.probe_alive().unwrap_or(false);
         self.write_release_marker()?;
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -787,7 +790,7 @@ impl BackgroundIpcHolderProbe {
 
         if self.ready_path.exists() && !was_alive_before_release {
             return Err(format!(
-                "background IPC holder was killed before release: ready marker {}, release marker {}, exited marker {}",
+                "background IPC leak probe was killed before release: ready marker {}, release marker {}, exited marker {}",
                 self.ready_path.display(),
                 self.release_path.display(),
                 self.exited_path.display()
@@ -795,7 +798,7 @@ impl BackgroundIpcHolderProbe {
             .into());
         }
         Err(format!(
-            "background IPC holder failed to exit after release: release marker {}, exited marker {}",
+            "background IPC leak probe failed to exit after release: release marker {}, exited marker {}",
             self.release_path.display(),
             self.exited_path.display()
         )
@@ -819,18 +822,18 @@ impl BackgroundIpcHolderProbe {
         false
     }
 
-    fn holder_alive(&self) -> TestResult<bool> {
+    fn probe_alive(&self) -> TestResult<bool> {
         if !self.ready_path.exists() {
             return Ok(false);
         }
-        Ok(process_is_alive(self.holder_pid()?))
+        Ok(process_is_alive(self.probe_pid()?))
     }
 
-    fn holder_pid(&self) -> TestResult<i32> {
+    fn probe_pid(&self) -> TestResult<i32> {
         let pid_text = fs::read_to_string(&self.ready_path)?;
         let pid = pid_text.trim().parse::<i32>().map_err(|err| {
             format!(
-                "background IPC holder ready marker did not contain a pid: {}: {err}",
+                "background IPC leak probe ready marker did not contain a pid: {}: {err}",
                 self.ready_path.display()
             )
         })?;
@@ -839,7 +842,7 @@ impl BackgroundIpcHolderProbe {
 }
 
 #[cfg(unix)]
-impl Drop for BackgroundIpcHolderProbe {
+impl Drop for BackgroundIpcLeakProbe {
     fn drop(&mut self) {
         if self.exited_path.exists() {
             return;
@@ -859,23 +862,23 @@ fn process_is_alive(pid: i32) -> bool {
 }
 
 #[cfg(unix)]
-async fn fail_background_ipc_test(
-    holder: &BackgroundIpcHolderProbe,
+async fn fail_background_ipc_leak_probe_test(
+    probe: &BackgroundIpcLeakProbe,
     session: common::McpTestSession,
     message: String,
 ) -> TestResult<()> {
-    let holder_cleanup = holder.release_and_wait_for_exit().await;
+    let probe_cleanup = probe.release_and_wait_for_exit().await;
     let session_cleanup = session.cancel().await;
-    match (holder_cleanup, session_cleanup) {
+    match (probe_cleanup, session_cleanup) {
         (Ok(()), Ok(())) => Err(message.into()),
-        (Err(holder_err), Ok(())) => {
-            Err(format!("{message}; holder cleanup failed: {holder_err}").into())
+        (Err(probe_err), Ok(())) => {
+            Err(format!("{message}; leak probe cleanup failed: {probe_err}").into())
         }
         (Ok(()), Err(session_err)) => {
             Err(format!("{message}; session cleanup failed: {session_err}").into())
         }
-        (Err(holder_err), Err(session_err)) => Err(format!(
-            "{message}; holder cleanup failed: {holder_err}; session cleanup failed: {session_err}"
+        (Err(probe_err), Err(session_err)) => Err(format!(
+            "{message}; leak probe cleanup failed: {probe_err}; session cleanup failed: {session_err}"
         )
         .into()),
     }
@@ -963,13 +966,13 @@ print("detached ready")
 }
 
 #[cfg(unix)]
-async fn arm_background_ipc_holder(
+async fn arm_background_ipc_leak_probe(
     session: &mut common::McpTestSession,
-) -> TestResult<BackgroundIpcHolderProbe> {
-    let holder = BackgroundIpcHolderProbe::new()?;
-    let ready_literal = holder.ready_literal()?;
-    let release_literal = holder.release_literal()?;
-    let exited_literal = holder.exited_literal()?;
+) -> TestResult<BackgroundIpcLeakProbe> {
+    let probe = BackgroundIpcLeakProbe::new()?;
+    let ready_literal = probe.ready_literal()?;
+    let release_literal = probe.release_literal()?;
+    let exited_literal = probe.exited_literal()?;
     let setup = session
         .write_stdin_raw_with(
             format!(
@@ -1007,7 +1010,7 @@ launcher = subprocess.Popen(
 launcher_status = launcher.wait()
 if launcher_status != 0:
     raise SystemExit(launcher_status)
-print("ipc background launcher exited")
+print("ipc leak probe launcher exited")
 "#
             ),
             Some(5.0),
@@ -1015,18 +1018,20 @@ print("ipc background launcher exited")
         .await?;
     let setup_text = result_text(&setup);
     if is_busy_response(&setup_text) {
-        let _ = holder.release_and_wait_for_exit().await;
-        return Err("background-ipc setup remained busy".into());
+        let _ = probe.release_and_wait_for_exit().await;
+        return Err("background IPC leak probe setup remained busy".into());
     }
-    if !setup_text.contains("ipc background launcher exited") {
-        let _ = holder.release_and_wait_for_exit().await;
-        return Err(format!("expected background-ipc setup reply, got: {setup_text:?}").into());
+    if !setup_text.contains("ipc leak probe launcher exited") {
+        let _ = probe.release_and_wait_for_exit().await;
+        return Err(
+            format!("expected background IPC leak probe setup reply, got: {setup_text:?}").into(),
+        );
     }
-    if let Err(err) = holder.wait_for_ready().await {
-        let _ = holder.release_and_wait_for_exit().await;
+    if let Err(err) = probe.wait_for_ready().await {
+        let _ = probe.release_and_wait_for_exit().await;
         return Err(err);
     }
-    Ok(holder)
+    Ok(probe)
 }
 
 #[cfg(unix)]
@@ -3222,48 +3227,48 @@ print("detached respawn armed")
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+async fn python_quit_does_not_wait_for_background_process_ipc_leak_probe() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
-    let holder = arm_background_ipc_holder(&mut session).await?;
+    let probe = arm_background_ipc_leak_probe(&mut session).await?;
 
     let start = Instant::now();
     let quit = session.write_stdin_raw_with("quit()", Some(5.0)).await?;
     let elapsed = start.elapsed();
     let quit_text = result_text(&quit);
     if is_busy_response(&quit_text) {
-        return fail_background_ipc_test(
-            &holder,
+        return fail_background_ipc_leak_probe_test(
+            &probe,
             session,
             format!("server waited or returned busy unexpectedly on quit(): {quit_text:?}"),
         )
         .await;
     }
     if elapsed >= shutdown_completion_budget() {
-        return fail_background_ipc_test(
-            &holder,
+        return fail_background_ipc_leak_probe_test(
+            &probe,
             session,
             format!("server waited unexpectedly on quit(); elapsed {elapsed:?}: {quit_text:?}"),
         )
         .await;
     }
 
-    if let Err(err) = holder.assert_running_before_release("after quit() returned") {
-        return fail_background_ipc_test(&holder, session, err.to_string()).await;
+    if let Err(err) = probe.assert_running_before_release("after quit() returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
     }
 
     let follow_up_start = Instant::now();
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_IPC_QUIT')", Some(5.0))
+        .write_stdin_raw_with("print('AFTER_IPC_LEAK_PROBE_QUIT')", Some(5.0))
         .await?;
     let follow_up_elapsed = follow_up_start.elapsed();
     let follow_up_text = result_text(&follow_up);
     if is_busy_response(&follow_up_text) {
-        return fail_background_ipc_test(
-            &holder,
+        return fail_background_ipc_leak_probe_test(
+            &probe,
             session,
             format!(
                 "server waited or returned busy unexpectedly after quit() respawn: {follow_up_text:?}"
@@ -3272,8 +3277,8 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
         .await;
     }
     if follow_up_elapsed >= shutdown_completion_budget() {
-        return fail_background_ipc_test(
-            &holder,
+        return fail_background_ipc_leak_probe_test(
+            &probe,
             session,
             format!(
                 "server waited unexpectedly after quit() respawn; elapsed {follow_up_elapsed:?}: {follow_up_text:?}"
@@ -3281,16 +3286,16 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
         )
         .await;
     }
-    if let Err(err) = holder.assert_running_before_release("after quit() respawn returned") {
-        return fail_background_ipc_test(&holder, session, err.to_string()).await;
+    if let Err(err) = probe.assert_running_before_release("after quit() respawn returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
     }
 
-    let holder_cleanup = holder.release_and_wait_for_exit().await;
+    let probe_cleanup = probe.release_and_wait_for_exit().await;
     session.cancel().await?;
-    holder_cleanup?;
+    probe_cleanup?;
 
     assert!(
-        follow_up_text.contains("AFTER_IPC_QUIT"),
+        follow_up_text.contains("AFTER_IPC_LEAK_PROBE_QUIT"),
         "expected prompt recovery after quit() respawn, got: {follow_up_text:?}"
     );
     Ok(())
@@ -3298,13 +3303,13 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_respawn_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+async fn python_respawn_does_not_wait_for_background_process_ipc_leak_probe() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
-    let holder = arm_background_ipc_holder(&mut session).await?;
+    let probe = arm_background_ipc_leak_probe(&mut session).await?;
 
     let arm = session
         .write_stdin_raw_with(
@@ -3320,31 +3325,33 @@ print("ipc respawn armed")
         .await?;
     let arm_text = result_text(&arm);
     if is_busy_response(&arm_text) {
-        return fail_background_ipc_test(
-            &holder,
+        return fail_background_ipc_leak_probe_test(
+            &probe,
             session,
-            format!("server returned busy while arming background IPC respawn: {arm_text:?}"),
+            format!(
+                "server returned busy while arming background IPC leak probe respawn: {arm_text:?}"
+            ),
         )
         .await;
     }
     assert!(
         arm_text.contains("ipc respawn armed"),
-        "expected background-ipc respawn arming reply, got: {arm_text:?}"
+        "expected background IPC leak probe respawn arming reply, got: {arm_text:?}"
     );
-    if let Err(err) = holder.assert_running_before_release("after respawn arming returned") {
-        return fail_background_ipc_test(&holder, session, err.to_string()).await;
+    if let Err(err) = probe.assert_running_before_release("after respawn arming returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
     }
 
     sleep(Duration::from_millis(500)).await;
     let start = Instant::now();
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_IPC_RESPAWN')", Some(5.0))
+        .write_stdin_raw_with("print('AFTER_IPC_LEAK_PROBE_RESPAWN')", Some(5.0))
         .await?;
     let elapsed = start.elapsed();
     let follow_up_text = result_text(&follow_up);
     if is_busy_response(&follow_up_text) {
-        return fail_background_ipc_test(
-            &holder,
+        return fail_background_ipc_leak_probe_test(
+            &probe,
             session,
             format!(
                 "server waited or returned busy unexpectedly after worker exit: {follow_up_text:?}"
@@ -3354,8 +3361,8 @@ print("ipc respawn armed")
     }
 
     if elapsed >= shutdown_completion_budget() {
-        return fail_background_ipc_test(
-            &holder,
+        return fail_background_ipc_leak_probe_test(
+            &probe,
             session,
             format!(
                 "server waited unexpectedly after worker exit; elapsed {elapsed:?}: {follow_up_text:?}"
@@ -3363,16 +3370,16 @@ print("ipc respawn armed")
         )
         .await;
     }
-    if let Err(err) = holder.assert_running_before_release("after respawn returned") {
-        return fail_background_ipc_test(&holder, session, err.to_string()).await;
+    if let Err(err) = probe.assert_running_before_release("after respawn returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
     }
 
-    let holder_cleanup = holder.release_and_wait_for_exit().await;
+    let probe_cleanup = probe.release_and_wait_for_exit().await;
     session.cancel().await?;
-    holder_cleanup?;
+    probe_cleanup?;
 
     assert!(
-        follow_up_text.contains("AFTER_IPC_RESPAWN"),
+        follow_up_text.contains("AFTER_IPC_LEAK_PROBE_RESPAWN"),
         "expected prompt recovery after respawn, got: {follow_up_text:?}"
     );
     Ok(())
