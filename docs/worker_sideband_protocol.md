@@ -1,6 +1,6 @@
 # Worker Sideband Protocol
 
-This document defines worker protocol version 6. The server rejects unsupported
+This document defines worker protocol version 7. The server rejects unsupported
 protocol versions before sending user input.
 
 The sideband is a UTF-8 JSON-lines IPC stream between the server and one worker
@@ -78,8 +78,10 @@ capture does not preserve separate stdout/stderr identity. Sideband
 `interrupt`
 - `{ "type": "interrupt" }`
 - Sent when the client requests interrupt and a worker IPC endpoint exists.
-- The server must also deliver a platform interrupt to the worker process or
-  process group when a worker process exists.
+- The server sends this cleanup message first, waits briefly for
+  `interrupt_ack`, and then delivers a platform interrupt to the worker process
+  or process group when a worker process exists. The platform interrupt is sent
+  whether the ack arrives or times out.
 - The IPC message carries no input and does not complete a batch. It tells the
   worker to discard pending managed input that has not yet been consumed by the
   runtime.
@@ -105,7 +107,7 @@ capture does not preserve separate stdout/stderr identity. Sideband
 - Built-in workers request runtime shutdown after receiving it. They may emit
   output from the active request before `session_end` and process exit.
 
-The server emits no other server-to-worker protocol messages in v6.
+The server emits no other server-to-worker protocol messages in v7.
 Built-in worker readers treat malformed or unknown server-to-worker messages as
 IPC loss and exit so the server can replace the worker.
 
@@ -116,9 +118,9 @@ invalid enum values, and invalid base64 payloads in base64 fields are protocol
 errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 7 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
 - Normal first worker message.
-- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `6`.
+- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `7`.
 - `worker.name` and `worker.version` are diagnostic metadata.
 - `capabilities.images` is advertised by workers that may emit image output; if
   the field is omitted inside `capabilities`, the server treats it as `false`.
@@ -140,6 +142,15 @@ errors.
 - If an input batch is active, this is the successful same-worker completion
   signal for that batch.
 - If no input batch is active, this permits prompt-free startup readiness.
+
+`interrupt_ack`
+- `{ "type": "interrupt_ack", "discarded_input": <bool> }`
+- Confirms that the worker processed the ordered sideband `interrupt` cleanup
+  message.
+- `discarded_input` is `true` when pending managed input was discarded before
+  the runtime consumed it. It is `false` when no pending managed input existed.
+- This message does not mark the worker ready, complete active input, interrupt
+  runtime code, or change server-side readiness.
 
 `input_line`
 - `{ "type": "input_line", "prompt": <string>, "text": <string> }`
@@ -189,7 +200,7 @@ errors.
 - This is terminal for the whole worker session, including any active input.
   After `session_end`, any later worker-to-server message is a protocol error.
 
-The worker emits no other worker-to-server protocol messages in v6.
+The worker emits no other worker-to-server protocol messages in v7.
 
 ## Readiness And Input
 
@@ -206,9 +217,11 @@ the worker emits `input_wait`; a prompt-free top-level loop may instead emit
 Built-in R and Python use the same ownership model: a worker-owned managed input
 queue feeds runtime input callbacks and managed stdin surfaces. The sideband IPC
 reader runs independently from the runtime thread. It receives `input_batch`,
-`interrupt`, and `shutdown`, mutates worker-owned queue/session state, and wakes
-the runtime when needed. The runtime thread consumes queued input only when the
-runtime calls its managed input boundary. A `shutdown` message asks built-in
+`interrupt`, and `shutdown`, mutates worker-owned queue/session state, emits
+`interrupt_ack` after cleanup, and wakes the runtime when needed. Runtime
+interruption comes from the server's platform interrupt delivery, not from the
+sideband `interrupt` message. The runtime thread consumes queued input only when
+the runtime calls its managed input boundary. A `shutdown` message asks built-in
 workers to stop accepting new input, preserve already accepted input until it
 is consumed, wake managed input readers with EOF after that queue drains, and
 exit after the active runtime request reaches a safe boundary or the server's
@@ -289,7 +302,7 @@ through the managed input path. Raw stdout/stderr remains authoritative for
 output that did not arrive through `output_text`; raw capture does not drive
 completion or readiness.
 
-The following older protocol concepts are not part of v6:
+The following older protocol concepts are not part of v7:
 
 - input IDs on `input_batch`, `input_line`, `input_wait`, `interrupt`, or
   `session_end`

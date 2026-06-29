@@ -292,6 +292,17 @@ async fn spawn_zod_delayed_interrupt_ready_server(
     .await
 }
 
+async fn spawn_zod_without_interrupt_ack_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![("MCP_REPL_ZOD_SKIP_INTERRUPT_ACK", "1")],
+        Vec::new(),
+    )
+    .await
+}
+
 async fn spawn_zod_pager_server(
     control_log: &std::path::Path,
     page_chars: u64,
@@ -524,30 +535,40 @@ async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_interrupt_prefix_waits_for_fresh_ready() -> TestResult<()> {
+async fn zod_worker_interrupt_prefix_uses_existing_readiness_after_ack() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_delayed_interrupt_ready_server(&control_log).await?;
 
     let result = session
-        .write_stdin_raw_with("\u{3}after fresh ready", Some(10.0))
+        .write_stdin_raw_with("\u{3}after interrupt ack", Some(10.0))
         .await?;
     let text = result_text(&result);
     assert!(
-        text.contains("v5-output: after fresh ready\n"),
-        "expected interrupt tail to run after fresh readiness, got: {text:?}"
+        text.contains("v5-output: after interrupt ack\n"),
+        "expected interrupt tail to run after ack and existing readiness, got: {text:?}"
     );
 
-    let log = wait_for_log_contains(&control_log, "fresh_ready_after_interrupt")?;
-    let fresh_ready_idx = log
-        .find("fresh_ready_after_interrupt")
-        .expect("fresh readiness log should be present");
+    let log = wait_for_log_contains(
+        &control_log,
+        "fresh_ready_after_interrupt_suppressed_for_pending_input",
+    )?;
+    let ack_idx = log
+        .find("interrupt_ack discarded_input=false")
+        .expect("interrupt ack log should be present");
     let input_idx = log
-        .find("input_batch input=after fresh ready")
+        .find("input_batch input=after interrupt ack")
         .expect("interrupt tail input log should be present");
+    let suppress_idx = log
+        .find("fresh_ready_after_interrupt_suppressed_for_pending_input")
+        .expect("suppressed fresh readiness log should be present");
     assert!(
-        fresh_ready_idx < input_idx,
-        "expected tail input only after fresh readiness, got log: {log:?}"
+        ack_idx < input_idx,
+        "expected ack before tail input, got log: {log:?}"
+    );
+    assert!(
+        input_idx < suppress_idx,
+        "expected tail input to be queued before delayed fresh readiness was suppressed, got log: {log:?}"
     );
 
     session.cancel().await?;
@@ -2272,6 +2293,110 @@ async fn zod_worker_v5_interrupt_is_payload_free() -> TestResult<()> {
     assert!(
         !log.contains("interrupt input_id"),
         "interrupt must not carry input identity, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_ack_precedes_os_interrupt_observation() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interrupt-report 5000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial timeout, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let interrupted_text = result_text(&interrupted);
+    assert!(
+        interrupted_text.contains("sideband interrupt: observed"),
+        "expected sideband interrupt observation, got: {interrupted_text:?}"
+    );
+    #[cfg(target_family = "unix")]
+    assert!(
+        interrupted_text.contains("os interrupt: observed"),
+        "expected OS interrupt observation, got: {interrupted_text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "os_interrupt_observed")?;
+    let ack_idx = log
+        .find("interrupt_ack discarded_input=false")
+        .expect("interrupt ack log should be present");
+    let os_idx = log
+        .find("os_interrupt_observed")
+        .expect("OS interrupt observation log should be present");
+    assert!(
+        ack_idx < os_idx,
+        "expected ack before runtime observed OS interrupt, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_ack_timeout_still_sends_os_interrupt() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_without_interrupt_ack_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interrupt-report 5000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial timeout, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let interrupted_text = result_text(&interrupted);
+    #[cfg(target_family = "unix")]
+    assert!(
+        interrupted_text.contains("os interrupt: observed"),
+        "expected OS interrupt despite missing ack, got: {interrupted_text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "interrupt_ack_suppressed")?;
+    assert!(
+        log.contains("interrupt"),
+        "expected sideband interrupt to be received before ack suppression, got: {log:?}"
     );
 
     session.cancel().await?;

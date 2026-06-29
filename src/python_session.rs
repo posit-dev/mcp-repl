@@ -20,8 +20,6 @@ mod state;
 mod stdio;
 #[cfg(target_family = "unix")]
 mod unix_stdin;
-#[cfg(windows)]
-mod windows_stdin;
 
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
 
@@ -92,43 +90,8 @@ fn take_exit_requested() -> bool {
     requested
 }
 
-pub(crate) fn interrupt() {
-    interrupt_for_request_generation(None);
-}
-
-fn interrupt_for_request_generation(_request_generation: Option<u64>) {
-    discard_pending_stdin();
-    #[cfg(target_family = "unix")]
-    unix_stdin::flush_terminal_input();
-    mark_interrupt_requested();
-    request_platform_interrupt();
-}
-
-fn mark_interrupt_requested() {
-    let Some(state) = SESSION_STATE.get() else {
-        return;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    guard.interrupt_requested = true;
-    state.cvar.notify_all();
-}
-
-#[cfg(windows)]
-fn request_platform_interrupt() {
-    let _ = unsafe { libc::raise(libc::SIGINT) };
-}
-
-#[cfg(not(windows))]
-fn request_platform_interrupt() {}
-
-fn take_interrupt_requested() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    let requested = guard.interrupt_requested;
-    guard.interrupt_requested = false;
-    requested
+pub(crate) fn interrupt() -> bool {
+    discard_pending_stdin()
 }
 
 pub(crate) fn begin_input(input: String) -> Result<(), String> {
@@ -141,7 +104,6 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         !guard.request_active
     };
     if should_record_background_plots {
-        clear_python_pending_interrupt();
         record_background_plots();
     }
     {
@@ -152,7 +114,6 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         guard.input_queue.push_payload(input);
         guard.request_active = true;
         guard.plot_reset_pending = true;
-        guard.interrupt_requested = false;
     }
     state.cvar.notify_all();
     Ok(())
@@ -166,13 +127,12 @@ pub(crate) fn request_shutdown() {
     // Preserve already accepted input; reset replies include output produced
     // while the old worker drains to a safe runtime boundary.
     guard.shutdown = true;
-    guard.interrupt_requested = false;
     state.cvar.notify_all();
 }
 
 #[cfg(target_family = "unix")]
-fn discard_pending_stdin() {
-    discard_queued_input();
+fn discard_pending_stdin() -> bool {
+    discard_queued_input()
 }
 
 fn emit_protocol_failure(message: &str) {
@@ -188,23 +148,23 @@ fn emit_protocol_failure(message: &str) {
 }
 
 #[cfg(windows)]
-fn discard_pending_stdin() {
-    discard_queued_input();
-    windows_stdin::discard_pending_stdin();
+fn discard_pending_stdin() -> bool {
+    discard_queued_input()
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]
-fn discard_pending_stdin() {
-    discard_queued_input();
+fn discard_pending_stdin() -> bool {
+    discard_queued_input()
 }
 
-fn discard_queued_input() {
+fn discard_queued_input() -> bool {
     let Some(state) = SESSION_STATE.get() else {
-        return;
+        return false;
     };
     let mut guard = state.inner.lock().unwrap();
-    guard.input_queue.clear_after_interrupt();
+    let discarded = guard.input_queue.discard_unconsumed_input();
     state.cvar.notify_all();
+    discarded
 }
 
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
@@ -377,18 +337,6 @@ fn wait_for_next_cell() -> Option<CellInput> {
         if guard.exit_requested {
             return None;
         }
-        if guard.interrupt_requested {
-            guard.interrupt_requested = false;
-            guard.request_active = false;
-            guard.cell_running = false;
-            guard.visible_input_prompt = None;
-            state.cvar.notify_all();
-            drop(guard);
-            clear_python_pending_interrupt();
-            ipc::emit_ready();
-            guard = state.inner.lock().unwrap();
-            continue;
-        }
         if !guard.input_queue.has_active_read_consumer()
             && let Some(source) = guard.input_queue.take_cell_payload()
         {
@@ -466,12 +414,6 @@ fn clear_python_stdin_buffers(api: &'static PythonApi) -> Result<(), String> {
     Ok(())
 }
 
-fn clear_python_pending_interrupt() {
-    let api = PythonApi::global();
-    let _gil = GilGuard::acquire();
-    api.clear_pending_signals();
-}
-
 fn finalize_python(
     api: &'static PythonApi,
     thread_state: *mut PyThreadState,
@@ -516,7 +458,6 @@ enum QueueReadAction {
     InputWait {
         prompt: String,
     },
-    Interrupted,
     Shutdown,
 }
 
@@ -558,15 +499,6 @@ fn next_queue_line_action(
             }
             state.cvar.notify_all();
             return QueueReadAction::Shutdown;
-        }
-        if guard.interrupt_requested {
-            guard.interrupt_requested = false;
-            if *owns_consumer {
-                guard.input_queue.end_read_consumer();
-                *owns_consumer = false;
-            }
-            state.cvar.notify_all();
-            return QueueReadAction::Interrupted;
         }
         if !*owns_consumer {
             if guard.input_queue.begin_read_consumer() {
@@ -657,12 +589,6 @@ fn read_queue_line(
                 remember_emitted_prompt(&prompt);
                 ipc::emit_input_wait(&prompt);
             }
-            QueueReadAction::Interrupted => {
-                return Ok(StdioLineRead {
-                    bytes: Vec::new(),
-                    interrupted: true,
-                });
-            }
             QueueReadAction::Shutdown => {
                 return Ok(StdioLineRead {
                     bytes: Vec::new(),
@@ -693,14 +619,6 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         state.cvar.notify_all();
                     }
                     return Ok(output);
-                }
-                if guard.interrupt_requested {
-                    guard.interrupt_requested = false;
-                    if owns_consumer {
-                        guard.input_queue.end_read_consumer();
-                        state.cvar.notify_all();
-                    }
-                    return Err(RawStdinReadError::Interrupted);
                 }
                 if !output.is_empty() {
                     return Ok(output);
@@ -769,7 +687,6 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 remember_emitted_prompt(&prompt);
                 ipc::emit_input_wait(&prompt);
             }
-            QueueReadAction::Interrupted => return Err(RawStdinReadError::Interrupted),
             QueueReadAction::Shutdown => return Ok(output),
         }
     }
@@ -844,7 +761,7 @@ unsafe extern "C" fn mcp_repl_readline(
     if accounting.discarded_after_interrupt() {
         return allocate_readline_result(b"\n");
     }
-    if read.interrupted || take_interrupt_requested() {
+    if read.interrupted {
         PythonApi::global().set_interrupt();
         return ptr::null_mut();
     }
@@ -947,7 +864,7 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     if accounting.discarded_after_interrupt() {
         return CStdinLine::Line("\n".to_string());
     }
-    if read.interrupted || take_interrupt_requested() {
+    if read.interrupted {
         PythonApi::global().set_interrupt();
         return CStdinLine::Error;
     }
@@ -1234,10 +1151,6 @@ unsafe extern "C" fn py_raw_stdin_read(_self: *mut PyObject, args: *mut PyObject
     };
     let bytes = match read_raw_stdin_bytes(size) {
         Ok(bytes) => bytes,
-        Err(RawStdinReadError::Interrupted) => {
-            api.set_interrupt();
-            return ptr::null_mut();
-        }
         Err(RawStdinReadError::Runtime(message)) => {
             set_callback_error(&message);
             return ptr::null_mut();

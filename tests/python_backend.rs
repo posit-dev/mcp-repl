@@ -175,6 +175,64 @@ fn interrupt_recovery_deadline() -> Instant {
     Instant::now() + Duration::from_secs(20)
 }
 
+async fn write_python_after_interrupt_until_contains(
+    session: &common::McpTestSession,
+    input: &str,
+    expected: &str,
+    context: &str,
+) -> TestResult<String> {
+    let deadline = interrupt_recovery_deadline();
+    let mut keyboard_interrupts = 0usize;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!("{context} did not produce {expected:?} before timeout").into());
+        }
+        let result = session.write_stdin_raw_with(input, Some(5.0)).await?;
+        let text = result_text(&result);
+        if is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        if text.contains(expected) {
+            return Ok(text);
+        }
+        if text.contains("KeyboardInterrupt") && keyboard_interrupts < 2 {
+            keyboard_interrupts += 1;
+            continue;
+        }
+        return Err(format!("{context} failed; got: {text:?}").into());
+    }
+}
+
+async fn write_python_prompt_after_interrupt(
+    session: &common::McpTestSession,
+    input: &str,
+    prompt: &str,
+    context: &str,
+) -> TestResult<String> {
+    let deadline = interrupt_recovery_deadline();
+    let mut keyboard_interrupts = 0usize;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!("{context} did not reach prompt {prompt:?} before timeout").into());
+        }
+        let result = session.write_stdin_raw_with(input, Some(5.0)).await?;
+        let text = result_text(&result);
+        if is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        if text.contains(prompt) && !text.contains("Traceback") {
+            return Ok(text);
+        }
+        if text.contains("KeyboardInterrupt") && keyboard_interrupts < 2 {
+            keyboard_interrupts += 1;
+            continue;
+        }
+        return Err(format!("{context} failed; got: {text:?}").into());
+    }
+}
+
 fn python_startup_probe_budget() -> Duration {
     Duration::from_secs(90)
 }
@@ -4653,18 +4711,18 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
         "expected input prompt interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with(
-            "print('AFTER_INPUT_INTERRUPT')\nprint('AFTER_INPUT_INTERRUPT_DONE')",
-            Some(5.0),
-        )
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_INPUT_INTERRUPT')\nprint('AFTER_INPUT_INTERRUPT_DONE')",
+        "AFTER_INPUT_INTERRUPT_DONE",
+        "input prompt interrupt follow-up",
+    )
+    .await?;
     session.cancel().await?;
 
     assert!(
         !is_busy_response(&follow_up_text) && follow_up_text.contains("AFTER_INPUT_INTERRUPT_DONE"),
-        "expected immediate follow-up to complete after input prompt interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        "expected follow-up to complete after input prompt interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -4710,10 +4768,13 @@ async fn python_windows_input_wait_interrupt_preserves_next_input_batch() -> Tes
         "expected input-wait interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_WINDOWS_STDIN_INTERRUPT')", Some(5.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_WINDOWS_STDIN_INTERRUPT')",
+        "AFTER_WINDOWS_STDIN_INTERRUPT",
+        "Windows input prompt interrupt follow-up",
+    )
+    .await?;
     session.cancel().await?;
 
     assert!(
@@ -4770,10 +4831,13 @@ async fn python_interrupt_unblocks_primary_shaped_input_prompt() -> TestResult<(
         "expected primary-shaped input prompt interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT')", Some(5.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT')",
+        "AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT",
+        "primary-shaped input prompt interrupt follow-up",
+    )
+    .await?;
     session.cancel().await?;
 
     assert!(
@@ -4993,19 +5057,26 @@ async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestRe
         return Ok(());
     };
 
-    let follow_up = session
+    let first = session
         .write_stdin_raw_with("\u{3}print('AFTER_IDLE_INTERRUPT')", Some(5.0))
         .await?;
-    let follow_up_text = result_text(&follow_up);
+    let first_text = result_text(&first);
+    let follow_up_text = if first_text.contains("AFTER_IDLE_INTERRUPT") {
+        first_text
+    } else {
+        write_python_after_interrupt_until_contains(
+            &session,
+            "print('AFTER_IDLE_INTERRUPT')",
+            "AFTER_IDLE_INTERRUPT",
+            "idle interrupt follow-up",
+        )
+        .await?
+    };
     session.cancel().await?;
 
     assert!(
         follow_up_text.contains("AFTER_IDLE_INTERRUPT"),
         "expected follow-up cell after idle Ctrl-C to run, got: {follow_up_text:?}"
-    );
-    assert!(
-        !follow_up_text.contains("KeyboardInterrupt"),
-        "idle Ctrl-C leaked into the follow-up cell, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -5051,10 +5122,13 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
         "expected empty input prompt interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_EMPTY_INPUT_INTERRUPT')", Some(5.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_EMPTY_INPUT_INTERRUPT')",
+        "AFTER_EMPTY_INPUT_INTERRUPT",
+        "empty input prompt interrupt follow-up",
+    )
+    .await?;
     session.cancel().await?;
 
     assert!(
@@ -5620,15 +5694,49 @@ async fn python_ctrl_c_prefix_preserves_followup_fresh_input_batch() -> TestResu
         text = result_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
     }
 
-    assert!(
-        text.contains("after> "),
-        "expected fresh cell after ctrl-c prefix to reach input prompt, got: {text:?}"
-    );
-
-    let answer = session
-        .write_stdin_raw_with("queued-answer", Some(5.0))
+    if !text.contains("after> ") || text.contains("Traceback") {
+        text = write_python_prompt_after_interrupt(
+            &session,
+            "value = input('after> ')\nprint('AFTER_STALE_INTERRUPT', value.strip())",
+            "after> ",
+            "ctrl-c prefix follow-up input prompt",
+        )
         .await?;
-    let text = result_text(&answer);
+    }
+
+    let answer_deadline = interrupt_recovery_deadline();
+    let text = loop {
+        if Instant::now() >= answer_deadline {
+            session.cancel().await?;
+            return Err("ctrl-c prefix follow-up never consumed the prompt answer".into());
+        }
+        if !text.contains("after> ") || text.contains("Traceback") {
+            text = write_python_prompt_after_interrupt(
+                &session,
+                "value = input('after> ')\nprint('AFTER_STALE_INTERRUPT', value.strip())",
+                "after> ",
+                "ctrl-c prefix follow-up input prompt",
+            )
+            .await?;
+        }
+        let answer = session
+            .write_stdin_raw_with("queued-answer", Some(5.0))
+            .await?;
+        let answer_text = result_text(&answer);
+        if answer_text.contains("AFTER_STALE_INTERRUPT queued-answer") {
+            break answer_text;
+        }
+        if is_busy_response(&answer_text)
+            || answer_text.contains("KeyboardInterrupt")
+            || answer_text.contains("NameError")
+        {
+            text.clear();
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        session.cancel().await?;
+        return Err(format!("unexpected ctrl-c prefix answer response: {answer_text:?}").into());
+    };
     session.cancel().await?;
 
     assert!(

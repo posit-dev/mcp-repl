@@ -5,6 +5,7 @@ use std::os::raw::{c_char, c_int, c_uchar};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use crate::ipc;
 #[cfg(target_family = "unix")]
@@ -33,6 +34,7 @@ use std::mem::MaybeUninit;
 use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 
 const MCP_REPL_R_SCRIPT: &str = include_str!("../r/mcp_repl.R");
+const R_READ_CONSOLE_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub struct RSession {
     init: Arc<SessionInit>,
@@ -79,7 +81,6 @@ impl RSession {
         // Preserve already accepted input; reset replies include output produced
         // while the old worker drains to a safe runtime boundary.
         guard.shutdown = true;
-        guard.read_interrupted = false;
         state.cvar.notify_all();
         Ok(())
     }
@@ -149,12 +150,8 @@ pub(crate) fn interrupt_pending_input() -> bool {
     let mut guard = state.inner.lock().unwrap();
     let had_pending = !guard.input_queue.is_empty();
     drain_input_queue(&mut guard.input_queue);
-    let interrupted_waiting_read = guard.waiting_for_input;
-    if interrupted_waiting_read {
-        guard.read_interrupted = true;
-    }
     state.cvar.notify_all();
-    had_pending || interrupted_waiting_read
+    had_pending
 }
 
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
@@ -196,8 +193,6 @@ struct SessionStateInner {
     last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
-    waiting_for_input: bool,
-    read_interrupted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,8 +210,6 @@ impl SessionState {
                 last_prompt: None,
                 shutdown: false,
                 session_end_emitted: false,
-                waiting_for_input: false,
-                read_interrupted: false,
             }),
             cvar: Condvar::new(),
         }
@@ -694,14 +687,37 @@ fn drain_input_queue(queue: &mut VecDeque<InputBatchLine>) -> String {
     drained
 }
 
-fn wait_until_console_input_changes(
-    state: &SessionState,
-    mut guard: MutexGuard<'_, SessionStateInner>,
+fn wait_until_console_input_changes<'a>(
+    state: &'a SessionState,
+    mut guard: MutexGuard<'a, SessionStateInner>,
 ) {
-    while guard.input_queue.is_empty() && !guard.shutdown && !guard.read_interrupted {
-        guard = state.cvar.wait(guard).unwrap();
+    loop {
+        if guard.shutdown {
+            break;
+        }
+        if !guard.input_queue.is_empty() {
+            drop(guard);
+            unsafe {
+                libr::R_CheckUserInterrupt();
+            }
+            guard = state.inner.lock().unwrap();
+            if guard.shutdown || !guard.input_queue.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        let (next_guard, _) = state
+            .cvar
+            .wait_timeout(guard, R_READ_CONSOLE_INTERRUPT_POLL_INTERVAL)
+            .unwrap();
+        guard = next_guard;
+        drop(guard);
+        unsafe {
+            libr::R_CheckUserInterrupt();
+        }
+        guard = state.inner.lock().unwrap();
     }
-    guard.waiting_for_input = false;
 }
 
 fn split_console_line(
@@ -1050,16 +1066,6 @@ pub extern "C-unwind" fn r_read_console(
             return 0;
         }
 
-        if guard.read_interrupted {
-            guard.read_interrupted = false;
-            guard.waiting_for_input = false;
-            drop(guard);
-            unsafe {
-                libr::Rf_onintr();
-            }
-            return 0;
-        }
-
         if let Some(line) = guard.input_queue.pop_front() {
             let max = (buflen as usize).saturating_sub(1);
             let (line_text, tail) = split_console_line(line, max);
@@ -1094,7 +1100,6 @@ pub extern "C-unwind" fn r_read_console(
         if guard.active_input {
             guard.active_input = false;
             guard.plot_hashes.clear();
-            guard.waiting_for_input = true;
             drop(guard);
             ipc::emit_input_wait(prompt);
             let guard = state.inner.lock().unwrap();
@@ -1103,7 +1108,6 @@ pub extern "C-unwind" fn r_read_console(
         }
 
         let prompt = prompt.to_string();
-        guard.waiting_for_input = true;
         drop(guard);
         ipc::emit_input_wait(&prompt);
         let guard = state.inner.lock().unwrap();

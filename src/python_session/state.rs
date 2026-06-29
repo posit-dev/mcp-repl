@@ -21,7 +21,6 @@ pub(super) struct SessionStateInner {
     pub(super) shutdown: bool,
     pub(super) session_end_emitted: bool,
     pub(super) plot_reset_pending: bool,
-    pub(super) interrupt_requested: bool,
 }
 
 pub(super) enum StdinReadAccounting {
@@ -35,7 +34,6 @@ impl StdinReadAccounting {
 }
 
 pub(super) enum RawStdinReadError {
-    Interrupted,
     Runtime(String),
 }
 
@@ -54,7 +52,6 @@ impl SessionState {
                 shutdown: false,
                 session_end_emitted: false,
                 plot_reset_pending: false,
-                interrupt_requested: false,
             }),
             cvar: Condvar::new(),
         }

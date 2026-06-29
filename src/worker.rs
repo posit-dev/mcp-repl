@@ -63,7 +63,8 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt {}) => {
-                        crate::r_session::interrupt_pending_input();
+                        let discarded_input = crate::r_session::interrupt_pending_input();
+                        crate::ipc::emit_interrupt_ack(discarded_input);
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
                         let _ = wait_for_r_session().and_then(RSession::request_shutdown);

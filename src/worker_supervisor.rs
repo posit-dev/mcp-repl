@@ -1200,16 +1200,6 @@ impl WorkerProcess {
         }
     }
 
-    #[cfg(target_family = "windows")]
-    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
-        self.send_windows_ctrl_break()
-    }
-
-    #[cfg(not(target_family = "windows"))]
-    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
-        self.send_interrupt()
-    }
-
     fn send_sigterm(&mut self) -> Result<(), WorkerError> {
         #[cfg(target_family = "unix")]
         {

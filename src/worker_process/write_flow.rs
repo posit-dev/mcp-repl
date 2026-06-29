@@ -7,6 +7,7 @@ use crate::sandbox::SandboxStateUpdate;
 use crate::worker_protocol::{WorkerContent, WorkerReply};
 
 use super::control_prefix::ControlPrefixInput;
+use super::interrupt::INTERRUPT_TAIL_SETTLE_WINDOW;
 use super::write_dispatch::WriteDispatchInput;
 use super::write_preflight::{WritePreflightInput, WritePreflightOutcome};
 use super::{
@@ -139,9 +140,18 @@ impl WorkerManager {
         let has_tail = !plan.tail.is_empty();
 
         let control_reply = match (mode, plan.action, plan.stage_interrupt_after_session_end) {
+            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) if has_tail => {
+                self.interrupt_files_for_tail(remaining_until(worker_deadline), None, true)
+            }
             (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) => {
                 self.interrupt_files(remaining_until(worker_deadline), None, true)
             }
+            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, false) if has_tail => self
+                .interrupt_files_for_tail(
+                    remaining_until(worker_deadline),
+                    plan.tail_sandbox_state_update.clone(),
+                    options.suppress_session_end_reset,
+                ),
             (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, false) => self
                 .interrupt_files(
                     remaining_until(worker_deadline),
@@ -151,9 +161,18 @@ impl WorkerManager {
             (WriteStdinMode::Files, WriteStdinControlAction::Restart, _) => {
                 self.restart_files(remaining_until(worker_deadline))
             }
+            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) if has_tail => {
+                self.interrupt_pager_for_tail(remaining_until(worker_deadline), None, true)
+            }
             (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) => {
                 self.interrupt_pager(remaining_until(worker_deadline), None, true)
             }
+            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, false) if has_tail => self
+                .interrupt_pager_for_tail(
+                    remaining_until(worker_deadline),
+                    plan.tail_sandbox_state_update.clone(),
+                    options.suppress_session_end_reset,
+                ),
             (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, false) => self
                 .interrupt_pager(
                     remaining_until(worker_deadline),
@@ -177,6 +196,9 @@ impl WorkerManager {
         }
         if !has_tail {
             return Ok(Some(control_reply));
+        }
+        if matches!(plan.action, WriteStdinControlAction::Interrupt) {
+            std::thread::sleep(INTERRUPT_TAIL_SETTLE_WINDOW);
         }
 
         let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);

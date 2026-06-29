@@ -41,14 +41,8 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt {}) => {
-                        #[cfg(windows)]
-                        {
-                            python_session::interrupt();
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            python_session::interrupt();
-                        }
+                        let discarded_input = python_session::interrupt();
+                        crate::ipc::emit_interrupt_ack(discarded_input);
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
                         python_session::request_shutdown();

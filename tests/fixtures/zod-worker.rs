@@ -34,6 +34,7 @@ const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
 const UTF8_TAIL_RELEASE_ENV: &str = "MCP_REPL_ZOD_UTF8_TAIL_RELEASE";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
+const SKIP_INTERRUPT_ACK_ENV: &str = "MCP_REPL_ZOD_SKIP_INTERRUPT_ACK";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
@@ -57,6 +58,7 @@ fn run_worker(
     writer: IpcWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
+    let skip_interrupt_ack = std::env::var_os(SKIP_INTERRUPT_ACK_ENV).is_some();
     let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
         .map(|value| {
             value
@@ -77,7 +79,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 6,
+            version: 7,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -110,8 +112,10 @@ fn run_worker(
     start_control_reader(
         sideband_reader,
         tx,
+        writer.clone(),
         sideband_interrupted.clone(),
         control_log_path.clone(),
+        skip_interrupt_ack,
     );
 
     let mut state = CommandState {
@@ -138,6 +142,31 @@ fn run_worker(
             ControlMessage::Interrupt => {
                 if let Some(millis) = delay_ready_after_interrupt_ms {
                     thread::sleep(Duration::from_millis(millis));
+                    match rx.try_recv() {
+                        Ok(ControlMessage::InputBatch { input }) => {
+                            append_control_log(
+                                control_log_path.as_deref(),
+                                "fresh_ready_after_interrupt_suppressed_for_pending_input",
+                            )?;
+                            if run_turn(
+                                &writer,
+                                &sideband_interrupted,
+                                &control_log_path,
+                                &input,
+                                &mut state,
+                            )? {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        Ok(ControlMessage::Shutdown) => {
+                            send_session_end(&writer, "shutdown")?;
+                            return Ok(());
+                        }
+                        Ok(ControlMessage::Interrupt) => {}
+                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                    }
                     append_control_log(control_log_path.as_deref(), "fresh_ready_after_interrupt")?;
                     writer.send(&WorkerToServer::Ready {})?;
                 }
@@ -660,8 +689,10 @@ struct CommandState {
 fn start_control_reader(
     reader: Box<dyn Read + Send>,
     turn_tx: mpsc::Sender<ControlMessage>,
+    writer: IpcWriter,
     interrupted: Arc<AtomicBool>,
     control_log_path: Option<PathBuf>,
+    skip_interrupt_ack: bool,
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
@@ -687,7 +718,24 @@ fn start_control_reader(
                 Ok(ServerToWorker::Interrupt {}) => {
                     interrupted.store(true, Ordering::SeqCst);
                     let _ = append_control_log(control_log_path.as_deref(), "interrupt");
+                    if skip_interrupt_ack {
+                        let _ = append_control_log(
+                            control_log_path.as_deref(),
+                            "interrupt_ack_suppressed",
+                        );
+                    } else {
+                        let _ = writer.send(&WorkerToServer::InterruptAck {
+                            discarded_input: false,
+                        });
+                        let _ = append_control_log(
+                            control_log_path.as_deref(),
+                            "interrupt_ack discarded_input=false",
+                        );
+                    }
                     let _ = turn_tx.send(ControlMessage::Interrupt);
+                }
+                Ok(ServerToWorker::Shutdown {}) => {
+                    let _ = turn_tx.send(ControlMessage::Shutdown);
                 }
                 Err(_) => {}
             }
@@ -727,6 +775,7 @@ enum ControlMessage {
 enum ServerToWorker {
     InputBatch { input: String },
     Interrupt {},
+    Shutdown {},
 }
 
 #[derive(Serialize)]
@@ -757,6 +806,9 @@ enum WorkerToServer {
         prompt: String,
     },
     Ready {},
+    InterruptAck {
+        discarded_input: bool,
+    },
     SessionEnd {
         reason: String,
         message: Option<String>,
@@ -922,7 +974,12 @@ fn observe_interrupts_for(millis: u64, sideband_interrupted: &AtomicBool) -> Int
     let mut os = false;
     while Instant::now() < deadline {
         sideband |= sideband_interrupted.swap(false, Ordering::SeqCst);
-        os |= take_os_interrupt();
+        let observed_os = take_os_interrupt();
+        if observed_os && !os {
+            let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
+            let _ = append_control_log(control_log_path.as_deref(), "os_interrupt_observed");
+        }
+        os |= observed_os;
         if sideband && os {
             break;
         }

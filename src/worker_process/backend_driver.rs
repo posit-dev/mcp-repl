@@ -4,7 +4,6 @@ use crate::backend::{Backend, WorkerLaunch};
 use crate::completion_reply::CompletionInfo;
 use crate::ipc::{IpcWaitError, ServerIpcConnection, ServerToWorkerIpcMessage};
 use crate::oversized_output::OversizedOutputMode;
-use crate::worker_supervisor::WorkerProcess;
 
 use super::WorkerError;
 use super::request_lifecycle::{REQUEST_COMPLETION_STABLE_WAIT, completion_info_from_ipc};
@@ -34,8 +33,6 @@ pub(super) trait BackendDriver: Send {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError>;
-
-    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError>;
 }
 
 pub(super) fn new_backend_driver(worker_launch: &WorkerLaunch) -> Box<dyn BackendDriver> {
@@ -70,15 +67,6 @@ fn driver_wait_for_completion(
         )),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
-}
-
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
-fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
-    if let Some(ipc) = process.ipc_connection() {
-        ipc.note_interrupt_sent();
-        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt {});
-    }
-    process.send_interrupt()
 }
 
 fn normalize_input_newlines(text: &str) -> String {
@@ -168,14 +156,6 @@ impl BackendDriver for RBackendDriver {
     ) -> Result<CompletionInfo, WorkerError> {
         driver_wait_for_completion(timeout, ipc)
     }
-
-    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(ipc) = process.ipc_connection() {
-            ipc.note_interrupt_sent();
-            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt {});
-        }
-        process.send_r_interrupt()
-    }
 }
 
 struct ProtocolBackendDriver;
@@ -235,15 +215,6 @@ impl BackendDriver for ProtocolBackendDriver {
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError> {
         driver_wait_for_completion(timeout, ipc)
-    }
-
-    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(ipc) = process.ipc_connection() {
-            ipc.note_interrupt_sent();
-            ipc.send(ServerToWorkerIpcMessage::Interrupt {})
-                .map_err(WorkerError::Io)?;
-        }
-        process.send_interrupt()
     }
 }
 

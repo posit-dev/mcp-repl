@@ -108,7 +108,6 @@ pub struct PythonApi {
     pub py_mem_raw_malloc: unsafe extern "C" fn(usize) -> *mut c_void,
     pub py_dec_ref: unsafe extern "C" fn(*mut PyObject),
     py_err_occurred: unsafe extern "C" fn() -> *mut PyObject,
-    pub py_err_check_signals: unsafe extern "C" fn() -> c_int,
     pub py_err_print: unsafe extern "C" fn(),
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
@@ -179,7 +178,6 @@ impl PythonApi {
             py_mem_raw_malloc: unsafe { load_symbol(&library, b"PyMem_RawMalloc\0")? },
             py_dec_ref: unsafe { load_symbol(&library, b"Py_DecRef\0")? },
             py_err_occurred: unsafe { load_symbol(&library, b"PyErr_Occurred\0")? },
-            py_err_check_signals: unsafe { load_symbol(&library, b"PyErr_CheckSignals\0")? },
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
@@ -353,12 +351,6 @@ impl PythonApi {
 
     pub fn set_interrupt(&self) {
         unsafe { (self.py_err_set_interrupt)() };
-    }
-
-    pub fn clear_pending_signals(&self) {
-        if unsafe { (self.py_err_check_signals)() } == -1 {
-            self.clear_error();
-        }
     }
 
     pub fn install_input_hook(&self, callback: PyOsInputHookCallback) -> Result<(), String> {

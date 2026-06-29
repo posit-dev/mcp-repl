@@ -99,6 +99,12 @@ pub fn emit_ready() {
     }
 }
 
+pub fn emit_interrupt_ack(discarded_input: bool) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::InterruptAck { discarded_input });
+    }
+}
+
 pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
     let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
     ipc.send_output_text(stream, bytes)

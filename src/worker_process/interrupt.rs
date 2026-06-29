@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset, timeout_status_content};
-use crate::ipc::{IpcInputReadiness, IpcWaitError};
+use crate::ipc::{IpcInputReadiness, IpcWaitError, ServerToWorkerIpcMessage};
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -29,6 +29,9 @@ struct InterruptPromptWait {
     prompt: Option<String>,
 }
 
+pub(super) const INTERRUPT_TAIL_SETTLE_WINDOW: Duration = Duration::from_millis(50);
+const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_millis(100);
+
 impl WorkerManager {
     pub(super) fn interrupt_files(
         &mut self,
@@ -36,11 +39,41 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            true,
+        )
+    }
+
+    pub(super) fn interrupt_files_for_tail(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            false,
+        )
+    }
+
+    fn interrupt_files_with_prompt_wait(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Files,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
+            wait_for_prompt,
         )
     }
 
@@ -50,11 +83,41 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            true,
+        )
+    }
+
+    pub(super) fn interrupt_pager_for_tail(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            false,
+        )
+    }
+
+    fn interrupt_pager_with_prompt_wait(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Pager,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
+            wait_for_prompt,
         )
     }
 
@@ -64,6 +127,7 @@ impl WorkerManager {
         timeout: Duration,
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_interrupt(timeout);
         let interrupt_drains_existing_completion =
@@ -80,7 +144,14 @@ impl WorkerManager {
             );
         }
 
-        let prompt_wait = self.wait_for_interrupt_prompt(timeout, interrupt_sent_at)?;
+        let prompt_wait = if wait_for_prompt {
+            self.wait_for_interrupt_prompt(timeout, interrupt_sent_at)?
+        } else {
+            InterruptPromptWait {
+                timed_out: false,
+                prompt: None,
+            }
+        };
         let timed_out = prompt_wait.timed_out;
         let reply = self.build_interrupt_reply_for_mode(mode, prompt_wait, timeout);
         let session_end = self.session_end_seen;
@@ -138,19 +209,19 @@ impl WorkerManager {
             .process
             .as_mut()
             .expect("worker process should be available");
-        let interrupt_sent_at = Instant::now();
-        let interrupt_result = self.driver.interrupt(process);
-        if let Err(err) = interrupt_result {
-            self.reset()?;
-            crate::event_log::log(
-                "worker_interrupt_error",
-                serde_json::json!({
-                    "error": err.to_string(),
-                }),
-            );
-            return Err(err);
+        match send_ordered_interrupt(process) {
+            Ok(interrupt_sent_at) => Ok(Some(interrupt_sent_at)),
+            Err(err) => {
+                self.reset()?;
+                crate::event_log::log(
+                    "worker_interrupt_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+                Err(err)
+            }
         }
-        Ok(Some(interrupt_sent_at))
     }
 
     fn drain_existing_completion_after_interrupt(
@@ -364,6 +435,73 @@ impl WorkerManager {
                 prompt_variants: None,
             },
         }
+    }
+}
+
+fn send_ordered_interrupt(
+    process: &mut crate::worker_supervisor::WorkerProcess,
+) -> Result<Instant, WorkerError> {
+    if let Some(ipc) = process.ipc_connection() {
+        ipc.note_interrupt_sent();
+        let ack_wait_since = Instant::now();
+        match ipc.send(ServerToWorkerIpcMessage::Interrupt {}) {
+            Ok(()) => {
+                match ipc.wait_for_fresh_interrupt_ack(INTERRUPT_ACK_TIMEOUT, ack_wait_since) {
+                    Ok(Some(ack)) => {
+                        crate::event_log::log(
+                            "worker_interrupt_ack_observed",
+                            serde_json::json!({
+                                "discarded_input": ack.discarded_input,
+                                "elapsed_ms": ack_wait_since.elapsed().as_millis(),
+                            }),
+                        );
+                    }
+                    Ok(None) => {
+                        crate::event_log::log(
+                            "worker_interrupt_ack_timeout",
+                            serde_json::json!({
+                                "timeout_ms": INTERRUPT_ACK_TIMEOUT.as_millis(),
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        crate::event_log::log(
+                            "worker_interrupt_ack_wait_error",
+                            serde_json::json!({
+                                "error": ipc_wait_error_message(&err),
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                crate::event_log::log(
+                    "worker_interrupt_sideband_send_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    let os_interrupt_sent_at = Instant::now();
+    process.send_interrupt()?;
+    crate::event_log::log(
+        "worker_interrupt_os_sent",
+        serde_json::json!({
+            "after_sideband_cleanup": true,
+        }),
+    );
+    Ok(os_interrupt_sent_at)
+}
+
+fn ipc_wait_error_message(err: &IpcWaitError) -> String {
+    match err {
+        IpcWaitError::Timeout => "timeout".to_string(),
+        IpcWaitError::SessionEnd => "session_end".to_string(),
+        IpcWaitError::Disconnected => "disconnected".to_string(),
+        IpcWaitError::Protocol(message) => format!("protocol: {message}"),
     }
 }
 

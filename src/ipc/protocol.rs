@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 6;
+pub const WORKER_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -48,6 +48,9 @@ pub enum WorkerToServerIpcMessage {
         reason: Option<String>,
         #[serde(default)]
         message: Option<String>,
+    },
+    InterruptAck {
+        discarded_input: bool,
     },
 }
 
@@ -235,6 +238,18 @@ mod tests {
         }));
 
         assert!(parsed.is_err(), "output_text should require data_b64");
+    }
+    #[test]
+    fn interrupt_ack_protocol_reports_discarded_input() {
+        let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "interrupt_ack",
+            "discarded_input": true
+        }));
+
+        let Ok(WorkerToServerIpcMessage::InterruptAck { discarded_input }) = parsed else {
+            panic!("interrupt_ack should deserialize");
+        };
+        assert!(discarded_input);
     }
     #[test]
     fn readline_start_is_not_protocol() {
