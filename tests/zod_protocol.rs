@@ -249,6 +249,24 @@ async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::M
     spawn_zod_server_with_extra_args(control_log, Vec::new()).await
 }
 
+async fn warm_zod_session(session: &common::McpTestSession) -> TestResult<()> {
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-output-after-input",
+                "timeout_ms": 5_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("after input_line"),
+        "zod worker warm-up did not complete as expected, got: {text:?}"
+    );
+    Ok(())
+}
+
 async fn spawn_zod_startup_ready_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
@@ -989,6 +1007,7 @@ async fn zod_files_timeout_does_not_wait_for_utf8_tail_grace_after_expiry() -> T
         Vec::new(),
     )
     .await?;
+    warm_zod_session(&session).await?;
 
     let timed_out = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1314,6 +1333,7 @@ async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestRe
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
+    warm_zod_session(&session).await?;
 
     let start = std::time::Instant::now();
     let result = session

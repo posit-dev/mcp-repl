@@ -158,6 +158,18 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn request_shutdown() {
+    let Some(state) = SESSION_STATE.get() else {
+        return;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    // Preserve already accepted input; reset replies include output produced
+    // while the old worker drains to a safe runtime boundary.
+    guard.shutdown = true;
+    guard.interrupt_requested = false;
+    state.cvar.notify_all();
+}
+
 #[cfg(target_family = "unix")]
 fn discard_pending_stdin() {
     discard_queued_input();
@@ -362,7 +374,7 @@ fn wait_for_next_cell() -> Option<CellInput> {
     let state = session_state();
     let mut guard = state.inner.lock().unwrap();
     loop {
-        if guard.shutdown || guard.exit_requested {
+        if guard.exit_requested {
             return None;
         }
         if guard.interrupt_requested {
@@ -382,6 +394,9 @@ fn wait_for_next_cell() -> Option<CellInput> {
         {
             guard.cell_running = true;
             return Some(CellInput { source });
+        }
+        if guard.shutdown {
+            return None;
         }
         guard = state.cvar.wait(guard).unwrap();
     }
@@ -536,7 +551,7 @@ fn next_queue_line_action(
 ) -> QueueReadAction {
     let mut guard = state.inner.lock().unwrap();
     loop {
-        if guard.shutdown || guard.exit_requested {
+        if guard.exit_requested {
             if *owns_consumer {
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
@@ -578,6 +593,14 @@ fn next_queue_line_action(
                 detached_request,
                 emit_input_line,
             };
+        }
+        if guard.shutdown {
+            if *owns_consumer {
+                guard.input_queue.end_read_consumer();
+                *owns_consumer = false;
+            }
+            state.cvar.notify_all();
+            return QueueReadAction::Shutdown;
         }
         if !*prompt_wait_emitted {
             *prompt_wait_emitted = true;
@@ -664,7 +687,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
         let action = {
             let mut guard = state.inner.lock().unwrap();
             loop {
-                if guard.shutdown || guard.exit_requested {
+                if guard.exit_requested {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
                         state.cvar.notify_all();
@@ -706,6 +729,13 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         detached_request: !guard.cell_running,
                         emit_input_line,
                     };
+                }
+                if guard.shutdown {
+                    if owns_consumer {
+                        guard.input_queue.end_read_consumer();
+                        state.cvar.notify_all();
+                    }
+                    return Ok(output);
                 }
                 if !prompt_wait_emitted {
                     prompt_wait_emitted = true;

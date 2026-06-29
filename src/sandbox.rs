@@ -2205,6 +2205,7 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
 fn linux_effective_file_system_policy(
     policy: &SandboxPolicy,
     session_temp_dir: &Path,
+    managed_network_socket_dir: Option<&Path>,
 ) -> FileSystemSandboxPolicy {
     let mut file_system = file_system_policy_from_legacy(policy);
     if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
@@ -2222,24 +2223,30 @@ fn linux_effective_file_system_policy(
         }
     }
     if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+        && let Some(socket_dir) =
+            managed_network_socket_dir.and_then(|path| ensure_absolute(path.to_path_buf()))
+    {
+        push_linux_read_entry(&mut file_system, socket_dir);
+    }
+    if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
         && !file_system.has_full_disk_read_access()
         && let Ok(current_exe) = std::env::current_exe()
         && let Some(current_exe) = ensure_absolute(current_exe)
     {
-        push_linux_implementation_read_entry(&mut file_system, current_exe);
+        push_linux_read_entry(&mut file_system, current_exe);
     }
     if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
         && !file_system.has_full_disk_read_access()
         && let Some(r_home) = embedded_r_home()
         && let Some(r_home) = ensure_absolute(r_home.clone())
     {
-        push_linux_implementation_read_entry(&mut file_system, r_home);
+        push_linux_read_entry(&mut file_system, r_home);
     }
     file_system
 }
 
 #[cfg(target_os = "linux")]
-fn push_linux_implementation_read_entry(file_system: &mut FileSystemSandboxPolicy, path: PathBuf) {
+fn push_linux_read_entry(file_system: &mut FileSystemSandboxPolicy, path: PathBuf) {
     let entry = FileSystemSandboxEntry {
         path: FileSystemPath::Path { path },
         access: FileSystemAccessMode::Read,
@@ -3143,6 +3150,7 @@ struct LinuxSandboxArgs {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LinuxManagedNetworkBridgeArgs {
+    socket_dir: PathBuf,
     http_socket: PathBuf,
     socks_socket: PathBuf,
 }
@@ -3266,10 +3274,10 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
         return Err("no command specified to execute".to_string());
     }
     let managed_network_bridge = match (managed_network_http_socket, managed_network_socks_socket) {
-        (Some(http_socket), Some(socks_socket)) => Some(LinuxManagedNetworkBridgeArgs {
+        (Some(http_socket), Some(socks_socket)) => Some(linux_managed_network_bridge_args(
             http_socket,
             socks_socket,
-        }),
+        )?),
         (None, None) => None,
         _ => {
             return Err(
@@ -3288,6 +3296,43 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
         apply_seccomp_then_exec,
         no_proc,
         managed_network_bridge,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_managed_network_bridge_args(
+    http_socket: PathBuf,
+    socks_socket: PathBuf,
+) -> Result<LinuxManagedNetworkBridgeArgs, String> {
+    if !http_socket.is_absolute() {
+        return Err(format!(
+            "HTTP managed network bridge socket path must be absolute: {}",
+            http_socket.display()
+        ));
+    }
+    if !socks_socket.is_absolute() {
+        return Err(format!(
+            "SOCKS managed network bridge socket path must be absolute: {}",
+            socks_socket.display()
+        ));
+    }
+    let http_parent = http_socket
+        .parent()
+        .ok_or_else(|| "HTTP managed network bridge socket path has no parent".to_string())?;
+    let socks_parent = socks_socket
+        .parent()
+        .ok_or_else(|| "SOCKS managed network bridge socket path has no parent".to_string())?;
+    if http_parent != socks_parent {
+        return Err(format!(
+            "Linux managed network bridge sockets must share a directory: {} and {}",
+            http_socket.display(),
+            socks_socket.display()
+        ));
+    }
+    Ok(LinuxManagedNetworkBridgeArgs {
+        socket_dir: http_parent.to_path_buf(),
+        http_socket,
+        socks_socket,
     })
 }
 
@@ -3599,8 +3644,15 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
     let bwrap_program = linux_find_bwrap_program()
         .ok_or_else(|| "bwrap executable not found (tried /usr/bin/bwrap and PATH)".to_string())?;
     let inner = linux_build_inner_seccomp_command(&args)?;
-    let file_system_policy =
-        linux_effective_file_system_policy(&args.sandbox_policy, &args.session_temp_dir);
+    let managed_network_socket_dir = args
+        .managed_network_bridge
+        .as_ref()
+        .map(|bridge| bridge.socket_dir.as_path());
+    let file_system_policy = linux_effective_file_system_policy(
+        &args.sandbox_policy,
+        &args.session_temp_dir,
+        managed_network_socket_dir,
+    );
     let network_mode =
         linux_bwrap_network_mode(&args.sandbox_policy, args.managed_network_bridge.is_some());
     let mount_proc = !args.no_proc
@@ -5096,7 +5148,8 @@ fn linux_apply_sandbox_policy_to_current_thread(
     apply_landlock_fs: bool,
     network_seccomp_mode: Option<LinuxNetworkSeccompMode>,
 ) -> Result<(), String> {
-    let file_system_policy = linux_effective_file_system_policy(sandbox_policy, session_temp_dir);
+    let file_system_policy =
+        linux_effective_file_system_policy(sandbox_policy, session_temp_dir, None);
     if !file_system_policy.has_full_disk_write_access() || network_seccomp_mode.is_some() {
         linux_set_no_new_privs()?;
     }
@@ -6380,6 +6433,21 @@ mod tests {
             "SOCKS relay socket should live under session temp: {:?}",
             prepared.args
         );
+        let http_socket = Path::new(&prepared.args[http_socket_index + 1]);
+        let socks_socket = Path::new(&prepared.args[socks_socket_index + 1]);
+        let socket_dir = http_socket.parent().expect("HTTP socket parent");
+        assert_eq!(
+            socks_socket.parent(),
+            Some(socket_dir),
+            "bridge sockets should share a private relay directory: {:?}",
+            prepared.args
+        );
+        assert_ne!(
+            socket_dir,
+            session_temp_dir.as_path(),
+            "bridge sockets should not live directly in writable session temp: {:?}",
+            prepared.args
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -6540,6 +6608,7 @@ mod tests {
                 exclude_slash_tmp: true,
             },
             &session_temp_dir,
+            None,
         );
 
         let err = linux_landlock_writable_root_paths(
@@ -6565,6 +6634,7 @@ mod tests {
                 network_access: false,
             },
             &session_temp_dir,
+            None,
         );
 
         let writable_roots =
@@ -7033,6 +7103,7 @@ mod tests {
                 network_access: false,
             },
             &session_temp_dir,
+            None,
         );
 
         let command =
@@ -7046,6 +7117,41 @@ mod tests {
                 .windows(3)
                 .any(|args| args[0] == "--ro-bind" && args[2] == git_text),
             "read-only session temp metadata should use private synthetic binds: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_managed_network_socket_dir_is_read_only() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-managed-network-")
+            .tempdir()
+            .expect("tempdir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session_temp_dir = root.path().join("session");
+        let socket_dir =
+            session_temp_dir.join(crate::managed_network::LINUX_MANAGED_NETWORK_SOCKET_DIR_NAME);
+        std::fs::create_dir_all(&socket_dir).expect("managed network socket dir");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            &session_temp_dir,
+            Some(&socket_dir),
+        );
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, &workspace, &session_temp_dir)
+                .expect("managed network bwrap profile should build");
+        let socket_dir_text = linux_path_to_string(&socket_dir);
+
+        assert!(
+            command.args.windows(3).any(|args| args[0] == "--ro-bind"
+                && args[1] == socket_dir_text
+                && args[2] == socket_dir_text),
+            "managed network relay socket directory should be read-only in bwrap: {:?}",
             command.args
         );
     }

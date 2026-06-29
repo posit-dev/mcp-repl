@@ -213,7 +213,7 @@ Sys.sleep(1.0)
     );
     assert!(
         !timeout_text.contains("RESTART_LINE_"),
-        "did not expect restart-only output before Ctrl-D closes stdin, got: {timeout_text:?}"
+        "did not expect restart-only output before Ctrl-D requests shutdown, got: {timeout_text:?}"
     );
 
     let restart = session
@@ -343,7 +343,7 @@ flush.console()
     );
     assert!(
         !timeout_text.contains("DURING_RESTART"),
-        "did not expect restart-only output before Ctrl-D closes stdin, got: {timeout_text:?}"
+        "did not expect restart-only output before Ctrl-D requests shutdown, got: {timeout_text:?}"
     );
 
     let restart = session

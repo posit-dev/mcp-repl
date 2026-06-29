@@ -51,7 +51,7 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
-                        std::process::exit(0);
+                        python_session::request_shutdown();
                     }
                     None => {
                         std::process::exit(0);

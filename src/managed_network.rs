@@ -64,6 +64,8 @@ pub(crate) const LINUX_MANAGED_NETWORK_SOCKS_BRIDGE_PORT: u16 = 39081;
 const LINUX_MANAGED_NETWORK_HTTP_SOCKET_NAME: &str = "mn-http.sock";
 #[cfg(target_os = "linux")]
 const LINUX_MANAGED_NETWORK_SOCKS_SOCKET_NAME: &str = "mn-socks.sock";
+#[cfg(target_os = "linux")]
+pub(crate) const LINUX_MANAGED_NETWORK_SOCKET_DIR_NAME: &str = ".mcp-repl-managed-network";
 
 #[cfg(test)]
 pub(crate) fn loopback_sockets_available_for_tests() -> bool {
@@ -227,6 +229,7 @@ pub struct ManagedNetworkProxy {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinuxManagedNetworkBridgeConfig {
+    pub(crate) socket_dir: PathBuf,
     pub(crate) http_socket: PathBuf,
     pub(crate) socks_socket: PathBuf,
 }
@@ -349,11 +352,17 @@ impl ManagedNetworkProxy {
             .lock()
             .map_err(|_| io::Error::other("managed network relay mutex poisoned"))?;
         let expected = LinuxManagedNetworkBridgeConfig {
-            http_socket: session_temp_dir.join(LINUX_MANAGED_NETWORK_HTTP_SOCKET_NAME),
-            socks_socket: session_temp_dir.join(LINUX_MANAGED_NETWORK_SOCKS_SOCKET_NAME),
+            socket_dir: session_temp_dir.join(LINUX_MANAGED_NETWORK_SOCKET_DIR_NAME),
+            http_socket: session_temp_dir
+                .join(LINUX_MANAGED_NETWORK_SOCKET_DIR_NAME)
+                .join(LINUX_MANAGED_NETWORK_HTTP_SOCKET_NAME),
+            socks_socket: session_temp_dir
+                .join(LINUX_MANAGED_NETWORK_SOCKET_DIR_NAME)
+                .join(LINUX_MANAGED_NETWORK_SOCKS_SOCKET_NAME),
         };
         let needs_new = relay.as_ref().is_none_or(|existing| {
             existing.config != expected
+                || !existing.config.socket_dir.is_dir()
                 || !existing.config.http_socket.exists()
                 || !existing.config.socks_socket.exists()
         });
@@ -400,9 +409,7 @@ impl LinuxManagedNetworkRelay {
         http_addr: SocketAddr,
         socks_addr: SocketAddr,
     ) -> Result<Self, ManagedNetworkError> {
-        if let Some(parent) = config.http_socket.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        prepare_unix_socket_dir(&config.socket_dir)?;
         remove_stale_unix_socket(&config.http_socket)?;
         remove_stale_unix_socket(&config.socks_socket)?;
         let http_listener = UnixListener::bind(&config.http_socket)?;
@@ -434,6 +441,20 @@ impl Drop for LinuxManagedNetworkRelay {
         }
         let _ = std::fs::remove_file(&self.config.http_socket);
         let _ = std::fs::remove_file(&self.config.socks_socket);
+        let _ = std::fs::remove_dir(&self.config.socket_dir);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_unix_socket_dir(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            std::fs::remove_file(path)?;
+            std::fs::create_dir_all(path)
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path),
+        Err(err) => Err(err),
     }
 }
 
@@ -1324,6 +1345,18 @@ mod tests {
         let bridge = proxy
             .apply_linux_bridge_to_env(&mut env, temp.path())
             .expect("Linux relay sockets");
+        assert_eq!(
+            bridge.socket_dir,
+            temp.path().join(LINUX_MANAGED_NETWORK_SOCKET_DIR_NAME)
+        );
+        assert_eq!(
+            bridge.http_socket.parent(),
+            Some(bridge.socket_dir.as_path())
+        );
+        assert_eq!(
+            bridge.socks_socket.parent(),
+            Some(bridge.socket_dir.as_path())
+        );
 
         let mut client = UnixStream::connect(&bridge.http_socket).expect("connect HTTP relay");
         client
@@ -1347,6 +1380,27 @@ mod tests {
         assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
         assert!(response.ends_with("relayed"), "{response}");
         origin_thread.join().expect("origin thread");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unix_socket_relay_replaces_stale_socket_dir_symlink() {
+        let temp = tempfile::Builder::new()
+            .prefix("mcp-repl-linux-relay-dir-")
+            .tempdir()
+            .expect("tempdir");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).expect("target dir");
+        let socket_dir = temp.path().join("relay");
+        std::os::unix::fs::symlink(&target, &socket_dir).expect("relay dir symlink");
+
+        prepare_unix_socket_dir(&socket_dir).expect("prepare relay dir");
+        let metadata = std::fs::symlink_metadata(&socket_dir).expect("relay dir metadata");
+
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "relay dir should be a real directory, not a stale symlink"
+        );
     }
 
     #[test]

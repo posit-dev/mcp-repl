@@ -486,6 +486,22 @@ fn encode_path(path: &Path) -> TestResult<String> {
     Ok(serde_json::to_string(&path.to_string_lossy().to_string())?)
 }
 
+async fn wait_for_path_then_remove(path: &Path, label: &str) -> TestResult<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("timed out waiting for {label}: {}", path.display()).into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 fn bundle_transcript_path(text: &str) -> Option<std::path::PathBuf> {
     disclosed_path(text, "transcript.txt")
 }
@@ -2150,7 +2166,7 @@ async fn sandbox_inherit_empty_poll_session_end_respawn_uses_current_state_meta(
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let drained = session
@@ -2312,7 +2328,7 @@ async fn sandbox_inherit_empty_poll_session_end_without_state_meta_does_not_resp
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let drained = session.write_stdin_raw_with("", Some(2.0)).await?;
@@ -2388,7 +2404,7 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_uses_current_state_met
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let interrupt = session
@@ -2453,7 +2469,7 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_without_state_meta_doe
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let interrupt = session
