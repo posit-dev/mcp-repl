@@ -379,10 +379,13 @@ fn send_ordered_interrupt(
     process: &mut crate::worker_supervisor::WorkerProcess,
     timeout: Duration,
 ) -> Result<Instant, WorkerError> {
+    let mut readiness_fresh_since = None;
     if let Some(ipc) = process.ipc_connection() {
         let ack_wait_since = Instant::now();
+        let sideband_interrupt_sent_at = Instant::now();
         match ipc.send_interrupt() {
             Ok(interrupt_id) => {
+                readiness_fresh_since = Some(sideband_interrupt_sent_at);
                 let ack_timeout = timeout.min(INTERRUPT_ACK_TIMEOUT);
                 match ipc.wait_for_interrupt_ack(ack_timeout, interrupt_id) {
                     Ok(Some(ack)) => {
@@ -442,7 +445,7 @@ fn send_ordered_interrupt(
             "after_sideband_cleanup": true,
         }),
     );
-    Ok(os_interrupt_sent_at)
+    Ok(readiness_fresh_since.unwrap_or(os_interrupt_sent_at))
 }
 
 fn remaining_until(deadline: Instant) -> Duration {

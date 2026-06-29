@@ -34,6 +34,7 @@ const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
 const UTF8_TAIL_RELEASE_ENV: &str = "MCP_REPL_ZOD_UTF8_TAIL_RELEASE";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
+const DELAY_INTERRUPT_ACK_ENV: &str = "MCP_REPL_ZOD_DELAY_INTERRUPT_ACK_MS";
 const SKIP_INTERRUPT_ACK_ENV: &str = "MCP_REPL_ZOD_SKIP_INTERRUPT_ACK";
 const INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK_ENV: &str =
     "MCP_REPL_ZOD_INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK";
@@ -67,6 +68,14 @@ fn run_worker(
     let preemptive_interrupt_ack_marker =
         std::env::var_os(PREEMPTIVE_INTERRUPT_ACK_MARKER_ENV).map(PathBuf::from);
     let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .parse::<u64>()
+                .map_err(io::Error::other)
+        })
+        .transpose()?;
+    let delay_interrupt_ack_ms = std::env::var_os(DELAY_INTERRUPT_ACK_ENV)
         .map(|value| {
             value
                 .to_string_lossy()
@@ -121,9 +130,12 @@ fn run_worker(
         tx,
         writer.clone(),
         sideband_interrupted.clone(),
-        control_log_path.clone(),
-        skip_interrupt_ack,
-        interrupt_protocol_error_before_ack,
+        ControlReaderConfig {
+            control_log_path: control_log_path.clone(),
+            skip_interrupt_ack,
+            interrupt_protocol_error_before_ack,
+            delay_interrupt_ack_ms,
+        },
     );
 
     let mut state = CommandState {
@@ -717,18 +729,29 @@ struct CommandState {
     preemptive_interrupt_ack_marker: Option<PathBuf>,
 }
 
+struct ControlReaderConfig {
+    control_log_path: Option<PathBuf>,
+    skip_interrupt_ack: bool,
+    interrupt_protocol_error_before_ack: bool,
+    delay_interrupt_ack_ms: Option<u64>,
+}
+
 fn start_control_reader(
     reader: Box<dyn Read + Send>,
     turn_tx: mpsc::Sender<ControlMessage>,
     writer: IpcWriter,
     interrupted: Arc<AtomicBool>,
-    control_log_path: Option<PathBuf>,
-    skip_interrupt_ack: bool,
-    interrupt_protocol_error_before_ack: bool,
+    config: ControlReaderConfig,
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
+        let ControlReaderConfig {
+            control_log_path,
+            skip_interrupt_ack,
+            interrupt_protocol_error_before_ack,
+            delay_interrupt_ack_ms,
+        } = config;
         loop {
             line.clear();
             match reader.read_line(&mut line) {
@@ -753,6 +776,10 @@ fn start_control_reader(
                         control_log_path.as_deref(),
                         &format!("interrupt interrupt_id={interrupt_id}"),
                     );
+                    let notify_before_ack = delay_interrupt_ack_ms.is_some();
+                    if notify_before_ack {
+                        let _ = turn_tx.send(ControlMessage::Interrupt);
+                    }
                     if interrupt_protocol_error_before_ack {
                         let _ = append_control_log(
                             control_log_path.as_deref(),
@@ -766,6 +793,9 @@ fn start_control_reader(
                             "interrupt_ack_suppressed",
                         );
                     } else {
+                        if let Some(millis) = delay_interrupt_ack_ms {
+                            thread::sleep(Duration::from_millis(millis));
+                        }
                         let _ = writer.send(&WorkerToServer::InterruptAck {
                             interrupt_id,
                             discarded_input: false,
@@ -777,7 +807,9 @@ fn start_control_reader(
                             ),
                         );
                     }
-                    let _ = turn_tx.send(ControlMessage::Interrupt);
+                    if !notify_before_ack {
+                        let _ = turn_tx.send(ControlMessage::Interrupt);
+                    }
                 }
                 Ok(ServerToWorker::Shutdown {}) => {
                     let _ = turn_tx.send(ControlMessage::Shutdown);
