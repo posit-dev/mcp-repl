@@ -546,40 +546,30 @@ async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_interrupt_prefix_uses_existing_readiness_after_ack() -> TestResult<()> {
+async fn zod_worker_interrupt_prefix_waits_for_fresh_ready() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_delayed_interrupt_ready_server(&control_log).await?;
 
     let result = session
-        .write_stdin_raw_with("\u{3}after interrupt ack", Some(10.0))
+        .write_stdin_raw_with("\u{3}after fresh ready", Some(10.0))
         .await?;
     let text = result_text(&result);
     assert!(
-        text.contains("v5-output: after interrupt ack\n"),
-        "expected interrupt tail to run after ack and existing readiness, got: {text:?}"
+        text.contains("v5-output: after fresh ready\n"),
+        "expected interrupt tail to run after fresh readiness, got: {text:?}"
     );
 
-    let log = wait_for_log_contains(
-        &control_log,
-        "fresh_ready_after_interrupt_suppressed_for_pending_input",
-    )?;
-    let ack_idx = log
-        .find("interrupt_ack interrupt_id=")
-        .expect("interrupt ack log should be present");
+    let log = wait_for_log_contains(&control_log, "fresh_ready_after_interrupt")?;
+    let fresh_ready_idx = log
+        .find("fresh_ready_after_interrupt")
+        .expect("fresh readiness log should be present");
     let input_idx = log
-        .find("input_batch input=after interrupt ack")
+        .find("input_batch input=after fresh ready")
         .expect("interrupt tail input log should be present");
-    let suppress_idx = log
-        .find("fresh_ready_after_interrupt_suppressed_for_pending_input")
-        .expect("suppressed fresh readiness log should be present");
     assert!(
-        ack_idx < input_idx,
-        "expected ack before tail input, got log: {log:?}"
-    );
-    assert!(
-        input_idx < suppress_idx,
-        "expected tail input to be queued before delayed fresh readiness was suppressed, got log: {log:?}"
+        fresh_ready_idx < input_idx,
+        "expected tail input only after fresh readiness, got log: {log:?}"
     );
 
     session.cancel().await?;

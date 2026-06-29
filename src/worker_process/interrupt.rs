@@ -39,41 +39,11 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
-        self.interrupt_files_with_prompt_wait(
-            timeout,
-            deferred_sandbox_state_update,
-            suppress_session_end_reset,
-            true,
-        )
-    }
-
-    pub(super) fn interrupt_files_for_tail(
-        &mut self,
-        timeout: Duration,
-        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
-        suppress_session_end_reset: bool,
-    ) -> Result<WorkerReply, WorkerError> {
-        self.interrupt_files_with_prompt_wait(
-            timeout,
-            deferred_sandbox_state_update,
-            suppress_session_end_reset,
-            false,
-        )
-    }
-
-    fn interrupt_files_with_prompt_wait(
-        &mut self,
-        timeout: Duration,
-        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
-        suppress_session_end_reset: bool,
-        wait_for_prompt: bool,
-    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Files,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
-            wait_for_prompt,
         )
     }
 
@@ -83,41 +53,11 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
-        self.interrupt_pager_with_prompt_wait(
-            timeout,
-            deferred_sandbox_state_update,
-            suppress_session_end_reset,
-            true,
-        )
-    }
-
-    pub(super) fn interrupt_pager_for_tail(
-        &mut self,
-        timeout: Duration,
-        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
-        suppress_session_end_reset: bool,
-    ) -> Result<WorkerReply, WorkerError> {
-        self.interrupt_pager_with_prompt_wait(
-            timeout,
-            deferred_sandbox_state_update,
-            suppress_session_end_reset,
-            false,
-        )
-    }
-
-    fn interrupt_pager_with_prompt_wait(
-        &mut self,
-        timeout: Duration,
-        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
-        suppress_session_end_reset: bool,
-        wait_for_prompt: bool,
-    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Pager,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
-            wait_for_prompt,
         )
     }
 
@@ -127,7 +67,6 @@ impl WorkerManager {
         timeout: Duration,
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
-        wait_for_prompt: bool,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_interrupt(timeout);
         let deadline = Instant::now() + timeout;
@@ -145,14 +84,8 @@ impl WorkerManager {
             );
         }
 
-        let prompt_wait = if wait_for_prompt {
-            self.wait_for_interrupt_prompt(remaining_until(deadline), interrupt_sent_at)?
-        } else {
-            InterruptPromptWait {
-                timed_out: false,
-                prompt: None,
-            }
-        };
+        let prompt_wait =
+            self.wait_for_interrupt_prompt(remaining_until(deadline), interrupt_sent_at)?;
         let timed_out = prompt_wait.timed_out;
         let reply = self.build_interrupt_reply_for_mode(mode, prompt_wait, timeout);
         let session_end = self.session_end_seen;
