@@ -71,6 +71,18 @@ impl RSession {
         state.cvar.notify_all();
         Ok(())
     }
+
+    pub fn request_shutdown(&self) -> Result<(), String> {
+        self.wait_until_ready()?;
+        let state = session_state();
+        let mut guard = state.inner.lock().unwrap();
+        // Preserve already accepted input; reset replies include output produced
+        // while the old worker drains to a safe runtime boundary.
+        guard.shutdown = true;
+        guard.read_interrupted = false;
+        state.cvar.notify_all();
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1038,17 +1050,6 @@ pub extern "C-unwind" fn r_read_console(
             return 0;
         }
 
-        if guard.shutdown {
-            let should_emit = !guard.session_end_emitted;
-            guard.session_end_emitted = true;
-            drop(guard);
-            complete_session_if_needed(should_emit);
-            if !buf.is_null() {
-                unsafe { *buf = 0 };
-            }
-            return 0;
-        }
-
         if guard.read_interrupted {
             guard.read_interrupted = false;
             guard.waiting_for_input = false;
@@ -1077,6 +1078,17 @@ pub extern "C-unwind" fn r_read_console(
             ipc::emit_input_line(prompt, &line_text.text);
 
             return 1;
+        }
+
+        if guard.shutdown {
+            let should_emit = !guard.session_end_emitted;
+            guard.session_end_emitted = true;
+            drop(guard);
+            complete_session_if_needed(should_emit);
+            if !buf.is_null() {
+                unsafe { *buf = 0 };
+            }
+            return 0;
         }
 
         if guard.active_input {
