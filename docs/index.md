@@ -15,7 +15,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/worker_sideband_protocol.md`: IPC-queued server/worker protocol
   contract.
 - `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
-- `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex `--sandbox inherit` from async updates to per-tool-call sandbox metadata.
+- `docs/plans/completed/codex-sandbox-state-meta-migration.md`: completed plan for migrating Codex sandbox inheritance from async updates to per-tool-call sandbox metadata.
 - `docs/plans/completed/unified-output-timeline-pipeline.md`: completed plan for consolidating normal replies, files overflow, and pager overflow onto one output timeline.
 
 ## Normative Docs

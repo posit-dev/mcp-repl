@@ -103,6 +103,26 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
+fn sandbox_docs_explain_inherit_codex_scope() {
+    let sandbox = read(&repo_root().join("docs/sandbox.md"));
+    let readme = read(&repo_root().join("README.md"));
+
+    for (source, text) in [
+        ("docs/sandbox.md", sandbox.as_str()),
+        ("README.md", readme.as_str()),
+    ] {
+        for required in [
+            "--sandbox inherit-codex",
+            "_meta[\"codex/sandbox-state-meta\"]",
+            "Claude",
+            "--sandbox workspace-write",
+        ] {
+            assert!(text.contains(required), "missing {required} in {source}");
+        }
+    }
+}
+
+#[test]
 fn worker_sideband_protocol_keeps_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 

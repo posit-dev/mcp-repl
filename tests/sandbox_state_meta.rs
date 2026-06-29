@@ -12,8 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder, TempDir, tempdir};
 
 const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
-const MISSING_INHERITED_STATE_MESSAGE: &str =
-    "--sandbox inherit requested but no client sandbox state was provided";
+const MISSING_INHERITED_STATE_MESSAGE: &str = "requires Codex per-tool-call sandbox metadata";
 const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
@@ -607,6 +606,15 @@ async fn spawn_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     .await
 }
 
+async fn spawn_inherit_codex_server(cwd: &Path) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec!["--sandbox".to_string(), "inherit-codex".to_string()],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
 #[cfg(target_os = "macos")]
 async fn spawn_python_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     common::spawn_server_with_args_env_and_cwd(
@@ -1011,6 +1019,32 @@ async fn sandbox_state_meta_capability_advertised_with_inherit() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_meta_capability_advertised_with_inherit_codex() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_codex_server(temp.path()).await?;
+    let info = session.server_info().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing server info from initialize".to_string(),
+        )
+    })?;
+    let experimental = info.capabilities.experimental.as_ref().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing experimental capabilities".to_string(),
+        )
+    })?;
+    assert!(
+        experimental.contains_key(SANDBOX_STATE_META_CAPABILITY),
+        "expected sandbox state meta capability in experimental: {experimental:?}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_meta_capability_hidden_without_inherit() -> TestResult<()> {
     if skip_sandbox_state_meta_unavailable() {
         return Ok(());
@@ -1029,7 +1063,7 @@ async fn sandbox_state_meta_capability_hidden_without_inherit() -> TestResult<()
         .is_some_and(|experimental| experimental.contains_key(SANDBOX_STATE_META_CAPABILITY));
     assert!(
         !advertised,
-        "did not expect sandbox state meta capability without `--sandbox inherit`: {info:?}"
+        "did not expect sandbox state meta capability without `--sandbox inherit-codex`: {info:?}"
     );
     session.cancel().await?;
     Ok(())
@@ -1093,7 +1127,7 @@ async fn sandbox_inherit_without_state_meta_fails_on_first_tool_call() -> TestRe
         return Ok(());
     }
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "expected missing sandbox-state-meta error, got: {text}"
     );
     assert_eq!(
@@ -1180,7 +1214,7 @@ async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestR
         "expected empty inherit repl call with metadata to return idle status, got: {text}"
     );
     assert!(
-        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        !text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "did not expect empty inherit repl call with metadata to fail closed, got: {text}"
     );
     session.cancel().await?;
@@ -5050,7 +5084,7 @@ async fn sandbox_inherit_without_state_meta_fails_on_ctrl_d() -> TestResult<()> 
         return Ok(());
     }
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "expected missing sandbox-state-meta error, got: {text}"
     );
     assert_eq!(
