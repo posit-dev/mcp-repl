@@ -616,9 +616,10 @@ Options:
       Choose oversized-output handling.
       Default: pager. Use files to spill oversized replies to bundle files.
 
-  --sandbox <inherit|read-only|workspace-write|danger-full-access>
+  --sandbox <read-only|workspace-write|danger-full-access|inherit-codex>
       Choose the base worker sandbox mode.
-      `inherit` uses client tool-call metadata.
+      `inherit-codex` uses Codex tool-call metadata.
+      `inherit` is accepted as a compatibility alias.
 
   --add-writable-root <abs-path>
       Append an absolute writable root in argument order.
@@ -869,7 +870,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_sandbox_mode_accepts_inherit() {
+    fn parse_sandbox_mode_accepts_inherit_codex() {
+        let mode = SandboxModeArg::parse("inherit-codex").expect("sandbox mode");
+        assert!(matches!(mode, SandboxModeArg::Inherit));
+    }
+
+    #[test]
+    fn parse_sandbox_mode_accepts_inherit_alias() {
         let mode = SandboxModeArg::parse("inherit").expect("sandbox mode");
         assert!(matches!(mode, SandboxModeArg::Inherit));
     }
@@ -1070,7 +1077,7 @@ mod tests {
         };
         let err = resolve_effective_sandbox_state(&plan, None).expect_err("missing inherit update");
         assert!(
-            err.contains("--sandbox inherit requested but no client sandbox state was provided"),
+            err.contains("requires Codex per-tool-call sandbox metadata"),
             "unexpected error: {err}"
         );
     }

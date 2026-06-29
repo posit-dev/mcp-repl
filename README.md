@@ -97,12 +97,14 @@ mcp-repl install --client codex --interpreter r  # limit to one interpreter
 By default this writes entries for both `r` and `python`.
 
 `install --client codex` writes
-`--sandbox inherit --oversized-output files` — `inherit` tells
-`mcp-repl` to take sandbox policy from Codex's per-call metadata (it
-fails closed if the metadata is missing or malformed).
+`--sandbox inherit-codex --oversized-output files` — `inherit-codex` tells
+`mcp-repl` to take sandbox policy from Codex's per-call
+`_meta["codex/sandbox-state-meta"]` metadata (it fails closed if the metadata
+is missing or malformed).
 `install --client claude` writes an explicit `--sandbox workspace-write`
-because Claude doesn't propagate that metadata. Bare `mcp-repl` (no
-install) defaults to `--oversized-output pager`.
+because Claude Code does not provide a way to propagate Codex's per-call
+sandbox metadata to MCP servers. Bare `mcp-repl` (no install) defaults to
+`--oversized-output pager`.
 
 Manual Codex entry:
 
@@ -110,11 +112,13 @@ Manual Codex entry:
 [mcp_servers.r]
 command = "/Users/alice/.cargo/bin/mcp-repl"
 tool_timeout_sec = 1800   # outer guard; mcp-repl handles the primary timeout
-args = ["--sandbox", "inherit", "--oversized-output", "files", "--interpreter", "r"]
+args = ["--sandbox", "inherit-codex", "--oversized-output", "files", "--interpreter", "r"]
 ```
 
 Swap `--interpreter r` for `--interpreter python` (and rename the
 section) for the Python entry.
+Existing Codex configs that use `--sandbox inherit` still work; it is a
+compatibility alias for `inherit-codex`.
 
 Manual Claude entry in `~/.claude.json`:
 

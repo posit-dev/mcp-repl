@@ -3,6 +3,7 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use std::path::PathBuf;
+use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -35,6 +36,23 @@ fn ipc_disconnect_is_not_treated_as_backend_unavailable() {
         !common::backend_unavailable(text),
         "request-completion IPC disconnects should fail tests instead of skipping them"
     );
+}
+
+#[test]
+fn cli_help_names_inherit_codex_sandbox_mode_last() -> TestResult<()> {
+    let exe = resolve_mcp_repl_path()?;
+    let output = StdCommand::new(exe).arg("--help").output()?;
+    assert!(output.status.success(), "expected --help to succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--sandbox <read-only|workspace-write|danger-full-access|inherit-codex>"),
+        "expected --help to name inherit-codex sandbox mode last, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("`inherit` is accepted as a compatibility alias."),
+        "expected --help to document inherit alias, got: {stdout:?}"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

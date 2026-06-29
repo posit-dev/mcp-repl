@@ -11,7 +11,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
-const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy metadata sent by Codex on each tool call.\n# mcp-repl fails closed if the tool call omits or malforms that metadata.\n";
+const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit-codex: use sandbox policy metadata sent by Codex on each tool call.\n# mcp-repl fails closed if the tool call omits or malforms that metadata.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
 const MCP_REPL_TOOL_NAMES: &[&str] = &["repl"];
@@ -346,7 +346,7 @@ fn codex_install_args(base_args: &[String]) -> Vec<String> {
     let mut args = base_args.to_vec();
     if !has_sandbox_config_arg(base_args) {
         args.push("--sandbox".to_string());
-        args.push("inherit".to_string());
+        args.push("inherit-codex".to_string());
     }
     if !has_oversized_output_arg(base_args) {
         args.push("--oversized-output".to_string());
@@ -428,7 +428,9 @@ fn upsert_codex_mcp_server(
             .leaf_decor_mut()
             .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
     }
-    let args_prefix = if contains_sandbox_state_value(args, "inherit") {
+    let args_prefix = if contains_sandbox_state_value(args, "inherit-codex")
+        || contains_sandbox_state_value(args, "inherit")
+    {
         CODEX_SANDBOX_INHERIT_COMMENT
     } else {
         ""
@@ -1023,14 +1025,14 @@ name="demo"
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--sandbox".to_string(), "inherit".to_string()],
+            &["--sandbox".to_string(), "inherit-codex".to_string()],
         )
         .expect("upsert codex");
 
         let text = fs::read_to_string(config).expect("read config");
         assert!(
             text.contains(
-                "--sandbox inherit: use sandbox policy metadata sent by Codex on each tool call"
+                "--sandbox inherit-codex: use sandbox policy metadata sent by Codex on each tool call"
             ),
             "expected inherit comment in codex config"
         );
@@ -1044,7 +1046,7 @@ name="demo"
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--sandbox".to_string(), "inherit".to_string()],
+            &["--sandbox".to_string(), "inherit-codex".to_string()],
         )
         .expect("upsert codex inherit");
         upsert_codex_mcp_server(
@@ -1058,7 +1060,7 @@ name="demo"
         let text = fs::read_to_string(config).expect("read config");
         assert!(
             !text.contains(
-                "--sandbox inherit: use sandbox policy metadata sent by Codex on each tool call"
+                "--sandbox inherit-codex: use sandbox policy metadata sent by Codex on each tool call"
             ),
             "inherit-only comment should be removed when inherit is no longer configured"
         );
@@ -1073,7 +1075,7 @@ name="demo"
                 "--interpreter".to_string(),
                 "python".to_string(),
                 "--sandbox".to_string(),
-                "inherit".to_string(),
+                "inherit-codex".to_string(),
                 "--oversized-output".to_string(),
                 "files".to_string()
             ]
@@ -1170,7 +1172,7 @@ name="demo"
                 "--interpreter".to_string(),
                 "python".to_string(),
                 "--sandbox".to_string(),
-                "inherit".to_string(),
+                "inherit-codex".to_string(),
             ]
         );
         assert_eq!(

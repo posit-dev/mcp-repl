@@ -1314,10 +1314,10 @@ mod unix_impl {
         let has_sandbox_inherit = r_args
             .iter()
             .zip(r_args.iter().skip(1))
-            .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
+            .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit-codex"));
         assert!(
             has_sandbox_inherit,
-            "expected installed Codex config to include `--sandbox inherit`"
+            "expected installed Codex config to include `--sandbox inherit-codex`"
         );
         let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
             .as_array()
@@ -1407,7 +1407,7 @@ tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
-args = ["--sandbox", "inherit"]
+args = ["--sandbox", "inherit-codex"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"
@@ -1441,7 +1441,7 @@ tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
-args = ["--sandbox", "inherit"]
+args = ["--sandbox", "inherit-codex"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"
@@ -1489,7 +1489,7 @@ responses_websockets = false
 
 [mcp_servers.r]
 command = "{python_program}"
-args = ["{trace_script}", "{mcp_repl}", "--sandbox", "inherit"]
+args = ["{trace_script}", "{mcp_repl}", "--sandbox", "inherit-codex"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"

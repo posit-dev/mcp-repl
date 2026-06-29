@@ -217,7 +217,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
 
 #[test]
 fn debug_repl_inherit_prints_initial_prompt() -> TestResult<()> {
-    assert_debug_repl_starts(&["--sandbox", "inherit"])
+    assert_debug_repl_starts(&["--sandbox", "inherit-codex"])
 }
 
 #[test]

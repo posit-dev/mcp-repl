@@ -10,11 +10,20 @@ When no CLI sandbox mode is provided, the default is:
 - `workspace-write`
 - `network_access: false`
 
-When `--sandbox inherit` is used for MCP server operation, the MCP client must
+When `--sandbox inherit-codex` is used for MCP server operation, Codex must
 attach per-tool-call sandbox metadata in `_meta["codex/sandbox-state-meta"]`.
 That metadata is the source of truth for the tool call that is about to run. If
-it is missing or malformed, `mcp-repl` fails closed with `--sandbox inherit
-requested but no client sandbox state was provided`.
+it is missing or malformed, `mcp-repl` fails closed instead of guessing a local
+policy. `--sandbox inherit` is accepted as a compatibility alias for existing
+Codex configs.
+
+Claude Code and other generic MCP clients do not provide sandbox policy in
+Codex's per-call metadata shape. Claude Code may send ordinary tool-call
+bookkeeping in `_meta`, such as progress or tool-use identifiers, but not a
+sandbox policy that `mcp-repl` can apply. Use an explicit mode such as
+`--sandbox workspace-write` with those clients. Claude-inherit support would
+need a separate startup/project-scoped mapping from Claude settings; it cannot
+use the Codex per-tool-call metadata path.
 
 Current Codex builds send this metadata as a `permissionProfile` plus a
 `sandboxCwd` file URI. On macOS, `mcp-repl` consumes the managed filesystem
@@ -27,9 +36,9 @@ existing CLI surface.
 
 Debug/dev builds have one local-only exception: `--debug-repl`. Because there
 is no MCP client metadata channel in that mode, `mcp-repl --debug-repl
---sandbox inherit` bootstraps one local inherited snapshot from the current
-default sandbox state before the first worker spawn. Shipped release binaries
-do not include `--debug-repl`.
+--sandbox inherit-codex` bootstraps one local inherited snapshot from the
+current default sandbox state before the first worker spawn. Shipped release
+binaries do not include `--debug-repl`.
 
 For `repl`, inherited sandbox metadata controls the worker session that handles
 the call. When a non-empty tool call would use the worker and the effective
@@ -58,7 +67,7 @@ More specifically:
   `_meta["codex/sandbox-state-meta"]`.
 - A non-empty retry after the memory guardrail aborts a worker is an ordinary
   non-empty call. It must have valid current metadata before `mcp-repl` resets
-  or retries under `--sandbox inherit`.
+  or retries under `--sandbox inherit-codex`.
 - Non-empty `repl` calls resolve stale timeout markers before deciding whether
   they are still looking at a live worker request.
 - If current metadata changes the effective inherited sandbox, `mcp-repl`
@@ -80,7 +89,7 @@ The worker also gets a per-session temp directory, exported as:
 
 ## Configure sandbox policy
 
-- Base mode: `mcp-repl --sandbox inherit|read-only|workspace-write|danger-full-access`
+- Base mode: `mcp-repl --sandbox read-only|workspace-write|danger-full-access|inherit-codex`
 - Add writable roots (workspace-write only, repeatable):
   `mcp-repl --add-writable-root /absolute/path`
 - Add allowed domains (repeatable):
@@ -88,7 +97,7 @@ The worker also gets a per-session temp directory, exported as:
 - Advanced overrides:
   `mcp-repl --config key=value` with documented sandbox/config keys
 - MCP sandbox metadata capability:
-  `codex/sandbox-state-meta` (advertised only when the effective CLI sandbox mode still resolves to `inherit` after later overrides)
+  `codex/sandbox-state-meta` (advertised only when the effective CLI sandbox mode still resolves to `inherit-codex` after later overrides)
 
 Operations are applied strictly in CLI argument order. Later operations win.
 `--sandbox ...` resets the base policy at the point where it appears.

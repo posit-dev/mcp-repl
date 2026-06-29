@@ -332,7 +332,7 @@ async fn pager_empty_input_does_not_start_worker_before_inherit_update() -> Test
     }
 
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        text.contains("requires Codex per-tool-call sandbox metadata"),
         "expected initial empty pager input to surface sandbox-state failure, got: {text:?}"
     );
     assert!(

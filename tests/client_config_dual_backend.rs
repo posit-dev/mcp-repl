@@ -185,10 +185,10 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let has_sandbox_inherit = r_args
         .iter()
         .zip(r_args.iter().skip(1))
-        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
+        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit-codex"));
     assert!(
         has_sandbox_inherit,
-        "expected r args to include `--sandbox inherit`"
+        "expected r args to include `--sandbox inherit-codex`"
     );
     let r_has_files_mode = r_args
         .iter()
@@ -213,10 +213,10 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let py_has_sandbox_inherit = py_args
         .iter()
         .zip(py_args.iter().skip(1))
-        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
+        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit-codex"));
     assert!(
         py_has_sandbox_inherit,
-        "expected python args to include `--sandbox inherit`"
+        "expected python args to include `--sandbox inherit-codex`"
     );
     let py_has_files_mode = py_args
         .iter()
