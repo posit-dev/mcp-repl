@@ -58,8 +58,7 @@ impl WorkerManager {
             return self.finish_default_preflight_reply(reply);
         }
 
-        self.resolve_pending_request_before_busy_reply(&input);
-        if let Some(outcome) = self.pending_request_busy_follow_up(&input)? {
+        if let Some(outcome) = self.settle_or_reply_to_pending_request_follow_up(&input)? {
             return Ok(outcome);
         }
 
@@ -92,8 +91,7 @@ impl WorkerManager {
         }
         self.output.start_capture();
         self.emit_guardrail_notice_and_resolve_timeout_marker(&input);
-        self.resolve_pending_request_before_busy_reply(&input);
-        if let Some(outcome) = self.pending_request_busy_follow_up(&input)? {
+        if let Some(outcome) = self.settle_or_reply_to_pending_request_follow_up(&input)? {
             return Ok(outcome);
         }
 
@@ -177,7 +175,7 @@ impl WorkerManager {
             return Ok(None);
         }
 
-        let reply = self.poll_pending_output_for_mode(input)?;
+        let reply = self.poll_pending_output_for_mode(input, input.worker_timeout)?;
         self.finish_caller_preflight_reply(reply, input).map(Some)
     }
 
@@ -202,13 +200,7 @@ impl WorkerManager {
         Ok(None)
     }
 
-    fn resolve_pending_request_before_busy_reply(&mut self, input: &WritePreflightInput<'_>) {
-        if !input.options.pending_state_prechecked && self.pending_request {
-            self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
-        }
-    }
-
-    fn pending_request_busy_follow_up(
+    fn settle_or_reply_to_pending_request_follow_up(
         &mut self,
         input: &WritePreflightInput<'_>,
     ) -> Result<Option<WritePreflightOutcome>, WorkerError> {
@@ -216,7 +208,26 @@ impl WorkerManager {
             return Ok(None);
         }
 
-        let mut reply = self.poll_pending_output_for_mode(input)?;
+        if !input.options.pending_state_prechecked {
+            self.resolve_timeout_marker_with_wait(input.worker_timeout);
+            if !self.pending_request {
+                return Ok(None);
+            }
+        }
+
+        self.pending_request_busy_follow_up(input, Duration::ZERO)
+    }
+
+    fn pending_request_busy_follow_up(
+        &mut self,
+        input: &WritePreflightInput<'_>,
+        timeout: Duration,
+    ) -> Result<Option<WritePreflightOutcome>, WorkerError> {
+        if !self.pending_request {
+            return Ok(None);
+        }
+
+        let mut reply = self.poll_pending_output_for_mode(input, timeout)?;
         let detached_prefix_item_count = match &reply.reply {
             WorkerReply::Output { contents, .. } => contents.len(),
         };
@@ -243,12 +254,11 @@ impl WorkerManager {
     fn poll_pending_output_for_mode(
         &mut self,
         input: &WritePreflightInput<'_>,
+        timeout: Duration,
     ) -> Result<ReplyWithOffset, WorkerError> {
         match input.mode {
-            WriteStdinMode::Files => self.poll_pending_output_files(input.worker_timeout),
-            WriteStdinMode::Pager => {
-                self.poll_pending_output_pager(input.worker_timeout, input.page_bytes)
-            }
+            WriteStdinMode::Files => self.poll_pending_output_files(timeout),
+            WriteStdinMode::Pager => self.poll_pending_output_pager(timeout, input.page_bytes),
         }
     }
 
