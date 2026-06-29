@@ -30,7 +30,7 @@ but the server-side request path should stay opaque.
 
 ## Intended Transport Model
 
-- Treat the protocol v7 `input_batch` payload as the managed input transport.
+- Treat the protocol v8 `input_batch` payload as the managed input transport.
 - Do not add framing headers or other synthetic protocol markers to raw process
   stdin.
 - Keep request metadata and queued input on sideband IPC.

@@ -176,6 +176,16 @@ fn worker_sideband_protocol_keeps_images_one_way() {
 }
 
 #[test]
+fn futurework_stdin_transport_tracks_worker_protocol_version() {
+    let futurework = read(&repo_root().join("docs/futurework/stdin-transport-single-owner.md"));
+
+    assert!(
+        futurework.contains("Treat the protocol v8 `input_batch` payload"),
+        "futurework stdin transport note should track the worker protocol version"
+    );
+}
+
+#[test]
 fn plans_layout_exists() {
     let root = repo_root();
     for required in [
