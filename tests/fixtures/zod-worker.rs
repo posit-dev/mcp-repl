@@ -35,6 +35,8 @@ const UTF8_TAIL_RELEASE_ENV: &str = "MCP_REPL_ZOD_UTF8_TAIL_RELEASE";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
 const SKIP_INTERRUPT_ACK_ENV: &str = "MCP_REPL_ZOD_SKIP_INTERRUPT_ACK";
+const INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK_ENV: &str =
+    "MCP_REPL_ZOD_INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
@@ -59,6 +61,8 @@ fn run_worker(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
     let skip_interrupt_ack = std::env::var_os(SKIP_INTERRUPT_ACK_ENV).is_some();
+    let interrupt_protocol_error_before_ack =
+        std::env::var_os(INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK_ENV).is_some();
     let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
         .map(|value| {
             value
@@ -116,6 +120,7 @@ fn run_worker(
         sideband_interrupted.clone(),
         control_log_path.clone(),
         skip_interrupt_ack,
+        interrupt_protocol_error_before_ack,
     );
 
     let mut state = CommandState {
@@ -693,6 +698,7 @@ fn start_control_reader(
     interrupted: Arc<AtomicBool>,
     control_log_path: Option<PathBuf>,
     skip_interrupt_ack: bool,
+    interrupt_protocol_error_before_ack: bool,
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
@@ -718,6 +724,13 @@ fn start_control_reader(
                 Ok(ServerToWorker::Interrupt {}) => {
                     interrupted.store(true, Ordering::SeqCst);
                     let _ = append_control_log(control_log_path.as_deref(), "interrupt");
+                    if interrupt_protocol_error_before_ack {
+                        let _ = append_control_log(
+                            control_log_path.as_deref(),
+                            "interrupt_protocol_error_before_ack",
+                        );
+                        let _ = writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64);
+                    }
                     if skip_interrupt_ack {
                         let _ = append_control_log(
                             control_log_path.as_deref(),

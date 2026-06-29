@@ -303,6 +303,17 @@ async fn spawn_zod_without_interrupt_ack_server(
     .await
 }
 
+async fn spawn_zod_protocol_error_before_interrupt_ack_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![("MCP_REPL_ZOD_INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK", "1")],
+        Vec::new(),
+    )
+    .await
+}
+
 async fn spawn_zod_pager_server(
     control_log: &std::path::Path,
     page_chars: u64,
@@ -2397,6 +2408,56 @@ async fn zod_worker_interrupt_ack_timeout_still_sends_os_interrupt() -> TestResu
     assert!(
         log.contains("interrupt"),
         "expected sideband interrupt to be received before ack suppression, got: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_ack_wait_protocol_error_fails_closed() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_protocol_error_before_interrupt_ack_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interrupt-report 5000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial timeout, got: {first_text:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let interrupted_text = result_text(&interrupted);
+    assert!(
+        interrupted_text.contains("worker protocol error: invalid output_text base64"),
+        "expected ack wait protocol error to fail closed, got: {interrupted_text:?}"
+    );
+    assert!(
+        interrupted.is_error.unwrap_or(false),
+        "expected protocol error interrupt result to set isError"
+    );
+
+    let log = wait_for_log_contains(&control_log, "interrupt_protocol_error_before_ack")?;
+    assert!(
+        log.contains("interrupt"),
+        "expected worker to receive interrupt before protocol error, got: {log:?}"
     );
 
     session.cancel().await?;

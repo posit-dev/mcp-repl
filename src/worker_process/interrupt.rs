@@ -470,6 +470,15 @@ fn send_ordered_interrupt(
                             }),
                         );
                     }
+                    Err(IpcWaitError::Protocol(message)) => {
+                        crate::event_log::log(
+                            "worker_interrupt_ack_wait_error",
+                            serde_json::json!({
+                                "error": format!("protocol: {message}"),
+                            }),
+                        );
+                        return Err(WorkerError::Protocol(message));
+                    }
                     Err(err) => {
                         crate::event_log::log(
                             "worker_interrupt_ack_wait_error",
