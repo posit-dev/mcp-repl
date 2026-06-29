@@ -103,6 +103,118 @@ fn docs_index_lists_main_docs() {
 }
 
 #[test]
+fn examples_folder_documents_chatlas_usage() {
+    let root = repo_root();
+    let readme_path = root.join("examples/README.md");
+    let chatlas_readme_path = root.join("examples/chatlas/README.md");
+    let pager_path = root.join("examples/chatlas/chatlas_pager_mode.py");
+    let files_path = root.join("examples/chatlas/chatlas_files_mode.py");
+    let async_pager_path = root.join("examples/chatlas/chatlas_async_pager_mode.py");
+    let async_files_path = root.join("examples/chatlas/chatlas_async_files_mode.py");
+    let tools_path = root.join("examples/chatlas/chatlas_tools.py");
+
+    for path in [
+        &readme_path,
+        &chatlas_readme_path,
+        &pager_path,
+        &files_path,
+        &async_pager_path,
+        &async_files_path,
+        &tools_path,
+    ] {
+        assert_exists(path);
+    }
+    for removed_path in [
+        "examples/chatlas_async_pager_mode.py",
+        "examples/chatlas_async_files_mode.py",
+        "examples/chatlas_tools.py",
+    ] {
+        assert!(
+            !root.join(removed_path).exists(),
+            "chatlas example should live under examples/chatlas: {removed_path}"
+        );
+    }
+
+    let readme = read(&readme_path);
+    assert!(
+        readme.lines().count() <= 30,
+        "examples/README.md should stay concise"
+    );
+    assert!(readme.contains("examples/chatlas/"));
+
+    let chatlas_readme = read(&chatlas_readme_path);
+    assert!(
+        chatlas_readme.lines().count() <= 30,
+        "examples/chatlas/README.md should stay concise"
+    );
+    for script in [
+        "chatlas_async_pager_mode.py",
+        "chatlas_async_files_mode.py",
+        "chatlas_pager_mode.py",
+        "chatlas_files_mode.py",
+    ] {
+        let command = format!("uv run --script examples/chatlas/{script}");
+        assert!(
+            chatlas_readme.contains(&command),
+            "examples/chatlas/README.md should document cross-platform uv invocation: {command}"
+        );
+    }
+
+    if !cfg!(windows) {
+        for path in [
+            &pager_path,
+            &files_path,
+            &async_pager_path,
+            &async_files_path,
+        ] {
+            let script = read(path);
+            assert!(
+                script.starts_with("#!/usr/bin/env -S uv run --script\n"),
+                "{} should be directly runnable by uv on Unix",
+                path.display()
+            );
+        }
+    }
+    for path in [&pager_path, &files_path] {
+        let script = read(path);
+        assert!(
+            script.contains(r#""chatlas""#),
+            "{} should declare its chatlas dependency",
+            path.display()
+        );
+    }
+    for path in [&async_pager_path, &async_files_path] {
+        let script = read(path);
+        assert!(
+            script.contains(r#""chatlas[mcp]""#),
+            "{} should declare its async chatlas MCP dependency",
+            path.display()
+        );
+    }
+
+    let tools = read(&tools_path);
+    assert!(tools.contains("def repl_tools"));
+    assert!(tools.contains("async def register_tool_repl"));
+    assert!(tools.contains("class OverflowMode(str, Enum)"));
+    assert!(
+        tools.contains("import sys"),
+        "chatlas tools should inspect the current Python executable"
+    );
+    assert!(
+        tools.contains(r#""MCP_REPL_PYTHON_EXECUTABLE": sys.executable"#),
+        "chatlas MCP tools should pin mcp-repl to the current Python executable"
+    );
+    assert!(
+        tools.contains("transport_kwargs={\"env\": _mcp_repl_env()}"),
+        "async chatlas MCP registration should pass the pinned Python environment"
+    );
+    assert!(
+        tools.contains("env=_mcp_repl_env()"),
+        "sync chatlas MCP client should pass the pinned Python environment"
+    );
+}
+
+#[test]
 fn worker_sideband_protocol_keeps_images_one_way() {
     let protocol = read(&repo_root().join("docs/worker_sideband_protocol.md"));
 
