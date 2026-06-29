@@ -3,7 +3,6 @@ use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
 
 use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
@@ -23,8 +22,6 @@ mod stdio;
 mod unix_stdin;
 
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
-const PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
 pub struct PythonSession;
 
 impl PythonSession {
@@ -79,7 +76,7 @@ fn request_exit() {
     };
     let mut guard = state.inner.lock().unwrap();
     guard.exit_requested = true;
-    state.cvar.notify_all();
+    state.notify_all();
 }
 
 fn take_exit_requested() -> bool {
@@ -117,7 +114,7 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         guard.request_active = true;
         guard.plot_reset_pending = true;
     }
-    state.cvar.notify_all();
+    state.notify_all();
     Ok(())
 }
 
@@ -129,7 +126,7 @@ pub(crate) fn request_shutdown() {
     // Preserve already accepted input; reset replies include output produced
     // while the old worker drains to a safe runtime boundary.
     guard.shutdown = true;
-    state.cvar.notify_all();
+    state.notify_all();
 }
 
 #[cfg(target_family = "unix")]
@@ -165,13 +162,19 @@ fn discard_queued_input() -> bool {
     };
     let mut guard = state.inner.lock().unwrap();
     let discarded = guard.input_queue.discard_unconsumed_input();
-    state.cvar.notify_all();
+    state.notify_all();
     discarded
 }
 
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     crate::diagnostics::startup_log("python-session: init begin");
-    let state = Arc::new(SessionState::new());
+    let state = match SessionState::new() {
+        Ok(state) => Arc::new(state),
+        Err(err) => {
+            init.mark_failed(err.clone());
+            return Err(err);
+        }
+    };
     if SESSION_STATE.set(state.clone()).is_err() {
         let message = "Python session state already initialized".to_string();
         init.mark_failed(message.clone());
@@ -210,6 +213,12 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     if let Err(err) = configure_python(api) {
+        let _gil = GilGuard::acquire();
+        api.print_error();
+        init.mark_failed(err.clone());
+        return Err(err);
+    }
+    if let Err(err) = configure_python_signal_wakeup_fd(api, &state) {
         let _gil = GilGuard::acquire();
         api.print_error();
         init.mark_failed(err.clone());
@@ -277,6 +286,33 @@ fn configure_python(api: &'static PythonApi) -> Result<(), String> {
         return Err("failed to get __main__ globals".to_string());
     }
     api.run_code(MCP_REPL_PYTHON, globals)?;
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn configure_python_signal_wakeup_fd(
+    api: &'static PythonApi,
+    state: &Arc<SessionState>,
+) -> Result<(), String> {
+    let _gil = GilGuard::acquire();
+    let main = api.import_module("__main__")?;
+    let globals = unsafe { (api.py_module_get_dict)(main.as_ptr()) };
+    if globals.is_null() {
+        return Err("failed to get __main__ globals".to_string());
+    }
+    let code = format!(
+        "import signal as _mcp_repl_signal\n_mcp_repl_signal.set_wakeup_fd({}, warn_on_full_buffer=False)\n",
+        state.runtime_wake.signal_write_fd()
+    );
+    api.run_code(&code, globals)?;
+    Ok(())
+}
+
+#[cfg(not(target_family = "unix"))]
+fn configure_python_signal_wakeup_fd(
+    _api: &'static PythonApi,
+    _state: &Arc<SessionState>,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -355,11 +391,7 @@ fn wait_for_next_cell() -> Result<Option<CellInput>, String> {
         if guard.shutdown {
             return Ok(None);
         }
-        guard = state
-            .cvar
-            .wait_timeout(guard, PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL)
-            .unwrap()
-            .0;
+        guard = wait_for_queue_notification(state, guard, false);
     }
 }
 
@@ -470,7 +502,7 @@ fn handle_input_hook() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
-    state.cvar.notify_all();
+    state.notify_all();
 }
 
 unsafe extern "C" fn pyos_input_hook() -> c_int {
@@ -496,21 +528,36 @@ fn wait_for_queue_notification<'a>(
     state: &'a Arc<SessionState>,
     guard: std::sync::MutexGuard<'a, state::SessionStateInner>,
     release_gil_while_waiting: bool,
-    max_wait: Option<Duration>,
 ) -> std::sync::MutexGuard<'a, state::SessionStateInner> {
-    if release_gil_while_waiting {
-        let allow_threads = PythonThreadsAllowed::new();
-        let guard = match max_wait {
-            Some(max_wait) => state.cvar.wait_timeout(guard, max_wait).unwrap().0,
-            None => state.cvar.wait(guard).unwrap(),
-        };
+    #[cfg(target_family = "unix")]
+    {
         drop(guard);
-        drop(allow_threads);
+        if release_gil_while_waiting {
+            let allow_threads = PythonThreadsAllowed::new();
+            state
+                .runtime_wake
+                .wait()
+                .expect("Python runtime wake wait failed");
+            drop(allow_threads);
+        } else {
+            state
+                .runtime_wake
+                .wait()
+                .expect("Python runtime wake wait failed");
+        }
         state.inner.lock().unwrap()
-    } else {
-        match max_wait {
-            Some(max_wait) => state.cvar.wait_timeout(guard, max_wait).unwrap().0,
-            None => state.cvar.wait(guard).unwrap(),
+    }
+
+    #[cfg(not(target_family = "unix"))]
+    {
+        if release_gil_while_waiting {
+            let allow_threads = PythonThreadsAllowed::new();
+            let guard = state.cvar.wait(guard).unwrap();
+            drop(guard);
+            drop(allow_threads);
+            state.inner.lock().unwrap()
+        } else {
+            state.cvar.wait(guard).unwrap()
         }
     }
 }
@@ -518,7 +565,7 @@ fn wait_for_queue_notification<'a>(
 fn release_read_consumer(state: &Arc<SessionState>) {
     let mut guard = state.inner.lock().unwrap();
     guard.input_queue.end_read_consumer();
-    state.cvar.notify_all();
+    state.notify_all();
 }
 
 fn next_queue_line_action(
@@ -535,14 +582,14 @@ fn next_queue_line_action(
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
             }
-            state.cvar.notify_all();
+            state.notify_all();
             return QueueReadAction::Shutdown;
         }
         if !*owns_consumer {
             if guard.input_queue.begin_read_consumer() {
                 *owns_consumer = true;
             } else {
-                guard = wait_for_queue_notification(state, guard, release_gil_while_waiting, None);
+                guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
                 continue;
             }
         }
@@ -553,7 +600,7 @@ fn next_queue_line_action(
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
             }
-            state.cvar.notify_all();
+            state.notify_all();
             return QueueReadAction::Interrupted;
         }
         guard = state.inner.lock().unwrap();
@@ -566,7 +613,7 @@ fn next_queue_line_action(
             if *owns_consumer {
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
-                state.cvar.notify_all();
+                state.notify_all();
             }
             return QueueReadAction::Line {
                 bytes: read.protocol_bytes,
@@ -580,7 +627,7 @@ fn next_queue_line_action(
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
             }
-            state.cvar.notify_all();
+            state.notify_all();
             return QueueReadAction::Shutdown;
         }
         if !*prompt_wait_emitted {
@@ -590,12 +637,7 @@ fn next_queue_line_action(
                 prompt: prompt.to_string(),
             };
         }
-        guard = wait_for_queue_notification(
-            state,
-            guard,
-            release_gil_while_waiting,
-            Some(PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL),
-        );
+        guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
     }
 }
 
@@ -676,7 +718,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 if guard.exit_requested {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
-                        state.cvar.notify_all();
+                        state.notify_all();
                     }
                     return Ok(output);
                 }
@@ -687,7 +729,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     if guard.input_queue.begin_read_consumer() {
                         owns_consumer = true;
                     } else {
-                        guard = wait_for_queue_notification(state, guard, true, None);
+                        guard = wait_for_queue_notification(state, guard, true);
                         continue;
                     }
                 }
@@ -697,7 +739,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
                     }
-                    state.cvar.notify_all();
+                    state.notify_all();
                     return Err(RawStdinReadError::Interrupted);
                 }
                 guard = state.inner.lock().unwrap();
@@ -709,7 +751,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
                         owns_consumer = false;
-                        state.cvar.notify_all();
+                        state.notify_all();
                     }
                     break QueueReadAction::Line {
                         bytes: read.protocol_bytes,
@@ -721,7 +763,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 if guard.shutdown {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
-                        state.cvar.notify_all();
+                        state.notify_all();
                     }
                     return Ok(output);
                 }
@@ -732,12 +774,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         prompt: String::new(),
                     };
                 }
-                guard = wait_for_queue_notification(
-                    state,
-                    guard,
-                    true,
-                    Some(PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL),
-                );
+                guard = wait_for_queue_notification(state, guard, true);
             }
         };
 
@@ -1071,7 +1108,7 @@ fn finish_session_end() {
     guard.cell_running = false;
     guard.input_queue.clear_after_interrupt();
     drop(guard);
-    state.cvar.notify_all();
+    state.notify_all();
     if should_emit {
         ipc::emit_session_end();
     }
