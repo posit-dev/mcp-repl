@@ -3,6 +3,7 @@ use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::ipc;
 use crate::python_ffi::{GilGuard, ModuleMethod, PyObject, PyPtr, PyThreadState, PythonApi};
@@ -22,6 +23,7 @@ mod stdio;
 mod unix_stdin;
 
 const MCP_REPL_PYTHON: &str = include_str!("../python/embedded.py");
+const PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub struct PythonSession;
 
@@ -282,7 +284,7 @@ fn run_cell_loop() -> Result<(), String> {
     let api = PythonApi::global();
     emit_ready()?;
     loop {
-        let Some(cell) = wait_for_next_cell() else {
+        let Some(cell) = wait_for_next_cell()? else {
             flush_original_stdio();
             return Ok(());
         };
@@ -330,15 +332,16 @@ fn mark_cell_running(running: bool) {
     guard.cell_running = running;
 }
 
-fn wait_for_next_cell() -> Option<CellInput> {
+fn wait_for_next_cell() -> Result<Option<CellInput>, String> {
     let state = session_state();
     let mut guard = state.inner.lock().unwrap();
     loop {
         if guard.exit_requested {
-            return None;
+            return Ok(None);
         }
         drop(guard);
         if check_python_signals_and_print() {
+            emit_ready()?;
             guard = state.inner.lock().unwrap();
             continue;
         }
@@ -347,12 +350,16 @@ fn wait_for_next_cell() -> Option<CellInput> {
             && let Some(source) = guard.input_queue.take_cell_payload()
         {
             guard.cell_running = true;
-            return Some(CellInput { source });
+            return Ok(Some(CellInput { source }));
         }
         if guard.shutdown {
-            return None;
+            return Ok(None);
         }
-        guard = state.cvar.wait(guard).unwrap();
+        guard = state
+            .cvar
+            .wait_timeout(guard, PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL)
+            .unwrap()
+            .0;
     }
 }
 
@@ -489,15 +496,22 @@ fn wait_for_queue_notification<'a>(
     state: &'a Arc<SessionState>,
     guard: std::sync::MutexGuard<'a, state::SessionStateInner>,
     release_gil_while_waiting: bool,
+    max_wait: Option<Duration>,
 ) -> std::sync::MutexGuard<'a, state::SessionStateInner> {
     if release_gil_while_waiting {
         let allow_threads = PythonThreadsAllowed::new();
-        let guard = state.cvar.wait(guard).unwrap();
+        let guard = match max_wait {
+            Some(max_wait) => state.cvar.wait_timeout(guard, max_wait).unwrap().0,
+            None => state.cvar.wait(guard).unwrap(),
+        };
         drop(guard);
         drop(allow_threads);
         state.inner.lock().unwrap()
     } else {
-        state.cvar.wait(guard).unwrap()
+        match max_wait {
+            Some(max_wait) => state.cvar.wait_timeout(guard, max_wait).unwrap().0,
+            None => state.cvar.wait(guard).unwrap(),
+        }
     }
 }
 
@@ -528,7 +542,7 @@ fn next_queue_line_action(
             if guard.input_queue.begin_read_consumer() {
                 *owns_consumer = true;
             } else {
-                guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
+                guard = wait_for_queue_notification(state, guard, release_gil_while_waiting, None);
                 continue;
             }
         }
@@ -576,7 +590,12 @@ fn next_queue_line_action(
                 prompt: prompt.to_string(),
             };
         }
-        guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
+        guard = wait_for_queue_notification(
+            state,
+            guard,
+            release_gil_while_waiting,
+            Some(PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL),
+        );
     }
 }
 
@@ -668,7 +687,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     if guard.input_queue.begin_read_consumer() {
                         owns_consumer = true;
                     } else {
-                        guard = wait_for_queue_notification(state, guard, true);
+                        guard = wait_for_queue_notification(state, guard, true, None);
                         continue;
                     }
                 }
@@ -713,7 +732,12 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         prompt: String::new(),
                     };
                 }
-                guard = wait_for_queue_notification(state, guard, true);
+                guard = wait_for_queue_notification(
+                    state,
+                    guard,
+                    true,
+                    Some(PYTHON_RUNTIME_INTERRUPT_POLL_INTERVAL),
+                );
             }
         };
 

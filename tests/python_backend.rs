@@ -4719,6 +4719,96 @@ async fn python_input_interrupt_tail_handles_signal_before_tail() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_bare_input_interrupt_completes_after_os_signal() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('bare interrupt> ')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("bare interrupt> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        text.contains("bare interrupt> "),
+        "expected input prompt, got: {text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected bare input interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_BARE_INPUT_INTERRUPT')",
+        "AFTER_BARE_INPUT_INTERRUPT",
+        "bare input interrupt follow-up",
+    )
+    .await?;
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_BARE_INPUT_INTERRUPT"),
+        "expected follow-up to run after bare input interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_bare_idle_interrupt_completes_after_os_signal() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected bare idle interrupt to complete, got: {interrupt_text:?}"
+    );
+    assert!(
+        interrupt_text.contains("KeyboardInterrupt"),
+        "expected bare idle interrupt to observe real Python interrupt, got: {interrupt_text:?}"
+    );
+
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_BARE_IDLE_INTERRUPT')",
+        "AFTER_BARE_IDLE_INTERRUPT",
+        "bare idle interrupt follow-up",
+    )
+    .await?;
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_BARE_IDLE_INTERRUPT"),
+        "expected follow-up to run after bare idle interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_input_interrupt_custom_handler_continues_waiting_for_answer() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
