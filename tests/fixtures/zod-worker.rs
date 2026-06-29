@@ -31,6 +31,7 @@ const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
 const LATE_RAW_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_RAW_MARKER";
 const LATE_STDERR_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_STDERR_MARKER";
 const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
+const UTF8_TAIL_RELEASE_ENV: &str = "MCP_REPL_ZOD_UTF8_TAIL_RELEASE";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
@@ -364,6 +365,14 @@ fn run_command(
     if command == "partial-utf8-then-sleep" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         sleep_for(200, sideband_interrupted, false);
+        return Ok(false);
+    }
+
+    if command == "partial-utf8-then-wait-for-release" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        append_control_log(control_log_path.as_deref(), "waiting_utf8_tail_release")?;
+        wait_for_marker(UTF8_TAIL_RELEASE_ENV)?;
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
         return Ok(false);
     }
 
