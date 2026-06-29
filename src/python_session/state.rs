@@ -18,6 +18,7 @@ pub(super) struct SessionStateInner {
     pub(super) python_continuation_prompt: String,
     pub(super) last_prompt_was_continuation: bool,
     pub(super) exit_requested: bool,
+    pub(super) interrupt_requested: bool,
     pub(super) shutdown: bool,
     pub(super) session_end_emitted: bool,
     pub(super) plot_reset_pending: bool,
@@ -34,6 +35,7 @@ impl StdinReadAccounting {
 }
 
 pub(super) enum RawStdinReadError {
+    Interrupted,
     Runtime(String),
 }
 
@@ -49,6 +51,7 @@ impl SessionState {
                 python_continuation_prompt: "... ".to_string(),
                 last_prompt_was_continuation: false,
                 exit_requested: false,
+                interrupt_requested: false,
                 shutdown: false,
                 session_end_emitted: false,
                 plot_reset_pending: false,

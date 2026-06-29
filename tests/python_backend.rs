@@ -4938,6 +4938,60 @@ print("SIGINT_FINAL", sigint_count)
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_interrupt_delivers_sigint_to_running_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let timeout_result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import signal
+sigint_count = 0
+def handle_sigint(signum, frame):
+    global sigint_count
+    sigint_count += 1
+signal.signal(signal.SIGINT, handle_sigint)
+print("WINDOWS_SIGINT_READY")
+while sigint_count == 0:
+    pass
+print("WINDOWS_SIGINT_DONE", sigint_count)
+""")
+"#,
+            Some(0.2),
+        )
+        .await?;
+    let timeout_text = result_text(&timeout_result);
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected Windows SIGINT handler loop to time out, got: {timeout_text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected Windows SIGINT interrupt to complete, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('WINDOWS_SIGINT_FINAL', sigint_count)", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("WINDOWS_SIGINT_FINAL 1"),
+        "expected Windows Ctrl-C to deliver one Python SIGINT, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_custom_prompts_do_not_escape_as_stderr() -> TestResult<()> {
     let _guard = lock_test_mutex();
