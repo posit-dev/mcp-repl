@@ -198,7 +198,10 @@ impl WorkerManager {
             return Ok(Some(control_reply));
         }
         if matches!(plan.action, WriteStdinControlAction::Interrupt) {
-            std::thread::sleep(INTERRUPT_TAIL_SETTLE_WINDOW);
+            let settle_window = remaining_until(worker_deadline).min(INTERRUPT_TAIL_SETTLE_WINDOW);
+            if !settle_window.is_zero() {
+                std::thread::sleep(settle_window);
+            }
         }
 
         let control_prefix_item_count = prefixed_worker_reply_item_count(&control_reply);

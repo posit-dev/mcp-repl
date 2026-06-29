@@ -130,22 +130,23 @@ impl WorkerManager {
         wait_for_prompt: bool,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_interrupt(timeout);
+        let deadline = Instant::now() + timeout;
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        let interrupt_sent_at = self.interrupt_worker_if_running()?;
+        let interrupt_sent_at = self.interrupt_worker_if_running(remaining_until(deadline))?;
         let mode = self.resolve_interrupt_mode(mode);
 
         if interrupt_drains_existing_completion {
             return self.drain_existing_completion_after_interrupt(
                 mode,
-                timeout,
+                remaining_until(deadline),
                 deferred_sandbox_state_update,
                 suppress_session_end_reset,
             );
         }
 
         let prompt_wait = if wait_for_prompt {
-            self.wait_for_interrupt_prompt(timeout, interrupt_sent_at)?
+            self.wait_for_interrupt_prompt(remaining_until(deadline), interrupt_sent_at)?
         } else {
             InterruptPromptWait {
                 timed_out: false,
@@ -200,7 +201,10 @@ impl WorkerManager {
         }
     }
 
-    fn interrupt_worker_if_running(&mut self) -> Result<Option<Instant>, WorkerError> {
+    fn interrupt_worker_if_running(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Instant>, WorkerError> {
         if !self.interrupt_target_running()? {
             return Ok(None);
         }
@@ -209,7 +213,7 @@ impl WorkerManager {
             .process
             .as_mut()
             .expect("worker process should be available");
-        match send_ordered_interrupt(process) {
+        match send_ordered_interrupt(process, timeout) {
             Ok(interrupt_sent_at) => Ok(Some(interrupt_sent_at)),
             Err(err) => {
                 self.reset()?;
@@ -440,13 +444,15 @@ impl WorkerManager {
 
 fn send_ordered_interrupt(
     process: &mut crate::worker_supervisor::WorkerProcess,
+    timeout: Duration,
 ) -> Result<Instant, WorkerError> {
     if let Some(ipc) = process.ipc_connection() {
         ipc.note_interrupt_sent();
         let ack_wait_since = Instant::now();
         match ipc.send(ServerToWorkerIpcMessage::Interrupt {}) {
             Ok(()) => {
-                match ipc.wait_for_fresh_interrupt_ack(INTERRUPT_ACK_TIMEOUT, ack_wait_since) {
+                let ack_timeout = timeout.min(INTERRUPT_ACK_TIMEOUT);
+                match ipc.wait_for_fresh_interrupt_ack(ack_timeout, ack_wait_since) {
                     Ok(Some(ack)) => {
                         crate::event_log::log(
                             "worker_interrupt_ack_observed",
@@ -460,7 +466,7 @@ fn send_ordered_interrupt(
                         crate::event_log::log(
                             "worker_interrupt_ack_timeout",
                             serde_json::json!({
-                                "timeout_ms": INTERRUPT_ACK_TIMEOUT.as_millis(),
+                                "timeout_ms": ack_timeout.as_millis(),
                             }),
                         );
                     }
@@ -494,6 +500,10 @@ fn send_ordered_interrupt(
         }),
     );
     Ok(os_interrupt_sent_at)
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 fn ipc_wait_error_message(err: &IpcWaitError) -> String {

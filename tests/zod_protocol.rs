@@ -7,7 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static ZOD_WORKER_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
@@ -2397,6 +2397,80 @@ async fn zod_worker_interrupt_ack_timeout_still_sends_os_interrupt() -> TestResu
     assert!(
         log.contains("interrupt"),
         "expected sideband interrupt to be received before ack suppression, got: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_ack_wait_respects_tiny_timeout() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_without_interrupt_ack_server(&control_log).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interrupt-report 5000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial timeout, got: {first_text:?}"
+    );
+
+    let started = Instant::now();
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    let interrupted_text = result_text(&interrupted);
+    assert!(
+        elapsed < Duration::from_millis(80),
+        "interrupt ack wait ignored tiny timeout; elapsed {elapsed:?}, reply {interrupted_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_interrupt_tail_settle_respects_tiny_timeout() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_server(&control_log).await?;
+
+    warm_zod_session(&session).await?;
+    let started = Instant::now();
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}emit-output-after-input",
+                "timeout_ms": 5
+            }),
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    let text = result_text(&result);
+    assert!(
+        text.contains("timeout"),
+        "expected tiny interrupt-tail timeout, got: {text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(45),
+        "interrupt tail settle ignored tiny timeout; elapsed {elapsed:?}, reply {text:?}"
     );
 
     session.cancel().await?;
