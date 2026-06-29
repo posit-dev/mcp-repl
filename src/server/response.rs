@@ -37,6 +37,8 @@ const OUTPUT_BUNDLE_MAX_BYTES_ENV: &str = "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES";
 const OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV: &str = "MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES";
 const OUTPUT_BUNDLE_HEADER: &[u8] = b"v1\ntext transcript.txt\nimages images/\n";
 const OUTPUT_BUNDLE_OMITTED_NOTICE: &str = "output bundle quota reached; later content omitted";
+const OUTPUT_BUNDLE_OMITTED_REPLY_NOTICE: &str =
+    "Omitted: later content past the output bundle quota";
 const TEXT_STREAM_META_KEY: &str = "mcpReplTextStream";
 
 pub(crate) struct ResponseState {
@@ -2540,50 +2542,86 @@ fn build_output_bundle_notice(
     bundle: &ActiveOutputBundle,
     displayed_anchor_count: usize,
 ) -> String {
-    let omitted = if bundle.omitted_tail {
-        "; later content omitted"
-    } else {
-        ""
-    };
-    let path = bundle.disclosure_path();
-    let label = if bundle.has_events_log() {
-        "ordered output bundle index"
-    } else if bundle.has_images() && !bundle.has_text() {
-        "output bundle images"
-    } else {
-        "full output"
-    };
-    match displayed_anchor_count {
-        0 => format!(
-            "...[middle truncated; {label}: {}{}]...",
-            path.display(),
-            omitted
-        ),
-        1 if bundle.next_image_number <= 1 && bundle.history_image_count <= 1 => format!(
-            "...[middle truncated; first image shown inline; {label}: {}{}]...",
-            path.display(),
-            omitted
-        ),
-        1 => format!(
-            "...[middle truncated; one image shown inline; {label}: {}{}]...",
-            path.display(),
-            omitted
-        ),
-        _ => format!(
-            "...[middle truncated; first and last images shown inline; {label}: {}{}]...",
-            path.display(),
-            omitted
-        ),
+    let mut resources = Vec::new();
+    if bundle.has_events_log() {
+        resources.push(path_resource_line(
+            "Ordered output index",
+            &bundle.paths.events_log,
+        ));
     }
+    if bundle.has_text() {
+        resources.push(path_resource_line("Transcript", &bundle.paths.transcript));
+    }
+    if bundle.has_images() {
+        resources.push(directory_resource_line("Images", &bundle.paths.images_dir));
+    }
+    if resources.is_empty() {
+        resources.push(path_resource_line(
+            "Output bundle",
+            bundle.disclosure_path(),
+        ));
+    }
+    build_structured_notice(
+        "Oversized mixed output",
+        image_anchor_shown_line(
+            displayed_anchor_count,
+            bundle.next_image_number,
+            bundle.history_image_count,
+        ),
+        resources,
+        bundle.omitted_tail,
+    )
 }
 
 fn build_output_bundle_unavailable_notice(image_count: usize) -> String {
-    match image_count {
-        0 => "...[middle truncated; output bundle unavailable]...".to_string(),
-        1 => "...[middle truncated; first image shown inline; output bundle unavailable]..."
-            .to_string(),
-        _ => "...[middle truncated; first and last images shown inline; output bundle unavailable]..."
-            .to_string(),
+    let title = if image_count == 0 {
+        "Oversized output"
+    } else {
+        "Oversized mixed output"
+    };
+    build_structured_notice(
+        title,
+        image_anchor_shown_line(image_count.min(2), image_count, image_count),
+        vec!["Output bundle unavailable".to_string()],
+        false,
+    )
+}
+
+fn build_structured_notice(
+    title: &str,
+    shown: Option<String>,
+    resources: Vec<String>,
+    omitted_tail: bool,
+) -> String {
+    let mut lines = vec![title.to_string()];
+    if let Some(shown) = shown {
+        lines.push(format!("Shown: {shown}"));
+    }
+    lines.extend(resources);
+    if omitted_tail {
+        lines.push(OUTPUT_BUNDLE_OMITTED_REPLY_NOTICE.to_string());
+    }
+    lines.join("\n")
+}
+
+fn path_resource_line(label: &str, path: &Path) -> String {
+    format!("{label}: {}", path.display())
+}
+
+fn directory_resource_line(label: &str, path: &Path) -> String {
+    format!("{label}: {}/", path.display())
+}
+
+fn image_anchor_shown_line(
+    displayed_anchor_count: usize,
+    image_count: usize,
+    history_image_count: usize,
+) -> Option<String> {
+    match displayed_anchor_count {
+        0 => None,
+        1 if image_count <= 1 && history_image_count <= 1 => Some("image inline".to_string()),
+        1 => Some("one image inline".to_string()),
+        _ => Some("first and last images inline".to_string()),
     }
 }
 
@@ -2793,20 +2831,23 @@ fn build_line_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> Op
 
     let head = lines[..head_count].concat();
     let tail = lines[lines.len() - tail_count..].concat();
-    let omitted = if omitted_tail {
-        "; later content omitted"
-    } else {
-        ""
-    };
-    let storage = preview_storage_clause(path);
-    let marker = format!(
-        "...[middle truncated; shown lines 1-{head_count} and {}-{} of {} total; {storage}{omitted}]...",
-        lines.len() - tail_count + 1,
-        lines.len(),
-        lines.len(),
+    let tail_start = lines.len() - tail_count + 1;
+    let notice = build_text_output_notice(
+        path,
+        Some(format!(
+            "lines 1-{head_count} and {tail_start}-{} of {}",
+            lines.len(),
+            lines.len(),
+        )),
+        omitted_tail,
     );
 
-    Some(format!("{head}{marker}\n{tail}"))
+    Some(format!(
+        "{notice}\n\n--- lines 1-{head_count} ---\n{head}--- omitted lines {}-{} ---\n--- lines {tail_start}-{} ---\n{tail}",
+        head_count + 1,
+        tail_start - 1,
+        lines.len(),
+    ))
 }
 
 fn build_char_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
@@ -2818,45 +2859,39 @@ fn build_char_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> St
     let tail_start = total.saturating_sub(tail_chars);
     let head: String = chars[..head_end].iter().collect();
     let tail: String = chars[tail_start..].iter().collect();
-    let omitted = if omitted_tail {
-        "; later content omitted"
-    } else {
-        ""
-    };
-    let storage = preview_storage_clause(path);
-    let marker = format!(
-        "...[middle truncated; shown chars 1-{head_end} and {}-{} of {} total; {storage}{omitted}]...",
-        tail_start.saturating_add(1),
-        total,
-        total,
+    let tail_start_display = tail_start.saturating_add(1);
+    let notice = build_text_output_notice(
+        path,
+        Some(format!(
+            "chars 1-{head_end} and {tail_start_display}-{total} of {total}"
+        )),
+        omitted_tail,
     );
-    format!("{head}\n{marker}\n{tail}")
+    format!(
+        "{notice}\n\n--- chars 1-{head_end} ---\n{head}\n--- omitted chars {}-{tail_start} ---\n--- chars {tail_start_display}-{total} ---\n{tail}",
+        head_end + 1,
+    )
 }
 
 fn build_short_preview(text: &str, path: Option<&Path>, omitted_tail: bool) -> String {
-    let mut out = String::new();
-    out.push_str(text);
-    if !text.is_empty() && !text.ends_with('\n') {
-        out.push('\n');
-    }
-    let omitted = if omitted_tail {
-        "; later content omitted"
+    let notice = build_text_output_notice(path, None, omitted_tail);
+    if text.is_empty() {
+        notice
     } else {
-        ""
-    };
-    out.push_str(&format!(
-        "...[{}{}]...",
-        preview_storage_clause(path),
-        omitted
-    ));
-    out
+        format!("{notice}\n\n{text}")
+    }
 }
 
-fn preview_storage_clause(path: Option<&Path>) -> String {
-    match path {
-        Some(path) => format!("full output: {}", path.display()),
-        None => "output bundle unavailable".to_string(),
-    }
+fn build_text_output_notice(
+    path: Option<&Path>,
+    shown: Option<String>,
+    omitted_tail: bool,
+) -> String {
+    let resource = match path {
+        Some(path) => path_resource_line("Full output", path),
+        None => "Output bundle unavailable".to_string(),
+    };
+    build_structured_notice("Oversized output", shown, vec![resource], omitted_tail)
 }
 
 fn ensure_nonempty_contents(contents: &mut Vec<Content>) {
@@ -3019,6 +3054,12 @@ mod tests {
         Ok(root)
     }
 
+    fn numbered_lines(prefix: &str, count: usize) -> String {
+        (1..=count)
+            .map(|index| format!("{prefix}{index:03} {}\n", prefix.repeat(80)))
+            .collect()
+    }
+
     fn worker_reply(
         contents: Vec<WorkerContent>,
         error_code: Option<WorkerErrorCode>,
@@ -3104,6 +3145,179 @@ mod tests {
         assert!(
             text.contains("\u{1b}[?9001h") && text.contains("\u{1b}[?1004h"),
             "expected terminal mode toggles in inline preview: {text:?}"
+        );
+    }
+
+    #[test]
+    fn text_bundle_line_preview_uses_structured_notice() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let visible = numbered_lines("line", 120);
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(visible)],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected transcript path, got: {text:?}"));
+
+        assert!(
+            text.starts_with("Oversized output\nShown: lines 1-"),
+            "expected structured line-preview heading, got: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("\nFull output: {}\n\n", transcript_path.display())),
+            "expected full transcript path in notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("\n--- lines 1-")
+                && text.contains("\n--- omitted lines ")
+                && text.contains("\n--- lines "),
+            "expected structured line preview sections, got: {text:?}"
+        );
+        assert!(
+            !text.contains("middle truncated"),
+            "did not expect legacy truncation marker, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn text_bundle_char_preview_uses_structured_notice() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let visible = "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(visible)],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected transcript path, got: {text:?}"));
+
+        assert!(
+            text.starts_with("Oversized output\nShown: chars 1-"),
+            "expected structured char-preview heading, got: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("\nFull output: {}\n\n", transcript_path.display())),
+            "expected full transcript path in notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("\n--- chars 1-")
+                && text.contains("\n--- omitted chars ")
+                && text.contains("\n--- chars "),
+            "expected structured char preview sections, got: {text:?}"
+        );
+        assert!(
+            !text.contains("middle truncated"),
+            "did not expect legacy truncation marker, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn hidden_only_transcript_spill_has_no_shown_range() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let hidden = "h".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200);
+        let visible = "VISIBLE\n";
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout_transcript_only(hidden),
+                    WorkerContent::worker_stdout(visible),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected transcript path, got: {text:?}"));
+
+        assert_eq!(
+            text,
+            format!(
+                "Oversized output\nFull output: {}\n\n{visible}",
+                transcript_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn text_bundle_quota_omission_uses_structured_notice() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.limits.max_bundle_bytes = 2048;
+        let visible = numbered_lines("quota", 500);
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout(visible)],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("\nOmitted: later content past the output bundle quota\n\n"),
+            "expected structured quota omission line, got: {text:?}"
+        );
+        assert!(
+            !text.contains("later content omitted"),
+            "did not expect legacy quota wording, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_image_bundle_notice_preserves_inline_anchor_images() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let contents = (0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD)
+            .map(|index| WorkerContent::ContentImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                id: format!("plot-{index}"),
+                is_new: true,
+            })
+            .collect();
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(contents, None)),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+        let images_dir = disclosed_path(&text, "images/")
+            .unwrap_or_else(|| panic!("expected images dir path, got: {text:?}"));
+
+        assert_eq!(images.len(), 2, "expected first and last image anchors");
+        assert_eq!(images[0], vec![0_u8], "expected first image anchor");
+        assert_eq!(
+            images[1],
+            vec![(super::IMAGE_OUTPUT_BUNDLE_THRESHOLD - 1) as u8],
+            "expected last image anchor"
+        );
+        assert_eq!(
+            text,
+            format!(
+                "Oversized mixed output\nShown: first and last images inline\nImages: {}",
+                images_dir.display()
+            )
         );
     }
 
@@ -3569,7 +3783,7 @@ mod tests {
             "expected the final detached-prefix image update to remain inline"
         );
         assert!(
-            !text.contains("output bundle images"),
+            !text.contains("Images:"),
             "did not expect a collapsed detached-prefix image update sequence to disclose a bundle, got: {text:?}"
         );
     }
@@ -3602,7 +3816,7 @@ mod tests {
             "expected follow-up reply inline, got: {text:?}"
         );
         assert!(
-            text.contains("output bundle images"),
+            text.contains("Images:"),
             "expected detached-prefix image burst to disclose an image bundle, got: {text:?}"
         );
         assert_eq!(
@@ -3645,7 +3859,7 @@ mod tests {
         let text = result_text(&result);
         let images = result_images(&result);
         assert!(
-            text.contains("output bundle images"),
+            text.contains("Images:"),
             "expected repeated image updates to disclose an image bundle, got: {text:?}"
         );
         assert_eq!(
@@ -3916,7 +4130,7 @@ mod tests {
             "expected fresh follow-up reply inline, got: {text:?}"
         );
         assert!(
-            !text.contains("output bundle images"),
+            !text.contains("Images:"),
             "did not expect stale timeout bundle notice in fresh follow-up reply: {text:?}"
         );
         assert!(
@@ -4441,7 +4655,7 @@ mod tests {
         let second_text = result_text(&second);
 
         assert!(
-            second_text.contains("output bundle unavailable"),
+            second_text.contains("Output bundle unavailable"),
             "expected inline fallback after timeout bundle setup failure, got: {second_text:?}"
         );
         assert!(
@@ -4503,7 +4717,7 @@ mod tests {
         let second_text = result_text(&second);
 
         assert!(
-            second_text.contains("output bundle unavailable"),
+            second_text.contains("Output bundle unavailable"),
             "expected inline fallback after detached-prefix bundle setup failure, got: {second_text:?}"
         );
         assert!(
@@ -4840,7 +5054,7 @@ mod tests {
 
         let text = result_text(&result);
         assert!(
-            text.contains("output bundle unavailable"),
+            text.contains("Output bundle unavailable"),
             "expected truncated fallback notice when bundle setup fails, got: {text:?}"
         );
         assert!(
@@ -4883,7 +5097,7 @@ mod tests {
             .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
 
         assert!(
-            text.contains("later content omitted"),
+            text.contains("later content past the output bundle quota"),
             "expected omission notice after bundle cap, got: {text:?}"
         );
         assert!(
@@ -5028,7 +5242,7 @@ mod tests {
         let images = result_images(&result);
 
         assert!(
-            text.contains("later content omitted"),
+            text.contains("later content past the output bundle quota"),
             "expected quota-truncated image bundle to report omitted content, got: {text:?}"
         );
         assert!(
@@ -5058,7 +5272,7 @@ mod tests {
 
         let initial_text = result_text(&initial);
         assert!(
-            initial_text.contains("later content omitted"),
+            initial_text.contains("later content past the output bundle quota"),
             "expected transcript-only quota omission to be disclosed, got: {initial_text:?}"
         );
         assert!(
@@ -5087,7 +5301,7 @@ mod tests {
         let text = result_text(&result);
         let images = result_images(&result);
         assert!(
-            text.contains("output bundle unavailable"),
+            text.contains("Output bundle unavailable"),
             "expected compact image fallback notice, got: {text:?}"
         );
         assert!(
@@ -5160,7 +5374,7 @@ mod tests {
 
         let text = result_text(&result);
         assert!(
-            text.contains("output bundle unavailable"),
+            text.contains("Output bundle unavailable"),
             "expected inline fallback after append failure, got: {text:?}"
         );
         assert!(
@@ -5194,7 +5408,7 @@ mod tests {
 
         let text = result_text(&result);
         assert!(
-            text.contains("output bundle unavailable"),
+            text.contains("Output bundle unavailable"),
             "expected truncated detached-prefix fallback when bundle append fails, got: {text:?}"
         );
         assert!(
@@ -5236,7 +5450,7 @@ mod tests {
 
         let text = result_text(&result);
         assert!(
-            text.contains("output bundle unavailable"),
+            text.contains("Output bundle unavailable"),
             "expected inline fallback after image bundle append failure, got: {text:?}"
         );
         assert!(
@@ -5399,7 +5613,7 @@ mod tests {
 
         let text = result_text(&result);
         assert!(
-            text.contains("later content omitted"),
+            text.contains("later content past the output bundle quota"),
             "expected omission notice even without worker text, got: {text:?}"
         );
         assert!(
