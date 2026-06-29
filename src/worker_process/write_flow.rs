@@ -141,26 +141,52 @@ impl WorkerManager {
 
         let control_reply = match (mode, plan.action, plan.stage_interrupt_after_session_end) {
             (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, true) => {
-                self.interrupt_files(remaining_until(worker_deadline), None, true)
+                if has_tail {
+                    self.interrupt_files_for_tail(remaining_until(worker_deadline), None, true)
+                } else {
+                    self.interrupt_files(remaining_until(worker_deadline), None, true)
+                }
             }
-            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, false) => self
-                .interrupt_files(
-                    remaining_until(worker_deadline),
-                    plan.tail_sandbox_state_update.clone(),
-                    options.suppress_session_end_reset,
-                ),
+            (WriteStdinMode::Files, WriteStdinControlAction::Interrupt, false) => {
+                if has_tail {
+                    self.interrupt_files_for_tail(
+                        remaining_until(worker_deadline),
+                        plan.tail_sandbox_state_update.clone(),
+                        options.suppress_session_end_reset,
+                    )
+                } else {
+                    self.interrupt_files(
+                        remaining_until(worker_deadline),
+                        plan.tail_sandbox_state_update.clone(),
+                        options.suppress_session_end_reset,
+                    )
+                }
+            }
             (WriteStdinMode::Files, WriteStdinControlAction::Restart, _) => {
                 self.restart_files(remaining_until(worker_deadline))
             }
             (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, true) => {
-                self.interrupt_pager(remaining_until(worker_deadline), None, true)
+                if has_tail {
+                    self.interrupt_pager_for_tail(remaining_until(worker_deadline), None, true)
+                } else {
+                    self.interrupt_pager(remaining_until(worker_deadline), None, true)
+                }
             }
-            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, false) => self
-                .interrupt_pager(
-                    remaining_until(worker_deadline),
-                    plan.tail_sandbox_state_update.clone(),
-                    options.suppress_session_end_reset,
-                ),
+            (WriteStdinMode::Pager, WriteStdinControlAction::Interrupt, false) => {
+                if has_tail {
+                    self.interrupt_pager_for_tail(
+                        remaining_until(worker_deadline),
+                        plan.tail_sandbox_state_update.clone(),
+                        options.suppress_session_end_reset,
+                    )
+                } else {
+                    self.interrupt_pager(
+                        remaining_until(worker_deadline),
+                        plan.tail_sandbox_state_update.clone(),
+                        options.suppress_session_end_reset,
+                    )
+                }
+            }
             (WriteStdinMode::Pager, WriteStdinControlAction::Restart, _) => {
                 self.restart_pager(remaining_until(worker_deadline))
             }

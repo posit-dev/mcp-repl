@@ -39,11 +39,41 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            true,
+        )
+    }
+
+    pub(super) fn interrupt_files_for_tail(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            false,
+        )
+    }
+
+    fn interrupt_files_with_prompt_wait(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Files,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
+            wait_for_prompt,
         )
     }
 
@@ -53,11 +83,41 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            true,
+        )
+    }
+
+    pub(super) fn interrupt_pager_for_tail(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            false,
+        )
+    }
+
+    fn interrupt_pager_with_prompt_wait(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Pager,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
+            wait_for_prompt,
         )
     }
 
@@ -67,6 +127,7 @@ impl WorkerManager {
         timeout: Duration,
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_interrupt(timeout);
         let deadline = Instant::now() + timeout;
@@ -84,8 +145,14 @@ impl WorkerManager {
             );
         }
 
-        let prompt_wait =
-            self.wait_for_interrupt_prompt(remaining_until(deadline), interrupt_sent_at)?;
+        let prompt_wait = if wait_for_prompt {
+            self.wait_for_interrupt_prompt(remaining_until(deadline), interrupt_sent_at)?
+        } else {
+            InterruptPromptWait {
+                timed_out: false,
+                prompt: None,
+            }
+        };
         let timed_out = prompt_wait.timed_out;
         let reply = self.build_interrupt_reply_for_mode(mode, prompt_wait, timeout);
         let session_end = self.session_end_seen;
@@ -380,6 +447,7 @@ fn send_ordered_interrupt(
     timeout: Duration,
 ) -> Result<Instant, WorkerError> {
     let mut readiness_fresh_since = None;
+    let mut protocol_error = None;
     if let Some(ipc) = process.ipc_connection() {
         let ack_wait_since = Instant::now();
         let sideband_interrupt_sent_at = Instant::now();
@@ -414,7 +482,7 @@ fn send_ordered_interrupt(
                                 "error": format!("protocol: {message}"),
                             }),
                         );
-                        return Err(WorkerError::Protocol(message));
+                        protocol_error = Some(message);
                     }
                     Err(err) => {
                         crate::event_log::log(
@@ -445,6 +513,9 @@ fn send_ordered_interrupt(
             "after_sideband_cleanup": true,
         }),
     );
+    if let Some(message) = protocol_error {
+        return Err(WorkerError::Protocol(message));
+    }
     Ok(readiness_fresh_since.unwrap_or(os_interrupt_sent_at))
 }
 

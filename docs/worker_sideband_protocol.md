@@ -81,8 +81,8 @@ capture does not preserve separate stdout/stderr identity. Sideband
 - The server sends this cleanup message first, waits briefly for
   `interrupt_ack` carrying the same `interrupt_id`, and then delivers a
   platform interrupt to the worker process or process group when a worker
-  process exists. The platform interrupt is sent whether the ack arrives or
-  times out.
+  process exists. The platform interrupt is sent whether the ack arrives, the
+  ack wait times out, or the ack wait observes a protocol error.
 - The IPC message carries no input and does not complete a batch. It tells the
   worker to discard pending managed input that has not yet been consumed by the
   runtime.
@@ -90,8 +90,11 @@ capture does not preserve separate stdout/stderr identity. Sideband
   connection. Workers must echo it in the matching `interrupt_ack`.
 - Sending `interrupt` does not change server-side readiness. Readiness changes
   only when the server sends `input_batch` or receives `input_wait` or `ready`.
-- While servicing an interrupt request, the server waits for `input_wait`,
-  `session_end`, process exit, or timeout.
+- A bare interrupt request may wait for `input_wait`, `session_end`, process
+  exit, or timeout. An interrupt request with tail input does not wait for fresh
+  worker readiness before dispatching the tail; it waits only for the ordered
+  cleanup/ack attempt, platform interrupt delivery, and the short tail settle
+  window.
 
 `shutdown`
 - `{ "type": "shutdown" }`
@@ -221,7 +224,7 @@ Built-in R and Python use the same ownership model: a worker-owned managed input
 queue feeds runtime input callbacks and managed stdin surfaces. The sideband IPC
 reader runs independently from the runtime thread. It receives `input_batch`,
 `interrupt`, and `shutdown`, mutates worker-owned queue/session state, emits
-`interrupt_ack` after cleanup, and wakes the runtime when needed. Runtime
+`interrupt_ack` after cleanup, and never injects runtime interrupts. Runtime
 interruption comes from the server's platform interrupt delivery, not from the
 sideband `interrupt` message. The runtime thread consumes queued input only when
 the runtime calls its managed input boundary. A `shutdown` message asks built-in
@@ -253,9 +256,10 @@ non-empty tool call, an existing `input_wait` means the payload is stdin for the
 waiting Python reader; otherwise the payload is one complete Python cell.
 `ready` with no prompt is normal cell readiness, not a missing prompt.
 `input_wait` is the only public signal that the next non-empty payload is
-stdin. After interrupt, the server must wait for fresh `ready`, but an already
-pending `input_wait` remains actionable because it still denotes a waiting
-stdin reader.
+stdin. Interrupt does not change readiness by itself. If a Ctrl-C input includes
+a tail, the server sends the tail after the sideband cleanup/ack attempt,
+platform interrupt delivery, and short tail settle window; the Python runtime
+must observe any pending Python signal before consuming queued tail bytes.
 
 Python may still use PTY or ConPTY process stdio for terminal behavior, but
 accepted request input is sent over sideband IPC, not by server writes to

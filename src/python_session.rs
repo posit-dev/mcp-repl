@@ -90,40 +90,8 @@ fn take_exit_requested() -> bool {
     requested
 }
 
-pub(crate) fn interrupt() -> bool {
-    let discarded_input = discard_pending_stdin();
-    #[cfg(target_family = "unix")]
-    unix_stdin::flush_terminal_input();
-    mark_interrupt_requested();
-    request_platform_interrupt();
-    discarded_input
-}
-
-fn mark_interrupt_requested() {
-    let Some(state) = SESSION_STATE.get() else {
-        return;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    guard.interrupt_requested = true;
-    state.cvar.notify_all();
-}
-
-#[cfg(windows)]
-fn request_platform_interrupt() {
-    let _ = unsafe { libc::raise(libc::SIGINT) };
-}
-
-#[cfg(not(windows))]
-fn request_platform_interrupt() {}
-
-fn take_interrupt_requested() -> bool {
-    let Some(state) = SESSION_STATE.get() else {
-        return false;
-    };
-    let mut guard = state.inner.lock().unwrap();
-    let requested = guard.interrupt_requested;
-    guard.interrupt_requested = false;
-    requested
+pub(crate) fn discard_unconsumed_input_for_interrupt_ack() -> bool {
+    discard_pending_stdin()
 }
 
 pub(crate) fn begin_input(input: String) -> Result<(), String> {
@@ -136,7 +104,6 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         !guard.request_active
     };
     if should_record_background_plots {
-        clear_python_pending_interrupt();
         record_background_plots();
     }
     {
@@ -147,7 +114,6 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         guard.input_queue.push_payload(input);
         guard.request_active = true;
         guard.plot_reset_pending = true;
-        guard.interrupt_requested = false;
     }
     state.cvar.notify_all();
     Ok(())
@@ -161,7 +127,6 @@ pub(crate) fn request_shutdown() {
     // Preserve already accepted input; reset replies include output produced
     // while the old worker drains to a safe runtime boundary.
     guard.shutdown = true;
-    guard.interrupt_requested = false;
     state.cvar.notify_all();
 }
 
@@ -372,18 +337,12 @@ fn wait_for_next_cell() -> Option<CellInput> {
         if guard.exit_requested {
             return None;
         }
-        if guard.interrupt_requested {
-            guard.interrupt_requested = false;
-            guard.request_active = false;
-            guard.cell_running = false;
-            guard.visible_input_prompt = None;
-            state.cvar.notify_all();
-            drop(guard);
-            clear_python_pending_interrupt();
-            ipc::emit_ready();
+        drop(guard);
+        if check_python_signals_and_print() {
             guard = state.inner.lock().unwrap();
             continue;
         }
+        guard = state.inner.lock().unwrap();
         if !guard.input_queue.has_active_read_consumer()
             && let Some(source) = guard.input_queue.take_cell_payload()
         {
@@ -394,6 +353,23 @@ fn wait_for_next_cell() -> Option<CellInput> {
             return None;
         }
         guard = state.cvar.wait(guard).unwrap();
+    }
+}
+
+fn check_python_signals() -> bool {
+    let api = PythonApi::global();
+    let _gil = GilGuard::acquire();
+    api.check_signals()
+}
+
+fn check_python_signals_and_print() -> bool {
+    let api = PythonApi::global();
+    let _gil = GilGuard::acquire();
+    if api.check_signals() {
+        api.print_error();
+        true
+    } else {
+        false
     }
 }
 
@@ -459,12 +435,6 @@ fn clear_python_stdin_buffers(api: &'static PythonApi) -> Result<(), String> {
     let result = PyPtr::from_owned(result, "Python stdin buffer cleanup failed")?;
     drop(result);
     Ok(())
-}
-
-fn clear_python_pending_interrupt() {
-    let api = PythonApi::global();
-    let _gil = GilGuard::acquire();
-    api.clear_pending_signals();
 }
 
 fn finalize_python(
@@ -554,15 +524,6 @@ fn next_queue_line_action(
             state.cvar.notify_all();
             return QueueReadAction::Shutdown;
         }
-        if guard.interrupt_requested {
-            guard.interrupt_requested = false;
-            if *owns_consumer {
-                guard.input_queue.end_read_consumer();
-                *owns_consumer = false;
-            }
-            state.cvar.notify_all();
-            return QueueReadAction::Interrupted;
-        }
         if !*owns_consumer {
             if guard.input_queue.begin_read_consumer() {
                 *owns_consumer = true;
@@ -571,6 +532,17 @@ fn next_queue_line_action(
                 continue;
             }
         }
+        drop(guard);
+        if check_python_signals() {
+            let mut guard = state.inner.lock().unwrap();
+            if *owns_consumer {
+                guard.input_queue.end_read_consumer();
+                *owns_consumer = false;
+            }
+            state.cvar.notify_all();
+            return QueueReadAction::Interrupted;
+        }
+        guard = state.inner.lock().unwrap();
         if let Some(read) = guard.input_queue.consume_line() {
             let emit_input_line = guard.request_active;
             let prompt_already_visible = guard.visible_input_prompt.as_deref() == Some(prompt);
@@ -692,14 +664,6 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 if !output.is_empty() {
                     return Ok(output);
                 }
-                if guard.interrupt_requested {
-                    guard.interrupt_requested = false;
-                    if owns_consumer {
-                        guard.input_queue.end_read_consumer();
-                        state.cvar.notify_all();
-                    }
-                    return Err(RawStdinReadError::Interrupted);
-                }
                 if !owns_consumer {
                     if guard.input_queue.begin_read_consumer() {
                         owns_consumer = true;
@@ -708,6 +672,16 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         continue;
                     }
                 }
+                drop(guard);
+                if check_python_signals() {
+                    let mut guard = state.inner.lock().unwrap();
+                    if owns_consumer {
+                        guard.input_queue.end_read_consumer();
+                    }
+                    state.cvar.notify_all();
+                    return Err(RawStdinReadError::Interrupted);
+                }
+                guard = state.inner.lock().unwrap();
                 let remaining = size - output.len();
                 if let Some(read) = guard.input_queue.consume_bytes(remaining) {
                     let emit_input_line = guard.request_active;
@@ -827,6 +801,7 @@ unsafe extern "C" fn mcp_repl_readline(
     if read.interrupted {
         #[cfg(target_family = "unix")]
         unix_stdin::flush_terminal_input();
+        return ptr::null_mut();
     }
     let accounting = match note_cpython_readline_bytes_read(&prompt_text, &read.bytes) {
         Ok(accounting) => accounting,
@@ -839,11 +814,6 @@ unsafe extern "C" fn mcp_repl_readline(
     if accounting.discarded_after_interrupt() {
         return allocate_readline_result(b"\n");
     }
-    if read.interrupted || take_interrupt_requested() {
-        PythonApi::global().set_interrupt();
-        return ptr::null_mut();
-    }
-
     allocate_readline_result(&read.bytes)
 }
 
@@ -929,6 +899,7 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
     if read.interrupted {
         #[cfg(target_family = "unix")]
         unix_stdin::flush_terminal_input();
+        return CStdinLine::Error;
     }
     let accounting =
         match note_stdin_line_read(prompt_for_sideband.to_str().unwrap_or(""), &read.bytes) {
@@ -941,10 +912,6 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
         };
     if accounting.discarded_after_interrupt() {
         return CStdinLine::Line("\n".to_string());
-    }
-    if read.interrupted || take_interrupt_requested() {
-        PythonApi::global().set_interrupt();
-        return CStdinLine::Error;
     }
     if read.bytes.is_empty() {
         CStdinLine::Eof
@@ -1229,10 +1196,7 @@ unsafe extern "C" fn py_raw_stdin_read(_self: *mut PyObject, args: *mut PyObject
     };
     let bytes = match read_raw_stdin_bytes(size) {
         Ok(bytes) => bytes,
-        Err(RawStdinReadError::Interrupted) => {
-            api.set_interrupt();
-            return ptr::null_mut();
-        }
+        Err(RawStdinReadError::Interrupted) => return ptr::null_mut(),
         Err(RawStdinReadError::Runtime(message)) => {
             set_callback_error(&message);
             return ptr::null_mut();

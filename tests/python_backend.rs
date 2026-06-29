@@ -4674,7 +4674,7 @@ print('DELAYED_VALUE', value)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
+async fn python_input_interrupt_tail_handles_signal_before_tail() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -4697,32 +4697,81 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
         "expected input prompt, got: {text:?}"
     );
 
-    let interrupt = session
-        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+    let tail = session
+        .write_stdin_raw_unterminated_with("\u{3}print('AFTER_INPUT_INTERRUPT_TAIL')", Some(5.0))
         .await?;
-    let interrupt_text = result_text(&interrupt);
-    if is_busy_response(&interrupt_text) {
-        eprintln!("input prompt interrupt stayed busy in this Python runtime; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    assert!(
-        !is_busy_response(&interrupt_text),
-        "expected input prompt interrupt to complete, got: {interrupt_text:?}"
-    );
-
-    let follow_up_text = write_python_after_interrupt_until_contains(
-        &session,
-        "print('AFTER_INPUT_INTERRUPT')\nprint('AFTER_INPUT_INTERRUPT_DONE')",
-        "AFTER_INPUT_INTERRUPT_DONE",
-        "input prompt interrupt follow-up",
-    )
-    .await?;
+    let tail_text = result_text(&tail);
     session.cancel().await?;
 
     assert!(
-        !is_busy_response(&follow_up_text) && follow_up_text.contains("AFTER_INPUT_INTERRUPT_DONE"),
-        "expected follow-up to complete after input prompt interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        !is_busy_response(&tail_text),
+        "expected interrupt tail to complete, got: {tail_text:?}"
+    );
+    assert!(
+        tail_text.contains("KeyboardInterrupt"),
+        "expected real Python interrupt before tail, got: {tail_text:?}"
+    );
+    assert!(
+        tail_text.contains("AFTER_INPUT_INTERRUPT_TAIL"),
+        "expected tail to run as a fresh cell after input interrupt, got: {tail_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_interrupt_custom_handler_continues_waiting_for_answer() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = r#"
+import signal
+sigint_count = 0
+def handle_sigint(signum, frame):
+    global sigint_count
+    sigint_count += 1
+    print("CUSTOM_INPUT_SIGINT", sigint_count)
+signal.signal(signal.SIGINT, handle_sigint)
+value = input('custom interrupt> ')
+print('CUSTOM_INPUT_VALUE', value, sigint_count)
+"#;
+    let mut text = result_text(&session.write_stdin_raw_with(setup, Some(1.0)).await?);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("custom interrupt> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        text.contains("custom interrupt> "),
+        "expected custom input prompt, got: {text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
+        .await?;
+    let _interrupt_text = result_text(&interrupt);
+
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+
+    assert!(
+        answer_text.contains("CUSTOM_INPUT_SIGINT 1"),
+        "expected custom SIGINT handler to run from real signal, got: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("CUSTOM_INPUT_VALUE answer 1"),
+        "expected input to keep waiting and consume later answer, got: {answer_text:?}"
+    );
+    assert!(
+        !answer_text.contains("KeyboardInterrupt"),
+        "sideband should not force KeyboardInterrupt when custom handler returns: {answer_text:?}"
     );
     Ok(())
 }
@@ -5105,7 +5154,7 @@ async fn python_interrupt_aborts_running_cell_without_replaying_tail() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestResult<()> {
+async fn python_idle_interrupt_tail_handles_signal_before_tail_cell() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -5131,6 +5180,10 @@ async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestRe
     assert!(
         follow_up_text.contains("AFTER_IDLE_INTERRUPT"),
         "expected follow-up cell after idle Ctrl-C to run, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("KeyboardInterrupt"),
+        "expected idle Ctrl-C to be handled before the tail cell, got: {follow_up_text:?}"
     );
     Ok(())
 }
