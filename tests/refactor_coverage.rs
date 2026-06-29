@@ -19,7 +19,7 @@ plot(1:5, type = "l")
 plot(5:1, type = "l")
 cat("plots_done\n")
 "#, timeout = 10.0);
-                write_stdin_raw_unterminated("\u{4}");
+                write_stdin_raw_unterminated("\u{4}", timeout = 5.0);
                 write_stdin("1+1", timeout = 10.0);
                 write_stdin("Sys.sleep(5)", timeout = 0.2);
                 write_stdin_raw_unterminated("\u{3}", timeout = 5.0);

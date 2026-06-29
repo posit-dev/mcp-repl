@@ -40,6 +40,7 @@ fn venv_python(venv: &Path) -> PathBuf {
 
 const EXTRA_PACKAGE: &str = "packaging";
 const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
+const MISSING_INHERITED_STATE_MESSAGE: &str = "requires Codex per-tool-call sandbox metadata";
 
 fn run_uv(mut command: Command, context: impl Into<String>) -> TestResult<Output> {
     let context = context.into();
@@ -820,7 +821,7 @@ async fn repl_prepare_inherit_requires_meta_before_explicit_python_probe() -> Te
         "expected missing inherited metadata to reject prepare, got: {text:?}"
     );
     assert!(
-        text.contains("sandbox inherit requested but no client sandbox state was provided"),
+        text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "expected inherited metadata error before probing, got: {text:?}"
     );
     assert!(
@@ -875,7 +876,7 @@ async fn repl_prepare_inherit_requires_meta_before_requirements_uv() -> TestResu
         "expected missing inherited metadata to reject prepare, got: {text:?}"
     );
     assert!(
-        text.contains("sandbox inherit requested but no client sandbox state was provided"),
+        text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "expected inherited metadata error before uv, got: {text:?}"
     );
     assert!(

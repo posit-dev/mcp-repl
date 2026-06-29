@@ -283,6 +283,7 @@ const WORKER_MEM_GUARDRAIL_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 const WORKER_MEM_GUARDRAIL_IDLE_INTERVAL: Duration = Duration::from_secs(60);
 
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKER_RESTART_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 const WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "windows")]
 pub(crate) const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(10);
@@ -431,6 +432,7 @@ fn seed_initial_readiness_from_process(
 pub(crate) struct WorkerProcess {
     child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
+    shutdown_stdin_policy: ShutdownStdinPolicy,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
     live_output: LiveOutputCapture,
@@ -449,6 +451,23 @@ pub(crate) struct WorkerProcess {
     linux_bwrap_sandboxed: bool,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownStdinPolicy {
+    CloseBeforeWait,
+    CloseAfterWait,
+}
+
+impl ShutdownStdinPolicy {
+    fn for_worker_launch(worker_launch: &WorkerLaunch) -> Self {
+        match worker_launch {
+            WorkerLaunch::Builtin(Backend::Python) | WorkerLaunch::PythonExecutable { .. } => {
+                Self::CloseAfterWait
+            }
+            WorkerLaunch::Builtin(Backend::R) | WorkerLaunch::Custom(_) => Self::CloseBeforeWait,
+        }
+    }
 }
 
 enum StdinCommand {
@@ -741,6 +760,7 @@ impl WorkerProcess {
         sandbox_state: &SandboxState,
         context: WorkerSpawnContext<'_>,
     ) -> Result<Self, WorkerError> {
+        let shutdown_stdin_policy = ShutdownStdinPolicy::for_worker_launch(&worker_launch);
         let WorkerSpawnContext {
             oversized_output,
             output_timeline,
@@ -904,6 +924,7 @@ impl WorkerProcess {
         Ok(Self {
             child,
             stdin_tx,
+            shutdown_stdin_policy,
             session_tmpdir,
             ipc,
             live_output,
@@ -1407,8 +1428,23 @@ impl WorkerProcess {
 
     pub(crate) fn shutdown_graceful(mut self, timeout: Duration) -> Result<(), WorkerError> {
         self.request_ipc_shutdown();
-        let _ = self.close_stdin(Duration::from_millis(200));
+        self.close_stdin_before_shutdown_wait();
+        self.finish_timed_shutdown(timeout)
+    }
 
+    pub(crate) fn shutdown_for_restart(mut self, timeout: Duration) -> Result<(), WorkerError> {
+        self.request_ipc_shutdown();
+        self.close_stdin_before_shutdown_wait();
+        self.finish_timed_shutdown(timeout.min(WORKER_RESTART_SHUTDOWN_TIMEOUT))
+    }
+
+    fn close_stdin_before_shutdown_wait(&mut self) {
+        if self.shutdown_stdin_policy == ShutdownStdinPolicy::CloseBeforeWait {
+            let _ = self.close_stdin(Duration::from_millis(200));
+        }
+    }
+
+    fn finish_timed_shutdown(mut self, timeout: Duration) -> Result<(), WorkerError> {
         let start = std::time::Instant::now();
         let timeout_deadline = start + timeout;
         let term_deadline = start + shutdown_term_delay(timeout);
@@ -1450,6 +1486,11 @@ impl WorkerProcess {
             }
         }
 
+        // Ensure the stdin writer is closed before finalization. Built-in
+        // Python reaches this point without an early close because Windows
+        // ConPTY can terminate the console worker before sideband shutdown lets
+        // an active request emit its final output.
+        let _ = self.close_stdin(Duration::from_millis(200));
         self.finalize_terminated_process()
     }
 
@@ -1636,6 +1677,7 @@ impl WorkerProcess {
         Self {
             child: WorkerChild::standard(child),
             stdin_tx,
+            shutdown_stdin_policy: ShutdownStdinPolicy::CloseBeforeWait,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
             live_output: LiveOutputCapture::new(
@@ -2466,8 +2508,9 @@ where
                 }
                 StdinCommand::Close { reply } => {
                     let result = writer.flush().map_err(WorkerError::Io);
+                    drop(writer);
                     let _ = reply.send(result);
-                    break;
+                    return;
                 }
             }
         }
@@ -2490,6 +2533,9 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
         return Duration::from_secs(0);
     }
     let by_fraction = timeout.mul_f64(0.75);
+    if timeout <= Duration::from_secs(10) {
+        return by_fraction;
+    }
     let by_remaining = timeout.saturating_sub(Duration::from_secs(10));
     by_fraction.min(by_remaining)
 }

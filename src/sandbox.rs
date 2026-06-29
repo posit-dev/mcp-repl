@@ -12,6 +12,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process;
@@ -1271,7 +1273,7 @@ pub fn sandbox_state_update_from_codex_meta(
         sandbox_policy,
         sandbox_cwd: Some(sandbox_cwd),
         #[cfg(target_os = "linux")]
-        use_linux_sandbox_bwrap: use_legacy_landlock.then_some(false),
+        use_linux_sandbox_bwrap: Some(!use_legacy_landlock),
         #[cfg(not(target_os = "linux"))]
         use_linux_sandbox_bwrap: None,
         #[cfg(target_os = "linux")]
@@ -1823,9 +1825,30 @@ fn configure_embedded_r_runtime_env(env: &mut HashMap<String, String>) {
 #[cfg(target_family = "unix")]
 fn embedded_r_home() -> Option<&'static PathBuf> {
     static R_HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    R_HOME
-        .get_or_init(|| harp::command::r_home_setup().ok())
-        .as_ref()
+    R_HOME.get_or_init(discover_embedded_r_home).as_ref()
+}
+
+#[cfg(target_family = "unix")]
+fn discover_embedded_r_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("R_HOME").filter(|home| !home.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+
+    let output = harp::command::r_command_from_path(|command| {
+        command.arg("RHOME");
+    })
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let home = String::from_utf8(output.stdout).ok()?;
+    let home = home.trim();
+    if home.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(home))
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -1897,11 +1920,27 @@ pub fn prepare_worker_command_with_managed_network(
             "0".to_string()
         },
     );
+    #[cfg(not(target_os = "linux"))]
     if let Some(proxy) = managed_network_proxy {
         proxy.apply_to_env(&mut env);
     }
 
     ensure_session_temp_dir(&state.session_temp_dir)?;
+    #[cfg(target_os = "linux")]
+    let linux_managed_network_bridge = if let Some(proxy) = managed_network_proxy {
+        if !state.use_linux_sandbox_bwrap {
+            return Err(SandboxError::LinuxSandbox(
+                "Linux managed network domain restrictions require bubblewrap; set features.use_linux_sandbox_bwrap=true and useLegacyLandlock=false".to_string(),
+            ));
+        }
+        Some(
+            proxy
+                .apply_linux_bridge_to_env(&mut env, &state.session_temp_dir)
+                .map_err(|err| SandboxError::LinuxSandbox(err.to_string()))?,
+        )
+    } else {
+        None
+    };
     {
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
@@ -2002,6 +2041,7 @@ pub fn prepare_worker_command_with_managed_network(
             &state.session_temp_dir,
             state.use_linux_sandbox_bwrap,
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
+            linux_managed_network_bridge.as_ref(),
         );
         let sandbox_program =
             std::env::current_exe().map_err(|err| SandboxError::LinuxSandbox(err.to_string()))?;
@@ -2066,6 +2106,7 @@ fn create_linux_sandbox_command_args(
     session_temp_dir: &Path,
     use_bwrap_sandbox: bool,
     no_proc: bool,
+    managed_network_bridge: Option<&crate::managed_network::LinuxManagedNetworkBridgeConfig>,
 ) -> Vec<String> {
     let sandbox_policy_cwd = sandbox_policy_cwd.to_string_lossy().to_string();
     let session_temp_dir = session_temp_dir.to_string_lossy().to_string();
@@ -2085,6 +2126,12 @@ fn create_linux_sandbox_command_args(
     }
     if no_proc {
         linux_cmd.push("--no-proc".to_string());
+    }
+    if let Some(bridge) = managed_network_bridge {
+        linux_cmd.push("--managed-network-http-socket".to_string());
+        linux_cmd.push(bridge.http_socket.to_string_lossy().to_string());
+        linux_cmd.push("--managed-network-socks-socket".to_string());
+        linux_cmd.push(bridge.socks_socket.to_string_lossy().to_string());
     }
     linux_cmd.extend(["--".to_string()]);
     linux_cmd.extend(command);
@@ -2158,6 +2205,7 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
 fn linux_effective_file_system_policy(
     policy: &SandboxPolicy,
     session_temp_dir: &Path,
+    managed_network_socket_dir: Option<&Path>,
 ) -> FileSystemSandboxPolicy {
     let mut file_system = file_system_policy_from_legacy(policy);
     if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
@@ -2175,24 +2223,30 @@ fn linux_effective_file_system_policy(
         }
     }
     if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
+        && let Some(socket_dir) =
+            managed_network_socket_dir.and_then(|path| ensure_absolute(path.to_path_buf()))
+    {
+        push_linux_read_entry(&mut file_system, socket_dir);
+    }
+    if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
         && !file_system.has_full_disk_read_access()
         && let Ok(current_exe) = std::env::current_exe()
         && let Some(current_exe) = ensure_absolute(current_exe)
     {
-        push_linux_implementation_read_entry(&mut file_system, current_exe);
+        push_linux_read_entry(&mut file_system, current_exe);
     }
     if matches!(file_system.kind, FileSystemSandboxKind::Restricted)
         && !file_system.has_full_disk_read_access()
         && let Some(r_home) = embedded_r_home()
         && let Some(r_home) = ensure_absolute(r_home.clone())
     {
-        push_linux_implementation_read_entry(&mut file_system, r_home);
+        push_linux_read_entry(&mut file_system, r_home);
     }
     file_system
 }
 
 #[cfg(target_os = "linux")]
-fn push_linux_implementation_read_entry(file_system: &mut FileSystemSandboxPolicy, path: PathBuf) {
+fn push_linux_read_entry(file_system: &mut FileSystemSandboxPolicy, path: PathBuf) {
     let entry = FileSystemSandboxEntry {
         path: FileSystemPath::Path { path },
         access: FileSystemAccessMode::Read,
@@ -3090,17 +3144,34 @@ struct LinuxSandboxArgs {
     use_bwrap_sandbox: bool,
     apply_seccomp_then_exec: bool,
     no_proc: bool,
+    managed_network_bridge: Option<LinuxManagedNetworkBridgeArgs>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxManagedNetworkBridgeArgs {
+    socket_dir: PathBuf,
+    http_socket: PathBuf,
+    socks_socket: PathBuf,
 }
 
 #[cfg(target_os = "linux")]
 fn linux_sandbox_main_impl() -> Result<(), String> {
     let args = linux_sandbox_parse_args()?;
     if args.apply_seccomp_then_exec {
+        if let Some(bridge) = args.managed_network_bridge.as_ref() {
+            start_linux_managed_network_bridge_children(bridge)?;
+        }
+        let network_seccomp_mode = linux_network_seccomp_mode_for_policy(
+            &args.sandbox_policy,
+            args.managed_network_bridge.is_some(),
+        );
         linux_apply_sandbox_policy_to_current_thread(
             &args.sandbox_policy,
             &args.sandbox_policy_cwd,
             &args.session_temp_dir,
             false,
+            network_seccomp_mode,
         )?;
         linux_execvp(args.command)?;
         return Ok(());
@@ -3114,6 +3185,7 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
         &args.sandbox_policy_cwd,
         &args.session_temp_dir,
         true,
+        linux_network_seccomp_mode_for_policy(&args.sandbox_policy, false),
     )?;
     linux_execvp(args.command)?;
     Ok(())
@@ -3128,6 +3200,8 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
     let mut use_bwrap_sandbox = false;
     let mut apply_seccomp_then_exec = false;
     let mut no_proc = false;
+    let mut managed_network_http_socket: Option<PathBuf> = None;
+    let mut managed_network_socks_socket: Option<PathBuf> = None;
 
     let mut args = std::env::args_os().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -3141,6 +3215,20 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
         }
         if arg == "--no-proc" {
             no_proc = true;
+            continue;
+        }
+        if arg == "--managed-network-http-socket" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --managed-network-http-socket".to_string())?;
+            managed_network_http_socket = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg == "--managed-network-socks-socket" {
+            let value = args
+                .next()
+                .ok_or_else(|| "missing value for --managed-network-socks-socket".to_string())?;
+            managed_network_socks_socket = Some(PathBuf::from(value));
             continue;
         }
         if arg == "--sandbox-policy-cwd" {
@@ -3185,6 +3273,19 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
     }
+    let managed_network_bridge = match (managed_network_http_socket, managed_network_socks_socket) {
+        (Some(http_socket), Some(socks_socket)) => Some(linux_managed_network_bridge_args(
+            http_socket,
+            socks_socket,
+        )?),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "Linux managed network bridge requires both HTTP and SOCKS socket paths"
+                    .to_string(),
+            );
+        }
+    };
 
     Ok(LinuxSandboxArgs {
         sandbox_policy_cwd,
@@ -3194,7 +3295,254 @@ fn linux_sandbox_parse_args() -> Result<LinuxSandboxArgs, String> {
         use_bwrap_sandbox,
         apply_seccomp_then_exec,
         no_proc,
+        managed_network_bridge,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_managed_network_bridge_args(
+    http_socket: PathBuf,
+    socks_socket: PathBuf,
+) -> Result<LinuxManagedNetworkBridgeArgs, String> {
+    if !http_socket.is_absolute() {
+        return Err(format!(
+            "HTTP managed network bridge socket path must be absolute: {}",
+            http_socket.display()
+        ));
+    }
+    if !socks_socket.is_absolute() {
+        return Err(format!(
+            "SOCKS managed network bridge socket path must be absolute: {}",
+            socks_socket.display()
+        ));
+    }
+    let http_parent = http_socket
+        .parent()
+        .ok_or_else(|| "HTTP managed network bridge socket path has no parent".to_string())?;
+    let socks_parent = socks_socket
+        .parent()
+        .ok_or_else(|| "SOCKS managed network bridge socket path has no parent".to_string())?;
+    if http_parent != socks_parent {
+        return Err(format!(
+            "Linux managed network bridge sockets must share a directory: {} and {}",
+            http_socket.display(),
+            socks_socket.display()
+        ));
+    }
+    Ok(LinuxManagedNetworkBridgeArgs {
+        socket_dir: http_parent.to_path_buf(),
+        http_socket,
+        socks_socket,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_managed_network_bridge_children(
+    bridge: &LinuxManagedNetworkBridgeArgs,
+) -> Result<(), String> {
+    let http_pid = start_linux_managed_network_bridge_child(
+        &bridge.http_socket,
+        crate::managed_network::LINUX_MANAGED_NETWORK_HTTP_BRIDGE_PORT,
+        "HTTP",
+    )?;
+
+    match start_linux_managed_network_bridge_child(
+        &bridge.socks_socket,
+        crate::managed_network::LINUX_MANAGED_NETWORK_SOCKS_BRIDGE_PORT,
+        "SOCKS",
+    ) {
+        Ok(_socks_pid) => Ok(()),
+        Err(err) => {
+            linux_terminate_child(http_pid);
+            Err(err)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_linux_managed_network_bridge_child(
+    socket_path: &Path,
+    port: u16,
+    label: &'static str,
+) -> Result<libc::pid_t, String> {
+    let mut ready_pipe = [-1; 2];
+    if unsafe { libc::pipe(ready_pipe.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "failed to create {label} managed network bridge readiness pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        linux_close_fd(ready_pipe[0]);
+        linux_close_fd(ready_pipe[1]);
+        return Err(format!(
+            "failed to fork {label} managed network bridge child: {err}"
+        ));
+    }
+
+    if pid == 0 {
+        linux_close_fd(ready_pipe[0]);
+        linux_managed_network_bridge_child_main(socket_path, port, label, ready_pipe[1]);
+    }
+
+    linux_close_fd(ready_pipe[1]);
+    let readiness = read_linux_managed_network_bridge_readiness(ready_pipe[0], pid, label);
+    linux_close_fd(ready_pipe[0]);
+    readiness.map(|()| pid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_managed_network_bridge_readiness(
+    fd: libc::c_int,
+    pid: libc::pid_t,
+    label: &str,
+) -> Result<(), String> {
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
+        if read == 1 {
+            break;
+        }
+        if read == 0 {
+            linux_wait_for_bridge_child(pid);
+            return Err(format!(
+                "{label} managed network bridge exited before signaling readiness"
+            ));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        linux_terminate_child(pid);
+        return Err(format!(
+            "failed to read {label} managed network bridge readiness: {err}"
+        ));
+    }
+
+    if byte[0] == 1 {
+        Ok(())
+    } else {
+        linux_wait_for_bridge_child(pid);
+        Err(format!("{label} managed network bridge failed to start"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_managed_network_bridge_child_main(
+    socket_path: &Path,
+    port: u16,
+    label: &str,
+    ready_fd: libc::c_int,
+) -> ! {
+    let _ = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+    if unsafe { libc::getppid() } == 1 {
+        unsafe { libc::_exit(1) };
+    }
+
+    let result = linux_run_managed_network_bridge_child(socket_path, port, ready_fd);
+    if let Err(err) = result {
+        eprintln!("codex-linux-sandbox: {label} managed network bridge failed: {err}");
+        let _ = linux_write_managed_network_bridge_ready(ready_fd, false);
+        linux_close_fd(ready_fd);
+        unsafe { libc::_exit(1) };
+    }
+    unsafe { libc::_exit(0) };
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_managed_network_bridge_child(
+    socket_path: &Path,
+    port: u16,
+    ready_fd: libc::c_int,
+) -> Result<(), String> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .map_err(|err| format!("failed to bind 127.0.0.1:{port}: {err}"))?;
+    listener
+        .set_nonblocking(false)
+        .map_err(|err| err.to_string())?;
+    linux_write_managed_network_bridge_ready(ready_fd, true).map_err(|err| err.to_string())?;
+    linux_close_fd(ready_fd);
+
+    loop {
+        let (client, _) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        let socket_path = socket_path.to_path_buf();
+        std::thread::spawn(move || linux_bridge_tcp_client_to_unix_socket(client, socket_path));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bridge_tcp_client_to_unix_socket(client: std::net::TcpStream, socket_path: PathBuf) {
+    let Ok(upstream) = UnixStream::connect(socket_path) else {
+        return;
+    };
+    let _ = linux_proxy_tcp_to_unix(client, upstream);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proxy_tcp_to_unix(
+    client: std::net::TcpStream,
+    upstream: UnixStream,
+) -> std::io::Result<()> {
+    let mut client_read = client.try_clone()?;
+    let mut upstream_write = upstream.try_clone()?;
+    let client_to_upstream = std::thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut upstream_write);
+        let _ = upstream_write.shutdown(std::net::Shutdown::Write);
+    });
+
+    let mut upstream_read = upstream;
+    let mut client_write = client;
+    let result = std::io::copy(&mut upstream_read, &mut client_write);
+    let _ = client_write.shutdown(std::net::Shutdown::Write);
+    let _ = client_to_upstream.join();
+    result.map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_write_managed_network_bridge_ready(fd: libc::c_int, ready: bool) -> std::io::Result<()> {
+    let byte = [u8::from(ready)];
+    loop {
+        let written = unsafe { libc::write(fd, byte.as_ptr().cast(), byte.len()) };
+        if written == 1 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_close_fd(fd: libc::c_int) {
+    if fd >= 0 {
+        let _ = unsafe { libc::close(fd) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_terminate_child(pid: libc::pid_t) {
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+    linux_wait_for_bridge_child(pid);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_wait_for_bridge_child(pid: libc::pid_t) {
+    let mut status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid || result < 0 {
+            return;
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3215,12 +3563,31 @@ fn linux_find_bwrap_program() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<String>, String> {
+struct LinuxInnerSeccompCommand {
+    command: Vec<String>,
+    helper_dir: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_build_inner_seccomp_command(
+    args: &LinuxSandboxArgs,
+) -> Result<LinuxInnerSeccompCommand, String> {
     let current_exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let helper_dir = Builder::new()
+        .prefix("mcp-repl-linux-helper-")
+        .tempdir_in(&args.session_temp_dir)
+        .map_err(|err| err.to_string())?;
+    let helper_exe = helper_dir.path().join("codex-linux-sandbox");
+    std::os::unix::fs::symlink(&current_exe, &helper_exe).map_err(|err| {
+        format!(
+            "failed to create Linux sandbox helper link at {}: {err}",
+            helper_exe.to_string_lossy()
+        )
+    })?;
     let policy = sanitize_linux_sandbox_policy(&args.sandbox_policy);
     let policy_json = serde_json::to_string(&policy).map_err(|err| err.to_string())?;
     let mut inner = vec![
-        current_exe.to_string_lossy().to_string(),
+        helper_exe.to_string_lossy().to_string(),
         "--sandbox-policy-cwd".to_string(),
         args.sandbox_policy_cwd.to_string_lossy().to_string(),
         "--session-temp-dir".to_string(),
@@ -3228,14 +3595,32 @@ fn linux_build_inner_seccomp_command(args: &LinuxSandboxArgs) -> Result<Vec<Stri
         "--sandbox-policy".to_string(),
         policy_json,
         "--apply-seccomp-then-exec".to_string(),
-        "--".to_string(),
     ];
+    append_linux_managed_network_bridge_args(&mut inner, args.managed_network_bridge.as_ref());
+    inner.push("--".to_string());
     inner.extend(
         args.command
             .iter()
             .map(|arg| arg.to_string_lossy().to_string()),
     );
-    Ok(inner)
+    Ok(LinuxInnerSeccompCommand {
+        command: inner,
+        helper_dir,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_managed_network_bridge_args(
+    args: &mut Vec<String>,
+    bridge: Option<&LinuxManagedNetworkBridgeArgs>,
+) {
+    let Some(bridge) = bridge else {
+        return;
+    };
+    args.push("--managed-network-http-socket".to_string());
+    args.push(bridge.http_socket.to_string_lossy().to_string());
+    args.push("--managed-network-socks-socket".to_string());
+    args.push(bridge.socks_socket.to_string_lossy().to_string());
 }
 
 #[cfg(target_os = "linux")]
@@ -3259,9 +3644,17 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
     let bwrap_program = linux_find_bwrap_program()
         .ok_or_else(|| "bwrap executable not found (tried /usr/bin/bwrap and PATH)".to_string())?;
     let inner = linux_build_inner_seccomp_command(&args)?;
-    let file_system_policy =
-        linux_effective_file_system_policy(&args.sandbox_policy, &args.session_temp_dir);
-    let network_mode = linux_bwrap_network_mode(&args.sandbox_policy);
+    let managed_network_socket_dir = args
+        .managed_network_bridge
+        .as_ref()
+        .map(|bridge| bridge.socket_dir.as_path());
+    let file_system_policy = linux_effective_file_system_policy(
+        &args.sandbox_policy,
+        &args.session_temp_dir,
+        managed_network_socket_dir,
+    );
+    let network_mode =
+        linux_bwrap_network_mode(&args.sandbox_policy, args.managed_network_bridge.is_some());
     let mount_proc = !args.no_proc
         && linux_bwrap_supports_proc_mount(
             bwrap_program.as_path(),
@@ -3271,7 +3664,7 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
             network_mode,
         );
     let bwrap_command = create_linux_bwrap_command_args(
-        inner,
+        inner.command,
         &file_system_policy,
         &args.sandbox_policy_cwd,
         &args.session_temp_dir,
@@ -3282,9 +3675,10 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
         args,
         preserved_files,
         empty_file_source_index: _,
-        preserved_tempdirs,
+        mut preserved_tempdirs,
         synthetic_mount_targets,
     } = bwrap_command;
+    preserved_tempdirs.push(inner.helper_dir);
     make_linux_files_inheritable(&preserved_files)?;
     let synthetic_mount_targets_for_cleanup = synthetic_mount_targets.clone();
     let mut full_command = Vec::with_capacity(1 + args.len());
@@ -3311,18 +3705,27 @@ fn linux_exec_bwrap_sandbox(args: LinuxSandboxArgs) -> Result<(), String> {
 enum LinuxBwrapNetworkMode {
     FullAccess,
     Isolated,
+    IsolatedProxyRouted,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxBwrapNetworkMode {
     fn should_unshare_network(self) -> bool {
-        matches!(self, LinuxBwrapNetworkMode::Isolated)
+        matches!(
+            self,
+            LinuxBwrapNetworkMode::Isolated | LinuxBwrapNetworkMode::IsolatedProxyRouted
+        )
     }
 }
 
 #[cfg(target_os = "linux")]
-fn linux_bwrap_network_mode(policy: &SandboxPolicy) -> LinuxBwrapNetworkMode {
-    if policy.has_full_network_access() {
+fn linux_bwrap_network_mode(
+    policy: &SandboxPolicy,
+    managed_network_bridge: bool,
+) -> LinuxBwrapNetworkMode {
+    if managed_network_bridge {
+        LinuxBwrapNetworkMode::IsolatedProxyRouted
+    } else if policy.has_full_network_access() {
         LinuxBwrapNetworkMode::FullAccess
     } else {
         LinuxBwrapNetworkMode::Isolated
@@ -3397,8 +3800,10 @@ fn create_linux_bwrap_command_args(
         "--die-with-parent".to_string(),
         "--new-session".to_string(),
         "--unshare-user".to_string(),
-        "--unshare-pid".to_string(),
     ];
+    if mount_proc {
+        bwrap_args.push("--unshare-pid".to_string());
+    }
     let mut bwrap_command =
         linux_bwrap_filesystem_args(file_system_policy, sandbox_policy_cwd, session_temp_dir)?;
     bwrap_args.append(&mut bwrap_command.args);
@@ -3628,7 +4033,13 @@ fn linux_bwrap_filesystem_args(
         }
         read_only_subpaths.sort_by_key(|path| linux_path_depth(path));
         for subpath in read_only_subpaths {
-            append_linux_read_only_subpath_args(&mut command, &subpath, &allowed_write_paths)?;
+            let allow_missing_protected_metadata_synthesis = true;
+            append_linux_read_only_subpath_args(
+                &mut command,
+                &subpath,
+                &allowed_write_paths,
+                allow_missing_protected_metadata_synthesis,
+            )?;
         }
 
         let mut nested_unreadable_roots = unreadable_roots
@@ -3813,12 +4224,16 @@ fn prepare_linux_missing_writable_roots(
             )
         })?;
 
-        let mut created_dirs = root
-            .ancestors()
-            .take_while(|path| *path != first_missing)
-            .map(Path::to_path_buf)
-            .collect::<Vec<_>>();
-        created_dirs.push(first_missing);
+        let mut created_dirs = Vec::new();
+        if first_missing != root {
+            created_dirs = root
+                .ancestors()
+                .skip(1)
+                .take_while(|path| *path != first_missing)
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>();
+            created_dirs.push(first_missing);
+        }
         created_dirs.reverse();
         command.synthetic_mount_targets.extend(
             created_dirs
@@ -3834,6 +4249,7 @@ fn append_linux_read_only_subpath_args(
     command: &mut LinuxBwrapCommand,
     subpath: &Path,
     allowed_write_paths: &[PathBuf],
+    allow_missing_protected_metadata_synthesis: bool,
 ) -> Result<(), String> {
     if let Some(symlink) = first_writable_symlink_component_in_path(subpath, allowed_write_paths) {
         return Err(format!(
@@ -3850,6 +4266,7 @@ fn append_linux_read_only_subpath_args(
                 command,
                 &first_missing,
                 allowed_write_paths,
+                allow_missing_protected_metadata_synthesis,
             )?;
         }
         return Ok(());
@@ -3895,17 +4312,24 @@ fn append_linux_missing_read_only_subpath_args(
     command: &mut LinuxBwrapCommand,
     path: &Path,
     allowed_write_paths: &[PathBuf],
+    allow_missing_protected_metadata_synthesis: bool,
 ) -> Result<(), String> {
-    if linux_protected_metadata_name(path).is_some() {
+    if linux_protected_metadata_name(path).is_some() && allow_missing_protected_metadata_synthesis {
         append_linux_empty_directory_ro_bind_args(command, path, allowed_write_paths)?;
         command
             .synthetic_mount_targets
             .push(LinuxSyntheticMountTarget::EmptyDirectory(
                 path.to_path_buf(),
             ));
-    } else {
-        append_linux_empty_file_bind_data_args(command, path, Some("000"), true)?;
+        return Ok(());
     }
+    if is_within_allowed_write_paths(path, allowed_write_paths) {
+        return Err(format!(
+            "cannot enforce sandbox read-only path {} because it does not exist under a writable root with the Linux bubblewrap backend",
+            path.display()
+        ));
+    }
+    append_linux_empty_file_bind_data_args(command, path, Some("000"), true)?;
     Ok(())
 }
 
@@ -4316,7 +4740,10 @@ fn append_linux_unreadable_root_args(
         if let Some(first_missing) = find_first_non_existent_component(unreadable_root)
             && is_within_allowed_write_paths(&first_missing, allowed_write_paths)
         {
-            append_linux_empty_file_bind_data_args(command, &first_missing, Some("000"), true)?;
+            return Err(format!(
+                "cannot enforce sandbox deny-read path {} because it does not exist under a writable root with the Linux bubblewrap backend",
+                first_missing.display()
+            ));
         }
         return Ok(());
     }
@@ -4710,11 +5137,7 @@ fn is_proc_mount_failure(stderr: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_bwrap_proc_probe_quiet_retry_failure(stderr: &str) -> bool {
-    stderr.contains("Can't bind mount /oldroot/")
-        && stderr.contains(" on /newroot/")
-        && (stderr.contains("Unable to mount source on destination: No such file or directory")
-            || stderr
-                .contains("Unable to remount destination with correct flags: Invalid argument"))
+    stderr.contains("bwrap: Can't bind mount /oldroot/") && stderr.contains(" on /newroot/")
 }
 
 #[cfg(target_os = "linux")]
@@ -4723,17 +5146,16 @@ fn linux_apply_sandbox_policy_to_current_thread(
     cwd: &Path,
     session_temp_dir: &Path,
     apply_landlock_fs: bool,
+    network_seccomp_mode: Option<LinuxNetworkSeccompMode>,
 ) -> Result<(), String> {
-    let file_system_policy = linux_effective_file_system_policy(sandbox_policy, session_temp_dir);
-    if !file_system_policy.has_full_disk_write_access() || !sandbox_policy.has_full_network_access()
-    {
+    let file_system_policy =
+        linux_effective_file_system_policy(sandbox_policy, session_temp_dir, None);
+    if !file_system_policy.has_full_disk_write_access() || network_seccomp_mode.is_some() {
         linux_set_no_new_privs()?;
     }
 
-    if !sandbox_policy.has_full_network_access() {
-        linux_install_network_seccomp_filter_on_current_thread(
-            LinuxNetworkSeccompMode::Restricted,
-        )?;
+    if let Some(mode) = network_seccomp_mode {
+        linux_install_network_seccomp_filter_on_current_thread(mode)?;
     }
 
     if apply_landlock_fs && !file_system_policy.has_full_disk_write_access() {
@@ -4749,6 +5171,20 @@ fn linux_apply_sandbox_policy_to_current_thread(
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_network_seccomp_mode_for_policy(
+    sandbox_policy: &SandboxPolicy,
+    managed_network_bridge: bool,
+) -> Option<LinuxNetworkSeccompMode> {
+    if managed_network_bridge {
+        Some(LinuxNetworkSeccompMode::ProxyRouted)
+    } else if sandbox_policy.has_full_network_access() {
+        None
+    } else {
+        Some(LinuxNetworkSeccompMode::Restricted)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -4809,7 +5245,7 @@ fn linux_install_filesystem_landlock_rules_on_current_thread(
         .map_err(|err| err.to_string())?
         .add_rules(landlock::path_beneath_rules(&["/dev/null"], access_rw))
         .map_err(|err| err.to_string())?
-        .set_no_new_privs(true);
+        .no_new_privs(true);
 
     if !writable_roots.is_empty() {
         ruleset = ruleset
@@ -4886,7 +5322,7 @@ fn linux_install_network_seccomp_filter_on_current_thread(
             rules.insert(libc::SYS_socketpair, vec![unix_only_rule]);
         }
         LinuxNetworkSeccompMode::ProxyRouted => {
-            let deny_non_ip_socket = SeccompRule::new(vec![
+            let deny_non_ip_socket_domain = SeccompRule::new(vec![
                 SeccompCondition::new(
                     0,
                     SeccompCmpArgLen::Dword,
@@ -4903,6 +5339,9 @@ fn linux_install_network_seccomp_filter_on_current_thread(
                 .map_err(|err| err.to_string())?,
             ])
             .map_err(|err| err.to_string())?;
+            // Proxy-routed workers may create TCP/IP sockets for the namespace-local
+            // proxy bridge, but must not open pathname Unix sockets visible from the
+            // read-only host filesystem.
             let deny_non_unix_socketpair = SeccompRule::new(vec![
                 SeccompCondition::new(
                     0,
@@ -4913,7 +5352,7 @@ fn linux_install_network_seccomp_filter_on_current_thread(
                 .map_err(|err| err.to_string())?,
             ])
             .map_err(|err| err.to_string())?;
-            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket]);
+            rules.insert(libc::SYS_socket, vec![deny_non_ip_socket_domain]);
             rules.insert(libc::SYS_socketpair, vec![deny_non_unix_socketpair]);
         }
     }
@@ -5542,6 +5981,15 @@ mod tests {
             .expect("linux bwrap env lock poisoned")
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn skip_when_loopback_sockets_are_unavailable(test_name: &str) -> bool {
+        if crate::managed_network::loopback_sockets_available_for_tests() {
+            return false;
+        }
+        eprintln!("{test_name}: loopback sockets unavailable in this sandbox; skipping");
+        true
+    }
+
     #[test]
     fn session_temp_dir_rejects_outside_system_tmp() {
         #[cfg(target_os = "windows")]
@@ -5743,6 +6191,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn prepare_worker_command_with_managed_proxy_injects_proxy_env_and_seatbelt_ports() {
+        if skip_when_loopback_sockets_are_unavailable(
+            "prepare_worker_command_with_managed_proxy_injects_proxy_env_and_seatbelt_ports",
+        ) {
+            return;
+        }
         let proxy = crate::managed_network::ManagedNetworkProxy::start(
             crate::managed_network::ManagedProxyConfig {
                 allowed_domains: vec!["example.com".to_string()],
@@ -5801,6 +6254,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn prepare_worker_command_with_managed_proxy_uses_session_temp_home() {
+        if skip_when_loopback_sockets_are_unavailable(
+            "prepare_worker_command_with_managed_proxy_uses_session_temp_home",
+        ) {
+            return;
+        }
         let proxy = crate::managed_network::ManagedNetworkProxy::start(
             crate::managed_network::ManagedProxyConfig {
                 allowed_domains: vec!["example.com".to_string()],
@@ -5852,6 +6310,11 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn prepare_worker_command_with_managed_proxy_routes_local_targets_through_proxy() {
+        if skip_when_loopback_sockets_are_unavailable(
+            "prepare_worker_command_with_managed_proxy_routes_local_targets_through_proxy",
+        ) {
+            return;
+        }
         let proxy = crate::managed_network::ManagedNetworkProxy::start(
             crate::managed_network::ManagedProxyConfig {
                 allowed_domains: vec!["example.com".to_string()],
@@ -5895,6 +6358,127 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn prepare_worker_command_with_linux_managed_proxy_uses_namespace_bridge() {
+        let proxy = crate::managed_network::ManagedNetworkProxy::start(
+            crate::managed_network::ManagedProxyConfig {
+                allowed_domains: vec!["example.com".to_string()],
+                denied_domains: Vec::new(),
+                allow_local_binding: true,
+            },
+        )
+        .expect("managed proxy");
+        let tmp = Builder::new()
+            .prefix("mcp-repl-linux-proxy-test-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = tmp.path().join("session");
+        let mut state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            session_temp_dir: session_temp_dir.clone(),
+            use_linux_sandbox_bwrap: true,
+            ..SandboxState::default()
+        };
+        state.managed_network_policy.allowed_domains = vec!["example.com".to_string()];
+        state.managed_network_policy.allow_local_binding = true;
+
+        let prepared = prepare_worker_command_with_managed_network(
+            Path::new("/bin/echo"),
+            vec!["ok".to_string()],
+            &state,
+            Some(&proxy),
+        )
+        .expect("prepare worker command");
+
+        assert_eq!(
+            prepared.env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:39080")
+        );
+        assert_eq!(
+            prepared.env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:39080")
+        );
+        assert_eq!(
+            prepared.env.get("ALL_PROXY").map(String::as_str),
+            Some("socks5h://127.0.0.1:39081")
+        );
+        assert_eq!(prepared.env.get("NO_PROXY").map(String::as_str), Some(""));
+        assert_eq!(prepared.env.get("no_proxy").map(String::as_str), Some(""));
+        assert_eq!(
+            prepared.env.get("npm_config_noproxy").map(String::as_str),
+            Some("")
+        );
+
+        let http_socket_index = prepared
+            .args
+            .iter()
+            .position(|arg| arg == "--managed-network-http-socket")
+            .expect("HTTP relay socket arg");
+        let socks_socket_index = prepared
+            .args
+            .iter()
+            .position(|arg| arg == "--managed-network-socks-socket")
+            .expect("SOCKS relay socket arg");
+        assert!(
+            Path::new(&prepared.args[http_socket_index + 1]).starts_with(&session_temp_dir),
+            "HTTP relay socket should live under session temp: {:?}",
+            prepared.args
+        );
+        assert!(
+            Path::new(&prepared.args[socks_socket_index + 1]).starts_with(&session_temp_dir),
+            "SOCKS relay socket should live under session temp: {:?}",
+            prepared.args
+        );
+        let http_socket = Path::new(&prepared.args[http_socket_index + 1]);
+        let socks_socket = Path::new(&prepared.args[socks_socket_index + 1]);
+        let socket_dir = http_socket.parent().expect("HTTP socket parent");
+        assert_eq!(
+            socks_socket.parent(),
+            Some(socket_dir),
+            "bridge sockets should share a private relay directory: {:?}",
+            prepared.args
+        );
+        assert_ne!(
+            socket_dir,
+            session_temp_dir.as_path(),
+            "bridge sockets should not live directly in writable session temp: {:?}",
+            prepared.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proxy_routed_bwrap_mode_unshares_network() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-proxy-routed-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::workspace_write(&[], false, false);
+
+        let command = create_linux_bwrap_command_args(
+            vec!["/bin/true".to_string()],
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+            false,
+            LinuxBwrapNetworkMode::IsolatedProxyRouted,
+        )
+        .expect("proxy-routed bwrap command should build");
+
+        assert!(
+            command.args.iter().any(|arg| arg == "--unshare-net"),
+            "proxy-routed bwrap mode must isolate direct egress: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn proc_mount_failure_detects_expected_stderr() {
         assert!(is_proc_mount_failure(
             "bwrap: Can't mount proc on /newroot/proc: Invalid argument"
@@ -5904,12 +6488,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn bwrap_proc_probe_quiet_retry_detects_old_bind_target_stderr() {
+    fn bwrap_proc_probe_quiet_retry_detects_oldroot_bind_stderr() {
         assert!(is_bwrap_proc_probe_quiet_retry_failure(
-            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-bm2Cuc on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to mount source on destination: No such file or directory"
-        ));
-        assert!(is_bwrap_proc_probe_quiet_retry_failure(
-            "bwrap: Can't bind mount /oldroot/home/runner/.cache/mcp-repl/bwrap/mcp-repl-bwrap-empty-dir-FlEdOV on /newroot/home/runner/work/mcp-repl/mcp-repl/.agents: Unable to remount destination with correct flags: Invalid argument"
+            "bwrap: Can't bind mount /oldroot/bind-source on /newroot/workspace/.agents: future bwrap detail"
         ));
         assert!(!is_bwrap_proc_probe_quiet_retry_failure(
             "bwrap: Unable to remount destination with correct flags: Invalid argument"
@@ -6016,6 +6597,35 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_landlock_workspace_write_metadata_carveouts_fail_closed() {
+        let writable_root = PathBuf::from("/tmp/mcp-repl-landlock-legacy-workspace");
+        let session_temp_dir = PathBuf::from("/tmp/mcp-repl-landlock-session");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: true,
+                exclude_slash_tmp: true,
+            },
+            &session_temp_dir,
+            None,
+        );
+
+        let err = linux_landlock_writable_root_paths(
+            &file_system_policy,
+            &writable_root,
+            &session_temp_dir,
+        )
+        .expect_err("legacy workspace-write should reject protected metadata carveouts");
+
+        assert!(
+            err.contains("read-only carveouts inside writable root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_landlock_allows_internal_session_temp_writable_root() {
         let cwd = PathBuf::from("/tmp/mcp-repl-landlock-workspace");
         let session_temp_dir = PathBuf::from("/tmp/mcp-repl-landlock-session");
@@ -6024,6 +6634,7 @@ mod tests {
                 network_access: false,
             },
             &session_temp_dir,
+            None,
         );
 
         let writable_roots =
@@ -6202,7 +6813,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_bwrap_missing_protected_metadata_uses_namespace_dir_and_read_only_empty_bind() {
+    fn linux_bwrap_missing_protected_metadata_under_writable_root_is_synthesized() {
         let root = Builder::new()
             .prefix("mcp-repl-bwrap-protected-metadata-")
             .tempdir()
@@ -6234,59 +6845,139 @@ mod tests {
             linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
                 .expect("missing protected metadata should build bwrap args");
         let codex_text = linux_path_to_string(&codex_path);
-        let dir_index = command
-            .args
-            .windows(2)
-            .position(|args| args[0] == "--dir" && args[1] == codex_text)
-            .expect("missing protected metadata should create its mount target inside bwrap");
-        let bind_index = command
-            .args
-            .windows(3)
-            .position(|args| args[0] == "--ro-bind" && args[2] == codex_text)
-            .expect("missing protected metadata should use a read-only empty directory bind");
-        assert!(
-            dir_index < bind_index,
-            "protected metadata mount target must exist before the bind: {:?}",
-            command.args
-        );
-        let bind_args = command
-            .args
-            .windows(3)
-            .find(|args| args[0] == "--ro-bind" && args[2] == codex_text)
-            .expect("missing protected metadata should use a read-only empty directory bind");
-        let source_path = PathBuf::from(&bind_args[1]);
 
         assert!(
-            !codex_path.exists(),
-            "missing protected metadata target should be created inside bwrap, not on the host"
+            command
+                .args
+                .windows(2)
+                .any(|args| args[0] == "--dir" && args[1] == codex_text),
+            "missing protected metadata should create a bwrap mount target: {:?}",
+            command.args
         );
         assert!(
             command
-                .preserved_tempdirs
-                .iter()
-                .any(|tempdir| tempdir.path() == source_path),
-            "directory bind should reference a preserved empty source directory"
+                .args
+                .windows(3)
+                .any(|args| args[0] == "--ro-bind" && args[2] == codex_text),
+            "missing protected metadata should bind over the synthetic target: {:?}",
+            command.args
+        );
+        assert!(
+            command
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(
+                    codex_path.clone()
+                )),
+            "missing protected metadata should require host cleanup: {:?}",
+            command.synthetic_mount_targets
+        );
+        assert!(
+            !codex_path.exists(),
+            "missing protected metadata target should not be created on the host"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_deny_path_under_writable_root_fails_closed() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-missing-deny-")
+            .tempdir()
+            .expect("tempdir");
+        for protected_name in PROTECTED_METADATA_SUBPATHS {
+            std::fs::create_dir(root.path().join(protected_name)).expect("metadata dir");
+        }
+        let denied_path = root.path().join("secret.txt");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: root.path().to_path_buf(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: denied_path.clone(),
+                },
+                access: FileSystemAccessMode::Deny,
+            },
+        ]);
+
+        let err = match linux_bwrap_filesystem_args(
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+        ) {
+            Ok(_) => panic!("missing deny path under writable root should fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("cannot enforce sandbox deny-read path")
+                && err.contains("does not exist under a writable root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !denied_path.exists(),
+            "rejected missing deny target should not be created on the host"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_missing_writable_root_is_not_cleanup_owned() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-missing-writable-root-")
+            .tempdir()
+            .expect("tempdir");
+        let writable_parent = root.path().join("generated");
+        let writable_root = writable_parent.join("output");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root,
+                },
+                access: FileSystemAccessMode::Read,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: writable_root.clone(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, root.path(), &session_temp_dir)
+                .expect("missing writable root should build bwrap args");
+
+        assert!(
+            writable_root.is_dir(),
+            "missing declared writable root should be materialized"
         );
         assert!(
             !command
-                .args
-                .windows(2)
-                .any(|args| args[0] == "--remount-ro" && args[1] == codex_text),
-            "missing protected metadata should not require tmpfs remount-ro: {:?}",
-            command.args
-        );
-        let protected_target = LinuxSyntheticMountTarget::EmptyDirectory(codex_path.clone());
-        assert!(
-            command.synthetic_mount_targets.contains(&protected_target),
-            "missing protected metadata target should be cleaned up after bwrap exits: {:?}",
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(
+                    writable_root.clone()
+                )),
+            "declared writable root should not be removed by synthetic cleanup: {:?}",
             command.synthetic_mount_targets
         );
         assert!(
             command
-                .preserved_tempdirs
-                .iter()
-                .all(|tempdir| !tempdir.path().starts_with(root.path())),
-            "empty bind sources must stay outside sandbox writable roots"
+                .synthetic_mount_targets
+                .contains(&LinuxSyntheticMountTarget::EmptyDirectory(writable_parent)),
+            "parent directories synthesized only for bwrap mounting may be cleanup-owned: {:?}",
+            command.synthetic_mount_targets
         );
     }
 
@@ -6412,6 +7103,7 @@ mod tests {
                 network_access: false,
             },
             &session_temp_dir,
+            None,
         );
 
         let command =
@@ -6425,6 +7117,41 @@ mod tests {
                 .windows(3)
                 .any(|args| args[0] == "--ro-bind" && args[2] == git_text),
             "read-only session temp metadata should use private synthetic binds: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_managed_network_socket_dir_is_read_only() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-managed-network-")
+            .tempdir()
+            .expect("tempdir");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session_temp_dir = root.path().join("session");
+        let socket_dir =
+            session_temp_dir.join(crate::managed_network::LINUX_MANAGED_NETWORK_SOCKET_DIR_NAME);
+        std::fs::create_dir_all(&socket_dir).expect("managed network socket dir");
+        let file_system_policy = linux_effective_file_system_policy(
+            &SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            &session_temp_dir,
+            Some(&socket_dir),
+        );
+
+        let command =
+            linux_bwrap_filesystem_args(&file_system_policy, &workspace, &session_temp_dir)
+                .expect("managed network bwrap profile should build");
+        let socket_dir_text = linux_path_to_string(&socket_dir);
+
+        assert!(
+            command.args.windows(3).any(|args| args[0] == "--ro-bind"
+                && args[1] == socket_dir_text
+                && args[2] == socket_dir_text),
+            "managed network relay socket directory should be read-only in bwrap: {:?}",
             command.args
         );
     }
@@ -6466,6 +7193,81 @@ mod tests {
             !command.args.iter().any(|arg| arg == "--argv0"),
             "bwrap args should work with Ubuntu 22.04 bubblewrap 0.6.1: {:?}",
             command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_bwrap_no_proc_does_not_unshare_pid_namespace() {
+        let root = Builder::new()
+            .prefix("mcp-repl-bwrap-no-proc-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        let file_system_policy = FileSystemSandboxPolicy::workspace_write(&[], false, false);
+
+        let command = create_linux_bwrap_command_args(
+            vec!["/bin/true".to_string()],
+            &file_system_policy,
+            root.path(),
+            &session_temp_dir,
+            false,
+            LinuxBwrapNetworkMode::FullAccess,
+        )
+        .expect("no-proc bwrap command should build");
+
+        assert!(
+            !command.args.iter().any(|arg| arg == "--unshare-pid"),
+            "no-proc bwrap should not create a PID namespace with the host /proc view: {:?}",
+            command.args
+        );
+        assert!(
+            !command.args.iter().any(|arg| arg == "--proc"),
+            "test setup should build no-proc bwrap args: {:?}",
+            command.args
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_inner_bwrap_command_invokes_helper_argv0_path() {
+        let root = Builder::new()
+            .prefix("mcp-repl-inner-helper-")
+            .tempdir()
+            .expect("tempdir");
+        let session_temp_dir = root.path().join("session");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+        let args = LinuxSandboxArgs {
+            sandbox_policy_cwd: root.path().to_path_buf(),
+            session_temp_dir: session_temp_dir.clone(),
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            command: vec![std::ffi::OsString::from("/bin/true")],
+            use_bwrap_sandbox: true,
+            apply_seccomp_then_exec: false,
+            no_proc: false,
+            managed_network_bridge: None,
+        };
+
+        let inner = linux_build_inner_seccomp_command(&args).expect("inner seccomp command");
+
+        assert_eq!(
+            Path::new(&inner.command[0]).file_name(),
+            Some(std::ffi::OsStr::new("codex-linux-sandbox")),
+            "inner bwrap command must dispatch through the helper argv0 path"
+        );
+        assert!(
+            Path::new(&inner.command[0]).starts_with(&session_temp_dir),
+            "helper argv0 path should live in the bwrap-visible session temp dir: {:?}",
+            inner.command
+        );
+        assert!(
+            Path::new(&inner.command[0]).is_symlink(),
+            "helper argv0 path should be a link to the current executable"
         );
     }
 
@@ -6800,7 +7602,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(update.use_legacy_landlock, Some(false));
         #[cfg(target_os = "linux")]
-        assert!(update.use_linux_sandbox_bwrap.is_none());
+        assert_eq!(update.use_linux_sandbox_bwrap, Some(true));
         #[cfg(not(target_os = "linux"))]
         assert!(update.use_linux_sandbox_bwrap.is_none());
     }
@@ -6829,11 +7631,20 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn codex_sandbox_state_meta_non_legacy_preserves_disabled_linux_bwrap() {
+    fn codex_sandbox_state_meta_non_legacy_reenables_linux_bwrap_after_legacy() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-cwd");
         let sandbox_cwd_uri = url::Url::from_file_path(&sandbox_cwd)
             .expect("absolute sandbox cwd should convert to file URI")
             .to_string();
+        let legacy_update = sandbox_state_update_from_codex_meta(&json!({
+            "permissionProfile": {
+                "type": "disabled"
+            },
+            "sandboxCwd": sandbox_cwd_uri,
+            "useLegacyLandlock": true,
+            "codexLinuxSandboxExe": serde_json::Value::Null,
+        }))
+        .expect("legacy Codex sandbox metadata");
         let non_legacy_update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
                 "type": "disabled"
@@ -6844,15 +7655,21 @@ mod tests {
         }))
         .expect("non-legacy Codex sandbox metadata");
         let mut state = SandboxState {
-            use_linux_sandbox_bwrap: false,
+            use_linux_sandbox_bwrap: true,
             ..SandboxState::default()
         };
+
+        state.apply_update(legacy_update);
+        assert!(
+            !state.use_linux_sandbox_bwrap,
+            "legacy Codex metadata should disable Linux bwrap"
+        );
 
         state.apply_update(non_legacy_update);
 
         assert!(
-            !state.use_linux_sandbox_bwrap,
-            "non-legacy Codex metadata should not override an explicitly disabled Linux bwrap default"
+            state.use_linux_sandbox_bwrap,
+            "non-legacy Codex metadata should re-enable Linux bwrap after legacy metadata clears"
         );
     }
 
@@ -7052,7 +7869,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn codex_permission_profile_meta_accepts_minimal_read_policy() {
+    fn codex_permission_profile_minimal_read_includes_seatbelt_platform_defaults() {
         let sandbox_cwd = std::env::temp_dir().join("mcp-repl-codex-meta-minimal-read");
         let update = sandbox_state_update_from_codex_meta(&json!({
             "permissionProfile": {
@@ -7087,6 +7904,26 @@ mod tests {
         assert!(
             !update.sandbox_policy.has_full_disk_read_access(),
             "minimal read policy must not be flattened to full read access"
+        );
+
+        let state = SandboxState {
+            sandbox_policy: update.sandbox_policy,
+            sandbox_cwd: update.sandbox_cwd.expect("sandbox cwd"),
+            ..SandboxState::default()
+        };
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("seatbelt command should prepare");
+        let policy = prepared
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-p")
+            .map(|pair| pair[1].as_str())
+            .expect("seatbelt policy argument");
+
+        assert!(
+            policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
+            "expected minimal profile seatbelt policy to include platform defaults: {policy}"
         );
     }
 
@@ -7181,7 +8018,7 @@ mod tests {
 
         assert!(
             policy.contains(MACOS_RESTRICTED_READ_ONLY_PLATFORM_DEFAULTS),
-            "expected restricted profile seatbelt policy to include platform defaults: {policy}"
+            "expected project-root read profile to include platform defaults: {policy}"
         );
     }
 

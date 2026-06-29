@@ -2,9 +2,9 @@
 
 ## Summary
 
-- Add a macOS-first managed network proxy for workers.
+- Add a managed network proxy for sandboxed workers.
 - Keep existing full-network sandbox behavior unchanged when no managed domain rules are configured.
-- Keep Linux as an explicit follow-up phase with clear unsupported errors for managed domain enforcement.
+- Support Linux managed-domain enforcement on the bubblewrap sandbox path.
 - Windows uses a setup-backed offline account plus account-scoped firewall rules
   and loopback WFP filters to route managed-domain traffic through the
   server-owned proxy.
@@ -12,18 +12,23 @@
 ## Status
 
 - State: active
-- Last updated: 2026-06-19
-- Current phase: Linux planning after Windows enforcement
+- Last updated: 2026-06-28
+- Current phase: follow-up scoping after Linux enforcement
 
 ## Current Direction
 
 - Use a server-owned HTTP/SOCKS proxy, proxy environment variables injected into the worker, and macOS Seatbelt egress limited to the proxy's loopback ports.
+- On Linux, use bubblewrap `--unshare-net`, namespace-local bridge listeners on
+  `127.0.0.1:39080` and `127.0.0.1:39081`, and Unix relay sockets under the
+  session temp directory to connect those bridge listeners back to the
+  server-owned proxy.
 - Use host/domain matching only for this slice. Exact URL/path filtering is out of scope because normal HTTPS proxying exposes only the `CONNECT host:port` target unless a MITM certificate flow is added.
 - Keep the code small and local to `mcp-repl`: use a simple proxy runtime tailored to package-install workflows.
 
 ## Long-Term Direction
 
-- Linux should route worker traffic through a server-owned proxy from inside the Linux sandbox without allowing direct egress.
+- Linux routes worker traffic through a server-owned proxy from inside the
+  bubblewrap network namespace without allowing direct worker egress.
 - Windows uses the same policy surface after `mcp-repl windows-sandbox setup`
   installs the offline account, firewall rules, and loopback WFP filters.
 - A future UI or approval flow can amend allow/deny rules, but this phase only supports static CLI/config rules.
@@ -36,7 +41,7 @@
 
 - Phase 0: completed - chose the managed proxy shape and enforcement boundary.
 - Phase 1: completed - implemented macOS managed proxy and public tests.
-- Phase 2: pending - Linux enforcement.
+- Phase 2: completed - Linux bwrap-backed managed-domain enforcement.
 - Phase 3: completed - Windows enforcement.
 
 ## Locked Decisions
@@ -49,13 +54,14 @@
 - Supported patterns are exact hosts, `*.example.com`, and `**.example.com`.
 - Exact URLs are rejected instead of being silently reduced to hosts.
 - Proxy-aware tools are the transparency target; tools that ignore proxy env vars fail closed.
+- Linux managed-domain enforcement requires bubblewrap. Legacy Landlock remains
+  available only for non-managed-domain Linux sandbox modes.
 - `mcp-repl` itself cannot request a permission escalation from an MCP client UI.
   User-approved network changes must happen through external client config,
   CLI args, project-local config, or a later non-MCP approval surface.
 
 ## Open Questions
 
-- Which Linux routing mechanism should become the long-term implementation: the existing internal sandbox helper, a socket bridge, or a separate network namespace path.
 - Whether a future HTTPS MITM mode is worth the certificate-management surface for URL/path-level filtering.
 - Whether a GET-only web policy is useful enough to justify TLS visibility work,
   or whether package mirrors and host/port restrictions cover the practical
@@ -64,9 +70,13 @@
 
 ## Next Safe Slice
 
-- Design the Linux routing path for managed domain enforcement.
-- Keep the same public policy surface: exact hosts, `*.example.com`, and `**.example.com`.
-- Preserve fail-closed behavior when domain rules are configured but a platform cannot enforce them.
+- Pick one follow-up from `docs/futurework/managed-network-follow-up.md`, such
+  as TLS SNI gating for `CONNECT`, explicit database TCP allowlists, local
+  Shiny/local-service bind support, or split local connect/bind controls.
+- Keep the same public policy surface until a follow-up explicitly justifies a
+  new rule shape.
+- Preserve fail-closed behavior when domain rules are configured but the active
+  sandbox mode cannot enforce them.
 
 ## Stop Conditions
 
@@ -81,3 +91,8 @@
 - 2026-04-30: Implemented the macOS slice with a small in-process HTTP/SOCKS proxy in `src/managed_network.rs`, CLI/config validation for host patterns, and worker launch wiring that injects proxy env vars before Seatbelt policy rendering.
 - 2026-05-01: Documented managed-network follow-up scenarios and tradeoffs for package, database, Shiny, local-service, and hardening workflows.
 - 2026-06-19: Implemented the Windows slice with explicit elevated setup, DPAPI-protected offline account credentials, fixed proxy ports, firewall rules scoped to the offline account SID, loopback WFP filters for direct local socket blocking, and offline-wrapper launch for workspace-write no-network or managed-domain sandbox policies.
+- 2026-06-28: Implemented the Linux slice on the bubblewrap path. The worker
+  runs in an isolated network namespace, bridge children listen on
+  namespace-local fixed proxy ports, Unix relay sockets under session temp
+  connect those bridge listeners to the server-owned proxy, and bwrap fallback
+  is disabled for managed-domain launches.

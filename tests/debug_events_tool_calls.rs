@@ -17,7 +17,7 @@ async fn debug_events_include_tool_call_arguments_and_results() -> TestResult<()
 
     let _ = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
     let _ = session
-        .call_tool_raw("repl_reset", serde_json::json!({}))
+        .write_stdin_raw_unterminated_with("\u{4}", Some(5.0))
         .await?;
     session.cancel().await?;
 
@@ -58,24 +58,24 @@ async fn debug_events_include_tool_call_arguments_and_results() -> TestResult<()
         "expected repl tool_call_end with serialized result"
     );
 
-    let saw_reset_begin = events.iter().any(|entry| {
+    let saw_ctrl_d_begin = events.iter().any(|entry| {
         entry["event"] == "tool_call_begin"
-            && entry["payload"]["tool"] == "repl_reset"
-            && entry["payload"]["arguments"].is_object()
+            && entry["payload"]["tool"] == "repl"
+            && entry["payload"]["arguments"]["input"] == "\u{4}"
     });
     assert!(
-        saw_reset_begin,
-        "expected repl_reset tool_call_begin with arguments object"
+        saw_ctrl_d_begin,
+        "expected Ctrl-D repl tool_call_begin with arguments"
     );
 
-    let saw_reset_end = events.iter().any(|entry| {
+    let saw_ctrl_d_end = events.iter().any(|entry| {
         entry["event"] == "tool_call_end"
-            && entry["payload"]["tool"] == "repl_reset"
+            && entry["payload"]["tool"] == "repl"
             && entry["payload"]["result"].is_object()
     });
     assert!(
-        saw_reset_end,
-        "expected repl_reset tool_call_end with serialized result"
+        saw_ctrl_d_end,
+        "expected Ctrl-D repl tool_call_end with serialized result"
     );
 
     Ok(())

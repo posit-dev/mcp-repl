@@ -153,3 +153,331 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_while_busy_not_reading_stdin_returns_promptly() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let _ = session
+        .write_stdin_raw_with("x <- 1; Sys.sleep(30)", Some(0.1))
+        .await?;
+
+    let start = Instant::now();
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(3.0))
+        .await?;
+    let elapsed = start.elapsed();
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("prompt restart test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart notice, got: {restart_text:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "expected busy restart to return promptly, elapsed={elapsed:?}, got: {restart_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_restart_preserves_output_captured_during_shutdown() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let input = r#"
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
+for (i in 1:80) cat(sprintf("RESTART_LINE_%03d\n", i))
+flush.console()
+Sys.sleep(1.0)
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("pager restart test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+    assert!(
+        !timeout_text.contains("RESTART_LINE_"),
+        "did not expect restart-only output before Ctrl-D requests shutdown, got: {timeout_text:?}"
+    );
+
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(0.8))
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("pager restart test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart notice, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("RESTART_LINE_"),
+        "expected restart reply to include pager output captured during shutdown, got: {restart_text:?}"
+    );
+
+    let next = session
+        .write_stdin_raw_unterminated_with("", Some(2.0))
+        .await?;
+    let next_text = result_text(&next);
+    session.cancel().await?;
+
+    assert!(
+        next_text.contains("RESTART_LINE_"),
+        "expected follow-up poll to continue paging shutdown output captured during restart, got: {next_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_d_restart_clears_active_pager_when_reply_has_no_overflow() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:80) cat(sprintf(\"STALE_PAGER_%03d\\n\", i))",
+            Some(30.0),
+        )
+        .await?;
+    let initial = common::wait_until_not_busy(
+        &mut session,
+        initial,
+        Duration::from_millis(100),
+        Duration::from_secs(60),
+    )
+    .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager reset test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("STALE_PAGER_"),
+        "expected initial reply to include stale-marker output, got: {initial_text:?}"
+    );
+    assert!(
+        initial_text.contains("--More--"),
+        "expected initial reply to activate pager, got: {initial_text:?}"
+    );
+
+    let reset = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(5.0))
+        .await?;
+    let reset_text = result_text(&reset);
+    if backend_unavailable(&reset_text) {
+        eprintln!("pager reset test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        reset_text.contains("new session started"),
+        "expected reset notice, got: {reset_text:?}"
+    );
+    assert!(
+        !reset_text.contains("STALE_PAGER_"),
+        "did not expect stale pager output in reset reply, got: {reset_text:?}"
+    );
+
+    let next = session.write_stdin_raw_with(":next", Some(5.0)).await?;
+    let next_text = result_text(&next);
+    session.cancel().await?;
+
+    assert!(
+        !next_text.contains("STALE_PAGER_"),
+        "did not expect stale pager output after reset, got: {next_text:?}"
+    );
+    assert!(
+        !next_text.contains("--More--"),
+        "did not expect :next to keep controlling a pre-reset pager, got: {next_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_while_busy_returns_output_captured_during_shutdown() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let input = r#"
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
+cat("DURING_RESTART\n")
+flush.console()
+Sys.sleep(1.0)
+cat("TOO_LATE\n")
+flush.console()
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!(
+            "restart graceful shutdown test backend unavailable in this environment; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+    assert!(
+        !timeout_text.contains("DURING_RESTART"),
+        "did not expect restart-only output before Ctrl-D requests shutdown, got: {timeout_text:?}"
+    );
+
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(0.8))
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!(
+            "restart graceful shutdown test backend unavailable in this environment; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("DURING_RESTART"),
+        "expected restart to return output captured during shutdown, got: {restart_text:?}"
+    );
+    assert!(
+        !restart_text.contains("TOO_LATE"),
+        "did not expect restart to include later old-session output, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart notice, got: {restart_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_tail_includes_output_captured_during_shutdown() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let input = r#"
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
+cat("DURING_RESTART\n")
+flush.console()
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("restart tail response test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+
+    let restart = session
+        .write_stdin_raw_unterminated_with("\u{4}cat(\"TAIL_DONE\\n\"); flush.console()", Some(5.0))
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("restart tail response test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("DURING_RESTART"),
+        "expected Ctrl-D tail to include old-worker shutdown output captured during shutdown, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart reply to include the fresh-session notice, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("TAIL_DONE"),
+        "expected Ctrl-D tail output in the same response, got: {restart_text:?}"
+    );
+    assert!(
+        !restart_text.contains("<<repl status: busy"),
+        "did not expect the completed Ctrl-D tail to require a follow-up poll, got: {restart_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_tail_uses_remaining_timeout_budget() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let session = spawn_manage_session().await?;
+
+    let input = r#"
+cat("WAITING_FOR_RESTART_EOF\n")
+flush.console()
+suppressWarnings(invisible(readLines("stdin", n = 1)))
+cat("DURING_RESTART\n")
+flush.console()
+Sys.sleep(1.0)
+"#;
+    let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
+    let timeout_text = result_text(&timeout);
+    if backend_unavailable(&timeout_text) {
+        eprintln!("restart tail timeout test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        timeout_text.contains("WAITING_FOR_RESTART_EOF"),
+        "expected request to block on stdin before restart, got: {timeout_text:?}"
+    );
+
+    let restart = session
+        .write_stdin_raw_unterminated_with(
+            "\u{4}Sys.sleep(0.45); cat(\"TAIL_DONE\\n\"); flush.console()",
+            Some(0.7),
+        )
+        .await?;
+    let restart_text = result_text(&restart);
+    if backend_unavailable(&restart_text) {
+        eprintln!("restart tail timeout test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    assert!(
+        restart_text.contains("DURING_RESTART"),
+        "expected Ctrl-D tail to include old-worker shutdown output captured during shutdown, got: {restart_text:?}"
+    );
+    assert!(
+        restart_text.contains("<<repl status: busy"),
+        "expected tail input to time out against the original Ctrl-D call budget, got: {restart_text:?}"
+    );
+    assert!(
+        !restart_text.contains("TAIL_DONE"),
+        "did not expect tail input to receive a fresh timeout budget, got: {restart_text:?}"
+    );
+    Ok(())
+}

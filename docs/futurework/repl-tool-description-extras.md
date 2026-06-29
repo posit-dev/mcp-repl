@@ -2,7 +2,7 @@
 
 ## Intent
 
-Keep the default `repl` and `repl_reset` tool descriptions short and schema-focused.
+Keep the default `repl` tool description short and schema-focused.
 
 Preserve the richer high-signal operational guidance from the old long-form tool description in an optional layer (skill or backend-specific extras) so we can bring it back without bloating default tool metadata.
 
@@ -165,10 +165,10 @@ It should be treated as source material for:
 - `\u0004` (Ctrl-D): reset session, then run remaining input in fresh session.
 - Optional separator newline after control prefix is accepted.
 
-### Reset tool semantics
+### Reset semantics
 
-- `repl_reset` is explicit state reset.
-- Prefer `repl_reset` when the intent is session lifecycle control rather than payload execution.
+- `\u0004` through `repl` is explicit state reset.
+- Prefer a bare `\u0004` when the intent is session lifecycle control rather than payload execution.
 
 ### Session exit and crashes
 

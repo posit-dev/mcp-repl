@@ -12,8 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{Builder, TempDir, tempdir};
 
 const SANDBOX_STATE_META_CAPABILITY: &str = "codex/sandbox-state-meta";
-const MISSING_INHERITED_STATE_MESSAGE: &str =
-    "--sandbox inherit requested but no client sandbox state was provided";
+const MISSING_INHERITED_STATE_MESSAGE: &str = "requires Codex per-tool-call sandbox metadata";
 const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
@@ -188,6 +187,15 @@ fn workspace_write_meta(sandbox_cwd: &Path) -> Value {
         workspace_write_profile(),
         sandbox_cwd,
         /*use_legacy_landlock*/ false,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_workspace_write_meta(sandbox_cwd: &Path) -> Value {
+    codex_sandbox_state_meta(
+        workspace_write_profile(),
+        sandbox_cwd,
+        /*use_legacy_landlock*/ true,
     )
 }
 
@@ -477,6 +485,22 @@ fn encode_path(path: &Path) -> TestResult<String> {
     Ok(serde_json::to_string(&path.to_string_lossy().to_string())?)
 }
 
+async fn wait_for_path_then_remove(path: &Path, label: &str) -> TestResult<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!("timed out waiting for {label}: {}", path.display()).into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 fn bundle_transcript_path(text: &str) -> Option<std::path::PathBuf> {
     disclosed_path(text, "transcript.txt")
 }
@@ -558,9 +582,33 @@ fn backend_unavailable(text: &str) -> bool {
     common::backend_unavailable(text)
 }
 
+fn skip_sandbox_state_meta_unavailable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if common::sandbox_exec_available() {
+            return false;
+        }
+        eprintln!("sandbox_state_meta sandbox unavailable in this environment; skipping");
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 async fn spawn_inherit_server(cwd: &Path) -> TestResult<McpTestSession> {
     common::spawn_server_with_args_env_and_cwd(
         vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+    )
+    .await
+}
+
+async fn spawn_inherit_codex_server(cwd: &Path) -> TestResult<McpTestSession> {
+    common::spawn_server_with_args_env_and_cwd(
+        vec!["--sandbox".to_string(), "inherit-codex".to_string()],
         Vec::new(),
         Some(cwd.to_path_buf()),
     )
@@ -945,6 +993,9 @@ fn read_only_meta_policy_type() -> &'static str {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_meta_capability_advertised_with_inherit() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let session =
         common::spawn_server_with_args(vec!["--sandbox".to_string(), "inherit".to_string()])
@@ -968,7 +1019,36 @@ async fn sandbox_state_meta_capability_advertised_with_inherit() -> TestResult<(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_state_meta_capability_advertised_with_inherit_codex() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let session = spawn_inherit_codex_server(temp.path()).await?;
+    let info = session.server_info().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing server info from initialize".to_string(),
+        )
+    })?;
+    let experimental = info.capabilities.experimental.as_ref().ok_or_else(|| {
+        Box::<dyn std::error::Error + Send + Sync>::from(
+            "missing experimental capabilities".to_string(),
+        )
+    })?;
+    assert!(
+        experimental.contains_key(SANDBOX_STATE_META_CAPABILITY),
+        "expected sandbox state meta capability in experimental: {experimental:?}"
+    );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_meta_capability_hidden_without_inherit() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let session = common::spawn_server().await?;
     let info = session.server_info().ok_or_else(|| {
@@ -983,7 +1063,7 @@ async fn sandbox_state_meta_capability_hidden_without_inherit() -> TestResult<()
         .is_some_and(|experimental| experimental.contains_key(SANDBOX_STATE_META_CAPABILITY));
     assert!(
         !advertised,
-        "did not expect sandbox state meta capability without `--sandbox inherit`: {info:?}"
+        "did not expect sandbox state meta capability without `--sandbox inherit-codex`: {info:?}"
     );
     session.cancel().await?;
     Ok(())
@@ -992,6 +1072,9 @@ async fn sandbox_state_meta_capability_hidden_without_inherit() -> TestResult<()
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_state_meta_capability_hidden_after_later_workspace_write_override()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-inherit-override-workspace-write")?;
     let session = spawn_inherit_then_workspace_write_server(scratch.path()).await?;
@@ -1030,6 +1113,9 @@ async fn sandbox_state_meta_capability_hidden_after_later_workspace_write_overri
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_without_state_meta_fails_on_first_tool_call() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -1041,7 +1127,7 @@ async fn sandbox_inherit_without_state_meta_fails_on_first_tool_call() -> TestRe
         return Ok(());
     }
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "expected missing sandbox-state-meta error, got: {text}"
     );
     assert_eq!(
@@ -1065,6 +1151,9 @@ async fn sandbox_inherit_without_state_meta_fails_on_first_tool_call() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_with_malformed_state_meta_fails_on_first_tool_call() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -1105,6 +1194,9 @@ async fn sandbox_inherit_with_malformed_state_meta_fails_on_first_tool_call() ->
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -1122,7 +1214,7 @@ async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestR
         "expected empty inherit repl call with metadata to return idle status, got: {text}"
     );
     assert!(
-        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        !text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "did not expect empty inherit repl call with metadata to fail closed, got: {text}"
     );
     session.cancel().await?;
@@ -1130,21 +1222,24 @@ async fn sandbox_inherit_empty_repl_uses_state_meta_when_spawn_needed() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_empty_repl_after_reset_uses_staged_state_meta() -> TestResult<()> {
+async fn sandbox_inherit_empty_repl_after_ctrl_d_uses_staged_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
     let reset = session
-        .call_tool_raw_with_meta(
-            "repl_reset",
-            json!({}),
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
             Some(workspace_write_meta(temp.path())),
         )
         .await?;
     let reset_text = collect_text(&reset);
     assert!(
         reset_text.contains("new session started"),
-        "expected repl_reset with sandbox metadata to succeed, got: {reset_text}"
+        "expected Ctrl-D with sandbox metadata to succeed, got: {reset_text}"
     );
 
     let result = session
@@ -1172,6 +1267,9 @@ async fn sandbox_inherit_empty_repl_after_reset_uses_staged_state_meta() -> Test
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_poll_with_existing_worker_ignores_bad_state_meta() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -1213,6 +1311,9 @@ async fn sandbox_inherit_empty_poll_with_existing_worker_ignores_bad_state_meta(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_repl_without_state_meta_sets_is_error() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -1239,6 +1340,9 @@ async fn sandbox_inherit_empty_repl_without_state_meta_sets_is_error() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -1282,6 +1386,9 @@ async fn sandbox_inherit_interrupt_follow_up_ignores_local_meta_errors() -> Test
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_bare_interrupt_ignores_missing_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -1328,6 +1435,9 @@ async fn sandbox_inherit_pending_bare_interrupt_ignores_missing_state_meta() -> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -1392,6 +1502,9 @@ async fn sandbox_inherit_metadata_error_preserves_hidden_timeout_bundle() -> Tes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_pager_server(temp.path(), 120).await?;
@@ -1437,6 +1550,9 @@ async fn sandbox_inherit_active_pager_command_ignores_missing_state_meta() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_active_pager_command_ignores_state_meta_changes() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_pager_server(temp.path(), 120).await?;
@@ -1486,6 +1602,9 @@ async fn sandbox_inherit_active_pager_command_ignores_state_meta_changes() -> Te
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_session_ended_pager_command_ignores_state_meta_changes() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-ended-pager-local-state-meta")?;
     let debug_dir = scratch.path().join("debug");
@@ -1542,6 +1661,9 @@ async fn sandbox_inherit_session_ended_pager_command_ignores_state_meta_changes(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_pager_command_ignores_missing_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_pager_server(temp.path(), 120).await?;
@@ -1599,6 +1721,9 @@ async fn sandbox_inherit_pending_pager_command_ignores_missing_state_meta() -> T
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_active_pager_empty_input_ignores_missing_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_pager_server(temp.path(), 120).await?;
@@ -1643,6 +1768,9 @@ async fn sandbox_inherit_active_pager_empty_input_ignores_missing_state_meta() -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_fails_closed() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -1721,6 +1849,9 @@ async fn sandbox_inherit_pending_interrupt_tail_with_bad_meta_fails_closed() -> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_restart_tail_with_bad_meta_fails_closed() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -1796,6 +1927,9 @@ async fn sandbox_inherit_pending_restart_tail_with_bad_meta_fails_closed() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_interrupt_tail_restarts_on_state_change() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -1841,6 +1975,9 @@ async fn sandbox_inherit_pending_interrupt_tail_restarts_on_state_change() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_follow_up_restarts_on_new_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -1897,6 +2034,9 @@ async fn sandbox_inherit_pending_follow_up_restarts_on_new_state_meta() -> TestR
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_busy_follow_up_stages_current_meta_before_session_end_reset()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -1950,6 +2090,9 @@ async fn sandbox_inherit_busy_follow_up_stages_current_meta_before_session_end_r
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_empty_poll_ignores_new_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -1982,6 +2125,9 @@ async fn sandbox_inherit_pending_empty_poll_ignores_new_state_meta() -> TestResu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_empty_poll_ignores_missing_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -2023,6 +2169,9 @@ async fn sandbox_inherit_pending_empty_poll_ignores_missing_state_meta() -> Test
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_poll_session_end_respawn_uses_current_state_meta() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-empty-poll-session-end-respawn")?;
     let home_dir = home_scratch_dir("sandbox-empty-poll-session-end-respawn-home")?;
@@ -2051,7 +2200,7 @@ async fn sandbox_inherit_empty_poll_session_end_respawn_uses_current_state_meta(
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let drained = session
@@ -2083,6 +2232,9 @@ async fn sandbox_inherit_empty_poll_session_end_respawn_uses_current_state_meta(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_poll_respawn_retires_disclosed_timeout_bundle() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-empty-poll-retires-timeout-bundle")?;
     let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
@@ -2179,6 +2331,9 @@ async fn sandbox_inherit_empty_poll_respawn_retires_disclosed_timeout_bundle() -
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_poll_session_end_without_state_meta_does_not_respawn_stale_worker()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-empty-poll-session-end-missing-meta")?;
     let home_dir = home_scratch_dir("sandbox-empty-poll-session-end-missing-meta-home")?;
@@ -2207,7 +2362,7 @@ async fn sandbox_inherit_empty_poll_session_end_without_state_meta_does_not_resp
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let drained = session.write_stdin_raw_with("", Some(2.0)).await?;
@@ -2252,6 +2407,9 @@ async fn sandbox_inherit_empty_poll_session_end_without_state_meta_does_not_resp
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_bare_interrupt_after_session_end_uses_current_state_meta() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-bare-interrupt-session-end-meta")?;
     let home_dir = home_scratch_dir("sandbox-bare-interrupt-session-end-meta-home")?;
@@ -2280,7 +2438,7 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_uses_current_state_met
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let interrupt = session
@@ -2314,6 +2472,9 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_uses_current_state_met
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_bare_interrupt_after_session_end_without_state_meta_does_not_respawn_stale_worker()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-bare-interrupt-session-end-missing-meta")?;
     let home_dir = home_scratch_dir("sandbox-bare-interrupt-session-end-missing-meta-home")?;
@@ -2342,7 +2503,7 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_without_state_meta_doe
         return Ok(());
     }
 
-    let _ = fs::remove_file(&startup_target);
+    wait_for_path_then_remove(&startup_target, "initial R startup marker").await?;
     tokio::time::sleep(std::time::Duration::from_millis(260)).await;
 
     let interrupt = session
@@ -2378,6 +2539,9 @@ async fn sandbox_inherit_bare_interrupt_after_session_end_without_state_meta_doe
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-timeout-settle-fresh-call")?;
     let target = scratch.path().join("fresh-call-write.txt");
@@ -2419,6 +2583,9 @@ async fn sandbox_inherit_applies_new_state_meta_after_timed_out_request_settles(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_metadata_change_keeps_settled_timeout_output() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-timeout-tail-across-state-change")?;
     let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
@@ -2467,6 +2634,9 @@ async fn sandbox_inherit_metadata_change_keeps_settled_timeout_output() -> TestR
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-timeout-bundle-across-state-change")?;
     let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
@@ -2531,6 +2701,9 @@ async fn sandbox_inherit_metadata_change_keeps_timeout_bundle_output() -> TestRe
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle_output()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-timeout-bundle-across-restart-tail-respawn")?;
     let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
@@ -2594,6 +2767,9 @@ async fn sandbox_inherit_restart_tail_after_sandbox_respawn_keeps_timeout_bundle
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_disclosed_timeout_bundle_is_retired_on_state_change() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-disclosed-timeout-bundle-respawn")?;
     let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
@@ -2672,6 +2848,9 @@ async fn sandbox_inherit_disclosed_timeout_bundle_is_retired_on_state_change() -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_busy_follow_up_never_executes_under_stale_sandbox() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     for delay_ms in [90_u64, 100, 110, 120, 130, 140, 150, 160] {
         let scratch = repo_scratch_dir(&format!("sandbox-busy-recheck-{delay_ms}"))?;
@@ -2719,6 +2898,9 @@ async fn sandbox_inherit_busy_follow_up_never_executes_under_stale_sandbox() -> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_restart_follow_up_applies_current_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-restart-follow-up-state-meta")?;
     let target = scratch.path().join("restart-follow-up-write.txt");
@@ -2765,6 +2947,9 @@ async fn sandbox_inherit_restart_follow_up_applies_current_state_meta() -> TestR
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-bare-restart-after-respawn")?;
     let session = spawn_inherit_files_server(scratch.path(), Vec::new()).await?;
@@ -2781,23 +2966,28 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
         session.cancel().await?;
         return Ok(());
     }
+    tokio::time::sleep(std::time::Duration::from_millis(260)).await;
     let restart = retry_reply_until(
         &session,
         "\u{4}",
         1.0,
         RetryMode::RawUnterminatedWithMeta(read_only_meta(scratch.path())),
         "bare restart after sandbox respawn",
-        |reply| {
-            let text = common::result_text(reply);
-            text.contains("new session started")
-                && text.contains("sandbox policy changed; new session started")
-        },
+        |reply| common::result_text(reply).contains("[repl] new session started"),
     )
     .await?;
     let restart_text = common::result_text(&restart);
     assert!(
-        !restart_text.contains("MID") && !restart_text.contains("TAIL"),
-        "did not expect bare Ctrl-D after sandbox respawn to drain preserved timeout output, got: {restart_text}"
+        !restart_text.contains("sandbox policy changed; new session started"),
+        "did not expect bare Ctrl-D to spawn a replacement worker before restarting, got: {restart_text}"
+    );
+    assert!(
+        restart_text.contains("MID"),
+        "expected bare Ctrl-D after sandbox respawn to return already captured output, got: {restart_text}"
+    );
+    assert!(
+        !restart_text.contains("TAIL"),
+        "did not expect bare Ctrl-D after sandbox respawn to wait for later timeout output, got: {restart_text}"
     );
     assert!(
         !restart_text.contains("<<repl status: idle>>"),
@@ -2828,6 +3018,9 @@ async fn sandbox_inherit_bare_restart_stays_restart_after_sandbox_respawn() -> T
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_respawn()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-pager-bare-restart-after-respawn")?;
     let session = spawn_inherit_pager_server(scratch.path(), 120).await?;
@@ -2868,8 +3061,8 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
         "expected active-pager bare Ctrl-D to emit the explicit restart reply, got: {restart_text}"
     );
     assert!(
-        restart_text.contains("sandbox policy changed; new session started"),
-        "expected active-pager bare Ctrl-D to flush the sandbox-change notice, got: {restart_text}"
+        !restart_text.contains("sandbox policy changed; new session started"),
+        "did not expect active-pager bare Ctrl-D to spawn a replacement worker before restarting, got: {restart_text}"
     );
     assert!(
         !restart_text.contains("line000"),
@@ -2880,6 +3073,9 @@ async fn sandbox_inherit_active_pager_bare_restart_stays_restart_after_sandbox_r
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-workspace-write")?;
     let target = scratch.path().join("allowed.txt");
@@ -2913,6 +3109,9 @@ async fn sandbox_inherit_workspace_write_meta_allows_write_in_cwd() -> TestResul
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_symlinked_workspace_write_meta_allows_write_through_alias()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-symlink-workspace-write")?;
     let real_workspace = scratch.path().join("real-workspace");
@@ -2957,6 +3156,9 @@ async fn sandbox_inherit_symlinked_workspace_write_meta_allows_write_through_ali
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_project_subpath_write_meta_allows_missing_writable_root() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-project-subpath-missing-write")?;
     let writable_subpath = "generated/output";
@@ -2998,10 +3200,49 @@ async fn sandbox_inherit_project_subpath_write_meta_allows_missing_writable_root
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_legacy_landlock_workspace_write_meta_fails_closed_for_metadata_carveouts()
+-> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
+    let _guard = test_guard();
+    let scratch = repo_scratch_dir("sandbox-legacy-landlock-protected")?;
+    for protected_name in [".git", ".agents", ".codex"] {
+        fs::create_dir(scratch.path().join(protected_name))?;
+    }
+    let target = scratch.path().join(".git/deny.txt");
+    let session = spawn_inherit_server(scratch.path()).await?;
+    let result = session
+        .write_stdin_raw_with_meta(
+            write_file_code(&target)?,
+            Some(10.0),
+            Some(legacy_workspace_write_meta(scratch.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("ipc disconnected while waiting for worker_ready"),
+        "expected legacy Landlock workspace-write metadata to fail closed at worker startup, got: {text}"
+    );
+    assert!(
+        !target.exists(),
+        "legacy Landlock failure should happen before worker writes protected metadata {}",
+        target.display()
+    );
+    Ok(())
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_explicit_path_write_meta_blocks_missing_protected_metadata()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-explicit-path-write-protected")?;
     let writable_root = scratch.path().join("explicit-root");
@@ -3050,35 +3291,71 @@ for (protected_name in c(".git", ".agents", ".codex")) {{
         session.cancel().await?;
         return Ok(());
     }
-    assert!(
-        text.contains("ALLOWED_WRITE_OK"),
-        "expected explicit path write root to allow ordinary writes, got: {text}"
-    );
-    assert!(
-        !text.contains("ALLOWED_WRITE_ERROR:"),
-        "explicit path write root unexpectedly blocked ordinary write: {text}"
-    );
-    for protected_name in [".git", ".agents", ".codex"] {
+    #[cfg(target_os = "linux")]
+    {
         assert!(
-            text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
-            "expected explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+            text.contains("ALLOWED_WRITE_OK"),
+            "expected Linux bwrap explicit path write root to allow ordinary writes, got: {text}"
         );
         assert!(
-            !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
-            "explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
+            !text.contains("ALLOWED_WRITE_ERROR:"),
+            "Linux bwrap explicit path write root unexpectedly blocked ordinary write: {text}"
         );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
+                "expected Linux bwrap explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+            );
+            assert!(
+                !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
+                "Linux bwrap explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
+            );
+        }
+        session.cancel().await?;
+        assert!(
+            writable_root.join("allowed.txt").exists(),
+            "ordinary write under explicit root should create the target file"
+        );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                !writable_root.join(protected_name).exists(),
+                "protected metadata write should not create {}",
+                writable_root.join(protected_name).display()
+            );
+        }
     }
-    session.cancel().await?;
-    assert!(
-        writable_root.join("allowed.txt").exists(),
-        "ordinary write under explicit root should create the target file"
-    );
-    for protected_name in [".git", ".agents", ".codex"] {
+    #[cfg(target_os = "macos")]
+    {
         assert!(
-            !writable_root.join(protected_name).exists(),
-            "protected metadata write should not create {}",
-            writable_root.join(protected_name).display()
+            text.contains("ALLOWED_WRITE_OK"),
+            "expected explicit path write root to allow ordinary writes, got: {text}"
         );
+        assert!(
+            !text.contains("ALLOWED_WRITE_ERROR:"),
+            "explicit path write root unexpectedly blocked ordinary write: {text}"
+        );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                text.contains(&format!("PROTECTED_WRITE_ERROR:{protected_name}:")),
+                "expected explicit path write root to block missing protected metadata {protected_name}, got: {text}"
+            );
+            assert!(
+                !text.contains(&format!("PROTECTED_WRITE_OK:{protected_name}")),
+                "explicit path write root unexpectedly allowed protected metadata write {protected_name}: {text}"
+            );
+        }
+        session.cancel().await?;
+        assert!(
+            writable_root.join("allowed.txt").exists(),
+            "ordinary write under explicit root should create the target file"
+        );
+        for protected_name in [".git", ".agents", ".codex"] {
+            assert!(
+                !writable_root.join(protected_name).exists(),
+                "protected metadata write should not create {}",
+                writable_root.join(protected_name).display()
+            );
+        }
     }
     Ok(())
 }
@@ -3087,6 +3364,9 @@ for (protected_name in c(".git", ".agents", ".codex")) {{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_workspace_write_meta_blocks_missing_protected_metadata_alias()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = Builder::new()
         .prefix(".tmp-sandbox-protected-alias-")
@@ -3141,31 +3421,52 @@ tryCatch({{
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert!(
-        text.contains("ALIAS_ALLOWED_WRITE_OK"),
-        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
-    );
-    assert!(
-        !text.contains("ALIAS_ALLOWED_WRITE_ERROR:"),
-        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
-    );
-    assert!(
-        text.contains("ALIAS_PROTECTED_WRITE_ERROR:"),
-        "expected canonical writable-root alias to block missing protected metadata, got: {text}"
-    );
-    assert!(
-        !text.contains("ALIAS_PROTECTED_WRITE_OK"),
-        "canonical writable-root alias unexpectedly allowed protected metadata write: {text}"
-    );
-    assert!(
-        canonical_scratch.join("allowed.txt").exists(),
-        "ordinary write through canonical writable-root alias should create the target file"
-    );
-    assert!(
-        !protected_dir.exists(),
-        "protected metadata write should not create {}",
-        protected_dir.display()
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            (text.contains("cannot enforce sandbox read-only path")
+                && text.contains("does not exist under a writable root"))
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject missing protected metadata alias under writable root, got: {text}"
+        );
+        assert!(
+            !canonical_scratch.join("allowed.txt").exists(),
+            "rejected Linux protected metadata alias policy should not run user code"
+        );
+        assert!(
+            !protected_dir.exists(),
+            "rejected Linux protected metadata alias policy should not create {}",
+            protected_dir.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            text.contains("ALIAS_ALLOWED_WRITE_OK"),
+            "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+        );
+        assert!(
+            !text.contains("ALIAS_ALLOWED_WRITE_ERROR:"),
+            "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+        );
+        assert!(
+            text.contains("ALIAS_PROTECTED_WRITE_ERROR:"),
+            "expected canonical writable-root alias to block missing protected metadata, got: {text}"
+        );
+        assert!(
+            !text.contains("ALIAS_PROTECTED_WRITE_OK"),
+            "canonical writable-root alias unexpectedly allowed protected metadata write: {text}"
+        );
+        assert!(
+            canonical_scratch.join("allowed.txt").exists(),
+            "ordinary write through canonical writable-root alias should create the target file"
+        );
+        assert!(
+            !protected_dir.exists(),
+            "protected metadata write should not create {}",
+            protected_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -3173,6 +3474,9 @@ tryCatch({{
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_glob_deny_meta_allows_write_but_blocks_read_and_unlink_in_cwd()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-glob-deny-write")?;
     let target = scratch.path().join("secret.env");
@@ -3258,6 +3562,9 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_literal_glob_deny_meta_blocks_future_create_in_cwd() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-literal-glob-deny-create")?;
     let target = scratch.path().join("future.env");
@@ -3304,8 +3611,10 @@ tryCatch({{
     #[cfg(target_os = "linux")]
     {
         assert!(
-            text.contains("WRITE_ERROR:"),
-            "expected Linux bwrap literal glob-denied future create to fail, got: {text}"
+            (text.contains("cannot enforce sandbox deny-read path")
+                && text.contains("does not exist under a writable root"))
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject literal glob-denied future create, got: {text}"
         );
         assert!(
             !text.contains("WRITE_OK"),
@@ -3324,6 +3633,9 @@ tryCatch({{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_glob_deny_meta_blocks_canonical_tmp_read_and_unlink() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = Builder::new()
         .prefix(".tmp-sandbox-glob-deny-canonical-")
@@ -3403,6 +3715,9 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_directory_glob_deny_meta_blocks_child_read_and_unlink() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-directory-glob-deny")?;
     let secrets_dir = scratch.path().join("secrets");
@@ -3458,6 +3773,9 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_blocks_write_read_and_unlink_in_cwd() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-path-deny-write")?;
     let target = scratch.path().join("secret.txt");
@@ -3523,6 +3841,9 @@ cat("UNLINK_STATUS:", status, "\n", sep = "")
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_blocks_missing_alias_path_creation() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = Builder::new()
         .prefix(".tmp-sandbox-path-deny-alias-")
@@ -3581,37 +3902,61 @@ tryCatch({{
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
         return Ok(());
     }
-    assert!(
-        text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_OK"),
-        "expected canonical writable-root alias to allow ordinary writes, got: {text}"
-    );
-    assert!(
-        !text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:"),
-        "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
-    );
-    assert!(
-        text.contains("PATH_DENY_ALIAS_WRITE_ERROR:"),
-        "expected canonical path-deny alias to block missing denied path creation, got: {text}"
-    );
-    assert!(
-        !text.contains("PATH_DENY_ALIAS_WRITE_OK"),
-        "canonical path-deny alias unexpectedly allowed denied path creation: {text}"
-    );
-    assert!(
-        canonical_scratch.join("allowed.txt").exists(),
-        "ordinary write through canonical writable-root alias should create the target file"
-    );
-    assert!(
-        !canonical_denied_dir.exists(),
-        "path-deny write should not create {}",
-        canonical_denied_dir.display()
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            (text.contains("cannot enforce sandbox deny-read path")
+                && text.contains("does not exist under a writable root"))
+                || text.contains("ipc disconnected while waiting for worker_ready"),
+            "expected Linux bwrap to reject missing path-deny alias under writable root, got: {text}"
+        );
+        assert!(
+            !canonical_scratch.join("allowed.txt").exists(),
+            "rejected Linux path-deny alias policy should not run user code"
+        );
+        assert!(
+            !canonical_denied_dir.exists(),
+            "rejected Linux path-deny alias policy should not create {}",
+            canonical_denied_dir.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_OK"),
+            "expected canonical writable-root alias to allow ordinary writes, got: {text}"
+        );
+        assert!(
+            !text.contains("PATH_DENY_ALIAS_ALLOWED_WRITE_ERROR:"),
+            "canonical writable-root alias unexpectedly blocked ordinary write: {text}"
+        );
+        assert!(
+            text.contains("PATH_DENY_ALIAS_WRITE_ERROR:"),
+            "expected canonical path-deny alias to block missing denied path creation, got: {text}"
+        );
+        assert!(
+            !text.contains("PATH_DENY_ALIAS_WRITE_OK"),
+            "canonical path-deny alias unexpectedly allowed denied path creation: {text}"
+        );
+        assert!(
+            canonical_scratch.join("allowed.txt").exists(),
+            "ordinary write through canonical writable-root alias should create the target file"
+        );
+        assert!(
+            !canonical_denied_dir.exists(),
+            "path-deny write should not create {}",
+            canonical_denied_dir.display()
+        );
+    }
     Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_preserves_more_specific_child_write() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-path-deny-child-write")?;
     let denied_dir = scratch.path().join("private");
@@ -3702,6 +4047,9 @@ tryCatch({{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_path_deny_meta_preserves_alias_child_write() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = Builder::new()
         .prefix(".tmp-sandbox-path-deny-child-alias-")
@@ -3805,6 +4153,9 @@ tryCatch({{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -3839,6 +4190,9 @@ async fn sandbox_inherit_accepts_restricted_read_workspace_write_meta() -> TestR
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_minimal_meta_blocks_slash_tmp_write_without_slash_tmp_entry()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-no-slash-tmp-{nanos}.txt"));
@@ -3896,6 +4250,9 @@ if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_workspace_write_meta_allows_explicit_slash_tmp_write() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let slash_tmp_target = Path::new("/tmp").join(format!("mcp-repl-slash-tmp-{nanos}.txt"));
@@ -3942,6 +4299,9 @@ if (file.exists(slash_tmp_target)) unlink(slash_tmp_target)
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_minimal_path_deny_blocks_platform_default_read() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let denied_root = Path::new("/Library/Preferences");
     let Some(denied_child) = fs::read_dir(denied_root)?
@@ -3993,6 +4353,9 @@ tryCatch({{
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_minimal_path_deny_allows_worker_start() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let denied_child = temp.path().join("secret.txt");
@@ -4042,6 +4405,9 @@ tryCatch({{
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_minimal_meta_allows_python_libomp_shm() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     if !common::python_available() {
         eprintln!("python not available; skipping");
@@ -4091,6 +4457,9 @@ else:
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_minimal_meta_allows_r_startup_and_practical_probes() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4129,6 +4498,9 @@ suppressWarnings({
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4165,6 +4537,9 @@ async fn sandbox_inherit_rejects_restricted_read_only_meta() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4192,6 +4567,9 @@ async fn sandbox_inherit_accepts_full_write_network_restricted_meta() -> TestRes
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_root_write_network_restricted_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4218,6 +4596,9 @@ async fn sandbox_inherit_accepts_root_write_network_restricted_meta() -> TestRes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_accepts_read_only_network_access_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4249,6 +4630,9 @@ async fn sandbox_inherit_accepts_read_only_network_access_meta() -> TestResult<(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_ignores_unknown_special_path_entries() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4283,6 +4667,9 @@ async fn sandbox_inherit_ignores_unknown_special_path_entries() -> TestResult<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_read_only_meta_blocks_write_in_cwd() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-read-only")?;
     let target = scratch.path().join("blocked.txt");
@@ -4315,6 +4702,9 @@ async fn sandbox_inherit_read_only_meta_blocks_write_in_cwd() -> TestResult<()> 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_read_only_meta_blocks_ambient_temp_writes() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let scratch = repo_scratch_dir("sandbox-read-only-temp")?;
     let ambient_tmpdir = tempdir()?;
@@ -4383,6 +4773,9 @@ tryCatch({{
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_full_access_meta_allows_write_outside_cwd() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let target = outside_workspace_target("full-access")?;
@@ -4417,6 +4810,9 @@ async fn sandbox_inherit_full_access_meta_allows_write_outside_cwd() -> TestResu
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tail_files()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let target = outside_workspace_target("ctrl-c-tail-files")?;
@@ -4478,6 +4874,9 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tail_pager()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let target = outside_workspace_target("ctrl-c-tail-pager")?;
@@ -4538,6 +4937,9 @@ async fn sandbox_inherit_pending_ctrl_c_tail_applies_new_meta_before_running_tai
 
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_workspace_write_mode_ignores_codex_sandbox_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let target = outside_workspace_target("ignored-meta")?;
@@ -4576,6 +4978,9 @@ async fn explicit_workspace_write_mode_ignores_codex_sandbox_state_meta() -> Tes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_restarts_worker_when_state_meta_changes() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4616,6 +5021,9 @@ async fn sandbox_inherit_restarts_worker_when_state_meta_changes() -> TestResult
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_non_legacy_meta_honors_env_disabled_bwrap() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -4659,11 +5067,16 @@ async fn sandbox_inherit_non_legacy_meta_honors_env_disabled_bwrap() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<()> {
+async fn sandbox_inherit_without_state_meta_fails_on_ctrl_d() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
-    let result = session.call_tool_raw("repl_reset", json!({})).await?;
+    let result = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(2.0))
+        .await?;
     let text = collect_text(&result);
     if backend_unavailable(&text) {
         eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
@@ -4671,13 +5084,13 @@ async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<
         return Ok(());
     }
     assert!(
-        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        text.contains(MISSING_INHERITED_STATE_MESSAGE),
         "expected missing sandbox-state-meta error, got: {text}"
     );
     assert_eq!(
         result.is_error,
         Some(true),
-        "expected repl_reset without required metadata to set isError, got: {:?}",
+        "expected Ctrl-D without required metadata to set isError, got: {:?}",
         result.is_error
     );
     session.cancel().await?;
@@ -4685,14 +5098,17 @@ async fn sandbox_inherit_without_state_meta_fails_on_repl_reset() -> TestResult<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_repl_reset_uses_state_meta() -> TestResult<()> {
+async fn sandbox_inherit_ctrl_d_uses_state_meta() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
     let result = session
-        .call_tool_raw_with_meta(
-            "repl_reset",
-            json!({}),
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
             Some(workspace_write_meta(temp.path())),
         )
         .await?;
@@ -4704,56 +5120,17 @@ async fn sandbox_inherit_repl_reset_uses_state_meta() -> TestResult<()> {
     }
     assert!(
         text.contains("new session started"),
-        "expected repl_reset with sandbox metadata to succeed, got: {text}"
+        "expected Ctrl-D with sandbox metadata to succeed, got: {text}"
     );
     session.cancel().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn sandbox_inherit_repl_reset_does_not_spawn_worker_just_to_stage_state() -> TestResult<()> {
-    let _guard = test_guard();
-    let temp = tempdir()?;
-    let debug_dir = temp.path().join("debug");
-    let session = spawn_inherit_server_with_env(
-        temp.path(),
-        vec![(
-            "MCP_REPL_DEBUG_DIR".to_string(),
-            debug_dir.to_string_lossy().to_string(),
-        )],
-    )
-    .await?;
-    let result = session
-        .call_tool_raw_with_meta(
-            "repl_reset",
-            json!({}),
-            Some(workspace_write_meta(temp.path())),
-        )
-        .await?;
-    let text = collect_text(&result);
-    assert!(
-        text.contains("new session started"),
-        "expected repl_reset with sandbox metadata to succeed, got: {text}"
-    );
-    session.cancel().await?;
-
-    let events = latest_debug_events(&debug_dir)?;
-    let saw_restart = events
-        .iter()
-        .any(|entry| entry["event"] == "worker_restart_begin");
-    assert!(saw_restart, "expected repl_reset to emit a restart event");
-    let saw_spawn = events
-        .iter()
-        .any(|entry| entry["event"] == "worker_spawn_begin");
-    assert!(
-        !saw_spawn,
-        "did not expect repl_reset to spawn a worker just to stage sandbox metadata"
-    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_ctrl_d_does_not_spawn_worker_just_to_stage_state() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -4795,7 +5172,62 @@ async fn sandbox_inherit_ctrl_d_does_not_spawn_worker_just_to_stage_state() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_ctrl_d_changed_meta_does_not_spawn_before_restart() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
+    let _guard = test_guard();
+    let temp = tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let session = spawn_inherit_server_with_env(
+        temp.path(),
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+    let first = session
+        .write_stdin_raw_with_meta("1+1", Some(2.0), Some(workspace_write_meta(temp.path())))
+        .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("sandbox_state_meta backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let result = session
+        .write_stdin_raw_unterminated_with_meta(
+            "\u{4}",
+            Some(2.0),
+            Some(read_only_meta(temp.path())),
+        )
+        .await?;
+    let text = collect_text(&result);
+    assert!(
+        text.contains("new session started"),
+        "expected bare Ctrl-D with changed sandbox metadata to restart the session, got: {text}"
+    );
+    session.cancel().await?;
+
+    let events = latest_debug_events(&debug_dir)?;
+    let spawn_count = events
+        .iter()
+        .filter(|entry| entry["event"] == "worker_spawn_begin")
+        .count();
+    assert_eq!(
+        spawn_count, 1,
+        "did not expect bare Ctrl-D to spawn a replacement worker before restarting"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_first_ctrl_d_tail_stages_current_meta_before_restart() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -4832,6 +5264,9 @@ async fn sandbox_inherit_first_ctrl_d_tail_stages_current_meta_before_restart() 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_ctrl_c_tail_stages_current_meta_before_session_end_reset()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -4907,6 +5342,9 @@ async fn sandbox_inherit_pending_ctrl_c_tail_stages_current_meta_before_session_
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_bare_ctrl_c_stages_current_meta_before_session_end_reset()
 -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -4968,6 +5406,9 @@ async fn sandbox_inherit_pending_bare_ctrl_c_stages_current_meta_before_session_
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_pending_bare_ctrl_c_keeps_old_meta_when_worker_survives() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -5046,6 +5487,9 @@ async fn sandbox_inherit_pending_bare_ctrl_c_keeps_old_meta_when_worker_survives
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_poll_stages_current_meta_before_session_end_reset() -> TestResult<()>
 {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -5101,6 +5545,9 @@ async fn sandbox_inherit_empty_poll_stages_current_meta_before_session_end_reset
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_empty_poll_without_meta_defers_session_end_respawn() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_files_server(temp.path(), Vec::new()).await?;
@@ -5164,6 +5611,9 @@ async fn sandbox_inherit_empty_poll_without_meta_defers_session_end_respawn() ->
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_idle_ctrl_d_without_state_meta_does_not_restart() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -5214,6 +5664,9 @@ async fn sandbox_inherit_idle_ctrl_d_without_state_meta_does_not_restart() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_idle_ctrl_d_with_bad_meta_does_not_restart() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;
@@ -5268,6 +5721,9 @@ async fn sandbox_inherit_idle_ctrl_d_with_bad_meta_does_not_restart() -> TestRes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_inherit_idle_ctrl_d_tail_with_bad_meta_does_not_run_tail() -> TestResult<()> {
+    if skip_sandbox_state_meta_unavailable() {
+        return Ok(());
+    }
     let _guard = test_guard();
     let temp = tempdir()?;
     let session = spawn_inherit_server(temp.path()).await?;

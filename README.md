@@ -36,14 +36,14 @@ you or the model reset.
 ### 1. Install
 
 Install from PyPI. The package is named `posit-mcp-repl` and exposes the
-`mcp-repl` executable:
+`mcp-repl` executable, plus a `posit-mcp-repl` alias for `uvx`:
 
 ```sh
 pipx install posit-mcp-repl
 # or
 uv tool install posit-mcp-repl
 # one-off
-uvx --from posit-mcp-repl mcp-repl --help
+uvx posit-mcp-repl --help
 ```
 
 Or install via `cargo` (needs the [Rust toolchain](https://rustup.rs)):
@@ -97,12 +97,14 @@ mcp-repl install --client codex --interpreter r  # limit to one interpreter
 By default this writes entries for both `r` and `python`.
 
 `install --client codex` writes
-`--sandbox inherit --oversized-output files` — `inherit` tells
-`mcp-repl` to take sandbox policy from Codex's per-call metadata (it
-fails closed if the metadata is missing or malformed).
+`--sandbox inherit-codex --oversized-output files` — `inherit-codex` tells
+`mcp-repl` to take sandbox policy from Codex's per-call
+`_meta["codex/sandbox-state-meta"]` metadata (it fails closed if the metadata
+is missing or malformed).
 `install --client claude` writes an explicit `--sandbox workspace-write`
-because Claude doesn't propagate that metadata. Bare `mcp-repl` (no
-install) defaults to `--oversized-output pager`.
+because Claude Code does not provide a way to propagate Codex's per-call
+sandbox metadata to MCP servers. Bare `mcp-repl` (no install) defaults to
+`--oversized-output pager`.
 
 Manual Codex entry:
 
@@ -110,11 +112,13 @@ Manual Codex entry:
 [mcp_servers.r]
 command = "/Users/alice/.cargo/bin/mcp-repl"
 tool_timeout_sec = 1800   # outer guard; mcp-repl handles the primary timeout
-args = ["--sandbox", "inherit", "--oversized-output", "files", "--interpreter", "r"]
+args = ["--sandbox", "inherit-codex", "--oversized-output", "files", "--interpreter", "r"]
 ```
 
 Swap `--interpreter r` for `--interpreter python` (and rename the
 section) for the Python entry.
+Existing Codex configs that use `--sandbox inherit` still work; it is a
+compatibility alias for `inherit-codex`.
 
 Manual Claude entry in `~/.claude.json`:
 
@@ -179,7 +183,6 @@ See `docs/sandbox.md` for precise behavior.
 ## MCP surface
 
 - `repl` → `{ "input": "1+1\n", "timeout_ms": 10000 }`
-- `repl_reset` → `{}`
 
 The exact `repl` tool description depends on the interpreter and
 `--oversized-output` mode. Per-tool guides live in
@@ -188,7 +191,12 @@ The exact `repl` tool description depends on the interpreter and
 ### Session control
 
 - **Interrupt**: prefix `repl` input with `\u0003` (SIGINT, best-effort). Session continues.
-- **Reset**: call `repl_reset`, or prefix input with `\u0004` (Ctrl-D); any remaining input runs in the fresh session. Reset attempts graceful shutdown, escalates to forceful termination, and on Unix falls back to scanning descendant processes if process-group signaling is unavailable.
+- **Reset**: prefix `repl` input with `\u0004` (Ctrl-D / EOF). Reset
+  requests worker shutdown, waits through a bounded graceful shutdown window,
+  escalates to forceful termination when that window expires, then starts a
+  fresh session. The same reply includes old-worker output captured through
+  that window, followed by any remaining input's fresh-session output under the
+  original call timeout.
 - **In-band exits**: `EOF`, `quit()`, etc. also work — output is
   returned and the next request runs in a fresh worker.
 

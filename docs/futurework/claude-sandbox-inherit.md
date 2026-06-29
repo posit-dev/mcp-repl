@@ -39,8 +39,8 @@ Reference: <https://docs.claude.com/en/docs/claude-code/settings>
   instead of preserving stale assumptions about settings shape or permission
   semantics.
 - Decide whether to add a Claude-specific inherit mode, for example
-  `--sandbox inherit-claude`, or to extend `--sandbox inherit` with a documented
-  client source.
+  `--sandbox claude-inherit`, or to add a broader documented client-source
+  selector.
 - Claude inheritance is likely startup/project scoped, not per-tool-call scoped,
   unless Claude later sends sandbox metadata with MCP tool calls.
 - Do not silently broaden permissions. If the Claude settings shape cannot be

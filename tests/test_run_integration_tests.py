@@ -39,6 +39,23 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         self.assertLess(index + 1, len(case.server_args))
         self.assertEqual(case.server_args[index + 1], "python")
 
+    def test_documented_reset_case_name_remains_selectable(self):
+        self.assertIs(
+            self.module.CASES["r-ctrl-d-clears-state"],
+            self.module.CASES["r-reset-clears-state"],
+        )
+
+        args = self.module.parse_args(
+            [
+                "--binary",
+                "target/debug/mcp-repl",
+                "--case",
+                "r-reset-clears-state",
+            ]
+        )
+
+        self.assertEqual(["r-reset-clears-state"], args.case)
+
     def test_python_console_basic_rejects_startup_failure_text(self):
         startup_failure = self.module.tool_result(
             self.module.text(
@@ -210,8 +227,7 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
         interrupted = self.module.tool_result(
             self.module.text("interrupt received\n"),
             self.module.text("\nstderr: \n"),
-            self.module.text("AFTER_INTERRUPT\n"),
-            self.module.text("> "),
+            self.module.text("AFTER_INTERRUPT\n> "),
         )
         test_case = self
         self_module = self.module
@@ -225,8 +241,7 @@ class RunIntegrationTestsCaseTests(unittest.TestCase):
                         30000,
                         self_module.tool_result(
                             self_module.text("[repl] new session started\n"),
-                            self_module.text("[1] FALSE\n"),
-                            self_module.text("> "),
+                            self_module.text("[1] FALSE\n> "),
                         ),
                     ),
                     (None, 1000, initial_busy),

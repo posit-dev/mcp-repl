@@ -5,16 +5,18 @@ Keep this file short. It is a table of contents, not the full manual.
 ## Immediate Rules
 
 - If you modified code, run all required checks before replying:
-  - `cargo check`
-  - `cargo build`
+  - `env RUSTFLAGS=-Dwarnings cargo check`
+  - `env RUSTFLAGS=-Dwarnings cargo build`
   - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
   - `cargo clippy --all-targets --all-features -- -D warnings`
-  - `cargo test --quiet`
+  - `env RUSTFLAGS=-Dwarnings cargo test --quiet`
   - `cargo +nightly fmt`
+  - `env RUSTFLAGS=-Dwarnings cargo build --release --locked`
 - For docs-only changes, run the narrow docs validation that covers the edited
   files, usually `cargo test --test docs_contracts`.
 - When changing Codex backend selection or CI real-client wiring, also run:
   - `MCP_REPL_CODEX_BACKEND=mock cargo test -j 1 --test codex_integration codex_exec_auto_backend_smoke -- --test-threads=1`
+- Rust compiler warnings are errors in local verification and CI.
 - Treat all clippy warnings as failures. Do not leave warning cleanup for later.
 - Never pass `--vanilla` to `R` or `Rscript` unless the user explicitly asks for it.
 
@@ -31,7 +33,7 @@ Keep this file short. It is a table of contents, not the full manual.
 
 ## Glossary
 
-- Agent: The model-facing actor using an MCP client to call `repl` or `repl_reset`.
+- Agent: The model-facing actor using an MCP client to call `repl`.
 - MCP client: Codex, Claude, or another app that starts `mcp-repl` over MCP stdio and sends tool calls.
 - Server: The main `mcp-repl` Rust process in MCP server mode. It owns the MCP surface, worker lifecycle, sandbox application, timeout policy, stdout/stderr capture, sideband interpretation, and response finalization.
 - Worker: The child process spawned by the server to run the selected R or Python REPL. It runs inside the effective sandbox and owns the worker-side endpoint of sideband IPC.
@@ -39,7 +41,7 @@ Keep this file short. It is a table of contents, not the full manual.
 - Backend / interpreter: `backend` is the worker-side implementation that presents a selected REPL runtime to the server and MCP client. `interpreter` is the user-facing selector for that presented runtime, currently `r` or `python`; it does not describe the implementation language of the worker binary.
 - Runtime: The live R or Python execution environment inside the worker. This is where client-submitted code via `repl` is evaluated.
 - REPL session: The stateful runtime in the active worker. One session per worker process instance.
-- Tool call: One MCP client invocation of `repl` or `repl_reset`.
+- Tool call: One MCP client invocation of `repl`.
 - Request: The unit of input accepted by the server for the worker to execute. A request may outlive the initial tool call when it times out and later polls drain output.
 - Reply: The MCP tool result returned to the client. Reply finalization is server-owned and may combine worker-originated content with server-only status notices.
 - Poll: An empty `repl` input used to drain pending output, wait again on a previously timed-out request, return idle status, or advance pager mode.

@@ -249,6 +249,24 @@ async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::M
     spawn_zod_server_with_extra_args(control_log, Vec::new()).await
 }
 
+async fn warm_zod_session(session: &common::McpTestSession) -> TestResult<()> {
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "emit-output-after-input",
+                "timeout_ms": 5_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("after input_line"),
+        "zod worker warm-up did not complete as expected, got: {text:?}"
+    );
+    Ok(())
+}
+
 async fn spawn_zod_startup_ready_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
@@ -323,7 +341,7 @@ async fn spawn_zod_stalled_control_server(
     );
     env.insert(
         "MCP_REPL_ZOD_STALL_CONTROL_READER".to_string(),
-        Value::String("1".to_string()),
+        Value::String("5000".to_string()),
     );
     let spec = json!({
         "executable": zod_worker_path()?,
@@ -950,7 +968,7 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
             "repl",
             json!({
                 "input": "partial-utf8-stderr-then-sleep",
-                "timeout_ms": 50
+                "timeout_ms": 300
             }),
         )
         .await?;
@@ -978,30 +996,63 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
 async fn zod_files_timeout_does_not_wait_for_utf8_tail_grace_after_expiry() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let release_path = tempdir.path().join("release-utf8-tail");
+    let release = release_path
+        .to_str()
+        .ok_or("release path must be valid utf-8")?
+        .to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![("MCP_REPL_ZOD_UTF8_TAIL_RELEASE", release.as_str())],
+        Vec::new(),
+    )
+    .await?;
+    warm_zod_session(&session).await?;
 
-    let started = std::time::Instant::now();
-    let timed_out = session
-        .call_tool_raw(
+    let timed_out = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.call_tool_raw(
             "repl",
             json!({
-                "input": "partial-utf8-then-sleep",
+                "input": "partial-utf8-then-wait-for-release",
                 "timeout_ms": 50
             }),
-        )
-        .await?;
-    let elapsed = started.elapsed();
+        ),
+    )
+    .await
+    .map_err(|_| "timeout reply waited for unreleased UTF-8 tail")??;
     let timeout_text = result_text(&timed_out);
-
-    session.cancel().await?;
+    let control_text = wait_for_log_contains(&control_log, "waiting_utf8_tail_release")?;
 
     assert!(
         timeout_text.contains("<<repl status: busy"),
         "expected the incomplete UTF-8 request to time out, got: {timeout_text:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(500),
-        "timeout should not wait for the UTF-8 tail grace after expiry; elapsed {elapsed:?}"
+        !timeout_text.contains("\\xC3"),
+        "timeout reply should keep the incomplete UTF-8 tail pending, got: {timeout_text:?}"
+    );
+    assert!(
+        !release_path.exists(),
+        "timeout reply should return before the test releases the UTF-8 tail; control log: {control_text:?}"
+    );
+
+    fs::write(&release_path, "go")?;
+    let completed = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let completed_text = result_text(&completed);
+    session.cancel().await?;
+
+    assert!(
+        completed_text.contains("é"),
+        "follow-up poll should drain the released UTF-8 sequence, got: {completed_text:?}"
     );
 
     Ok(())
@@ -1282,6 +1333,7 @@ async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestRe
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
+    warm_zod_session(&session).await?;
 
     let start = std::time::Instant::now();
     let result = session
@@ -1314,7 +1366,17 @@ async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestRe
 async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let late_stderr_marker = tempdir.path().join("late-stderr-marker");
+    let late_stderr_marker_env = late_stderr_marker.display().to_string();
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![(
+            "MCP_REPL_ZOD_LATE_STDERR_MARKER",
+            late_stderr_marker_env.as_str(),
+        )],
+        Vec::new(),
+    )
+    .await?;
 
     let first = session
         .call_tool_raw(
@@ -1331,7 +1393,9 @@ async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> Te
         "completed request should keep an incomplete UTF-8 tail detached, got: {first_text:?}"
     );
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_log_contains(&control_log, "waiting_late_stderr_marker")?;
+    std::fs::write(&late_stderr_marker, b"go")?;
+    wait_for_log_contains(&control_log, "late_stderr_after_completion")?;
 
     let second = session
         .call_tool_raw(
@@ -1988,6 +2052,11 @@ async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_st
     assert!(
         text.contains("worker response timed out"),
         "expected bounded input_batch write timeout, got: {text:?}"
+    );
+    let log = wait_for_log_contains(&control_log, "control_reader_stalled")?;
+    assert!(
+        !log.contains("input_batch input="),
+        "stalled fixture must not consume the timed-out input batch, got log: {log:?}"
     );
 
     session.cancel().await?;

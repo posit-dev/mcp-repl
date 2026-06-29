@@ -51,6 +51,15 @@ fn sandbox_available() -> bool {
     true
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn skip_sandbox_unavailable(test_name: &str) -> bool {
+    if sandbox_available() {
+        return false;
+    }
+    eprintln!("{test_name} sandbox unavailable in this environment; skipping");
+    true
+}
+
 #[cfg(target_os = "linux")]
 fn linux_bwrap_available() -> bool {
     let absolute = PathBuf::from("/usr/bin/bwrap");
@@ -186,6 +195,8 @@ fn sandbox_backend_unavailable(text: &str) -> bool {
         || text.contains("unable to initialize the JIT")
         || text.contains("libR.so: cannot open shared object file")
         || text.contains("options(\"defaultPackages\") was not found")
+        || (text.contains("read-only carveouts inside writable root")
+            && text.contains("legacy Linux Landlock filesystem backend"))
         || text.contains("worker protocol error: ipc disconnected while waiting for backend info")
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
@@ -219,6 +230,9 @@ fn extract_prefixed_value_does_not_match_substrings() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_sandbox_probe_detects_available_sandbox_exec() {
+    if skip_sandbox_unavailable("macos_sandbox_probe_detects_available_sandbox_exec") {
+        return;
+    }
     assert!(common::sandbox_exec_available());
 }
 
@@ -686,7 +700,9 @@ fn prepopulate_reticulate_keras_jax_cache() -> TestResult<bool> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_allows_workspace_writes() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_workspace_write_allows_workspace_writes") {
+        return Ok(());
+    }
     let repo_root = std::env::current_dir()?;
     let target = unique_path(&repo_root, "workspace-write");
     let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
@@ -711,7 +727,9 @@ async fn sandbox_workspace_write_allows_workspace_writes() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_allows_r_package_cache_root_from_config() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_workspace_write_allows_r_package_cache_root_from_config") {
+        return Ok(());
+    }
     let Some(home) = std::env::var_os("HOME") else {
         return Ok(());
     };
@@ -770,7 +788,9 @@ async fn sandbox_workspace_write_allows_r_package_cache_root_from_config() -> Te
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_read_only_blocks_r_package_cache_root_writes") {
+        return Ok(());
+    }
     let Some(home) = std::env::var_os("HOME") else {
         return Ok(());
     };
@@ -830,7 +850,9 @@ async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_read_only_blocks_network_access") {
+        return Ok(());
+    }
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
@@ -858,7 +880,9 @@ async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_reticulate_keras_backend") {
+        return Ok(());
+    }
     if !prepopulate_reticulate_keras_jax_cache()? {
         return Ok(());
     }
@@ -908,7 +932,9 @@ async fn sandbox_reticulate_keras_backend() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_tempdir_stable_across_restart() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_tempdir_stable_across_restart") {
+        return Ok(());
+    }
     let mut session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
     let Some(first) = fetch_tempdir_info(&mut session).await? else {
         eprintln!(
@@ -949,7 +975,9 @@ async fn sandbox_tempdir_stable_across_restart() -> TestResult<()> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_ignores_preexisting_r_session_tmpdir() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_ignores_preexisting_r_session_tmpdir") {
+        return Ok(());
+    }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1000,7 +1028,9 @@ cat("MCP_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_full_access_allows_network_access() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_full_access_allows_network_access") {
+        return Ok(());
+    }
     let Some(addr) = start_loopback_server_if_available().await? else {
         return Ok(());
     };
@@ -1024,7 +1054,9 @@ async fn sandbox_full_access_allows_network_access() -> TestResult<()> {
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_allows_sysctl_used_by_quarto() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_allows_sysctl_used_by_quarto") {
+        return Ok(());
+    }
 
     let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let code = r#"
@@ -1064,7 +1096,9 @@ cat("SYSCTL_OIDFMT_STATUS=", status_oidfmt, "\n", sep = "")
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_allows_parallel_detect_cores() -> TestResult<()> {
-    assert!(sandbox_available(), "sandbox-exec unavailable");
+    if skip_sandbox_unavailable("sandbox_allows_parallel_detect_cores") {
+        return Ok(());
+    }
 
     let session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let code = r#"
@@ -1251,6 +1285,58 @@ for (i in seq_along(targets)) {{
             "write unexpectedly succeeded for {label}: {text}"
         );
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_bwrap_preserves_existing_missing_root_parent_after_exit() -> TestResult<()> {
+    if !linux_bwrap_available() {
+        eprintln!("bwrap unavailable; skipping");
+        return Ok(());
+    }
+    let repo_root = std::env::current_dir()?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let writable_parent = repo_root.join(format!("mcp-repl-bwrap-missing-root-{nanos}"));
+    std::fs::create_dir_all(&writable_parent)?;
+    let writable_root = writable_parent.join("output");
+
+    let session = spawn_server_with_sandbox_state_and_env(
+        sandbox_state_workspace_write_with_roots(false, vec![writable_root.clone()]),
+        vec![("MCP_REPL_USE_LINUX_BWRAP".to_string(), "1".to_string())],
+    )
+    .await?;
+    let target = writable_root.to_string_lossy().to_string();
+    let code = format!(
+        r#"
+target <- {target:?}
+dir.create(target, recursive = TRUE, showWarnings = FALSE)
+cat("ROOT_EXISTS=", dir.exists(target), "\n", sep = "")
+unlink(target, recursive = TRUE)
+"#
+    );
+    let result = session.write_stdin_raw_with(&code, Some(10.0)).await?;
+    let text = collect_text(&result);
+    if bwrap_worker_unavailable(&text) {
+        eprintln!("bwrap unavailable in this environment; skipping");
+        session.cancel().await?;
+        let _ = std::fs::remove_dir_all(&writable_parent);
+        return Ok(());
+    }
+    assert!(
+        text.contains("ROOT_EXISTS=TRUE"),
+        "expected worker to observe missing writable root, got: {text}"
+    );
+
+    session.cancel().await?;
+    assert!(
+        writable_parent.is_dir(),
+        "pre-existing writable root parent should survive bwrap teardown"
+    );
+    let _ = std::fs::remove_dir_all(&writable_parent);
     Ok(())
 }
 

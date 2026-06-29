@@ -5,6 +5,9 @@ use std::error::Error;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(windows)]
@@ -21,6 +24,7 @@ use rmcp::service::ServiceError;
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -30,7 +34,46 @@ use windows_sys::Win32::{
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
+#[derive(Clone, Default)]
+struct CapturedServerStderr {
+    tail: Arc<Mutex<Vec<u8>>>,
+}
+
+impl CapturedServerStderr {
+    fn start(stderr: Option<tokio::process::ChildStderr>) -> Self {
+        let capture = Self::default();
+        if let Some(mut stderr) = stderr {
+            let capture_for_task = capture.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => capture_for_task.append(&buffer[..n]),
+                    }
+                }
+            });
+        }
+        capture
+    }
+
+    fn append(&self, bytes: &[u8]) {
+        let mut tail = self.tail.lock().expect("server stderr capture poisoned");
+        tail.extend_from_slice(bytes);
+        if tail.len() > SERVER_STDERR_TAIL_LIMIT {
+            let dropped = tail.len() - SERVER_STDERR_TAIL_LIMIT;
+            tail.drain(..dropped);
+        }
+    }
+
+    fn text(&self) -> String {
+        let tail = self.tail.lock().expect("server stderr capture poisoned");
+        String::from_utf8_lossy(&tail).into_owned()
+    }
+}
+
 const TEST_PAGER_PAGE_CHARS: u64 = 300;
+const SERVER_STDERR_TAIL_LIMIT: usize = 64 * 1024;
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
 #[cfg(windows)]
@@ -387,7 +430,6 @@ impl TestBackend {
 fn normalize_tool_name_for_request(tool: &str) -> &str {
     match tool {
         "r_repl" | "py_repl" => "repl",
-        "r_repl_reset" | "py_repl_reset" => "repl_reset",
         _ => tool,
     }
 }
@@ -661,10 +703,11 @@ pub struct McpTestSession {
     steps: Vec<SnapshotStep>,
     server_pid: Option<u32>,
     backend: TestBackend,
+    server_stderr: CapturedServerStderr,
 }
 
 impl McpTestSession {
-    pub fn server_info(&self) -> Option<&rmcp::model::ServerInfo> {
+    pub fn server_info(&self) -> Option<Arc<rmcp::model::ServerInfo>> {
         self.service.peer_info()
     }
 
@@ -680,6 +723,10 @@ impl McpTestSession {
     pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>, ServiceError> {
         let tools = self.service.peer().list_tools(None).await?;
         Ok(tools.tools.into_iter().collect())
+    }
+
+    pub fn server_stderr_text(&self) -> String {
+        self.server_stderr.text()
     }
 
     #[allow(dead_code)]
@@ -1362,32 +1409,43 @@ fn strip_prompt_prefix(line: &str) -> Option<&str> {
     None
 }
 
+fn behavior_test_sandbox_args() -> Vec<String> {
+    vec!["--sandbox".to_string(), "danger-full-access".to_string()]
+}
+
+fn behavior_test_files_args() -> Vec<String> {
+    let mut args = behavior_test_sandbox_args();
+    args.extend(["--oversized-output".to_string(), "files".to_string()]);
+    args
+}
+
 pub async fn spawn_server() -> TestResult<McpTestSession> {
-    spawn_server_with_args_env(Vec::new(), Vec::new()).await
+    spawn_server_with_args_env(behavior_test_sandbox_args(), Vec::new()).await
 }
 
 pub async fn spawn_server_with_files() -> TestResult<McpTestSession> {
-    spawn_server_with_args(vec!["--oversized-output".to_string(), "files".to_string()]).await
+    spawn_server_with_args(behavior_test_files_args()).await
 }
 
 pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), Vec::new(), page_bytes).await
+    spawn_server_with_args_env_and_pager_page_chars(
+        behavior_test_sandbox_args(),
+        Vec::new(),
+        page_bytes,
+    )
+    .await
 }
 
 pub async fn spawn_server_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env(Vec::new(), env_vars).await
+    spawn_server_with_args_env(behavior_test_sandbox_args(), env_vars).await
 }
 
 pub async fn spawn_server_with_files_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env(
-        vec!["--oversized-output".to_string(), "files".to_string()],
-        env_vars,
-    )
-    .await
+    spawn_server_with_args_env(behavior_test_files_args(), env_vars).await
 }
 
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {
@@ -1517,31 +1575,46 @@ pub async fn spawn_server_with_args_env_and_cwd(
         args.push("danger-full-access".to_string());
     }
     let current_dir = cwd;
-    let transport = TokioChildProcess::new(Command::new(exe).configure(|cmd| {
-        cmd.env_remove("R_PROFILE_USER");
-        cmd.env_remove("R_PROFILE_SITE");
-        cmd.env_remove("R_ENVIRON");
-        cmd.env_remove("R_ENVIRON_USER");
-        cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
-        cmd.env("PAGER", "cat");
-        cmd.env("MANPAGER", "cat");
-        if let Some(cwd) = &current_dir {
-            cmd.current_dir(cwd);
-        }
-        cmd.args(&args);
-        for (key, value) in &env_vars {
-            cmd.env(key, value);
-        }
-    }))?;
+    let (transport, server_stderr_handle) =
+        TokioChildProcess::builder(Command::new(exe).configure(|cmd| {
+            cmd.env_remove("R_PROFILE_USER");
+            cmd.env_remove("R_PROFILE_SITE");
+            cmd.env_remove("R_ENVIRON");
+            cmd.env_remove("R_ENVIRON_USER");
+            cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
+            cmd.env("PAGER", "cat");
+            cmd.env("MANPAGER", "cat");
+            if let Some(cwd) = &current_dir {
+                cmd.current_dir(cwd);
+            }
+            cmd.args(&args);
+            for (key, value) in &env_vars {
+                cmd.env(key, value);
+            }
+        }))
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let server_stderr = CapturedServerStderr::start(server_stderr_handle);
 
     let server_pid = transport.id();
-    let service = TestClient.serve(transport).await?;
+    let service =
+        TestClient
+            .serve(transport)
+            .await
+            .map_err(|err| -> Box<dyn Error + Send + Sync> {
+                let stderr = server_stderr.text();
+                if stderr.trim().is_empty() {
+                    return Box::new(err);
+                }
+                format!("server initialization failed: {err}\nserver stderr:\n{stderr}").into()
+            })?;
     drop(suite_lock);
     Ok(McpTestSession {
         service,
         steps: Vec::new(),
         server_pid,
         backend,
+        server_stderr,
     })
 }
 

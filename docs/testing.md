@@ -5,7 +5,7 @@ This file is the entrypoint for deciding how to verify a change.
 
 ## Core Test Surface
 
-- `tests/run_integration_tests.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, R `repl_reset` state clearing, and public sandbox policy behavior.
+- `tests/run_integration_tests.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, Ctrl-D state clearing, R `repl_reset` state clearing, and public sandbox policy behavior.
 - `tests/common/`: shared Rust MCP harness for public tool calls, transcript snapshots, sandbox assertions, and client-install fixtures.
 - `tests/repl_surface.rs`, `tests/server_smoke.rs`, `tests/mcp_transcripts.rs`, and `tests/write_stdin_*.rs`: core `repl`, R `repl_reset`, timeout polling, oversized text replies, transcript-file behavior, and snapshot coverage through the public tool API.
 - `tests/pager*.rs` and `tests/oversized_output_cli.rs`: pager mode, files mode, and oversized-output CLI behavior.
@@ -33,7 +33,7 @@ This file is the entrypoint for deciding how to verify a change.
 Build the binary first, then run the Python suite:
 
 ```sh
-cargo build
+env RUSTFLAGS=-Dwarnings cargo build
 python3 tests/run_integration_tests.py --binary target/debug/mcp-repl
 ```
 
@@ -75,6 +75,21 @@ target.
 Do not opt Rust test targets out of Cargo discovery in anticipation of a future
 Python migration; migrate a scenario only when the Rust coverage is deleted or
 reduced in the same change that adds equivalent external coverage.
+
+## Quiet/Fast Iteration
+
+Use focused test targets while iterating, then run the full verification set
+before sending a change for review. Prefer one of these forms:
+
+```sh
+cargo test --quiet --test zod_protocol zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail
+python3 tests/run_integration_tests.py --binary target/debug/mcp-repl --case r-reset-clears-state
+```
+
+Successful Rust test runs should stay quiet. The shared test harness captures
+server stderr from spawned test servers and keeps it available to tests through
+`McpTestSession::server_stderr_text()` instead of inheriting expected
+negative-path diagnostics into passing logs.
 
 ## Real Client Integrations
 
@@ -119,14 +134,19 @@ remains local because provider authentication is unavailable in CI.
 
 ## Full Verification Before Replying
 
+Rust compiler warnings are errors in local verification and CI. Run Cargo
+compile steps with `RUSTFLAGS=-Dwarnings`, including the release build, so
+release-only warnings fail before a PR is merged.
+
 If you modify code, run:
 
-- `cargo check`
-- `cargo build`
+- `env RUSTFLAGS=-Dwarnings cargo check`
+- `env RUSTFLAGS=-Dwarnings cargo build`
 - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --quiet`
+- `env RUSTFLAGS=-Dwarnings cargo test --quiet`
 - `cargo +nightly fmt`
+- `env RUSTFLAGS=-Dwarnings cargo build --release --locked`
 
 For docs-only changes, run the narrow validation that covers the edited docs.
 For agent-facing docs, that is usually:

@@ -426,7 +426,10 @@ mod unix_impl {
         if !codex_client_ready(TEST_NAME) {
             return Ok(());
         }
-        assert!(common::sandbox_exec_available(), "sandbox-exec unavailable");
+        if !common::sandbox_exec_available() {
+            print_skip_banner(TEST_NAME, "sandbox-exec unavailable");
+            return Ok(());
+        }
         if !loopback_bind_available().await {
             print_skip_banner(TEST_NAME, "loopback TCP bind unavailable");
             return Ok(());
@@ -490,6 +493,12 @@ mod unix_impl {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) async fn run_mock_rejects_malformed_responses_payload() -> TestResult<()> {
+        const TEST_NAME: &str = "mock_rejects_malformed_responses_payload";
+        if !loopback_bind_available().await {
+            print_skip_banner(TEST_NAME, "loopback TCP bind unavailable");
+            return Ok(());
+        }
+
         let tool_args = tool_args_for_code(&sandbox_run_code());
         let mock_server =
             MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
@@ -623,13 +632,24 @@ mod unix_impl {
                 )
                 .into()),
             },
-            CodexBackendMode::Auto => match live_codex_spark_auth()? {
-                Ok(auth_json) => Ok(CodexBackendChoice::Live { auth_json }),
-                Err(reason) => {
+            CodexBackendMode::Auto => {
+                if outer_sandbox_network_disabled() {
+                    let reason = "outer sandbox disables network".to_string();
                     print_backend_banner(test_name, &format!("live backend unavailable: {reason}"));
-                    Ok(CodexBackendChoice::Mock { reason })
+                    return Ok(CodexBackendChoice::Mock { reason });
                 }
-            },
+
+                match live_codex_spark_auth()? {
+                    Ok(auth_json) => Ok(CodexBackendChoice::Live { auth_json }),
+                    Err(reason) => {
+                        print_backend_banner(
+                            test_name,
+                            &format!("live backend unavailable: {reason}"),
+                        );
+                        Ok(CodexBackendChoice::Mock { reason })
+                    }
+                }
+            }
         }
     }
 
@@ -750,6 +770,10 @@ mod unix_impl {
             return Some(PathBuf::from(profile).join(".codex"));
         }
         None
+    }
+
+    fn outer_sandbox_network_disabled() -> bool {
+        std::env::var_os("CODEX_SANDBOX_NETWORK_DISABLED").is_some_and(|value| value == "1")
     }
 
     fn create_isolated_codex_env_with_config(
@@ -1290,10 +1314,10 @@ mod unix_impl {
         let has_sandbox_inherit = r_args
             .iter()
             .zip(r_args.iter().skip(1))
-            .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
+            .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit-codex"));
         assert!(
             has_sandbox_inherit,
-            "expected installed Codex config to include `--sandbox inherit`"
+            "expected installed Codex config to include `--sandbox inherit-codex`"
         );
         let direct_only = doc["features"]["code_mode"]["direct_only_tool_namespaces"]
             .as_array()
@@ -1383,7 +1407,7 @@ tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
-args = ["--sandbox", "inherit"]
+args = ["--sandbox", "inherit-codex"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"
@@ -1417,7 +1441,7 @@ tool_suggest = false
 
 [mcp_servers.r]
 command = "{mcp_repl}"
-args = ["--sandbox", "inherit"]
+args = ["--sandbox", "inherit-codex"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"
@@ -1465,7 +1489,7 @@ responses_websockets = false
 
 [mcp_servers.r]
 command = "{python_program}"
-args = ["{trace_script}", "{mcp_repl}", "--sandbox", "inherit"]
+args = ["{trace_script}", "{mcp_repl}", "--sandbox", "inherit-codex"]
 env_vars = ["MCP_REPL_DEBUG_DIR"]
 [projects."{repo_root}"]
 trust_level = "trusted"

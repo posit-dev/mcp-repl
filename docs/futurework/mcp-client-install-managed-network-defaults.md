@@ -62,10 +62,10 @@ prefer explicit, explainable entries over a large convenience allowlist.
 
 - MCP client install is written by `src/install.rs`.
 - `mcp-repl install --client codex` currently writes MCP server entries with
-  `--sandbox inherit --oversized-output files`.
-- `--sandbox inherit` means the server resolves the effective worker sandbox
-  from Codex per-tool-call sandbox metadata before applying later CLI/config
-  operations.
+  `--sandbox inherit-codex --oversized-output files`.
+- `--sandbox inherit-codex` means the server resolves the effective worker
+  sandbox from Codex per-tool-call sandbox metadata before applying later
+  CLI/config operations.
 - `mcp-repl install --client claude` currently writes Claude config with an
   explicit sandbox mode and `--oversized-output files`; Claude sandbox-inherit
   support is separate future work.
@@ -83,8 +83,8 @@ prefer explicit, explainable entries over a large convenience allowlist.
   sandbox, or that diverges from Claude's configured sandbox shape.
 - Avoid forcing network configuration onto read-only tool calls. A naive
   `--config sandbox_workspace_write.network_access=true` appended after
-  `--sandbox inherit` can fail when Codex sends read-only sandbox metadata,
-  because that setting only applies to workspace-write policies.
+  `--sandbox inherit-codex` can fail when Codex sends read-only sandbox
+  metadata, because that setting only applies to workspace-write policies.
 - Decide whether defaults belong in the MCP client's own sandbox configuration,
   in `mcp-repl` server args, or in a new install-time helper that only affects
   workspace-write calls. The MCP client and `mcp-repl` should agree on the
@@ -103,7 +103,7 @@ prefer explicit, explainable entries over a large convenience allowlist.
   client config contains default managed-network entries in the chosen config
   location.
 - For Codex, assert that generated MCP server entries still preserve
-  `--sandbox inherit`.
+  `--sandbox inherit-codex`.
 - For Codex, assert that read-only inherited sandbox metadata does not fail
   solely because install added managed-network defaults for workspace-write
   calls.

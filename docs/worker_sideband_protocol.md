@@ -90,8 +90,20 @@ capture does not preserve separate stdout/stderr identity. Sideband
 
 `shutdown`
 - `{ "type": "shutdown" }`
-- Requests worker shutdown during reset, replacement, or server teardown.
-- Built-in workers currently exit the process after receiving it.
+- Requests worker shutdown during server teardown and replacement paths that
+  need worker-side lifecycle control. The worker should stop accepting new
+  input, preserve already accepted input until the runtime consumes it, wake
+  managed stdin readers with EOF once that accepted input is drained, let the
+  active runtime request reach a safe boundary, and exit. The server waits
+  through a bounded graceful shutdown window, then escalates if needed. The
+  server may also close process stdin during that window for worker types that
+  rely on stdin EOF to unblock direct stdin consumers; built-in Python keeps
+  process stdin open during the graceful window because sideband owns accepted
+  input. Restart replies include output captured through that window, followed
+  by fresh-session tail output when the same input contains text after
+  `Ctrl-D`.
+- Built-in workers request runtime shutdown after receiving it. They may emit
+  output from the active request before `session_end` and process exit.
 
 The server emits no other server-to-worker protocol messages in v6.
 Built-in worker readers treat malformed or unknown server-to-worker messages as
@@ -198,7 +210,13 @@ queue feeds runtime input callbacks and managed stdin surfaces. The sideband IPC
 reader runs independently from the runtime thread. It receives `input_batch`,
 `interrupt`, and `shutdown`, mutates worker-owned queue/session state, and wakes
 the runtime when needed. The runtime thread consumes queued input only when the
-runtime calls its managed input boundary.
+runtime calls its managed input boundary. A `shutdown` message asks built-in
+workers to stop accepting new input, preserve already accepted input until it
+is consumed, wake managed input readers with EOF after that queue drains, and
+exit after the active runtime request reaches a safe boundary or the server's
+bounded shutdown window expires. The server still applies the worker's process
+stdin shutdown policy so stdin-backed readers can be unblocked without making
+stdin EOF the only shutdown signal.
 
 For R, the managed input boundary is R's embedded `ReadConsole` callback,
 installed through `Rstart.ReadConsole` on Windows and `ptr_R_ReadConsole` on

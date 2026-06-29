@@ -465,10 +465,6 @@ impl WorkerManager {
         self.resolve_timeout_marker_with_wait(wait);
     }
 
-    pub fn missing_inherited_state_without_worker(&self) -> bool {
-        self.missing_inherited_sandbox_state() && self.process.is_none()
-    }
-
     pub fn detached_prefix_item_count(&self) -> usize {
         self.last_detached_prefix_item_count
     }

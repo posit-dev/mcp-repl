@@ -51,7 +51,7 @@ Example project config:
 oversized_output = "files"
 
 [sandbox]
-mode = "inherit"
+mode = "inherit-codex"
 
 [sandbox.workspace_write]
 network_access = true

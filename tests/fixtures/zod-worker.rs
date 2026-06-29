@@ -29,7 +29,9 @@ const STARTUP_PROTOCOL_ERROR_ENV: &str = "MCP_REPL_ZOD_STARTUP_PROTOCOL_ERROR";
 const STARTUP_READY_ENV: &str = "MCP_REPL_ZOD_STARTUP_READY";
 const CONTROL_LOG_ENV: &str = "MCP_REPL_ZOD_CONTROL_LOG";
 const LATE_RAW_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_RAW_MARKER";
+const LATE_STDERR_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_STDERR_MARKER";
 const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
+const UTF8_TAIL_RELEASE_ENV: &str = "MCP_REPL_ZOD_UTF8_TAIL_RELEASE";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
@@ -95,12 +97,14 @@ fn run_worker(
         })?;
         append_control_log(control_log_path.as_deref(), "input_wait")?;
     }
-    if std::env::var_os(STALL_CONTROL_READER_ENV).is_some() {
+    if let Some(stall_millis) = std::env::var_os(STALL_CONTROL_READER_ENV) {
+        let stall_millis = stall_millis.to_string_lossy().parse::<u64>()?;
         let _sideband_reader = sideband_reader;
         let _turn_tx = tx;
-        loop {
-            thread::park();
-        }
+        append_control_log(control_log_path.as_deref(), "control_reader_stalled")?;
+        thread::sleep(Duration::from_millis(stall_millis));
+        append_control_log(control_log_path.as_deref(), "control_reader_stall_elapsed")?;
+        return Ok(());
     }
 
     start_control_reader(
@@ -256,13 +260,20 @@ fn run_command(
     }
 
     if command == "partial-stderr-utf8-then-late-stderr-after-completion" {
+        let late_stderr_marker = std::env::var_os(LATE_STDERR_MARKER_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, LATE_STDERR_MARKER_ENV))?;
         output_stderr_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         state.ready_after_turn = true;
         let writer = writer.clone();
         let control_log_path = control_log_path.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(950));
+            let _ = append_control_log(control_log_path.as_deref(), "waiting_late_stderr_marker");
+            if wait_for_marker_path(&late_stderr_marker).is_err() {
+                return;
+            }
             let _ = output_stderr_text(&writer, &control_log_path, b"after\n");
+            let _ = append_control_log(control_log_path.as_deref(), "late_stderr_after_completion");
         });
         return Ok(false);
     }
@@ -347,13 +358,21 @@ fn run_command(
     if command == "partial-utf8-stderr-then-sleep" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         output_stderr_text(writer, control_log_path, b"tail-visible\n")?;
-        sleep_for(200, sideband_interrupted, false);
+        sleep_for(1000, sideband_interrupted, false);
         return Ok(false);
     }
 
     if command == "partial-utf8-then-sleep" {
         output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
         sleep_for(200, sideband_interrupted, false);
+        return Ok(false);
+    }
+
+    if command == "partial-utf8-then-wait-for-release" {
+        output_text_with_continuation(writer, control_log_path, &[0xC3], false)?;
+        append_control_log(control_log_path.as_deref(), "waiting_utf8_tail_release")?;
+        wait_for_marker(UTF8_TAIL_RELEASE_ENV)?;
+        output_text_with_continuation(writer, control_log_path, &[0xA9], true)?;
         return Ok(false);
     }
 
@@ -938,6 +957,10 @@ fn wait_for_marker(env_name: &str) -> io::Result<()> {
     let marker = std::env::var_os(env_name)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, env_name))?;
+    wait_for_marker_path(&marker)
+}
+
+fn wait_for_marker_path(marker: &Path) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if marker.exists() {

@@ -66,7 +66,7 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         crate::r_session::interrupt_pending_input();
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
-                        std::process::exit(0);
+                        let _ = wait_for_r_session().and_then(RSession::request_shutdown);
                     }
                     None => {
                         // Without IPC, the worker cannot participate in input accounting (prompt,

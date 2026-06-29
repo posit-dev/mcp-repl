@@ -28,7 +28,7 @@ expression: serialized
         "script": [
           "grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\"), width = 800, height = 600, res = 96)",
           "plot(1:10)",
-          "grDevices::dev.off()"
+          "invisible(grDevices::dev.off())"
         ]
       }
     },
@@ -61,7 +61,7 @@ expression: serialized
           "grDevices::png(filename = Sys.getenv(\"MCP_REPL_TEST_PNG_DEST\"), width = 800, height = 600, res = 96)",
           "plot(1:10)",
           "lines(4:8, 4:8)",
-          "grDevices::dev.off()"
+          "invisible(grDevices::dev.off())"
         ]
       }
     },

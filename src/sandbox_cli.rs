@@ -3,8 +3,12 @@ use std::path::PathBuf;
 use crate::managed_network::validate_domain_patterns;
 use crate::sandbox::{SandboxPolicy, SandboxState};
 
-pub const MISSING_INHERITED_SANDBOX_STATE_MESSAGE: &str =
-    "--sandbox inherit requested but no client sandbox state was provided";
+pub const MISSING_INHERITED_SANDBOX_STATE_MESSAGE: &str = concat!(
+    "--sandbox inherit-codex (or its inherit alias) requires Codex per-tool-call ",
+    "sandbox metadata in _meta[\"codex/sandbox-state-meta\"]; Claude Code and other ",
+    "generic MCP clients do not provide that metadata, so use an explicit mode such ",
+    "as --sandbox workspace-write with those clients"
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxModeArg {
@@ -17,12 +21,12 @@ pub enum SandboxModeArg {
 impl SandboxModeArg {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim() {
-            "inherit" => Ok(Self::Inherit),
+            "inherit-codex" | "inherit" => Ok(Self::Inherit),
             "read-only" => Ok(Self::ReadOnly),
             "workspace-write" => Ok(Self::WorkspaceWrite),
             "danger-full-access" => Ok(Self::DangerFullAccess),
             _ => Err(format!(
-                "invalid sandbox mode: {value} (expected inherit|read-only|workspace-write|danger-full-access)"
+                "invalid sandbox mode: {value} (expected read-only|workspace-write|danger-full-access|inherit-codex)"
             )),
         }
     }

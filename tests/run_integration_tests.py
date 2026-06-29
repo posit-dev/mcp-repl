@@ -91,6 +91,43 @@ class LoopbackServer:
                 return
 
 
+class HttpLoopbackServer(LoopbackServer):
+    def __enter__(self) -> HttpLoopbackServer:
+        super().__enter__()
+        if self.port in (39080, 39081):
+            self.__exit__(None, None, None)
+            raise SuiteSkip(
+                f"loopback server selected reserved managed-network port {self.port}"
+            )
+        return self
+
+    def _serve(self) -> None:
+        listener = self.listener
+        assert listener is not None
+        while not self.stop_event.is_set():
+            try:
+                conn, _addr = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(2.0)
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    request += chunk
+                body = b"ok"
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                )
+
+
 def collect_stderr(stream: Any, sink: list[str]) -> None:
     for raw in iter(stream.readline, b""):
         sink.append(raw.decode("utf-8", errors="replace").rstrip())
@@ -235,9 +272,6 @@ class McpStdioClient:
         if timeout_ms is not None:
             arguments["timeout_ms"] = timeout_ms
         return self.call_tool("repl", arguments)
-
-    def repl_reset(self) -> dict[str, Any]:
-        return self.call_tool("repl_reset", {})
 
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = self.next_request_id
@@ -855,6 +889,84 @@ def python_busy_discards_input(client: McpStdioClient) -> None:
     )
 
 
+def python_linux_managed_network_domain_allowlist(client: McpStdioClient) -> None:
+    with HttpLoopbackServer() as server:
+        received = client.repl(
+            dedent(
+                f"""
+                import socket
+                import tempfile
+                import urllib.request
+                from pathlib import Path
+
+                port = {server.port}
+
+                try:
+                    with tempfile.TemporaryDirectory() as unix_socket_dir:
+                        unix_socket_path = str(Path(unix_socket_dir) / "ipc.sock")
+                        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                            listener.bind(unix_socket_path)
+                            listener.listen(1)
+                            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                                client.connect(unix_socket_path)
+                                conn, _addr = listener.accept()
+                                with conn:
+                                    client.sendall(b"ping")
+                                    print("UNIX_OK:" + conn.recv(4).decode())
+                except Exception as exc:
+                    print("UNIX_ERROR:" + type(exc).__name__ + ":" + str(exc))
+
+                try:
+                    body = urllib.request.urlopen(
+                        f"http://localhost:{{port}}/allowed",
+                        timeout=5,
+                    ).read().decode()
+                    print("PROXY_OK:" + body)
+                except Exception as exc:
+                    print("PROXY_ERROR:" + type(exc).__name__ + ":" + str(exc))
+
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+                        sock.sendall(b"GET /direct HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n")
+                        print("DIRECT_OK:" + repr(sock.recv(16)))
+                except Exception as exc:
+                    print("DIRECT_ERROR:" + type(exc).__name__ + ":" + str(exc))
+
+                try:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{{port}}/denied",
+                        timeout=5,
+                    ).read()
+                    print("DENIED_OK")
+                except Exception as exc:
+                    print("DENIED_ERROR:" + type(exc).__name__ + ":" + str(exc))
+                """
+            ),
+            timeout_ms=30000,
+        )
+    received_text = require_success(received, "Linux managed network allowlist repl")
+    if "UNIX_ERROR:" not in received_text or "UNIX_OK:" in received_text:
+        raise SuiteFailure(
+            "expected Unix-domain sockets to be unavailable in managed network mode, "
+            f"got: {received_text!r}"
+        )
+    if "PROXY_OK:ok" not in received_text or "PROXY_ERROR:" in received_text:
+        raise SuiteFailure(
+            "expected allowlisted localhost request to succeed through the proxy, "
+            f"got: {received_text!r}"
+        )
+    if "DIRECT_ERROR:" not in received_text or "DIRECT_OK:" in received_text:
+        raise SuiteFailure(
+            "expected direct worker socket connection to fail in the isolated namespace, "
+            f"got: {received_text!r}"
+        )
+    if "DENIED_ERROR:" not in received_text or "DENIED_OK" in received_text:
+        raise SuiteFailure(
+            "expected disallowed host request to fail through the managed proxy, "
+            f"got: {received_text!r}"
+        )
+
+
 def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     warmup = client.repl("1+1\n", timeout_ms=30000)
     assert_identical(
@@ -897,7 +1009,7 @@ def r_timeout_busy_recovers(client: McpStdioClient) -> None:
     )
 
 
-def r_reset_clears_state(client: McpStdioClient) -> None:
+def r_ctrl_d_clears_state(client: McpStdioClient) -> None:
     set_var = client.repl("x <- 1\n", timeout_ms=30000)
     assert_identical(
         tool_result(text("> ")),
@@ -905,11 +1017,11 @@ def r_reset_clears_state(client: McpStdioClient) -> None:
         "set variable repl",
     )
 
-    reset = client.repl_reset()
+    reset = client.repl("\u0004", timeout_ms=30000)
     assert_identical(
         tool_result(text("[repl] new session started")),
         reset,
-        "repl_reset",
+        "ctrl-d reset repl",
     )
 
     after_reset = client.repl('print(exists("x"))\n', timeout_ms=30000)
@@ -1379,9 +1491,26 @@ def python_suite_case(
     )
 
 
-CASES: dict[str, SuiteCase] = {
+CANONICAL_CASES: dict[str, SuiteCase] = {
     "python-busy-discards-input": python_suite_case(python_busy_discards_input),
     "python-console-basic": python_suite_case(python_console_basic),
+    "python-linux-managed-network-domain-allowlist": python_suite_case(
+        python_linux_managed_network_domain_allowlist,
+        server_args=(
+            "--sandbox",
+            "workspace-write",
+            "--config",
+            "sandbox_workspace_write.network_access=true",
+            "--config",
+            'permissions.network.allowed_domains=["localhost"]',
+            "--config",
+            "permissions.network.allow_local_binding=true",
+        ),
+        server_cwd=Path(
+            "target/test-scratch/run-integration-tests/python-linux-managed-network-domain-allowlist"
+        ),
+        platforms=("linux",),
+    ),
     "r-console-basic": r_suite_case(r_console_basic),
     "r-full-access-sandbox": r_suite_case(
         r_full_access_sandbox,
@@ -1426,7 +1555,7 @@ CASES: dict[str, SuiteCase] = {
         server_args=("--sandbox", "read-only"),
         server_cwd=Path("target/test-scratch/run-integration-tests/r-read-only-sandbox"),
     ),
-    "r-reset-clears-state": r_suite_case(r_reset_clears_state),
+    "r-ctrl-d-clears-state": r_suite_case(r_ctrl_d_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
     "r-write-stdin-bundles-huge-assignment-input-echoes": r_suite_case(
         r_write_stdin_files_bundle_includes_huge_assignment_input_echoes,
@@ -1467,6 +1596,15 @@ CASES: dict[str, SuiteCase] = {
             "target/test-scratch/run-integration-tests/r-workspace-write-network-blocked"
         ),
     ),
+}
+
+CASE_ALIASES: dict[str, str] = {
+    "r-reset-clears-state": "r-ctrl-d-clears-state",
+}
+
+CASES: dict[str, SuiteCase] = {
+    **CANONICAL_CASES,
+    **{alias: CANONICAL_CASES[target] for alias, target in CASE_ALIASES.items()},
 }
 
 
@@ -1517,7 +1655,7 @@ def main(argv: Sequence[str]) -> int:
         return 2
     binary = resolve_binary_path(args.binary)
 
-    selected = args.case or sorted(CASES)
+    selected = args.case or sorted(CANONICAL_CASES)
     failures = 0
     for case_name in selected:
         case = CASES[case_name]

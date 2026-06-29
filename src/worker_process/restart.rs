@@ -2,8 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::{WorkerError, WorkerManager};
-use crate::completion_reply::ReplyWithOffset;
-use crate::oversized_output::OversizedOutputMode;
+use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
 use crate::worker_protocol::WorkerReply;
@@ -19,16 +18,15 @@ enum RestartShutdownSnapshot {
         output: Option<FormattedPendingOutput>,
     },
     Pager {
-        pre_shutdown_end_offset: Option<u64>,
-        post_shutdown_end_offset: Option<u64>,
+        end_offset: Option<u64>,
     },
 }
 
 impl WorkerManager {
-    pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+    pub(crate) fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         match self.oversized_output {
-            OversizedOutputMode::Files => self.restart_files(timeout),
-            OversizedOutputMode::Pager => self.restart_pager(timeout),
+            crate::oversized_output::OversizedOutputMode::Files => self.restart_files(timeout),
+            crate::oversized_output::OversizedOutputMode::Pager => self.restart_pager(timeout),
         }
     }
 
@@ -50,6 +48,7 @@ impl WorkerManager {
         self.maybe_emit_pending_server_notice();
         let snapshot = self.shutdown_existing_worker_for_restart(mode, timeout);
         self.clear_restart_busy_guardrail();
+        self.clear_stale_pager_before_restart_reply(mode);
         let reply = self.build_restart_reply_for_mode(snapshot);
         self.finish_restart_for_mode(mode);
         Self::end_restart_ok();
@@ -84,14 +83,11 @@ impl WorkerManager {
         &mut self,
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
-        let output = self
-            .process
-            .is_some()
-            .then(|| self.drain_sealed_formatted_output());
+        let had_process = self.process.is_some();
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(timeout);
-            self.pending_output_tape.clear();
+            let _ = process.shutdown_for_restart(timeout);
         }
+        let output = had_process.then(|| self.drain_sealed_formatted_output());
         RestartShutdownSnapshot::Files { output }
     }
 
@@ -100,23 +96,22 @@ impl WorkerManager {
         timeout: Duration,
     ) -> RestartShutdownSnapshot {
         self.output_timeline.seal_utf8_tails();
-        let pre_shutdown_end_offset = self
-            .process
-            .is_some()
-            .then(|| self.output.end_offset().unwrap_or(0));
         if let Some(process) = self.process.take() {
-            let _ = process.shutdown_graceful(timeout);
+            let _ = process.shutdown_for_restart(timeout);
         }
         self.output_timeline.seal_utf8_tails();
-        let post_shutdown_end_offset = self.output.end_offset();
-        RestartShutdownSnapshot::Pager {
-            pre_shutdown_end_offset,
-            post_shutdown_end_offset,
-        }
+        let end_offset = self.output.end_offset();
+        RestartShutdownSnapshot::Pager { end_offset }
     }
 
     fn clear_restart_busy_guardrail(&self) {
         self.guardrail.busy.store(false, Ordering::Relaxed);
+    }
+
+    fn clear_stale_pager_before_restart_reply(&mut self, mode: RestartMode) {
+        if let RestartMode::Pager = mode {
+            self.pager = pager::Pager::default();
+        }
     }
 
     fn build_restart_reply_for_mode(
@@ -129,29 +124,22 @@ impl WorkerManager {
                     .build_session_reset_reply_files_from_formatted("new session started", output),
                 None => self.build_session_reset_reply_files("new session started"),
             },
-            RestartShutdownSnapshot::Pager {
-                pre_shutdown_end_offset,
-                post_shutdown_end_offset,
-            } => self.build_restart_reply_pager(pre_shutdown_end_offset, post_shutdown_end_offset),
+            RestartShutdownSnapshot::Pager { end_offset } => {
+                self.build_restart_reply_pager(end_offset)
+            }
         }
     }
 
-    fn build_restart_reply_pager(
-        &mut self,
-        pre_shutdown_end_offset: Option<u64>,
-        post_shutdown_end_offset: Option<u64>,
-    ) -> ReplyWithOffset {
+    fn build_restart_reply_pager(&mut self, end_offset: Option<u64>) -> ReplyWithOffset {
         let page_bytes = pager::resolve_page_bytes(None);
-        match pre_shutdown_end_offset {
+        match end_offset {
             Some(end_offset) => {
                 let reply = self.build_session_reset_reply_pager_to_offset(
                     page_bytes,
                     "new session started",
                     end_offset,
                 );
-                if let Some(end_offset) = post_shutdown_end_offset {
-                    self.output.advance_offset_to(end_offset);
-                }
+                self.output.advance_offset_to(end_offset);
                 reply
             }
             None => self.build_session_reset_reply_pager(page_bytes, "new session started"),
@@ -162,7 +150,13 @@ impl WorkerManager {
         self.clear_preserved_prefixes();
         match mode {
             RestartMode::Files => self.reset_output_state_files(true),
-            RestartMode::Pager => self.reset_output_state_pager(true, false),
+            RestartMode::Pager => {
+                let preserve_pager = self.pager.is_active();
+                self.reset_output_state_pager(true, preserve_pager);
+                if preserve_pager {
+                    self.pager_prompt = Some(PagerCompletionPrompt::PromptFree);
+                }
+            }
         }
         self.note_respawn_during_write();
     }
@@ -172,11 +166,12 @@ impl WorkerManager {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::oversized_output::OversizedOutputMode;
     use crate::sandbox_cli::SandboxCliPlan;
     use crate::worker_process::WriteStdinOptions;
     use crate::worker_process::output_state::PrefixCapture;
     use crate::worker_process::test_support::contents_text;
-    use crate::worker_protocol::WorkerContent;
+    use crate::worker_protocol::{WorkerContent, WorkerReply};
 
     #[test]
     fn bare_restart_flushes_queued_sandbox_change_notice() {
