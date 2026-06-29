@@ -652,6 +652,43 @@ async fn zod_worker_interrupt_prefix_accepts_ready_during_ack_wait() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_bare_interrupt_ignores_ready_during_ack_wait() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let session = spawn_zod_interrupt_ready_during_ack_server(&control_log).await?;
+
+    let result = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}",
+                "timeout_ms": 1_000
+            }),
+        )
+        .await?;
+    let text = result_text(&result);
+    assert!(
+        text.contains("<<repl status: busy"),
+        "bare interrupt must not settle from readiness emitted before OS interrupt, got: {text:?}"
+    );
+
+    let log = wait_for_log_contains(&control_log, "interrupt_ack interrupt_id=")?;
+    let ready_idx = log
+        .find("fresh_ready_after_interrupt")
+        .expect("fresh readiness log should be present");
+    let ack_idx = log
+        .find("interrupt_ack interrupt_id=")
+        .expect("interrupt ack log should be present");
+    assert!(
+        ready_idx < ack_idx,
+        "test must cover readiness observed during ack wait, got log: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_hidden_input_echoes_do_not_evict_visible_output() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");

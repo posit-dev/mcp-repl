@@ -446,14 +446,11 @@ fn send_ordered_interrupt(
     process: &mut crate::worker_supervisor::WorkerProcess,
     timeout: Duration,
 ) -> Result<Instant, WorkerError> {
-    let mut readiness_fresh_since = None;
     let mut protocol_error = None;
     if let Some(ipc) = process.ipc_connection() {
         let ack_wait_since = Instant::now();
-        let sideband_interrupt_sent_at = Instant::now();
         match ipc.send_interrupt() {
             Ok(interrupt_id) => {
-                readiness_fresh_since = Some(sideband_interrupt_sent_at);
                 let ack_timeout = timeout.min(INTERRUPT_ACK_TIMEOUT);
                 match ipc.wait_for_interrupt_ack(ack_timeout, interrupt_id) {
                     Ok(Some(ack)) => {
@@ -505,8 +502,8 @@ fn send_ordered_interrupt(
         }
     }
 
-    let os_interrupt_sent_at = Instant::now();
     process.send_interrupt()?;
+    let os_interrupt_sent_at = Instant::now();
     crate::event_log::log(
         "worker_interrupt_os_sent",
         serde_json::json!({
@@ -516,7 +513,7 @@ fn send_ordered_interrupt(
     if let Some(message) = protocol_error {
         return Err(WorkerError::Protocol(message));
     }
-    Ok(readiness_fresh_since.unwrap_or(os_interrupt_sent_at))
+    Ok(os_interrupt_sent_at)
 }
 
 fn remaining_until(deadline: Instant) -> Duration {
