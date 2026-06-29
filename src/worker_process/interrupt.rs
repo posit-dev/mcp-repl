@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset, timeout_status_content};
-use crate::ipc::{IpcInputReadiness, IpcWaitError, ServerToWorkerIpcMessage};
+use crate::ipc::{IpcInputReadiness, IpcWaitError};
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -380,10 +380,9 @@ fn send_ordered_interrupt(
     timeout: Duration,
 ) -> Result<Instant, WorkerError> {
     if let Some(ipc) = process.ipc_connection() {
-        let interrupt_id = ipc.next_interrupt_id();
         let ack_wait_since = Instant::now();
-        match ipc.send(ServerToWorkerIpcMessage::Interrupt { interrupt_id }) {
-            Ok(()) => {
+        match ipc.send_interrupt() {
+            Ok(interrupt_id) => {
                 let ack_timeout = timeout.min(INTERRUPT_ACK_TIMEOUT);
                 match ipc.wait_for_interrupt_ack(ack_timeout, interrupt_id) {
                     Ok(Some(ack)) => {

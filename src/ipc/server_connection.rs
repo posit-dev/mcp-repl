@@ -36,6 +36,7 @@ struct ServerIpcInbox {
     protocol_warnings: VecDeque<String>,
     interrupt_acks: VecDeque<IpcInterruptAck>,
     next_interrupt_id: u64,
+    last_sent_interrupt_id: u64,
     disconnected: bool,
 }
 
@@ -247,6 +248,13 @@ impl ServerIpcConnection {
                         discarded_input,
                     } => {
                         let mut guard = reader_inbox.lock().unwrap();
+                        if interrupt_id == 0 || interrupt_id > guard.last_sent_interrupt_id {
+                            guard
+                                .input_state
+                                .latch_protocol_error("interrupt_ack for unsent interrupt");
+                            reader_cvar.notify_all();
+                            break;
+                        }
                         guard.interrupt_acks.push_back(IpcInterruptAck {
                             interrupt_id,
                             discarded_input,
@@ -359,10 +367,6 @@ impl ServerIpcConnection {
         })
     }
 
-    pub fn send(&self, message: ServerToWorkerIpcMessage) -> io::Result<()> {
-        self.writer.send(message)
-    }
-
     pub fn send_with_timeout(
         &self,
         message: ServerToWorkerIpcMessage,
@@ -453,11 +457,22 @@ impl ServerIpcConnection {
         }
     }
 
-    pub fn next_interrupt_id(&self) -> u64 {
+    #[cfg(test)]
+    pub fn note_interrupt_sent_for_tests(&self) {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.input_state.note_interrupt_sent();
+    }
+
+    pub fn send_interrupt(&self) -> io::Result<u64> {
         let mut guard = self.inbox.lock().unwrap();
         guard.next_interrupt_id += 1;
+        let interrupt_id = guard.next_interrupt_id;
+        self.writer
+            .send(ServerToWorkerIpcMessage::Interrupt { interrupt_id })?;
+        guard.last_sent_interrupt_id = interrupt_id;
         guard.input_state.note_interrupt_sent();
-        guard.next_interrupt_id
+        self.cvar.notify_all();
+        Ok(interrupt_id)
     }
 
     pub fn wait_for_interrupt_ack(
@@ -1159,7 +1174,7 @@ mod tests {
             .wait_for_input_wait(Duration::from_millis(200))
             .expect("server observes input_wait");
 
-        server.next_interrupt_id();
+        server.note_interrupt_sent_for_tests();
 
         server
             .begin_input()
@@ -1180,7 +1195,7 @@ mod tests {
             .wait_for_input_wait(Duration::from_millis(200))
             .expect("server observes input_wait");
 
-        let interrupt_id = server.next_interrupt_id();
+        let interrupt_id = server.send_interrupt().expect("send interrupt");
         worker
             .send(WorkerToServerIpcMessage::InterruptAck {
                 interrupt_id,
@@ -1214,7 +1229,7 @@ mod tests {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
-        let first_interrupt_id = server.next_interrupt_id();
+        let first_interrupt_id = server.send_interrupt().expect("send first interrupt");
         worker
             .send(WorkerToServerIpcMessage::InterruptAck {
                 interrupt_id: first_interrupt_id,
@@ -1222,7 +1237,7 @@ mod tests {
             })
             .expect("send delayed interrupt_ack");
 
-        let second_interrupt_id = server.next_interrupt_id();
+        let second_interrupt_id = server.send_interrupt().expect("send second interrupt");
         let stale = server
             .wait_for_interrupt_ack(Duration::from_millis(20), second_interrupt_id)
             .expect("ack wait should not fail");
@@ -1247,7 +1262,7 @@ mod tests {
             .expect("server observes input_wait");
         server.begin_input().expect("begin input");
 
-        let interrupt_id = server.next_interrupt_id();
+        let interrupt_id = server.send_interrupt().expect("send interrupt");
         worker
             .send(WorkerToServerIpcMessage::InterruptAck {
                 interrupt_id,
@@ -1267,6 +1282,23 @@ mod tests {
             matches!(completion, Err(IpcWaitError::Timeout)),
             "interrupt_ack must not complete active input, got: {completion:?}"
         );
+    }
+
+    #[test]
+    fn unsolicited_interrupt_ack_latches_protocol_error() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::InterruptAck {
+                interrupt_id: 1,
+                discarded_input: false,
+            })
+            .expect("send unsolicited interrupt_ack");
+
+        let err =
+            wait_for_protocol_error(&server).expect("server should latch interrupt_ack error");
+        assert_eq!(err, "interrupt_ack for unsent interrupt");
     }
 
     #[test]

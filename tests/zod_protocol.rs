@@ -314,6 +314,21 @@ async fn spawn_zod_protocol_error_before_interrupt_ack_server(
     .await
 }
 
+async fn spawn_zod_preemptive_interrupt_ack_server(
+    control_log: &std::path::Path,
+    marker: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_extra_env_and_extra_args(
+        control_log,
+        vec![(
+            "MCP_REPL_ZOD_PREEMPTIVE_INTERRUPT_ACK_MARKER",
+            marker.to_str().ok_or("marker path must be valid UTF-8")?,
+        )],
+        Vec::new(),
+    )
+    .await
+}
+
 async fn spawn_zod_pager_server(
     control_log: &std::path::Path,
     page_chars: u64,
@@ -2452,6 +2467,58 @@ async fn zod_worker_interrupt_ack_wait_protocol_error_fails_closed() -> TestResu
     assert!(
         log.contains("interrupt"),
         "expected worker to receive interrupt before protocol error, got: {log:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zod_worker_rejects_preemptive_interrupt_ack() -> TestResult<()> {
+    let tempdir = tempfile::tempdir()?;
+    let control_log = tempdir.path().join("control.log");
+    let marker = tempdir.path().join("release-preemptive-ack");
+    let session = spawn_zod_preemptive_interrupt_ack_server(&control_log, &marker).await?;
+
+    let first = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "interrupt-report 5000",
+                "timeout_ms": 10
+            }),
+        )
+        .await?;
+    let first_text = result_text(&first);
+    assert!(
+        first_text.contains("<<repl status: busy"),
+        "expected initial timeout, got: {first_text:?}"
+    );
+
+    fs::write(&marker, b"go")?;
+    let log = wait_for_log_contains(&control_log, "preemptive_interrupt_ack interrupt_id=1")?;
+    assert!(
+        !log.contains("interrupt interrupt_id=1"),
+        "preemptive ack must be emitted before the server sends interrupt 1, got log: {log:?}"
+    );
+
+    let interrupted = session
+        .call_tool_raw(
+            "repl",
+            json!({
+                "input": "\u{3}",
+                "timeout_ms": 10_000
+            }),
+        )
+        .await?;
+    let interrupted_text = result_text(&interrupted);
+    assert!(
+        interrupted_text.contains("worker protocol error: interrupt_ack for unsent interrupt"),
+        "expected preemptive ack to fail closed, got: {interrupted_text:?}"
+    );
+    assert!(
+        interrupted.is_error.unwrap_or(false),
+        "expected preemptive ack interrupt result to set isError"
     );
 
     session.cancel().await?;

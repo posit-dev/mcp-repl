@@ -37,6 +37,7 @@ const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_IN
 const SKIP_INTERRUPT_ACK_ENV: &str = "MCP_REPL_ZOD_SKIP_INTERRUPT_ACK";
 const INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK_ENV: &str =
     "MCP_REPL_ZOD_INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK";
+const PREEMPTIVE_INTERRUPT_ACK_MARKER_ENV: &str = "MCP_REPL_ZOD_PREEMPTIVE_INTERRUPT_ACK_MARKER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
@@ -63,6 +64,8 @@ fn run_worker(
     let skip_interrupt_ack = std::env::var_os(SKIP_INTERRUPT_ACK_ENV).is_some();
     let interrupt_protocol_error_before_ack =
         std::env::var_os(INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK_ENV).is_some();
+    let preemptive_interrupt_ack_marker =
+        std::env::var_os(PREEMPTIVE_INTERRUPT_ACK_MARKER_ENV).map(PathBuf::from);
     let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
         .map(|value| {
             value
@@ -130,6 +133,7 @@ fn run_worker(
         session_end_after_input_wait: false,
         bad_output_after_input_wait: None,
         ready_after_turn: false,
+        preemptive_interrupt_ack_marker,
     };
     while let Ok(message) = rx.recv() {
         match message {
@@ -259,6 +263,27 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("interrupt-report ") {
+        if let Some(marker) = state.preemptive_interrupt_ack_marker.take() {
+            let writer = writer.clone();
+            let control_log_path = control_log_path.clone();
+            thread::spawn(move || {
+                let _ = append_control_log(
+                    control_log_path.as_deref(),
+                    "preemptive_interrupt_ack_waiting",
+                );
+                if wait_for_marker_path(&marker).is_err() {
+                    return;
+                }
+                let _ = writer.send(&WorkerToServer::InterruptAck {
+                    interrupt_id: 1,
+                    discarded_input: false,
+                });
+                let _ = append_control_log(
+                    control_log_path.as_deref(),
+                    "preemptive_interrupt_ack interrupt_id=1",
+                );
+            });
+        }
         let report = observe_interrupts_for(parse_millis(millis)?, sideband_interrupted);
         let text = format!(
             "sideband interrupt: {}\nos interrupt: {}\n",
@@ -689,6 +714,7 @@ struct CommandState {
     session_end_after_input_wait: bool,
     bad_output_after_input_wait: Option<Duration>,
     ready_after_turn: bool,
+    preemptive_interrupt_ack_marker: Option<PathBuf>,
 }
 
 fn start_control_reader(
