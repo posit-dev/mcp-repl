@@ -5117,6 +5117,10 @@ print("WINDOWS_SIGINT_DONE", sigint_count)
         !is_busy_response(&interrupt_text),
         "expected Windows SIGINT interrupt to complete, got: {interrupt_text:?}"
     );
+    assert!(
+        interrupt_text.contains("WINDOWS_SIGINT_DONE 1"),
+        "expected Windows interrupt reply to show Python SIGINT delivery, got: {interrupt_text:?}"
+    );
 
     let follow_up = session
         .write_stdin_raw_with("print('WINDOWS_SIGINT_FINAL', sigint_count)", Some(5.0))

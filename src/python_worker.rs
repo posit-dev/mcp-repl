@@ -43,6 +43,8 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                     Some(ServerToWorkerIpcMessage::Interrupt { interrupt_id }) => {
                         let discarded_input =
                             python_session::discard_unconsumed_input_for_interrupt_ack();
+                        #[cfg(windows)]
+                        python_session::request_windows_python_sigint();
                         crate::ipc::emit_interrupt_ack(interrupt_id, discarded_input);
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {

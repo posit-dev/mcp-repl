@@ -93,6 +93,11 @@ pub(crate) fn discard_unconsumed_input_for_interrupt_ack() -> bool {
     discard_pending_stdin()
 }
 
+#[cfg(windows)]
+pub(crate) fn request_windows_python_sigint() {
+    let _ = unsafe { libc::raise(libc::SIGINT) };
+}
+
 pub(crate) fn begin_input(input: String) -> Result<(), String> {
     if input.is_empty() {
         return Ok(());
