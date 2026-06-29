@@ -447,16 +447,17 @@ fn send_ordered_interrupt(
     timeout: Duration,
 ) -> Result<Instant, WorkerError> {
     if let Some(ipc) = process.ipc_connection() {
-        ipc.note_interrupt_sent();
+        let interrupt_id = ipc.next_interrupt_id();
         let ack_wait_since = Instant::now();
-        match ipc.send(ServerToWorkerIpcMessage::Interrupt {}) {
+        match ipc.send(ServerToWorkerIpcMessage::Interrupt { interrupt_id }) {
             Ok(()) => {
                 let ack_timeout = timeout.min(INTERRUPT_ACK_TIMEOUT);
-                match ipc.wait_for_fresh_interrupt_ack(ack_timeout, ack_wait_since) {
+                match ipc.wait_for_interrupt_ack(ack_timeout, interrupt_id) {
                     Ok(Some(ack)) => {
                         crate::event_log::log(
                             "worker_interrupt_ack_observed",
                             serde_json::json!({
+                                "interrupt_id": ack.interrupt_id,
                                 "discarded_input": ack.discarded_input,
                                 "elapsed_ms": ack_wait_since.elapsed().as_millis(),
                             }),
@@ -466,6 +467,7 @@ fn send_ordered_interrupt(
                         crate::event_log::log(
                             "worker_interrupt_ack_timeout",
                             serde_json::json!({
+                                "interrupt_id": interrupt_id,
                                 "timeout_ms": ack_timeout.as_millis(),
                             }),
                         );

@@ -99,9 +99,12 @@ pub fn emit_ready() {
     }
 }
 
-pub fn emit_interrupt_ack(discarded_input: bool) {
+pub fn emit_interrupt_ack(interrupt_id: u64, discarded_input: bool) {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::InterruptAck { discarded_input });
+        let _ = ipc.send(WorkerToServerIpcMessage::InterruptAck {
+            interrupt_id,
+            discarded_input,
+        });
     }
 }
 

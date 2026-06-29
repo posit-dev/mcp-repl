@@ -1,6 +1,6 @@
 # Worker Sideband Protocol
 
-This document defines worker protocol version 7. The server rejects unsupported
+This document defines worker protocol version 8. The server rejects unsupported
 protocol versions before sending user input.
 
 The sideband is a UTF-8 JSON-lines IPC stream between the server and one worker
@@ -76,15 +76,18 @@ capture does not preserve separate stdout/stderr identity. Sideband
   line-oriented runtimes.
 
 `interrupt`
-- `{ "type": "interrupt" }`
+- `{ "type": "interrupt", "interrupt_id": <integer> }`
 - Sent when the client requests interrupt and a worker IPC endpoint exists.
 - The server sends this cleanup message first, waits briefly for
-  `interrupt_ack`, and then delivers a platform interrupt to the worker process
-  or process group when a worker process exists. The platform interrupt is sent
-  whether the ack arrives or times out.
+  `interrupt_ack` carrying the same `interrupt_id`, and then delivers a
+  platform interrupt to the worker process or process group when a worker
+  process exists. The platform interrupt is sent whether the ack arrives or
+  times out.
 - The IPC message carries no input and does not complete a batch. It tells the
   worker to discard pending managed input that has not yet been consumed by the
   runtime.
+- `interrupt_id` is assigned by the server and is scoped to the worker
+  connection. Workers must echo it in the matching `interrupt_ack`.
 - Sending `interrupt` does not change server-side readiness. Readiness changes
   only when the server sends `input_batch` or receives `input_wait` or `ready`.
 - While servicing an interrupt request, the server waits for `input_wait`,
@@ -118,9 +121,9 @@ invalid enum values, and invalid base64 payloads in base64 fields are protocol
 errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 7 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 8 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
 - Normal first worker message.
-- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `7`.
+- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `8`.
 - `worker.name` and `worker.version` are diagnostic metadata.
 - `capabilities.images` is advertised by workers that may emit image output; if
   the field is omitted inside `capabilities`, the server treats it as `false`.
@@ -144,9 +147,9 @@ errors.
 - If no input batch is active, this permits prompt-free startup readiness.
 
 `interrupt_ack`
-- `{ "type": "interrupt_ack", "discarded_input": <bool> }`
+- `{ "type": "interrupt_ack", "interrupt_id": <integer>, "discarded_input": <bool> }`
 - Confirms that the worker processed the ordered sideband `interrupt` cleanup
-  message.
+  message with the same `interrupt_id`.
 - `discarded_input` is `true` when pending managed input was discarded before
   the runtime consumed it. It is `false` when no pending managed input existed.
 - This message does not mark the worker ready, complete active input, interrupt

@@ -83,7 +83,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 7,
+            version: 8,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -721,9 +721,12 @@ fn start_control_reader(
                     );
                     let _ = turn_tx.send(ControlMessage::InputBatch { input });
                 }
-                Ok(ServerToWorker::Interrupt {}) => {
+                Ok(ServerToWorker::Interrupt { interrupt_id }) => {
                     interrupted.store(true, Ordering::SeqCst);
-                    let _ = append_control_log(control_log_path.as_deref(), "interrupt");
+                    let _ = append_control_log(
+                        control_log_path.as_deref(),
+                        &format!("interrupt interrupt_id={interrupt_id}"),
+                    );
                     if interrupt_protocol_error_before_ack {
                         let _ = append_control_log(
                             control_log_path.as_deref(),
@@ -738,11 +741,14 @@ fn start_control_reader(
                         );
                     } else {
                         let _ = writer.send(&WorkerToServer::InterruptAck {
+                            interrupt_id,
                             discarded_input: false,
                         });
                         let _ = append_control_log(
                             control_log_path.as_deref(),
-                            "interrupt_ack discarded_input=false",
+                            &format!(
+                                "interrupt_ack interrupt_id={interrupt_id} discarded_input=false"
+                            ),
                         );
                     }
                     let _ = turn_tx.send(ControlMessage::Interrupt);
@@ -787,7 +793,7 @@ enum ControlMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerToWorker {
     InputBatch { input: String },
-    Interrupt {},
+    Interrupt { interrupt_id: u64 },
     Shutdown {},
 }
 
@@ -820,6 +826,7 @@ enum WorkerToServer {
     },
     Ready {},
     InterruptAck {
+        interrupt_id: u64,
         discarded_input: bool,
     },
     SessionEnd {

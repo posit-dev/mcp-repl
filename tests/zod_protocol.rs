@@ -565,7 +565,7 @@ async fn zod_worker_interrupt_prefix_uses_existing_readiness_after_ack() -> Test
         "fresh_ready_after_interrupt_suppressed_for_pending_input",
     )?;
     let ack_idx = log
-        .find("interrupt_ack discarded_input=false")
+        .find("interrupt_ack interrupt_id=")
         .expect("interrupt ack log should be present");
     let input_idx = log
         .find("input_batch input=after interrupt ack")
@@ -2260,7 +2260,7 @@ async fn zod_worker_v5_busy_follow_up_does_not_send_second_input_batch() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v5_interrupt_is_payload_free() -> TestResult<()> {
+async fn zod_worker_v5_interrupt_carries_interrupt_id() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -2301,6 +2301,10 @@ async fn zod_worker_v5_interrupt_is_payload_free() -> TestResult<()> {
     );
 
     let log = wait_for_log_contains(&control_log, "interrupt")?;
+    assert!(
+        log.contains("interrupt interrupt_id="),
+        "interrupt must carry an interrupt identity, got log: {log:?}"
+    );
     assert!(
         !log.contains("interrupt input_id"),
         "interrupt must not carry input identity, got log: {log:?}"
@@ -2353,7 +2357,7 @@ async fn zod_worker_interrupt_ack_precedes_os_interrupt_observation() -> TestRes
 
     let log = wait_for_log_contains(&control_log, "os_interrupt_observed")?;
     let ack_idx = log
-        .find("interrupt_ack discarded_input=false")
+        .find("interrupt_ack interrupt_id=")
         .expect("interrupt ack log should be present");
     let os_idx = log
         .find("os_interrupt_observed")

@@ -40,9 +40,9 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::Interrupt {}) => {
+                    Some(ServerToWorkerIpcMessage::Interrupt { interrupt_id }) => {
                         let discarded_input = python_session::interrupt();
-                        crate::ipc::emit_interrupt_ack(discarded_input);
+                        crate::ipc::emit_interrupt_ack(interrupt_id, discarded_input);
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
                         python_session::request_shutdown();

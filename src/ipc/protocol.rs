@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 7;
+pub const WORKER_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerToWorkerIpcMessage {
     InputBatch { input: String },
-    Interrupt {},
+    Interrupt { interrupt_id: u64 },
     Shutdown {},
 }
 
@@ -50,6 +50,7 @@ pub enum WorkerToServerIpcMessage {
         message: Option<String>,
     },
     InterruptAck {
+        interrupt_id: u64,
         discarded_input: bool,
     },
 }
@@ -243,12 +244,18 @@ mod tests {
     fn interrupt_ack_protocol_reports_discarded_input() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
             "type": "interrupt_ack",
+            "interrupt_id": 7,
             "discarded_input": true
         }));
 
-        let Ok(WorkerToServerIpcMessage::InterruptAck { discarded_input }) = parsed else {
+        let Ok(WorkerToServerIpcMessage::InterruptAck {
+            interrupt_id,
+            discarded_input,
+        }) = parsed
+        else {
             panic!("interrupt_ack should deserialize");
         };
+        assert_eq!(interrupt_id, 7);
         assert!(discarded_input);
     }
     #[test]
@@ -522,13 +529,17 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_is_payload_free_server_to_worker_control() {
+    fn interrupt_carries_server_interrupt_id() {
         let interrupt = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
-            "type": "interrupt"
+            "type": "interrupt",
+            "interrupt_id": 7
         }));
         assert!(
-            matches!(interrupt, Ok(ServerToWorkerIpcMessage::Interrupt {})),
-            "interrupt should deserialize without payload"
+            matches!(
+                interrupt,
+                Ok(ServerToWorkerIpcMessage::Interrupt { interrupt_id: 7 })
+            ),
+            "interrupt should deserialize with interrupt_id"
         );
 
         assert!(

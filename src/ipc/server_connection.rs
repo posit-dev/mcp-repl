@@ -35,6 +35,7 @@ struct ServerIpcInbox {
     request_output_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
     interrupt_acks: VecDeque<IpcInterruptAck>,
+    next_interrupt_id: u64,
     disconnected: bool,
 }
 
@@ -55,8 +56,8 @@ pub enum IpcInputReadiness {
 
 #[derive(Debug, Clone)]
 pub struct IpcInterruptAck {
+    pub interrupt_id: u64,
     pub discarded_input: bool,
-    observed_at: Instant,
 }
 
 struct IpcHandlerGate {
@@ -241,11 +242,14 @@ impl ServerIpcConnection {
                             reader_handler_gate.dispatch(|| handler());
                         }
                     }
-                    WorkerToServerIpcMessage::InterruptAck { discarded_input } => {
+                    WorkerToServerIpcMessage::InterruptAck {
+                        interrupt_id,
+                        discarded_input,
+                    } => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.interrupt_acks.push_back(IpcInterruptAck {
+                            interrupt_id,
                             discarded_input,
-                            observed_at: Instant::now(),
                         });
                         reader_cvar.notify_all();
                     }
@@ -449,15 +453,17 @@ impl ServerIpcConnection {
         }
     }
 
-    pub fn note_interrupt_sent(&self) {
+    pub fn next_interrupt_id(&self) -> u64 {
         let mut guard = self.inbox.lock().unwrap();
+        guard.next_interrupt_id += 1;
         guard.input_state.note_interrupt_sent();
+        guard.next_interrupt_id
     }
 
-    pub fn wait_for_fresh_interrupt_ack(
+    pub fn wait_for_interrupt_ack(
         &self,
         timeout: Duration,
-        since: Instant,
+        interrupt_id: u64,
     ) -> Result<Option<IpcInterruptAck>, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
@@ -471,12 +477,17 @@ impl ServerIpcConnection {
             while guard
                 .interrupt_acks
                 .front()
-                .is_some_and(|ack| ack.observed_at <= since)
+                .is_some_and(|ack| ack.interrupt_id < interrupt_id)
             {
                 guard.interrupt_acks.pop_front();
             }
-            if let Some(ack) = guard.interrupt_acks.pop_front() {
-                return Ok(Some(ack));
+            if let Some(ack) = guard.interrupt_acks.front() {
+                if ack.interrupt_id == interrupt_id {
+                    return Ok(guard.interrupt_acks.pop_front());
+                }
+                return Err(IpcWaitError::Protocol(
+                    "interrupt_ack for unsent interrupt".to_string(),
+                ));
             }
 
             let now = Instant::now();
@@ -496,16 +507,25 @@ impl ServerIpcConnection {
                 while guard
                     .interrupt_acks
                     .front()
-                    .is_some_and(|ack| ack.observed_at <= since)
+                    .is_some_and(|ack| ack.interrupt_id < interrupt_id)
                 {
                     guard.interrupt_acks.pop_front();
                 }
                 if guard
                     .interrupt_acks
                     .front()
-                    .is_some_and(|ack| ack.observed_at <= deadline)
+                    .is_some_and(|ack| ack.interrupt_id == interrupt_id)
                 {
                     return Ok(guard.interrupt_acks.pop_front());
+                }
+                if guard
+                    .interrupt_acks
+                    .front()
+                    .is_some_and(|ack| ack.interrupt_id > interrupt_id)
+                {
+                    return Err(IpcWaitError::Protocol(
+                        "interrupt_ack for unsent interrupt".to_string(),
+                    ));
                 }
                 return Ok(None);
             }
@@ -1139,7 +1159,7 @@ mod tests {
             .wait_for_input_wait(Duration::from_millis(200))
             .expect("server observes input_wait");
 
-        server.note_interrupt_sent();
+        server.next_interrupt_id();
 
         server
             .begin_input()
@@ -1160,16 +1180,18 @@ mod tests {
             .wait_for_input_wait(Duration::from_millis(200))
             .expect("server observes input_wait");
 
-        let before_ack = Instant::now();
+        let interrupt_id = server.next_interrupt_id();
         worker
             .send(WorkerToServerIpcMessage::InterruptAck {
+                interrupt_id,
                 discarded_input: false,
             })
             .expect("send interrupt_ack");
         let ack = server
-            .wait_for_fresh_interrupt_ack(Duration::from_millis(200), before_ack)
+            .wait_for_interrupt_ack(Duration::from_millis(200), interrupt_id)
             .expect("ack wait should not fail")
             .expect("fresh ack should arrive");
+        assert_eq!(ack.interrupt_id, interrupt_id);
         assert!(
             !ack.discarded_input,
             "no queued worker input should report discarded_input=false"
@@ -1178,13 +1200,35 @@ mod tests {
             .begin_input()
             .expect("interrupt_ack must not change input_wait readiness");
 
-        let after_ack = Instant::now();
         let stale = server
-            .wait_for_fresh_interrupt_ack(Duration::from_millis(20), after_ack)
+            .wait_for_interrupt_ack(Duration::from_millis(20), interrupt_id)
             .expect("stale ack wait should not fail");
         assert!(
             stale.is_none(),
             "fresh ack wait should ignore already observed acks"
+        );
+    }
+
+    #[test]
+    fn delayed_interrupt_ack_is_not_reused_for_later_interrupt() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        let first_interrupt_id = server.next_interrupt_id();
+        worker
+            .send(WorkerToServerIpcMessage::InterruptAck {
+                interrupt_id: first_interrupt_id,
+                discarded_input: false,
+            })
+            .expect("send delayed interrupt_ack");
+
+        let second_interrupt_id = server.next_interrupt_id();
+        let stale = server
+            .wait_for_interrupt_ack(Duration::from_millis(20), second_interrupt_id)
+            .expect("ack wait should not fail");
+        assert!(
+            stale.is_none(),
+            "delayed ack from an earlier interrupt must not satisfy a later interrupt"
         );
     }
 
@@ -1203,16 +1247,18 @@ mod tests {
             .expect("server observes input_wait");
         server.begin_input().expect("begin input");
 
-        let before_ack = Instant::now();
+        let interrupt_id = server.next_interrupt_id();
         worker
             .send(WorkerToServerIpcMessage::InterruptAck {
+                interrupt_id,
                 discarded_input: true,
             })
             .expect("send interrupt_ack");
         let ack = server
-            .wait_for_fresh_interrupt_ack(Duration::from_millis(200), before_ack)
+            .wait_for_interrupt_ack(Duration::from_millis(200), interrupt_id)
             .expect("ack wait should not fail")
             .expect("fresh ack should arrive");
+        assert_eq!(ack.interrupt_id, interrupt_id);
         assert!(ack.discarded_input);
 
         let completion =
