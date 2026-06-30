@@ -1,6 +1,7 @@
 #[cfg(windows)]
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::ThreadId;
 
 #[cfg(windows)]
 use crate::python_ffi::PythonApi;
@@ -15,6 +16,7 @@ pub(super) struct SessionState {
     pub(super) inner: Mutex<SessionStateInner>,
     pub(super) cvar: Condvar,
     pub(super) runtime_wake: RuntimeWake,
+    pub(super) runtime_thread_id: ThreadId,
 }
 
 pub(super) struct SessionStateInner {
@@ -65,6 +67,7 @@ impl SessionState {
             cvar: Condvar::new(),
             runtime_wake: RuntimeWake::new()
                 .map_err(|err| format!("failed to create Python runtime wake pipe: {err}"))?,
+            runtime_thread_id: std::thread::current().id(),
         })
     }
 
@@ -73,27 +76,30 @@ impl SessionState {
     }
 
     pub(super) fn notify_runtime_input_available(&self) {
-        self.notify_runtime_input_waiters();
+        self.cvar.notify_all();
+        self.runtime_wake.wake_input();
     }
 
     pub(super) fn notify_runtime_input_closed(&self) {
-        self.notify_runtime_input_waiters();
+        self.cvar.notify_all();
+        self.runtime_wake.wake_input();
+        self.runtime_wake.wake_state();
     }
 
     pub(super) fn notify_runtime_input_consumer_released(&self) {
-        self.notify_runtime_input_waiters();
-    }
-
-    fn notify_runtime_input_waiters(&self) {
         self.cvar.notify_all();
-        self.runtime_wake.wake_queue();
+        self.runtime_wake.wake_state();
     }
 }
 
 #[cfg(target_family = "unix")]
 pub(super) struct RuntimeWake {
-    queue_read_fd: libc::c_int,
-    queue_write_fd: libc::c_int,
+    // Keep input, state, and signal wakes separate so non-owner waiters cannot
+    // drain the wake needed by the active stdin reader or the runtime thread.
+    input_read_fd: libc::c_int,
+    input_write_fd: libc::c_int,
+    state_read_fd: libc::c_int,
+    state_write_fd: libc::c_int,
     signal_read_fd: libc::c_int,
     signal_write_fd: libc::c_int,
 }
@@ -101,17 +107,29 @@ pub(super) struct RuntimeWake {
 #[cfg(target_family = "unix")]
 impl RuntimeWake {
     fn new() -> std::io::Result<Self> {
-        let (queue_read_fd, queue_write_fd) = create_wake_pipe()?;
+        let (input_read_fd, input_write_fd) = create_wake_pipe()?;
+        let (state_read_fd, state_write_fd) = match create_wake_pipe() {
+            Ok(fds) => fds,
+            Err(err) => {
+                close_fd(input_read_fd);
+                close_fd(input_write_fd);
+                return Err(err);
+            }
+        };
         match create_wake_pipe() {
             Ok((signal_read_fd, signal_write_fd)) => Ok(Self {
-                queue_read_fd,
-                queue_write_fd,
+                input_read_fd,
+                input_write_fd,
+                state_read_fd,
+                state_write_fd,
                 signal_read_fd,
                 signal_write_fd,
             }),
             Err(err) => {
-                close_fd(queue_read_fd);
-                close_fd(queue_write_fd);
+                close_fd(input_read_fd);
+                close_fd(input_write_fd);
+                close_fd(state_read_fd);
+                close_fd(state_write_fd);
                 Err(err)
             }
         }
@@ -121,23 +139,50 @@ impl RuntimeWake {
         self.signal_write_fd
     }
 
-    fn wake_queue(&self) {
-        write_wake_byte(self.queue_write_fd);
+    fn wake_input(&self) {
+        write_wake_byte(self.input_write_fd);
     }
 
-    pub(super) fn wait(&self) -> std::io::Result<()> {
-        let mut fds = [
-            libc::pollfd {
-                fd: self.queue_read_fd,
+    fn wake_state(&self) {
+        write_wake_byte(self.state_write_fd);
+    }
+
+    pub(super) fn wait_input_or_signal(&self, include_signal: bool) -> std::io::Result<()> {
+        self.wait_for_fds(true, false, include_signal)
+    }
+
+    pub(super) fn wait_state_or_signal(&self, include_signal: bool) -> std::io::Result<()> {
+        self.wait_for_fds(false, true, include_signal)
+    }
+
+    fn wait_for_fds(
+        &self,
+        include_input: bool,
+        include_state: bool,
+        include_signal: bool,
+    ) -> std::io::Result<()> {
+        let mut fds = Vec::with_capacity(3);
+        if include_input {
+            fds.push(libc::pollfd {
+                fd: self.input_read_fd,
                 events: libc::POLLIN,
                 revents: 0,
-            },
-            libc::pollfd {
+            });
+        }
+        if include_state {
+            fds.push(libc::pollfd {
+                fd: self.state_read_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if include_signal {
+            fds.push(libc::pollfd {
                 fd: self.signal_read_fd,
                 events: libc::POLLIN,
                 revents: 0,
-            },
-        ];
+            });
+        }
         loop {
             let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
             if rc < 0 {
@@ -150,11 +195,10 @@ impl RuntimeWake {
             if rc == 0 {
                 continue;
             }
-            if fds[0].revents != 0 {
-                drain_fd(self.queue_read_fd);
-            }
-            if fds[1].revents != 0 {
-                drain_fd(self.signal_read_fd);
+            for fd in &fds {
+                if fd.revents != 0 {
+                    drain_fd(fd.fd);
+                }
             }
             return Ok(());
         }
@@ -164,8 +208,10 @@ impl RuntimeWake {
 #[cfg(target_family = "unix")]
 impl Drop for RuntimeWake {
     fn drop(&mut self) {
-        close_fd(self.queue_read_fd);
-        close_fd(self.queue_write_fd);
+        close_fd(self.input_read_fd);
+        close_fd(self.input_write_fd);
+        close_fd(self.state_read_fd);
+        close_fd(self.state_write_fd);
         close_fd(self.signal_read_fd);
         close_fd(self.signal_write_fd);
     }
@@ -250,21 +296,33 @@ fn close_fd(fd: libc::c_int) {
 
 #[cfg(windows)]
 pub(super) struct RuntimeWake {
-    queue_event: isize,
+    // Keep input, state, and signal wakes separate so non-owner waiters cannot
+    // drain the wake needed by the active stdin reader or the runtime thread.
+    input_event: isize,
+    state_event: isize,
     signal_event: isize,
 }
 
 #[cfg(windows)]
 impl RuntimeWake {
     fn new() -> std::io::Result<Self> {
-        let queue_event = create_event()?;
+        let input_event = create_event()?;
+        let state_event = match create_event() {
+            Ok(handle) => handle,
+            Err(err) => {
+                close_handle(input_event);
+                return Err(err);
+            }
+        };
         match create_event() {
             Ok(signal_event) => Ok(Self {
-                queue_event,
+                input_event,
+                state_event,
                 signal_event,
             }),
             Err(err) => {
-                close_handle(queue_event);
+                close_handle(input_event);
+                close_handle(state_event);
                 Err(err)
             }
         }
@@ -287,15 +345,38 @@ impl RuntimeWake {
         Ok(())
     }
 
-    fn wake_queue(&self) {
-        set_event(self.queue_event);
+    fn wake_input(&self) {
+        set_event(self.input_event);
     }
 
-    pub(super) fn wait(&self) -> std::io::Result<()> {
-        let handles = [
-            self.queue_event as windows_sys::Win32::Foundation::HANDLE,
-            self.signal_event as windows_sys::Win32::Foundation::HANDLE,
-        ];
+    fn wake_state(&self) {
+        set_event(self.state_event);
+    }
+
+    pub(super) fn wait_input_or_signal(&self, include_signal: bool) -> std::io::Result<()> {
+        self.wait_for_events(true, false, include_signal)
+    }
+
+    pub(super) fn wait_state_or_signal(&self, include_signal: bool) -> std::io::Result<()> {
+        self.wait_for_events(false, true, include_signal)
+    }
+
+    fn wait_for_events(
+        &self,
+        include_input: bool,
+        include_state: bool,
+        include_signal: bool,
+    ) -> std::io::Result<()> {
+        let mut handles = Vec::with_capacity(3);
+        if include_input {
+            handles.push(self.input_event as windows_sys::Win32::Foundation::HANDLE);
+        }
+        if include_state {
+            handles.push(self.state_event as windows_sys::Win32::Foundation::HANDLE);
+        }
+        if include_signal {
+            handles.push(self.signal_event as windows_sys::Win32::Foundation::HANDLE);
+        }
         loop {
             let result = unsafe {
                 windows_sys::Win32::System::Threading::WaitForMultipleObjects(
@@ -305,8 +386,8 @@ impl RuntimeWake {
                     windows_sys::Win32::System::Threading::INFINITE,
                 )
             };
-            if result == windows_sys::Win32::Foundation::WAIT_OBJECT_0
-                || result == windows_sys::Win32::Foundation::WAIT_OBJECT_0 + 1
+            if result >= windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                && result < windows_sys::Win32::Foundation::WAIT_OBJECT_0 + handles.len() as u32
             {
                 return Ok(());
             }
@@ -320,7 +401,8 @@ impl RuntimeWake {
 #[cfg(windows)]
 impl Drop for RuntimeWake {
     fn drop(&mut self) {
-        close_handle(self.queue_event);
+        close_handle(self.input_event);
+        close_handle(self.state_event);
         close_handle(self.signal_event);
     }
 }
@@ -378,7 +460,9 @@ impl RuntimeWake {
         Ok(Self)
     }
 
-    fn wake_queue(&self) {}
+    fn wake_input(&self) {}
+
+    fn wake_state(&self) {}
 }
 
 pub(super) fn session_state() -> &'static Arc<SessionState> {

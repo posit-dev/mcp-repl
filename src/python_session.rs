@@ -388,16 +388,102 @@ fn wait_for_next_cell() -> Result<Option<CellInput>, String> {
             continue;
         }
         guard = state.inner.lock().unwrap();
-        if !guard.input_queue.has_active_read_consumer()
-            && let Some(source) = guard.input_queue.take_cell_payload()
-        {
+        if guard.input_queue.has_active_read_consumer() {
+            guard = wait_for_state_notification(state, guard, false, true);
+            continue;
+        }
+        if let Some(source) = guard.input_queue.take_cell_payload() {
             guard.cell_running = true;
             return Ok(Some(CellInput { source }));
         }
         if guard.shutdown {
             return Ok(None);
         }
-        guard = wait_for_queue_notification(state, guard, false);
+        guard = wait_for_queue_notification(state, guard, false, true);
+    }
+}
+
+fn current_thread_can_handle_python_signals(state: &Arc<SessionState>) -> bool {
+    std::thread::current().id() == state.runtime_thread_id
+}
+
+fn wait_for_state_notification<'a>(
+    state: &'a Arc<SessionState>,
+    guard: std::sync::MutexGuard<'a, state::SessionStateInner>,
+    release_gil_while_waiting: bool,
+    include_signal: bool,
+) -> std::sync::MutexGuard<'a, state::SessionStateInner> {
+    #[cfg(any(target_family = "unix", windows))]
+    {
+        drop(guard);
+        if release_gil_while_waiting {
+            let allow_threads = PythonThreadsAllowed::new();
+            state
+                .runtime_wake
+                .wait_state_or_signal(include_signal)
+                .expect("Python runtime state wake wait failed");
+            drop(allow_threads);
+        } else {
+            state
+                .runtime_wake
+                .wait_state_or_signal(include_signal)
+                .expect("Python runtime state wake wait failed");
+        }
+        state.inner.lock().unwrap()
+    }
+
+    #[cfg(not(any(target_family = "unix", windows)))]
+    {
+        let _ = include_signal;
+        if release_gil_while_waiting {
+            let allow_threads = PythonThreadsAllowed::new();
+            let guard = state.cvar.wait(guard).unwrap();
+            drop(guard);
+            drop(allow_threads);
+            state.inner.lock().unwrap()
+        } else {
+            state.cvar.wait(guard).unwrap()
+        }
+    }
+}
+
+fn wait_for_queue_notification<'a>(
+    state: &'a Arc<SessionState>,
+    guard: std::sync::MutexGuard<'a, state::SessionStateInner>,
+    release_gil_while_waiting: bool,
+    include_signal: bool,
+) -> std::sync::MutexGuard<'a, state::SessionStateInner> {
+    #[cfg(any(target_family = "unix", windows))]
+    {
+        drop(guard);
+        if release_gil_while_waiting {
+            let allow_threads = PythonThreadsAllowed::new();
+            state
+                .runtime_wake
+                .wait_input_or_signal(include_signal)
+                .expect("Python runtime input wake wait failed");
+            drop(allow_threads);
+        } else {
+            state
+                .runtime_wake
+                .wait_input_or_signal(include_signal)
+                .expect("Python runtime input wake wait failed");
+        }
+        state.inner.lock().unwrap()
+    }
+
+    #[cfg(not(any(target_family = "unix", windows)))]
+    {
+        let _ = include_signal;
+        if release_gil_while_waiting {
+            let allow_threads = PythonThreadsAllowed::new();
+            let guard = state.cvar.wait(guard).unwrap();
+            drop(guard);
+            drop(allow_threads);
+            state.inner.lock().unwrap()
+        } else {
+            state.cvar.wait(guard).unwrap()
+        }
     }
 }
 
@@ -530,63 +616,6 @@ enum QueueReadAction {
     Shutdown,
 }
 
-fn wait_for_queue_notification<'a>(
-    state: &'a Arc<SessionState>,
-    guard: std::sync::MutexGuard<'a, state::SessionStateInner>,
-    release_gil_while_waiting: bool,
-) -> std::sync::MutexGuard<'a, state::SessionStateInner> {
-    #[cfg(target_family = "unix")]
-    {
-        drop(guard);
-        if release_gil_while_waiting {
-            let allow_threads = PythonThreadsAllowed::new();
-            state
-                .runtime_wake
-                .wait()
-                .expect("Python runtime wake wait failed");
-            drop(allow_threads);
-        } else {
-            state
-                .runtime_wake
-                .wait()
-                .expect("Python runtime wake wait failed");
-        }
-        state.inner.lock().unwrap()
-    }
-
-    #[cfg(windows)]
-    {
-        drop(guard);
-        if release_gil_while_waiting {
-            let allow_threads = PythonThreadsAllowed::new();
-            state
-                .runtime_wake
-                .wait()
-                .expect("Python runtime wake wait failed");
-            drop(allow_threads);
-        } else {
-            state
-                .runtime_wake
-                .wait()
-                .expect("Python runtime wake wait failed");
-        }
-        state.inner.lock().unwrap()
-    }
-
-    #[cfg(not(any(target_family = "unix", windows)))]
-    {
-        if release_gil_while_waiting {
-            let allow_threads = PythonThreadsAllowed::new();
-            let guard = state.cvar.wait(guard).unwrap();
-            drop(guard);
-            drop(allow_threads);
-            state.inner.lock().unwrap()
-        } else {
-            state.cvar.wait(guard).unwrap()
-        }
-    }
-}
-
 fn release_read_consumer(state: &Arc<SessionState>) {
     let mut guard = state.inner.lock().unwrap();
     guard.input_queue.end_read_consumer();
@@ -614,7 +643,12 @@ fn next_queue_line_action(
             if guard.input_queue.begin_read_consumer() {
                 *owns_consumer = true;
             } else {
-                guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
+                guard = wait_for_state_notification(
+                    state,
+                    guard,
+                    release_gil_while_waiting,
+                    current_thread_can_handle_python_signals(state),
+                );
                 continue;
             }
         }
@@ -662,7 +696,12 @@ fn next_queue_line_action(
                 prompt: prompt.to_string(),
             };
         }
-        guard = wait_for_queue_notification(state, guard, release_gil_while_waiting);
+        guard = wait_for_queue_notification(
+            state,
+            guard,
+            release_gil_while_waiting,
+            current_thread_can_handle_python_signals(state),
+        );
     }
 }
 
@@ -754,7 +793,12 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     if guard.input_queue.begin_read_consumer() {
                         owns_consumer = true;
                     } else {
-                        guard = wait_for_queue_notification(state, guard, true);
+                        guard = wait_for_state_notification(
+                            state,
+                            guard,
+                            true,
+                            current_thread_can_handle_python_signals(state),
+                        );
                         continue;
                     }
                 }
@@ -799,7 +843,12 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                         prompt: String::new(),
                     };
                 }
-                guard = wait_for_queue_notification(state, guard, true);
+                guard = wait_for_queue_notification(
+                    state,
+                    guard,
+                    true,
+                    current_thread_can_handle_python_signals(state),
+                );
             }
         };
 
