@@ -330,8 +330,6 @@ R invariants:
 - Whether non-Unix R needs the same input-wait shape as Unix R in this
   initiative. The current non-Unix R wait still uses a timed
   `R_CheckUserInterrupt()` loop, so the no-polling invariant is not yet portable.
-- Whether protocol versioning should reject all old `interrupt` and `ready`
-  messages at the parser layer or only in protocol contract tests.
 
 ## Next Safe Slice
 
@@ -379,3 +377,6 @@ R invariants:
   wake pipe. A Unix SIGINT handler marks R's pending interrupt flag and writes
   the pipe so the main R thread observes the interrupt through
   `R_CheckUserInterrupt()`.
+- 2026-06-29: Chose parser-layer rejection for stale generic `interrupt`,
+  `interrupt_ack`, and `ready` protocol messages so review cannot treat old
+  interrupt sideband names as compatibility surfaces.
