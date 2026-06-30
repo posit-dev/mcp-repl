@@ -13,10 +13,9 @@
 
 ## Status
 
-- State: active
-- Last updated: 2026-06-29
-- Current phase: Unix and Windows implementation complete; unsupported
-  non-Unix/non-Windows input-wait shape remains a fallback boundary.
+- State: completed
+- Last updated: 2026-06-30
+- Current phase: complete.
 
 ## Motivating Scenario
 
@@ -303,7 +302,7 @@ R invariants:
 - Phase 3: complete - update worker queue handling so sideband cleanup cannot
   wake or mutate runtime interrupt state. Python and R sideband cleanup now
   discard queued input only.
-- Phase 4: complete on Unix and pending full Windows host verification - update Python and R waits to preserve
+- Phase 4: complete - update Python and R waits to preserve
   runtime-native interrupt behavior without normal-operation busy polling.
   Unix Python uses a Python signal wake fd; Unix R uses a runtime input wake
   pipe plus a SIGINT bridge that marks R's pending interrupt flag and lets the
@@ -314,9 +313,8 @@ R invariants:
   waits when `CTRL_C_EVENT` arrives; the embedded R handler sets `UserBreak` so
   the main R thread observes the interrupt through R's Windows event path.
   Windows pipe workers do not have a supported targeted Ctrl-C path.
-- Phase 5: complete on Unix and protocol fixtures - update public tests and
-  protocol fixture tests to lock the boundary. Windows runtime tests still need
-  to be run on a Windows host.
+- Phase 5: complete - update public tests and protocol fixture tests to lock
+  the boundary. Windows runtime tests passed on a Windows host.
 
 ## Locked Decisions
 
@@ -334,26 +332,24 @@ R invariants:
   pseudo-console instead of broadcasting a console-wide event from the main
   server process.
 
-## Open Questions
+## Future Work
 
 - Whether unsupported non-Unix/non-Windows platforms should keep the current
   condvar/timed fallback or fail fast instead of pretending to satisfy the full
   interrupt contract.
 
-## Next Safe Slice
-
-- Push the branch and run the Windows tests on a Windows host.
-- Decide whether to fail fast on unsupported non-Unix/non-Windows platforms.
-
 ## Verification
 
+- `cargo +nightly fmt`
 - `env RUSTFLAGS=-Dwarnings cargo check`
 - `env RUSTFLAGS=-Dwarnings cargo build`
 - `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `env RUSTFLAGS=-Dwarnings cargo test --quiet`
-- `cargo +nightly fmt`
 - `env RUSTFLAGS=-Dwarnings cargo build --release --locked`
+- Windows host: `cargo test -j 1 --test zod_protocol zod_worker_discard_pending_input_ack_precedes_os_interrupt_observation -- --test-threads=1 --nocapture`
+- Windows host: `cargo test -j 1 --test python_backend python_windows_ -- --test-threads=1 --nocapture`
+- Windows host: `cargo test -j 1 --test interrupt write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input_on_windows -- --test-threads=1 --nocapture`
 
 ## Stop Conditions
 
