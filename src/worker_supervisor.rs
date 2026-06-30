@@ -1205,16 +1205,16 @@ impl WorkerProcess {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
-        if let WorkerChild::DirectWindows(child) = &self.child {
-            return crate::windows_ctrl_c::spawn_ctrl_c_sender(child.process_id())
-                .map_err(WorkerError::Protocol);
-        }
         if self.ctrl_c_via_stdin {
             return send_stdin_command(
                 &self.stdin_tx,
                 Some(vec![0x03]),
                 Duration::from_millis(200),
             );
+        }
+        if let WorkerChild::DirectWindows(child) = &self.child {
+            return crate::windows_ctrl_c::spawn_ctrl_c_sender(child.process_id())
+                .map_err(WorkerError::Protocol);
         }
         Err(WorkerError::Protocol(
             "Windows Ctrl-C interrupts require PTY stdin transport".to_string(),
