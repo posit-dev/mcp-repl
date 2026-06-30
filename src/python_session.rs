@@ -161,8 +161,7 @@ fn discard_queued_input() -> bool {
         return false;
     };
     let mut guard = state.inner.lock().unwrap();
-    let discarded = guard.input_queue.discard_unconsumed_input();
-    discarded
+    guard.input_queue.discard_unconsumed_input()
 }
 
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
