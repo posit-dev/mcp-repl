@@ -62,7 +62,6 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE, WAIT_FAILED, WAIT_TIMEOUT,
 };
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 #[cfg(target_family = "windows")]
@@ -415,6 +414,8 @@ pub(crate) struct WorkerProcess {
     child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     shutdown_stdin_policy: ShutdownStdinPolicy,
+    #[cfg(target_family = "windows")]
+    ctrl_c_via_stdin: bool,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
     live_output: LiveOutputCapture,
@@ -492,6 +493,8 @@ fn send_stdin_command(
 struct SpawnedWorker {
     child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
+    #[cfg(target_family = "windows")]
+    ctrl_c_via_stdin: bool,
     session_tmpdir: Option<PathBuf>,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
@@ -528,11 +531,10 @@ impl WorkerChild {
         Self::Standard(child)
     }
 
+    #[cfg(target_family = "unix")]
     fn id(&self) -> u32 {
         match self {
             Self::Standard(child) => child.id(),
-            #[cfg(target_family = "windows")]
-            Self::DirectWindows(child) => child.id(),
         }
     }
 
@@ -581,7 +583,6 @@ impl WorkerChild {
 struct WindowsProcess {
     process: HANDLE,
     thread: HANDLE,
-    process_id: u32,
     job: Option<crate::windows_conpty::JobHandle>,
     _conpty: Option<crate::windows_conpty::Conpty>,
 }
@@ -599,14 +600,9 @@ impl WindowsProcess {
         Self {
             process: proc_info.hProcess,
             thread: proc_info.hThread,
-            process_id: proc_info.dwProcessId,
             job,
             _conpty: conpty,
         }
-    }
-
-    fn id(&self) -> u32 {
-        self.process_id
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
@@ -750,7 +746,10 @@ impl WorkerProcess {
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(oversized_output, output_timeline.clone());
         #[cfg(target_os = "windows")]
-        let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
+        let live_output = if matches!(
+            &worker_launch,
+            WorkerLaunch::Builtin(Backend::Python | Backend::R)
+        ) {
             live_output.with_windows_conpty_startup_noise_filter()
         } else {
             live_output
@@ -758,6 +757,8 @@ impl WorkerProcess {
         let SpawnedWorker {
             child,
             stdin_tx,
+            #[cfg(target_family = "windows")]
+            ctrl_c_via_stdin,
             session_tmpdir,
             stdout_reader,
             stderr_reader,
@@ -862,6 +863,8 @@ impl WorkerProcess {
             child,
             stdin_tx,
             shutdown_stdin_policy,
+            #[cfg(target_family = "windows")]
+            ctrl_c_via_stdin,
             session_tmpdir,
             ipc,
             live_output,
@@ -960,6 +963,8 @@ impl WorkerProcess {
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
+        #[cfg(target_family = "windows")]
+        let ctrl_c_via_stdin = matches!(stdin_transport, WorkerStdinTransport::Pty);
         #[cfg(target_os = "windows")]
         let spawn_stdin_transport =
             windows_spawn_transport(&mut command, &prepared.args, stdin_transport);
@@ -1013,6 +1018,8 @@ impl WorkerProcess {
         Ok(SpawnedWorker {
             child,
             stdin_tx,
+            #[cfg(target_family = "windows")]
+            ctrl_c_via_stdin,
             session_tmpdir,
             stdout_reader,
             stderr_reader,
@@ -1088,6 +1095,8 @@ impl WorkerProcess {
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         let stdin_transport = spec.stdin.transport();
+        #[cfg(target_family = "windows")]
+        let ctrl_c_via_stdin = matches!(stdin_transport, WorkerStdinTransport::Pty);
         #[cfg(target_os = "windows")]
         let spawn_stdin_transport =
             windows_spawn_transport(&mut command, &prepared.args, stdin_transport);
@@ -1137,6 +1146,8 @@ impl WorkerProcess {
         Ok(SpawnedWorker {
             child,
             stdin_tx,
+            #[cfg(target_family = "windows")]
+            ctrl_c_via_stdin,
             session_tmpdir,
             stdout_reader,
             stderr_reader,
@@ -1177,7 +1188,7 @@ impl WorkerProcess {
         }
         #[cfg(target_family = "windows")]
         {
-            self.send_windows_ctrl_break()
+            self.send_windows_interrupt()
         }
         #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         {
@@ -1186,19 +1197,20 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "windows")]
-    fn send_windows_ctrl_break(&mut self) -> Result<(), WorkerError> {
+    fn send_windows_interrupt(&mut self) -> Result<(), WorkerError> {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
-        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.child.id()) };
-        if ok != 0 {
-            return Ok(());
+        if self.ctrl_c_via_stdin {
+            return send_stdin_command(
+                &self.stdin_tx,
+                Some(vec![0x03]),
+                Duration::from_millis(200),
+            );
         }
-
-        match self.child.try_wait()? {
-            Some(_) => Ok(()),
-            None => Err(WorkerError::Io(std::io::Error::last_os_error())),
-        }
+        Err(WorkerError::Protocol(
+            "Windows Ctrl-C interrupts require PTY stdin transport".to_string(),
+        ))
     }
 
     fn send_sigterm(&mut self) -> Result<(), WorkerError> {
@@ -1587,6 +1599,8 @@ impl WorkerProcess {
             child: WorkerChild::standard(child),
             stdin_tx,
             shutdown_stdin_policy: ShutdownStdinPolicy::CloseBeforeWait,
+            #[cfg(target_family = "windows")]
+            ctrl_c_via_stdin: false,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
             live_output: LiveOutputCapture::new(

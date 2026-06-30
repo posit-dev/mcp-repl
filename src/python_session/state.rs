@@ -357,7 +357,6 @@ fn close_handle(handle: isize) {
 unsafe extern "system" fn windows_signal_wake_handler(event: u32) -> i32 {
     let signum = match event {
         windows_sys::Win32::System::Console::CTRL_C_EVENT => libc::SIGINT,
-        windows_sys::Win32::System::Console::CTRL_BREAK_EVENT => windows_sigbreak(),
         _ => return 0,
     };
     if let Some(api) = PythonApi::try_global() {
@@ -367,13 +366,7 @@ unsafe extern "system" fn windows_signal_wake_handler(event: u32) -> i32 {
     if handle != 0 {
         set_event(handle);
     }
-    0
-}
-
-#[cfg(windows)]
-fn windows_sigbreak() -> libc::c_int {
-    // MSVCRT's SIGBREAK value, used by CPython for CTRL_BREAK_EVENT.
-    21
+    1
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]

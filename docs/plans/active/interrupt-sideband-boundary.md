@@ -303,13 +303,14 @@ R invariants:
 - Phase 3: complete - update worker queue handling so sideband cleanup cannot
   wake or mutate runtime interrupt state. Python and R sideband cleanup now
   discard queued input only.
-- Phase 4: complete on Unix and Windows - update Python and R waits to preserve
+- Phase 4: complete on Unix and in progress on Windows - update Python and R waits to preserve
   runtime-native interrupt behavior without normal-operation busy polling.
   Unix Python uses a Python signal wake fd; Unix R uses a runtime input wake
   pipe plus a SIGINT bridge that marks R's pending interrupt flag and lets the
-  main R thread call `R_CheckUserInterrupt()`. Windows Python and R use runtime
-  input events plus console-control event wake handlers; the handlers wake the
-  runtime wait and return control to the runtime's normal interrupt handling.
+  main R thread call `R_CheckUserInterrupt()`. Windows PTY/ConPTY workers receive
+  terminal Ctrl-C through their pseudo-console input, and runtime console-control
+  handlers wake managed waits when `CTRL_C_EVENT` arrives. Windows pipe workers
+  do not have a supported targeted Ctrl-C path.
 - Phase 5: complete on Unix and protocol fixtures - update public tests and
   protocol fixture tests to lock the boundary. Windows runtime tests still need
   to be run on a Windows host.
@@ -324,6 +325,10 @@ R invariants:
 - Prompt-free readiness is represented as `input_wait { prompt: null }`.
 - The Ctrl-C tail settle delay is best effort. It improves common user-visible
   behavior but is not a correctness guarantee.
+- Windows Ctrl-C delivery must mean `CTRL_C_EVENT`/`SIGINT`, not
+  `CTRL_BREAK_EVENT`/`SIGBREAK`. Built-in Windows runtimes use PTY/ConPTY
+  transport so the server can write terminal Ctrl-C to a worker-owned
+  pseudo-console instead of broadcasting a console-wide event.
 
 ## Open Questions
 
@@ -380,3 +385,7 @@ R invariants:
 - 2026-06-29: Added Windows runtime input wake events for Python and R. Queue
   send/close sets the queue event; real console-control delivery sets the signal
   event; sideband discard still only clears queued input and sends an ack.
+- 2026-06-29: Removed `CTRL_BREAK_EVENT` as the Windows Ctrl-C approximation.
+  Windows runtime interruption now targets `CTRL_C_EVENT` by writing ETX to
+  PTY/ConPTY stdin; pipe-only Windows workers intentionally have no targeted
+  Ctrl-C interrupt path.

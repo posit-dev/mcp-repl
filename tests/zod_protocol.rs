@@ -214,6 +214,33 @@ async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
     server_env: Vec<(String, String)>,
     extra_args: Vec<String>,
 ) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_options(
+        control_log,
+        extra_env,
+        server_env,
+        extra_args,
+        zod_default_stdin_transport(),
+    )
+    .await
+}
+
+#[cfg(windows)]
+fn zod_default_stdin_transport() -> &'static str {
+    "pty"
+}
+
+#[cfg(not(windows))]
+fn zod_default_stdin_transport() -> &'static str {
+    "pipe"
+}
+
+async fn spawn_zod_server_with_options(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    server_env: Vec<(String, String)>,
+    extra_args: Vec<String>,
+    stdin_transport: &str,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
     let mut env = Map::new();
@@ -229,7 +256,7 @@ async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
         "args": [],
         "working_dir": "inherit",
         "env": env,
-        "stdin": "pipe",
+        "stdin": stdin_transport,
         "sandbox": "server"
     });
     std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;

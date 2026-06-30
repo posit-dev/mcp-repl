@@ -4822,7 +4822,7 @@ def handle_sigint(signum, frame):
     global sigint_count
     sigint_count += 1
     print("CUSTOM_INPUT_INTERRUPT", sigint_count)
-signal.signal(getattr(signal, "SIGBREAK", signal.SIGINT), handle_sigint)
+signal.signal(signal.SIGINT, handle_sigint)
 value = input('custom interrupt> ')
 print('CUSTOM_INPUT_VALUE', value, sigint_count)
 "#;
@@ -4880,11 +4880,11 @@ async fn python_windows_input_wait_interrupt_preserves_next_input_batch() -> Tes
                 r#"
 import signal
 interrupt_count = 0
-def handle_sigbreak(signum, frame):
+def handle_sigint(signum, frame):
     global interrupt_count
     interrupt_count += 1
-    print("WINDOWS_INPUT_SIGBREAK", interrupt_count)
-signal.signal(signal.SIGBREAK, handle_sigbreak)
+    print("WINDOWS_INPUT_SIGINT", interrupt_count)
+signal.signal(signal.SIGINT, handle_sigint)
 value = input('win interrupt> ')
 print('WINDOWS_INPUT_VALUE', value, interrupt_count)
 "#,
@@ -4925,8 +4925,8 @@ print('WINDOWS_INPUT_VALUE', value, interrupt_count)
     session.cancel().await?;
 
     assert!(
-        answer_text.contains("WINDOWS_INPUT_SIGBREAK 1"),
-        "expected Windows SIGBREAK handler to run from real control-break event, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
+        answer_text.contains("WINDOWS_INPUT_SIGINT 1"),
+        "expected Windows SIGINT handler to run from real terminal Ctrl-C, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
     );
     assert!(
         answer_text.contains("WINDOWS_INPUT_VALUE answer 1"),
@@ -5050,7 +5050,7 @@ def handle_interrupt(signum, frame):
     global interrupt_count
     interrupt_count += 1
     print("SIGNAL_COUNT", interrupt_count)
-signal.signal(getattr(signal, "SIGBREAK", signal.SIGINT), handle_interrupt)
+signal.signal(signal.SIGINT, handle_interrupt)
 print("SIGNAL_READY")
 while interrupt_count == 0:
     pass
@@ -5091,7 +5091,7 @@ print("SIGNAL_FINAL", interrupt_count)
 
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_windows_interrupt_delivers_sigbreak_to_running_cell() -> TestResult<()> {
+async fn python_windows_interrupt_delivers_sigint_to_running_cell() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -5101,15 +5101,15 @@ async fn python_windows_interrupt_delivers_sigbreak_to_running_cell() -> TestRes
         .write_stdin_raw_with(
             r#"exec("""
 import signal
-sigbreak_count = 0
-def handle_sigbreak(signum, frame):
-    global sigbreak_count
-    sigbreak_count += 1
-signal.signal(signal.SIGBREAK, handle_sigbreak)
-print("WINDOWS_SIGBREAK_READY")
-while sigbreak_count == 0:
+sigint_count = 0
+def handle_sigint(signum, frame):
+    global sigint_count
+    sigint_count += 1
+signal.signal(signal.SIGINT, handle_sigint)
+print("WINDOWS_SIGINT_READY")
+while sigint_count == 0:
     pass
-print("WINDOWS_SIGBREAK_DONE", sigbreak_count)
+print("WINDOWS_SIGINT_DONE", sigint_count)
 """)
 "#,
             Some(0.2),
@@ -5118,7 +5118,7 @@ print("WINDOWS_SIGBREAK_DONE", sigbreak_count)
     let timeout_text = result_text(&timeout_result);
     assert!(
         timeout_text.contains("<<repl status: busy"),
-        "expected Windows SIGBREAK handler loop to time out, got: {timeout_text:?}"
+        "expected Windows SIGINT handler loop to time out, got: {timeout_text:?}"
     );
 
     let interrupt = session
@@ -5127,22 +5127,22 @@ print("WINDOWS_SIGBREAK_DONE", sigbreak_count)
     let interrupt_text = result_text(&interrupt);
     assert!(
         !is_busy_response(&interrupt_text),
-        "expected Windows SIGBREAK interrupt to complete, got: {interrupt_text:?}"
+        "expected Windows SIGINT interrupt to complete, got: {interrupt_text:?}"
     );
     assert!(
-        interrupt_text.contains("WINDOWS_SIGBREAK_DONE 1"),
-        "expected Windows interrupt reply to show Python SIGBREAK delivery, got: {interrupt_text:?}"
+        interrupt_text.contains("WINDOWS_SIGINT_DONE 1"),
+        "expected Windows interrupt reply to show Python SIGINT delivery, got: {interrupt_text:?}"
     );
 
     let follow_up = session
-        .write_stdin_raw_with("print('WINDOWS_SIGBREAK_FINAL', sigbreak_count)", Some(5.0))
+        .write_stdin_raw_with("print('WINDOWS_SIGINT_FINAL', sigint_count)", Some(5.0))
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;
 
     assert!(
-        follow_up_text.contains("WINDOWS_SIGBREAK_FINAL 1"),
-        "expected Windows Ctrl-C to deliver one Python SIGBREAK, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        follow_up_text.contains("WINDOWS_SIGINT_FINAL 1"),
+        "expected Windows Ctrl-C to deliver one Python SIGINT, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -5974,7 +5974,7 @@ def handle_interrupt(signum, frame):
     print("PY_SLEEP_INTERRUPT")
     raise KeyboardInterrupt
 
-signal.signal(getattr(signal, "SIGBREAK", signal.SIGINT), handle_interrupt)
+signal.signal(signal.SIGINT, handle_interrupt)
 print("PY_SLEEP_READY", flush=True)
 try:
     time.sleep(30)

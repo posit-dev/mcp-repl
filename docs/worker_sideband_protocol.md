@@ -291,8 +291,10 @@ Current built-in behavior:
 - For Python, those boundaries are `PyOS_ReadlineFunctionPointer`, managed
   `sys.stdin`, and raw-stdin shims, so already-returned bytes are owned by
   CPython or the Python code that read them.
-- The server sends `SIGINT` on Unix and `CTRL_BREAK_EVENT` on Windows to the
-  worker process group.
+- The server sends `SIGINT` on Unix. On Windows PTY/ConPTY workers, it writes
+  terminal Ctrl-C to the worker's pseudo-console input so the console delivers
+  `CTRL_C_EVENT` to the attached runtime. Windows pipe workers do not have a
+  supported targeted Ctrl-C interrupt path.
 
 If cleanup is uncertain because old input may still be buffered in PTY, libc,
 readline, or interpreter state, the worker must not emit `input_wait`. It should

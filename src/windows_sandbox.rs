@@ -94,12 +94,10 @@ use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
-use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
-use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -318,21 +316,9 @@ struct WrapperWriteGuard<'a> {
     write_in_progress: &'a AtomicBool,
 }
 
-struct ConsoleCtrlHandlerGuard {
-    handler: unsafe extern "system" fn(u32) -> i32,
-}
-
 impl Drop for WrapperWriteGuard<'_> {
     fn drop(&mut self) {
         self.write_in_progress.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for ConsoleCtrlHandlerGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = SetConsoleCtrlHandler(Some(self.handler), 0);
-        }
     }
 }
 
@@ -356,23 +342,6 @@ impl Drop for PreparedLaunchLiveMarker {
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
     !policy.has_full_network_access()
-}
-
-unsafe extern "system" fn ignore_wrapper_ctrl_break(event: u32) -> i32 {
-    if event == CTRL_BREAK_EVENT { 1 } else { 0 }
-}
-
-fn install_wrapper_ctrl_break_handler() -> Result<ConsoleCtrlHandlerGuard, String> {
-    let ok = unsafe { SetConsoleCtrlHandler(Some(ignore_wrapper_ctrl_break), 1) };
-    if ok == 0 {
-        return Err(format!(
-            "SetConsoleCtrlHandler failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(ConsoleCtrlHandlerGuard {
-        handler: ignore_wrapper_ctrl_break,
-    })
 }
 
 fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -1760,7 +1729,6 @@ fn run_sandboxed_command_with_env_map(
             CloseHandle(base_token);
             return Err("prepared capability SID requires an unrestricted base token".to_string());
         }
-        let _ctrl_handler_guard = install_wrapper_ctrl_break_handler()?;
         let capability_sids =
             resolve_launch_capability_sids(policy, sandbox_policy_cwd, prepared_capability_sid)?;
         let psid_capability = convert_string_sid_to_sid(&capability_sids.filesystem_sid)
@@ -1894,7 +1862,7 @@ fn run_sandboxed_command_with_env_map(
                 sandbox_policy_cwd,
                 &mut env_map,
             );
-            let (proc_info, conpty, output_forwarder) = match spawn_result {
+            let (proc_info, mut conpty, output_forwarder) = match spawn_result {
                 Ok(value) => value,
                 Err(err) => {
                     cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
@@ -1907,6 +1875,13 @@ fn run_sandboxed_command_with_env_map(
                 }
             };
             crate::diagnostics::startup_log("windows-sandbox: conpty child spawned");
+            let input_forwarder = conpty.take_input_writer().ok().map(|mut input_write| {
+                thread::spawn(move || {
+                    let mut wrapper_stdin = io::stdin();
+                    let _ = io::copy(&mut wrapper_stdin, &mut input_write);
+                    let _ = input_write.flush();
+                })
+            });
 
             let job_handle = create_job_kill_on_close().ok();
             if let Some(job) = job_handle {
@@ -1919,6 +1894,7 @@ fn run_sandboxed_command_with_env_map(
                     CloseHandle(job);
                 }
                 drop(conpty);
+                drop(input_forwarder);
                 let _ = output_forwarder.join();
                 cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(proc_info.hThread);
@@ -1940,6 +1916,7 @@ fn run_sandboxed_command_with_env_map(
                     CloseHandle(job);
                 }
                 drop(conpty);
+                drop(input_forwarder);
                 let _ = output_forwarder.join();
                 cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(proc_info.hThread);
@@ -1962,6 +1939,7 @@ fn run_sandboxed_command_with_env_map(
                 "windows-sandbox: conpty child exited {exit_code}"
             ));
             drop(conpty);
+            drop(input_forwarder);
             let _ = output_forwarder.join();
             cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             drop(live_marker);
