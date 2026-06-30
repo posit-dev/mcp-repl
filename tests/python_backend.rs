@@ -69,6 +69,7 @@ async fn poll_until_contains(
     Ok(text)
 }
 
+#[cfg(unix)]
 async fn poll_until_contains_ready(
     session: &common::McpTestSession,
     mut text: String,
