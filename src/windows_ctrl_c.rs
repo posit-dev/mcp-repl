@@ -54,7 +54,7 @@ pub fn send_ctrl_c_to_process_console(pid: u32) -> Result<(), String> {
             ));
         }
         let _guard = AttachedConsoleGuard;
-        if SetConsoleCtrlHandler(None, 1) == 0 {
+        if SetConsoleCtrlHandler(Some(ignore_ctrl_c_handler), 1) == 0 {
             return Err(format!(
                 "SetConsoleCtrlHandler(ignore Ctrl-C) failed: {}",
                 std::io::Error::last_os_error()
@@ -86,7 +86,11 @@ struct ConsoleCtrlIgnoreGuard;
 impl Drop for ConsoleCtrlIgnoreGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = SetConsoleCtrlHandler(None, 0);
+            let _ = SetConsoleCtrlHandler(Some(ignore_ctrl_c_handler), 0);
         }
     }
+}
+
+unsafe extern "system" fn ignore_ctrl_c_handler(event: u32) -> i32 {
+    if event == CTRL_C_EVENT { 1 } else { 0 }
 }
