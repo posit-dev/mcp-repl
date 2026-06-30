@@ -194,6 +194,7 @@ fn readme_documents_release_install_contract() {
     let readme = read(&repo_root().join("README.md"));
 
     for required in [
+        "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/docs/assets/mcp-repl-hex.png",
         "pipx install posit-mcp-repl",
         "uv tool install posit-mcp-repl",
         "uvx posit-mcp-repl",
@@ -227,6 +228,19 @@ fn readme_documents_release_install_contract() {
             "did not expect {forbidden} in README.md"
         );
     }
+}
+
+#[test]
+fn readme_uses_pypi_visible_package_hex() {
+    let root = repo_root();
+    let readme = read(&root.join("README.md"));
+    let hex = root.join("docs/assets/mcp-repl-hex.png");
+
+    assert_exists(&hex);
+    assert!(
+        readme.contains(r#"<img src="https://raw.githubusercontent.com/posit-dev/mcp-repl/main/docs/assets/mcp-repl-hex.png" alt="mcp-repl package hex" width="240">"#),
+        "README.md should use an absolute HTTPS image URL so PyPI can render the package hex"
+    );
 }
 
 #[test]
