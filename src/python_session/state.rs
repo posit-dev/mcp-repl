@@ -386,9 +386,7 @@ impl RuntimeWake {
                     windows_sys::Win32::System::Threading::INFINITE,
                 )
             };
-            if result >= windows_sys::Win32::Foundation::WAIT_OBJECT_0
-                && result < windows_sys::Win32::Foundation::WAIT_OBJECT_0 + handles.len() as u32
-            {
+            if result < handles.len() as u32 {
                 return Ok(());
             }
             if result == windows_sys::Win32::Foundation::WAIT_FAILED {
