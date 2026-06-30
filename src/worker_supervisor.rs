@@ -346,10 +346,15 @@ fn take_ansi_control_token(bytes: &[u8]) -> Option<(AnsiControlToken, &[u8])> {
         b'J' if params == b"2" => AnsiControlToken::ClearScreen,
         b'H' if ansi_cursor_position_params(params) => AnsiControlToken::CursorPosition,
         b'm' if params.is_empty() => AnsiControlToken::OtherAllowed,
-        b'h' | b'l' if params == b"?25" => AnsiControlToken::OtherAllowed,
+        b'h' | b'l' if conpty_private_mode_params(params) => AnsiControlToken::OtherAllowed,
         _ => return None,
     };
     Some((token, after))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn conpty_private_mode_params(params: &[u8]) -> bool {
+    params == b"?25" || params == b"?9001" || params == b"?1004"
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -3168,6 +3173,24 @@ mod tests {
         assert!(
             tape.drain_final_output().contents.is_empty(),
             "raw ConPTY title reset should not enter output bundles after input"
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_shutdown_and_title_reset_is_dropped_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.note_accepted_input_starting();
+        capture.append_raw_text(
+            b"\x1b[?25l\x1b[?9001l\x1b[?1004l\x1b[2J\x1b[m\x1b[H\x1b]0;C:\\repo\\mcp-repl.exe\x07\x1b[?25h",
+            TextStream::Stdout,
+        );
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_output().contents.is_empty(),
+            "raw ConPTY shutdown and title reset should not enter output bundles after input"
         );
     }
 
