@@ -11,6 +11,20 @@ use std::time::{Duration, Instant};
 
 static ZOD_WORKER_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
+#[cfg(windows)]
+fn zod_test_mutex() -> &'static tokio::sync::Mutex<()> {
+    static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(windows)]
+async fn lock_zod_test() -> tokio::sync::MutexGuard<'static, ()> {
+    zod_test_mutex().lock().await
+}
+
+#[cfg(not(windows))]
+async fn lock_zod_test() {}
+
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
@@ -245,14 +259,18 @@ async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
     .await
 }
 
-#[cfg(windows)]
 fn zod_default_stdin_transport() -> &'static str {
+    "pipe"
+}
+
+#[cfg(windows)]
+fn zod_interrupt_stdin_transport() -> &'static str {
     "pty"
 }
 
 #[cfg(not(windows))]
-fn zod_default_stdin_transport() -> &'static str {
-    "pipe"
+fn zod_interrupt_stdin_transport() -> &'static str {
+    zod_default_stdin_transport()
 }
 
 async fn spawn_zod_server_with_options(
@@ -297,6 +315,28 @@ async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::M
     spawn_zod_server_with_extra_args(control_log, Vec::new()).await
 }
 
+async fn spawn_zod_interrupt_server(
+    control_log: &std::path::Path,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_interrupt_server_with_extra_env_and_extra_args(control_log, Vec::new(), Vec::new())
+        .await
+}
+
+async fn spawn_zod_interrupt_server_with_extra_env_and_extra_args(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    extra_args: Vec<String>,
+) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_options(
+        control_log,
+        extra_env,
+        Vec::new(),
+        extra_args,
+        zod_interrupt_stdin_transport(),
+    )
+    .await
+}
+
 async fn warm_zod_session(session: &common::McpTestSession) -> TestResult<()> {
     let result = session
         .call_tool_raw(
@@ -329,7 +369,7 @@ async fn spawn_zod_startup_ready_server(
 async fn spawn_zod_delayed_interrupt_ready_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
-    spawn_zod_server_with_extra_env_and_extra_args(
+    spawn_zod_interrupt_server_with_extra_env_and_extra_args(
         control_log,
         vec![
             ("MCP_REPL_ZOD_STARTUP_READY", "1"),
@@ -343,7 +383,7 @@ async fn spawn_zod_delayed_interrupt_ready_server(
 async fn spawn_zod_interrupt_ready_during_ack_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
-    spawn_zod_server_with_extra_env_and_extra_args(
+    spawn_zod_interrupt_server_with_extra_env_and_extra_args(
         control_log,
         vec![
             ("MCP_REPL_ZOD_STARTUP_READY", "1"),
@@ -358,7 +398,7 @@ async fn spawn_zod_interrupt_ready_during_ack_server(
 async fn spawn_zod_without_discard_pending_input_ack_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
-    spawn_zod_server_with_extra_env_and_extra_args(
+    spawn_zod_interrupt_server_with_extra_env_and_extra_args(
         control_log,
         vec![("MCP_REPL_ZOD_SKIP_DISCARD_PENDING_INPUT_ACK", "1")],
         Vec::new(),
@@ -369,7 +409,7 @@ async fn spawn_zod_without_discard_pending_input_ack_server(
 async fn spawn_zod_protocol_error_before_discard_pending_input_ack_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
-    spawn_zod_server_with_extra_env_and_extra_args(
+    spawn_zod_interrupt_server_with_extra_env_and_extra_args(
         control_log,
         vec![(
             "MCP_REPL_ZOD_DISCARD_PENDING_INPUT_PROTOCOL_ERROR_BEFORE_ACK",
@@ -384,7 +424,7 @@ async fn spawn_zod_preemptive_discard_pending_input_ack_server(
     control_log: &std::path::Path,
     marker: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
-    spawn_zod_server_with_extra_env_and_extra_args(
+    spawn_zod_interrupt_server_with_extra_env_and_extra_args(
         control_log,
         vec![(
             "MCP_REPL_ZOD_PREEMPTIVE_DISCARD_PENDING_INPUT_ACK_MARKER",
@@ -546,6 +586,7 @@ fn latest_debug_events(debug_dir: &std::path::Path) -> TestResult<Vec<Value>> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -586,6 +627,7 @@ async fn zod_worker_v5_receives_input_batch_without_raw_stdin() -> TestResult<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_startup_ready_server(&control_log).await?;
@@ -628,6 +670,7 @@ async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> T
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_interrupt_prefix_does_not_wait_for_fresh_ready() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_delayed_interrupt_ready_server(&control_log).await?;
@@ -662,6 +705,7 @@ async fn zod_worker_interrupt_prefix_does_not_wait_for_fresh_ready() -> TestResu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_interrupt_prefix_accepts_ready_during_ack_wait() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_interrupt_ready_during_ack_server(&control_log).await?;
@@ -704,6 +748,7 @@ async fn zod_worker_interrupt_prefix_accepts_ready_during_ack_wait() -> TestResu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_bare_interrupt_ignores_ready_during_ack_wait() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_interrupt_ready_during_ack_server(&control_log).await?;
@@ -741,6 +786,7 @@ async fn zod_worker_bare_interrupt_ignores_ready_during_ack_wait() -> TestResult
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_hidden_input_echoes_do_not_evict_visible_output() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 4_000).await?;
@@ -781,6 +827,7 @@ async fn zod_pager_hidden_input_echoes_do_not_evict_visible_output() -> TestResu
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_leading_hidden_input_echo_does_not_consume_first_page_budget() -> TestResult<()>
 {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 4_000).await?;
@@ -818,6 +865,7 @@ async fn zod_pager_leading_hidden_input_echo_does_not_consume_first_page_budget(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_refresh_keeps_later_input_echo_hidden() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 4_000).await?;
@@ -865,6 +913,7 @@ async fn zod_pager_refresh_keeps_later_input_echo_hidden() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 4_000).await?;
@@ -896,6 +945,7 @@ async fn zod_pager_hidden_input_echo_before_stderr_does_not_add_blank_line() -> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_reset_clears_stderr_prefix_state() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -996,6 +1046,7 @@ async fn zod_files_reset_clears_stderr_prefix_state() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_stderr_label_starts_after_unterminated_stdout() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1027,6 +1078,7 @@ async fn zod_stderr_label_starts_after_unterminated_stdout() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_hidden_input_echo_preserves_unterminated_stdout_before_stderr() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1062,6 +1114,7 @@ async fn zod_hidden_input_echo_preserves_unterminated_stdout_before_stderr() -> 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1093,6 +1146,7 @@ async fn zod_files_clean_session_end_flushes_partial_utf8_before_notice() -> Tes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1144,6 +1198,7 @@ async fn zod_files_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1179,6 +1234,7 @@ async fn zod_files_timeout_drains_stderr_after_incomplete_utf8() -> TestResult<(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_timeout_does_not_wait_for_utf8_tail_grace_after_expiry() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let release_path = tempdir.path().join("release-utf8-tail");
@@ -1245,6 +1301,7 @@ async fn zod_files_timeout_does_not_wait_for_utf8_tail_grace_after_expiry() -> T
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_session_end_flushes_partial_utf8_before_notice() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 4_000).await?;
@@ -1276,6 +1333,7 @@ async fn zod_pager_session_end_flushes_partial_utf8_before_notice() -> TestResul
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_timeout_drains_event_after_incomplete_utf8() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 4_000).await?;
@@ -1328,6 +1386,7 @@ async fn zod_pager_timeout_drains_event_after_incomplete_utf8() -> TestResult<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_preserves_equal_offset_update_notice_before_image() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 1_000).await?;
@@ -1380,6 +1439,7 @@ async fn zod_pager_preserves_equal_offset_update_notice_before_image() -> TestRe
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_raw_split_utf8_survives_input_wait_marker() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1426,6 +1486,7 @@ async fn zod_raw_split_utf8_survives_input_wait_marker() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_pager_server(&control_log, 4_000).await?;
@@ -1453,6 +1514,7 @@ async fn zod_pager_output_text_matching_input_line_remains_visible() -> TestResu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_completion_settles_split_utf8_tail_before_request_boundary() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1484,6 +1546,7 @@ async fn zod_files_completion_settles_split_utf8_tail_before_request_boundary() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1515,6 +1578,7 @@ async fn zod_files_completion_keeps_stable_wait_after_utf8_recovery() -> TestRes
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1549,6 +1613,7 @@ async fn zod_files_completion_bounds_stable_wait_after_utf8_recovery() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let late_stderr_marker = tempdir.path().join("late-stderr-marker");
@@ -1609,6 +1674,7 @@ async fn zod_files_request_boundary_resets_stderr_after_sealed_utf8_tail() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1654,6 +1720,7 @@ async fn zod_worker_v5_split_utf8_stdout_survives_interleaved_stderr() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_split_utf8_stdout_stays_before_interleaved_image() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1705,6 +1772,7 @@ async fn zod_worker_v5_split_utf8_stdout_stays_before_interleaved_image() -> Tes
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let marker_path = tempdir.path().join("failed-once");
@@ -1757,6 +1825,7 @@ async fn zod_worker_ready_failure_releases_ipc_for_next_launch() -> TestResult<(
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -1827,6 +1896,7 @@ async fn zod_worker_session_end_respawn_terminates_old_worker() -> TestResult<()
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_session_end_respawn_drops_late_raw_stdout_from_old_worker() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let late_raw_marker = tempdir.path().join("late-raw-marker");
@@ -1898,6 +1968,7 @@ async fn zod_worker_session_end_respawn_drops_late_raw_stdout_from_old_worker() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_bundle_preserves_image_after_large_hidden_input_echo() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
@@ -1946,6 +2017,7 @@ async fn zod_files_bundle_preserves_image_after_large_hidden_input_echo() -> Tes
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_bundle_records_hidden_echo_omission_before_later_visible_text() -> TestResult<()>
 {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
@@ -2009,6 +2081,7 @@ async fn zod_files_bundle_records_hidden_echo_omission_before_later_visible_text
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_bundle_reports_hidden_echo_dropped_for_later_raw_text() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
@@ -2066,6 +2139,7 @@ async fn zod_files_bundle_reports_hidden_echo_dropped_for_later_raw_text() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_files_bundle_reports_omitted_input_echoes_past_timeline_capacity() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server_with_extra_env_server_env_and_extra_args(
@@ -2134,6 +2208,7 @@ fn text_row_byte_range(line: &str) -> Option<(usize, usize)> {
 #[cfg(target_family = "unix")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_session_end_respawn_drops_late_sideband_from_old_worker() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let late_sideband_marker = tempdir.path().join("late-sideband-marker");
@@ -2210,6 +2285,7 @@ async fn zod_worker_session_end_respawn_drops_late_sideband_from_old_worker() ->
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_stalls()
 -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_stalled_control_server(&control_log).await?;
@@ -2250,6 +2326,7 @@ async fn zod_worker_v5_input_batch_write_respects_timeout_when_control_reader_st
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_line_is_ordered_before_output_text_and_rendered() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -2296,6 +2373,7 @@ async fn zod_worker_v5_input_line_is_ordered_before_output_text_and_rendered() -
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_output_text_matching_input_line_remains_visible() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -2322,6 +2400,7 @@ async fn zod_worker_v5_output_text_matching_input_line_remains_visible() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_wait_completes_batch() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -2353,9 +2432,10 @@ async fn zod_worker_v5_input_wait_completes_batch() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_busy_follow_up_does_not_send_second_input_batch() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let session = spawn_zod_interrupt_server(&control_log).await?;
 
     let first = session
         .call_tool_raw(
@@ -2414,9 +2494,10 @@ async fn zod_worker_v5_busy_follow_up_does_not_send_second_input_batch() -> Test
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_discard_pending_input_carries_discard_id() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let session = spawn_zod_interrupt_server(&control_log).await?;
 
     let first = session
         .call_tool_raw(
@@ -2470,9 +2551,10 @@ async fn zod_worker_v5_discard_pending_input_carries_discard_id() -> TestResult<
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_discard_pending_input_ack_precedes_os_interrupt_observation() -> TestResult<()>
 {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let session = spawn_zod_interrupt_server(&control_log).await?;
 
     let first = session
         .call_tool_raw(
@@ -2527,6 +2609,7 @@ async fn zod_worker_discard_pending_input_ack_precedes_os_interrupt_observation(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_discard_pending_input_ack_timeout_still_sends_os_interrupt() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_without_discard_pending_input_ack_server(&control_log).await?;
@@ -2574,6 +2657,7 @@ async fn zod_worker_discard_pending_input_ack_timeout_still_sends_os_interrupt()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_discard_pending_input_ack_wait_protocol_error_fails_closed() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session =
@@ -2628,6 +2712,7 @@ async fn zod_worker_discard_pending_input_ack_wait_protocol_error_fails_closed()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_rejects_preemptive_discard_pending_input_ack() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let marker = tempdir.path().join("release-preemptive-ack");
@@ -2686,10 +2771,11 @@ async fn zod_worker_rejects_preemptive_discard_pending_input_ack() -> TestResult
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_discard_pending_input_ack_wait_respects_tiny_timeout() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let debug_dir = tempdir.path().join("debug");
-    let session = spawn_zod_server_with_extra_env_and_extra_args(
+    let session = spawn_zod_interrupt_server_with_extra_env_and_extra_args(
         &control_log,
         vec![("MCP_REPL_ZOD_SKIP_DISCARD_PENDING_INPUT_ACK", "1")],
         vec!["--debug-dir".to_string(), debug_dir.display().to_string()],
@@ -2740,9 +2826,10 @@ async fn zod_worker_discard_pending_input_ack_wait_respects_tiny_timeout() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_interrupt_tail_settle_respects_tiny_timeout() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let session = spawn_zod_interrupt_server(&control_log).await?;
 
     warm_zod_session(&session).await?;
     let started = Instant::now();
@@ -2772,9 +2859,10 @@ async fn zod_worker_interrupt_tail_settle_respects_tiny_timeout() -> TestResult<
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let session = spawn_zod_interrupt_server(&control_log).await?;
 
     let first = session
         .call_tool_raw(
@@ -2827,6 +2915,7 @@ async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> Te
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_input_line_after_input_wait_is_protocol_error() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -2870,6 +2959,7 @@ async fn zod_worker_v5_input_line_after_input_wait_is_protocol_error() -> TestRe
 
 #[tokio::test(flavor = "multi_thread")]
 async fn zod_worker_v5_latched_protocol_error_blocks_next_input_batch() -> TestResult<()> {
+    let _guard = lock_zod_test().await;
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let debug_dir = tempdir.path().join("debug");

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Console::{CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 
 #[cfg(target_family = "unix")]
 const IPC_READ_FD_ENV: &str = "MCP_REPL_IPC_READ_FD";
@@ -1158,7 +1158,7 @@ fn install_signal_handler() -> io::Result<()> {
 
 #[cfg(target_family = "windows")]
 unsafe extern "system" fn handle_console_ctrl(event: u32) -> i32 {
-    if event == CTRL_C_EVENT {
+    if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
         INTERRUPTED_BY_OS.store(true, Ordering::SeqCst);
         1
     } else {
