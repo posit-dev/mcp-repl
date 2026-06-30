@@ -2,6 +2,8 @@
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+#[cfg(windows)]
+use crate::python_ffi::PythonApi;
 use crate::python_input_queue::PythonInputQueue;
 
 pub(super) static SESSION_STATE: OnceLock<Arc<SessionState>> = OnceLock::new();
@@ -353,15 +355,25 @@ fn close_handle(handle: isize) {
 
 #[cfg(windows)]
 unsafe extern "system" fn windows_signal_wake_handler(event: u32) -> i32 {
-    if event == windows_sys::Win32::System::Console::CTRL_BREAK_EVENT
-        || event == windows_sys::Win32::System::Console::CTRL_C_EVENT
-    {
-        let handle = WINDOWS_SIGNAL_WAKE_EVENT.load(Ordering::SeqCst);
-        if handle != 0 {
-            set_event(handle);
-        }
+    let signum = match event {
+        windows_sys::Win32::System::Console::CTRL_C_EVENT => libc::SIGINT,
+        windows_sys::Win32::System::Console::CTRL_BREAK_EVENT => windows_sigbreak(),
+        _ => return 0,
+    };
+    if let Some(api) = PythonApi::try_global() {
+        api.set_interrupt_for_signal(signum);
+    }
+    let handle = WINDOWS_SIGNAL_WAKE_EVENT.load(Ordering::SeqCst);
+    if handle != 0 {
+        set_event(handle);
     }
     0
+}
+
+#[cfg(windows)]
+fn windows_sigbreak() -> libc::c_int {
+    // MSVCRT's SIGBREAK value, used by CPython for CTRL_BREAK_EVENT.
+    21
 }
 
 #[cfg(not(any(target_family = "unix", windows)))]

@@ -2399,7 +2399,7 @@ async fn zod_worker_v5_discard_pending_input_carries_discard_id() -> TestResult<
         interrupted_text.contains("sideband discard: observed"),
         "expected v5 worker to observe sideband discard, got: {interrupted_text:?}"
     );
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     assert!(
         interrupted_text.contains("os interrupt: observed"),
         "expected v5 worker to observe OS interrupt, got: {interrupted_text:?}"
@@ -2455,7 +2455,7 @@ async fn zod_worker_discard_pending_input_ack_precedes_os_interrupt_observation(
         interrupted_text.contains("sideband discard: observed"),
         "expected sideband discard observation, got: {interrupted_text:?}"
     );
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     assert!(
         interrupted_text.contains("os interrupt: observed"),
         "expected OS interrupt observation, got: {interrupted_text:?}"
@@ -2508,7 +2508,7 @@ async fn zod_worker_discard_pending_input_ack_timeout_still_sends_os_interrupt()
         )
         .await?;
     let interrupted_text = result_text(&interrupted);
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     assert!(
         interrupted_text.contains("os interrupt: observed"),
         "expected OS interrupt despite missing ack, got: {interrupted_text:?}"
