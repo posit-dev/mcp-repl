@@ -69,6 +69,28 @@ async fn poll_until_contains(
     Ok(text)
 }
 
+async fn poll_until_contains_ready(
+    session: &common::McpTestSession,
+    mut text: String,
+    expected: &str,
+    context: &str,
+    timeout: Duration,
+) -> TestResult<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        let poll_text = result_text(&poll);
+        text.push_str(&poll_text);
+        if text.contains(expected) && !is_busy_response(&poll_text) {
+            return Ok(text);
+        }
+    }
+    Err(format!("expected {context}, got: {text:?}").into())
+}
+
 fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
     let end = text
         .find("transcript.txt")?
@@ -2452,11 +2474,11 @@ print("DETACHED_RAW_MAIN_DONE", flush=True)
     );
 
     fs::write(&release_path, "go")?;
-    let _wait_text = poll_until_contains(
+    let _wait_text = poll_until_contains_ready(
         &session,
         String::new(),
         "DETACHED_RAW_THREAD_WAITING",
-        "detached raw stdin reader to start before follow-up input",
+        "detached raw stdin reader to enter input wait before follow-up input",
         Duration::from_secs(5),
     )
     .await?;
@@ -2537,11 +2559,11 @@ print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
     );
 
     fs::write(&release_path, "go")?;
-    let _wait_text = poll_until_contains(
+    let _wait_text = poll_until_contains_ready(
         &session,
         String::new(),
         "DETACHED_RAW_PAIR_WAITING",
-        "detached raw stdin reader to start before follow-up input",
+        "detached raw stdin reader to enter input wait before follow-up input",
         Duration::from_secs(5),
     )
     .await?;
