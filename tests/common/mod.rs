@@ -917,22 +917,24 @@ impl McpTestSession {
         self.service.send_notification(notification).await
     }
 
-    pub async fn cancel(self) -> TestResult<()> {
-        let McpTestSession {
-            service,
-            server_pid,
-            ..
-        } = self;
-        let cancel_result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), service.cancel()).await;
-        if let Some(pid) = server_pid {
+    pub async fn cancel(mut self) -> TestResult<()> {
+        let cancel_result = self
+            .service
+            .close_with_timeout(std::time::Duration::from_secs(10))
+            .await;
+        if let Some(pid) = self.server_pid.take() {
             terminate_process_tree(pid);
         }
-        let Ok(cancel_result) = cancel_result else {
-            return Ok(());
-        };
         cancel_result?;
         Ok(())
+    }
+}
+
+impl Drop for McpTestSession {
+    fn drop(&mut self) {
+        if let Some(pid) = self.server_pid.take() {
+            terminate_process_tree(pid);
+        }
     }
 }
 

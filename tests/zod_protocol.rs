@@ -2848,8 +2848,15 @@ async fn zod_worker_interrupt_tail_settle_respects_tiny_timeout() -> TestResult<
         text.contains("timeout"),
         "expected tiny interrupt-tail timeout, got: {text:?}"
     );
+    // Windows console-control delivery keeps the sender attached briefly after
+    // GenerateConsoleCtrlEvent, so the tiny timeout cannot bound that syscall path.
+    let max_elapsed = if cfg!(windows) {
+        Duration::from_millis(180)
+    } else {
+        Duration::from_millis(45)
+    };
     assert!(
-        elapsed < Duration::from_millis(45),
+        elapsed < max_elapsed,
         "interrupt tail settle ignored tiny timeout; elapsed {elapsed:?}, reply {text:?}"
     );
 
