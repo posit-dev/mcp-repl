@@ -303,16 +303,16 @@ R invariants:
 - Phase 3: complete - update worker queue handling so sideband cleanup cannot
   wake or mutate runtime interrupt state. Python and R sideband cleanup now
   discard queued input only.
-- Phase 4: complete on Unix and pending Windows host verification - update Python and R waits to preserve
+- Phase 4: complete on Unix and pending full Windows host verification - update Python and R waits to preserve
   runtime-native interrupt behavior without normal-operation busy polling.
   Unix Python uses a Python signal wake fd; Unix R uses a runtime input wake
   pipe plus a SIGINT bridge that marks R's pending interrupt flag and lets the
   main R thread call `R_CheckUserInterrupt()`. Windows PTY/ConPTY workers receive
-  `CTRL_C_EVENT`; direct workers use a helper process attached to the worker
-  console, and sandbox wrappers translate the wrapper stdin Ctrl-C byte into
-  `CTRL_C_EVENT` for the inner ConPTY child. Runtime console-control handlers
-  wake managed waits when `CTRL_C_EVENT` arrives. Windows pipe workers do not
-  have a supported targeted Ctrl-C path.
+  Ctrl-C through ConPTY input, are launched without `CREATE_NEW_PROCESS_GROUP`,
+  and explicitly re-enable Ctrl-C processing after attaching to ConPTY so the
+  console produces `CTRL_C_EVENT`. Runtime console-control handlers wake managed
+  waits when `CTRL_C_EVENT` arrives. Windows pipe workers do not have a supported
+  targeted Ctrl-C path.
 - Phase 5: complete on Unix and protocol fixtures - update public tests and
   protocol fixture tests to lock the boundary. Windows runtime tests still need
   to be run on a Windows host.
@@ -329,8 +329,9 @@ R invariants:
   behavior but is not a correctness guarantee.
 - Windows Ctrl-C delivery must mean `CTRL_C_EVENT`/`SIGINT`, not
   `CTRL_BREAK_EVENT`/`SIGBREAK`. Built-in Windows runtimes use PTY/ConPTY
-  transport so the server can request Ctrl-C delivery without broadcasting a
-  console-wide event from the main server process.
+  transport so the server sends terminal Ctrl-C input to the worker-owned
+  pseudo-console instead of broadcasting a console-wide event from the main
+  server process.
 
 ## Open Questions
 
@@ -388,8 +389,8 @@ R invariants:
   send/close sets the queue event; real console-control delivery sets the signal
   event; sideband discard still only clears queued input and sends an ack.
 - 2026-06-29: Removed `CTRL_BREAK_EVENT` as the Windows Ctrl-C approximation.
-  Windows runtime interruption now targets `CTRL_C_EVENT`. Direct ConPTY
-  workers use a helper process to attach to the worker console and generate
-  Ctrl-C; sandbox wrappers translate the wrapper stdin Ctrl-C byte into
-  `CTRL_C_EVENT` for the inner ConPTY child. Pipe-only Windows workers
-  intentionally have no targeted Ctrl-C interrupt path.
+  Windows runtime interruption now targets `CTRL_C_EVENT` by sending Ctrl-C to
+  ConPTY input. ConPTY children are not launched with `CREATE_NEW_PROCESS_GROUP`,
+  and built-in workers re-enable Ctrl-C processing after attaching to ConPTY so
+  the console can deliver `CTRL_C_EVENT`. Pipe-only Windows workers intentionally
+  have no targeted Ctrl-C interrupt path.
