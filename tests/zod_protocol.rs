@@ -143,6 +143,27 @@ fn wait_for_debug_event_message_contains(
     }
 }
 
+fn wait_for_debug_event(debug_dir: &std::path::Path, event: &str) -> TestResult<Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut latest = Vec::new();
+    loop {
+        if let Ok(events) = latest_debug_events(debug_dir) {
+            latest = events;
+            if let Some(entry) = latest.iter().find(|entry| entry["event"] == event) {
+                return Ok(entry.clone());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "expected {event:?} in {}, got {latest:?}",
+                debug_dir.display()
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn zod_worker_path() -> TestResult<PathBuf> {
     match ZOD_WORKER_PATH.get_or_init(build_zod_worker) {
         Ok(path) => Ok(path.clone()),
@@ -2667,7 +2688,13 @@ async fn zod_worker_rejects_preemptive_discard_pending_input_ack() -> TestResult
 async fn zod_worker_discard_pending_input_ack_wait_respects_tiny_timeout() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_without_discard_pending_input_ack_server(&control_log).await?;
+    let debug_dir = tempdir.path().join("debug");
+    let session = spawn_zod_server_with_extra_env_and_extra_args(
+        &control_log,
+        vec![("MCP_REPL_ZOD_SKIP_DISCARD_PENDING_INPUT_ACK", "1")],
+        vec!["--debug-dir".to_string(), debug_dir.display().to_string()],
+    )
+    .await?;
 
     let first = session
         .call_tool_raw(
@@ -2684,7 +2711,6 @@ async fn zod_worker_discard_pending_input_ack_wait_respects_tiny_timeout() -> Te
         "expected initial timeout, got: {first_text:?}"
     );
 
-    let started = Instant::now();
     let interrupted = session
         .call_tool_raw(
             "repl",
@@ -2694,11 +2720,18 @@ async fn zod_worker_discard_pending_input_ack_wait_respects_tiny_timeout() -> Te
             }),
         )
         .await?;
-    let elapsed = started.elapsed();
     let interrupted_text = result_text(&interrupted);
     assert!(
-        elapsed < Duration::from_millis(80),
-        "discard ack wait ignored tiny timeout; elapsed {elapsed:?}, reply {interrupted_text:?}"
+        interrupted_text.contains("<<repl status: busy"),
+        "expected interrupt with tiny timeout to return busy status, got: {interrupted_text:?}"
+    );
+    let ack_timeout = wait_for_debug_event(&debug_dir, "worker_discard_pending_input_ack_timeout")?;
+    let timeout_ms = ack_timeout["payload"]["timeout_ms"]
+        .as_u64()
+        .ok_or_else(|| format!("missing timeout_ms in event: {ack_timeout:?}"))?;
+    assert!(
+        timeout_ms <= 10,
+        "discard ack wait should use the tiny worker timeout, got event: {ack_timeout:?}"
     );
 
     session.cancel().await?;
