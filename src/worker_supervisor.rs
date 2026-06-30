@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(target_family = "windows")]
+use std::sync::OnceLock;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -771,6 +773,9 @@ impl Drop for WindowsProcess {
 
 #[cfg(target_family = "windows")]
 fn send_windows_console_interrupt_event(process_id: u32) -> std::io::Result<()> {
+    let _console_guard = windows_console_interrupt_mutex()
+        .lock()
+        .map_err(|_| std::io::Error::other("Windows console interrupt lock poisoned"))?;
     unsafe {
         let _ = FreeConsole();
         if AttachConsole(process_id) == 0 {
@@ -786,6 +791,12 @@ fn send_windows_console_interrupt_event(process_id: u32) -> std::io::Result<()> 
         let _ = FreeConsole();
     }
     Ok(())
+}
+
+#[cfg(target_family = "windows")]
+fn windows_console_interrupt_mutex() -> &'static Mutex<()> {
+    static INTERRUPT_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    INTERRUPT_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
 #[cfg(target_family = "windows")]
