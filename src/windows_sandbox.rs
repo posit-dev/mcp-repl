@@ -1171,7 +1171,10 @@ fn offline_identity_read_execute_paths(launch: &PreparedSandboxLaunch) -> HashSe
     let mut read_paths = HashSet::new();
     read_paths.insert(launch.sandbox_policy_cwd.clone());
     if let Ok(exe) = std::env::current_exe() {
-        insert_offline_read_path(&mut read_paths, exe);
+        insert_offline_read_path(&mut read_paths, exe.clone());
+        if let Some(parent) = exe.parent() {
+            insert_offline_read_path(&mut read_paths, parent.to_path_buf());
+        }
     }
     for env_key in [
         crate::python_runtime::PYTHON_EXECUTABLE_ENV,
@@ -1182,6 +1185,11 @@ fn offline_identity_read_execute_paths(launch: &PreparedSandboxLaunch) -> HashSe
         if let Some(value) = std::env::var_os(env_key) {
             insert_offline_read_path(&mut read_paths, PathBuf::from(value));
         }
+    }
+    if std::env::var_os("R_HOME").is_none_or(|value| value.is_empty())
+        && let Some(r_home) = crate::r_session::discover_windows_r_home()
+    {
+        insert_offline_read_path(&mut read_paths, r_home);
     }
     for env_key in ["PYTHONPATH", "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE"] {
         if let Some(value) = std::env::var_os(env_key) {
@@ -4048,6 +4056,7 @@ mod tests {
         let python_lib = tmp.path().join("python-lib");
         let r_lib_a = tmp.path().join("r-lib-a");
         let r_lib_b = tmp.path().join("r-lib-b");
+        let _r_home = ScopedEnvVar::set_os("R_HOME", OsStr::new(""));
         for path in [&cwd, &session_temp_dir, &python_lib, &r_lib_a, &r_lib_b] {
             std::fs::create_dir_all(path).expect("create test dir");
         }
@@ -4074,7 +4083,13 @@ mod tests {
         };
 
         let read_paths = offline_identity_read_execute_paths(&launch);
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe_dir = current_exe.parent().expect("current exe parent");
 
+        assert!(read_paths.contains(&canonicalize_or_identity(current_exe_dir)));
+        if let Some(r_home) = crate::r_session::discover_windows_r_home() {
+            assert!(read_paths.contains(&canonicalize_or_identity(&r_home)));
+        }
         assert!(read_paths.contains(&canonicalize_or_identity(&python_lib)));
         assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_a)));
         assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_b)));

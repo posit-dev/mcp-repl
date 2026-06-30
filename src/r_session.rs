@@ -737,7 +737,7 @@ fn normalize_empty_r_home_env() {
 }
 
 #[cfg(windows)]
-fn discover_windows_r_home() -> Option<PathBuf> {
+pub(crate) fn discover_windows_r_home() -> Option<PathBuf> {
     let mut roots = Vec::new();
     for key in ["ProgramW6432", "ProgramFiles"] {
         if let Some(root) = std::env::var_os(key).map(PathBuf::from) {
