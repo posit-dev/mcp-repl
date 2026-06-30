@@ -1875,11 +1875,10 @@ fn run_sandboxed_command_with_env_map(
                 }
             };
             crate::diagnostics::startup_log("windows-sandbox: conpty child spawned");
+            let conpty_child_pid = proc_info.dwProcessId;
             let input_forwarder = conpty.take_input_writer().ok().map(|mut input_write| {
                 thread::spawn(move || {
-                    let mut wrapper_stdin = io::stdin();
-                    let _ = io::copy(&mut wrapper_stdin, &mut input_write);
-                    let _ = input_write.flush();
+                    forward_wrapper_stdin_to_conpty(&mut input_write, conpty_child_pid);
                 })
             });
 
@@ -2466,6 +2465,42 @@ fn spawn_wrapper_stdio_forwarders(stdio: WrapperChildStdio) -> WrapperStdioForwa
         stdout_state,
         stderr_state,
     }
+}
+
+fn forward_wrapper_stdin_to_conpty(input_write: &mut File, child_pid: u32) {
+    let mut wrapper_stdin = io::stdin();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = match wrapper_stdin.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut segment_start = 0;
+        for index in 0..read {
+            if buffer[index] != 0x03 {
+                continue;
+            }
+            if segment_start < index
+                && input_write
+                    .write_all(&buffer[segment_start..index])
+                    .is_err()
+            {
+                return;
+            }
+            if let Err(err) = crate::windows_ctrl_c::send_ctrl_c_to_process_console(child_pid) {
+                crate::diagnostics::startup_log(format!(
+                    "windows-sandbox: failed to send Ctrl-C to conpty child: {err}"
+                ));
+            }
+            segment_start = index + 1;
+        }
+        if segment_start < read && input_write.write_all(&buffer[segment_start..read]).is_err() {
+            return;
+        }
+    }
+    let _ = input_write.flush();
 }
 
 fn copy_wrapper_output(

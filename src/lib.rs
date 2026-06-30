@@ -34,6 +34,8 @@ mod stdin_payload;
 #[cfg(target_os = "windows")]
 mod windows_conpty;
 #[cfg(target_os = "windows")]
+mod windows_ctrl_c;
+#[cfg(target_os = "windows")]
 mod windows_sandbox;
 #[cfg(target_os = "windows")]
 mod windows_sandbox_setup;
@@ -80,6 +82,10 @@ pub async fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     // crashing.
     ignore_sigpipe();
     crate::diagnostics::startup_log("main: entry");
+    #[cfg(target_os = "windows")]
+    if windows_ctrl_c::invoked_as_windows_ctrl_c_sender() {
+        windows_ctrl_c::run_windows_ctrl_c_sender_main();
+    }
     #[cfg(target_os = "windows")]
     windows_conpty::attach_stdio_to_conpty_if_attached()?;
     #[cfg(target_os = "windows")]

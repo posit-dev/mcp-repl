@@ -66,8 +66,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, GetExitCodeProcess, PROCESS_INFORMATION, TerminateProcess,
-    WaitForSingleObject,
+    CREATE_NEW_PROCESS_GROUP, GetExitCodeProcess, GetProcessId, PROCESS_INFORMATION,
+    TerminateProcess, WaitForSingleObject,
 };
 
 #[cfg(all(test, target_family = "unix"))]
@@ -640,6 +640,10 @@ impl WindowsProcess {
         self.job.take();
     }
 
+    fn process_id(&self) -> u32 {
+        unsafe { GetProcessId(self.process) }
+    }
+
     fn exit_status(&self) -> std::io::Result<ExitStatus> {
         let mut exit_code = 0u32;
         if unsafe { GetExitCodeProcess(self.process, &mut exit_code) } == 0 {
@@ -1200,6 +1204,10 @@ impl WorkerProcess {
     fn send_windows_interrupt(&mut self) -> Result<(), WorkerError> {
         if self.child.try_wait()?.is_some() {
             return Ok(());
+        }
+        if let WorkerChild::DirectWindows(child) = &self.child {
+            return crate::windows_ctrl_c::spawn_ctrl_c_sender(child.process_id())
+                .map_err(WorkerError::Protocol);
         }
         if self.ctrl_c_via_stdin {
             return send_stdin_command(
