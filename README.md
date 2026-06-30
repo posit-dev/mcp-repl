@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/posit-dev/mcp-repl/main/docs/assets/mcp-repl-hex.png" alt="mcp-repl package hex" width="240">
+</p>
+
 # mcp-repl
 
 `mcp-repl` is an MCP server that gives an agent a persistent Python or R
