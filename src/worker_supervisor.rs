@@ -179,6 +179,9 @@ impl LiveOutputCapture {
 
     #[cfg(any(test, target_os = "windows"))]
     fn should_drop_windows_conpty_startup_noise(&self, bytes: &[u8]) -> bool {
+        if windows_conpty_terminal_reset_noise_only(bytes) {
+            return true;
+        }
         let Some(drop_startup_noise) = &self.drop_windows_conpty_startup_noise_before_input else {
             return false;
         };
@@ -267,13 +270,18 @@ impl LiveOutputCapture {
 
 #[cfg(any(test, target_os = "windows"))]
 fn windows_conpty_startup_noise_only(bytes: &[u8]) -> bool {
-    const STARTUP_NOISE_PATTERNS: &[&[u8]] =
-        &[b"\x1b[?9001h\x1b[?1004h", b"\x1b[2J\x1b[m\x1b[H\x1b[?25h"];
-    STARTUP_NOISE_PATTERNS.iter().any(|pattern| {
-        bytes
-            .strip_prefix(*pattern)
-            .is_some_and(|rest| rest.iter().all(|byte| matches!(byte, b'\r' | b'\n')))
-    })
+    const STARTUP_NOISE: &[u8] = b"\x1b[?9001h\x1b[?1004h";
+    bytes
+        .strip_prefix(STARTUP_NOISE)
+        .is_some_and(|rest| rest.iter().all(|byte| matches!(byte, b'\r' | b'\n')))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_conpty_terminal_reset_noise_only(bytes: &[u8]) -> bool {
+    const TERMINAL_RESET: &[u8] = b"\x1b[2J\x1b[m\x1b[H\x1b[?25h";
+    bytes
+        .strip_prefix(TERMINAL_RESET)
+        .is_some_and(|rest| rest.iter().all(|byte| matches!(byte, b'\r' | b'\n')))
 }
 
 #[cfg(target_family = "unix")]
@@ -2938,6 +2946,21 @@ mod tests {
         assert!(
             tape.drain_final_output().contents.is_empty(),
             "raw ConPTY terminal reset should not enter output bundles before input"
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_terminal_reset_is_dropped_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.note_accepted_input_starting();
+        capture.append_raw_text(b"\x1b[2J\x1b[m\x1b[H\x1b[?25h", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_output().contents.is_empty(),
+            "raw ConPTY terminal reset should not enter output bundles after input"
         );
     }
 
