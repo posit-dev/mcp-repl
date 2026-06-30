@@ -15,7 +15,8 @@
 
 - State: active
 - Last updated: 2026-06-29
-- Current phase: implementation
+- Current phase: Unix implementation complete; non-Unix input-wait shape still
+  needs an explicit merge-scope decision.
 
 ## Motivating Scenario
 
@@ -302,12 +303,12 @@ R invariants:
 - Phase 3: complete - update worker queue handling so sideband cleanup cannot
   wake or mutate runtime interrupt state. Python and R sideband cleanup now
   discard queued input only.
-- Phase 4: active - update Python and R waits to preserve runtime-native
+- Phase 4: complete on Unix - update Python and R waits to preserve runtime-native
   interrupt behavior without normal-operation busy polling. Unix Python uses a
   Python signal wake fd; Unix R uses a runtime input wake pipe plus a SIGINT
   bridge that marks R's pending interrupt flag and lets the main R thread call
   `R_CheckUserInterrupt()`.
-- Phase 5: active - update public tests and protocol fixture tests to lock the
+- Phase 5: complete on Unix - update public tests and protocol fixture tests to lock the
   boundary.
 
 ## Locked Decisions
@@ -327,15 +328,28 @@ R invariants:
   primitive inside managed readline now that sideband discard no longer wakes
   the condvar wait.
 - Whether non-Unix R needs the same input-wait shape as Unix R in this
-  initiative, or can remain on the existing platform-specific event path.
+  initiative. The current non-Unix R wait still uses a timed
+  `R_CheckUserInterrupt()` loop, so the no-polling invariant is not yet portable.
 - Whether protocol versioning should reject all old `interrupt` and `ready`
   messages at the parser layer or only in protocol contract tests.
 
 ## Next Safe Slice
 
-- Run the full required local verification suite on Unix.
-- Decide and implement the non-Unix runtime input wake shape if this initiative
-  must close the boundary for Windows before merge.
+- Decide whether the merge scope is Unix-only or portable.
+- If portable, design and implement non-Unix blocking waits that are woken by
+  runtime-native interrupt mechanisms, not by sideband discard.
+- If Unix-only, document that boundary in the PR and keep the non-Unix questions
+  tracked here.
+
+## Verification
+
+- `env RUSTFLAGS=-Dwarnings cargo check`
+- `env RUSTFLAGS=-Dwarnings cargo build`
+- `python3 tests/run_integration_tests.py --binary target/debug/mcp-repl`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `env RUSTFLAGS=-Dwarnings cargo test --quiet`
+- `cargo +nightly fmt`
+- `env RUSTFLAGS=-Dwarnings cargo build --release --locked`
 
 ## Stop Conditions
 
