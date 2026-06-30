@@ -299,12 +299,14 @@ R invariants:
   and nullable `input_wait`.
 - Phase 2: complete - update server interrupt flow so OS interrupt is always
   sent after best-effort sideband cleanup.
-- Phase 3: active - update worker queue handling so sideband cleanup cannot
+- Phase 3: complete - update worker queue handling so sideband cleanup cannot
   wake or mutate runtime interrupt state. Python and R sideband cleanup now
-  discard queued input only; remaining work is to audit any non-Unix signal
-  receptivity assumptions.
+  discard queued input only.
 - Phase 4: active - update Python and R waits to preserve runtime-native
-  interrupt behavior without normal-operation busy polling.
+  interrupt behavior without normal-operation busy polling. Unix Python uses a
+  Python signal wake fd; Unix R uses a runtime input wake pipe plus a SIGINT
+  bridge that marks R's pending interrupt flag and lets the main R thread call
+  `R_CheckUserInterrupt()`.
 - Phase 5: active - update public tests and protocol fixture tests to lock the
   boundary.
 
@@ -324,21 +326,16 @@ R invariants:
 - Whether non-Unix Python needs a platform-specific signal-receptive blocking
   primitive inside managed readline now that sideband discard no longer wakes
   the condvar wait.
-- Whether R's timed `ReadConsole` interrupt check should be replaced in this
-  initiative or treated as an existing runtime-specific compromise outside the
-  sideband boundary.
+- Whether non-Unix R needs the same input-wait shape as Unix R in this
+  initiative, or can remain on the existing platform-specific event path.
 - Whether protocol versioning should reject all old `interrupt` and `ready`
   messages at the parser layer or only in protocol contract tests.
 
 ## Next Safe Slice
 
-- Run the full required local verification suite.
-- Audit the remaining R `ReadConsole` timeout loop against the no-polling
-  target and either replace it with a signal-receptive blocking primitive or
-  document why it is outside this slice.
-- If Windows support is in scope for this slice, add/adjust a Windows-specific
-  Python wait primitive so OS control events, not sideband cleanup, wake managed
-  waits.
+- Run the full required local verification suite on Unix.
+- Decide and implement the non-Unix runtime input wake shape if this initiative
+  must close the boundary for Windows before merge.
 
 ## Stop Conditions
 
@@ -364,3 +361,7 @@ R invariants:
   separate `ready` worker event in favor of `input_wait { prompt: null }`.
 - 2026-06-29: Split Python sideband cleanup from runtime input wakeups; discard
   ack handling now clears queued input without waking the runtime wait.
+- 2026-06-29: Replaced Unix R's timed `ReadConsole` wait with a blocking input
+  wake pipe. A Unix SIGINT handler marks R's pending interrupt flag and writes
+  the pipe so the main R thread observes the interrupt through
+  `R_CheckUserInterrupt()`.
