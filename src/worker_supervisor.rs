@@ -1143,6 +1143,8 @@ impl WorkerProcess {
             &mut command,
             spawn_stdin_transport,
             !matches!(backend, Backend::Python),
+            #[cfg(target_family = "windows")]
+            false,
         );
         #[cfg(target_family = "unix")]
         {
@@ -1271,7 +1273,13 @@ impl WorkerProcess {
         configure_command_process_group(&mut command, stdin_transport);
         #[cfg(not(target_os = "windows"))]
         let spawn_stdin_transport = stdin_transport;
-        let child_result = spawn_command_with_transport(&mut command, spawn_stdin_transport, true);
+        let child_result = spawn_command_with_transport(
+            &mut command,
+            spawn_stdin_transport,
+            true,
+            #[cfg(target_family = "windows")]
+            true,
+        );
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -2275,6 +2283,7 @@ fn spawn_command_with_transport(
     command: &mut Command,
     stdin_transport: WorkerStdinTransport,
     pty_echo: bool,
+    #[cfg(target_family = "windows")] wrap_custom_pty_stdio: bool,
 ) -> Result<SpawnedCommand, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
@@ -2289,7 +2298,12 @@ fn spawn_command_with_transport(
                 pty_stdio: None,
             })
         }
-        WorkerStdinTransport::Pty => spawn_command_with_pty(command, pty_echo),
+        WorkerStdinTransport::Pty => spawn_command_with_pty(
+            command,
+            pty_echo,
+            #[cfg(target_family = "windows")]
+            wrap_custom_pty_stdio,
+        ),
     }
 }
 
@@ -2441,6 +2455,7 @@ fn remove_windows_conpty_env(env_map: &mut std::collections::HashMap<String, Str
 fn spawn_command_with_pty(
     command: &mut Command,
     _echo: bool,
+    wrap_custom_pty_stdio: bool,
 ) -> Result<SpawnedCommand, WorkerError> {
     let mut command_line = Vec::new();
     command_line.push(command.get_program().to_string_lossy().to_string());
@@ -2449,6 +2464,9 @@ fn spawn_command_with_pty(
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string()),
     );
+    if wrap_custom_pty_stdio {
+        command_line = windows_conpty_attach_command_line(&command_line)?;
+    }
     let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
     apply_command_env_overrides_for_windows_conpty(
         &mut env_map,
@@ -2482,6 +2500,18 @@ fn spawn_command_with_pty(
             writer: Box::new(writer),
         }),
     })
+}
+
+#[cfg(target_family = "windows")]
+fn windows_conpty_attach_command_line(command: &[String]) -> Result<Vec<String>, WorkerError> {
+    let exe = std::env::current_exe().map_err(WorkerError::Io)?;
+    let mut wrapped = vec![
+        exe.to_string_lossy().to_string(),
+        crate::windows_conpty::WINDOWS_CONPTY_ATTACH_ARG.to_string(),
+        "--".to_string(),
+    ];
+    wrapped.extend(command.iter().cloned());
+    Ok(wrapped)
 }
 
 #[cfg(not(any(target_family = "unix", target_family = "windows")))]

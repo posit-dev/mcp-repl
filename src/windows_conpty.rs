@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::Path;
+use std::process::Command;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{
@@ -35,6 +36,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub const WINDOWS_CONPTY_ARG: &str = "--windows-conpty";
+pub const WINDOWS_CONPTY_ATTACH_ARG: &str = "--windows-conpty-attach";
 pub const WINDOWS_CONPTY_REQUEST_ENV: &str = "MCP_REPL_WINDOWS_CONPTY";
 const WINDOWS_CONPTY_ATTACHED_ENV: &str = "MCP_REPL_WINDOWS_CONPTY_ATTACHED";
 
@@ -51,8 +53,22 @@ pub fn invoked_as_windows_conpty() -> bool {
     std::env::args_os().nth(1).as_deref() == Some(OsStr::new(WINDOWS_CONPTY_ARG))
 }
 
+pub fn invoked_as_windows_conpty_attach() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(OsStr::new(WINDOWS_CONPTY_ATTACH_ARG))
+}
+
 pub fn run_windows_conpty_main() -> ! {
     match windows_conpty_main_impl() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn run_windows_conpty_attach_main() -> ! {
+    match windows_conpty_attach_main_impl() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("{err}");
@@ -189,11 +205,46 @@ fn windows_conpty_main_impl() -> Result<i32, String> {
     run_conpty_command_with_env_map(&command, std::env::vars().collect(), None)
 }
 
+fn windows_conpty_attach_main_impl() -> Result<i32, String> {
+    crate::diagnostics::startup_log("windows-conpty-attach: begin");
+    let command = parse_windows_conpty_attach_args(std::env::args_os().skip(1).collect())?;
+    crate::diagnostics::startup_log("windows-conpty-attach: parsed args");
+    unsafe {
+        if SetConsoleCtrlHandler(Some(ignore_attached_wrapper_ctrl_event), 1) == 0 {
+            return Err(format!(
+                "failed to install Windows ConPTY attach wrapper control handler: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    let status = child
+        .status()
+        .map_err(|err| format!("failed to run attached Windows ConPTY command: {err}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+unsafe extern "system" fn ignore_attached_wrapper_ctrl_event(_event: u32) -> i32 {
+    1
+}
+
 fn parse_windows_conpty_args(raw_args: Vec<OsString>) -> Result<Vec<String>, String> {
+    parse_windows_conpty_command_args(raw_args, WINDOWS_CONPTY_ARG)
+}
+
+fn parse_windows_conpty_attach_args(raw_args: Vec<OsString>) -> Result<Vec<String>, String> {
+    parse_windows_conpty_command_args(raw_args, WINDOWS_CONPTY_ATTACH_ARG)
+}
+
+fn parse_windows_conpty_command_args(
+    raw_args: Vec<OsString>,
+    mode_arg: &str,
+) -> Result<Vec<String>, String> {
     let mut command = Vec::new();
     let mut args = raw_args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == WINDOWS_CONPTY_ARG {
+        if arg == mode_arg {
             continue;
         }
         if arg == "--" {

@@ -274,27 +274,23 @@ impl WorkerManager {
         if let Some(process) = self.process.as_ref()
             && let Some(ipc) = process.ipc_connection()
         {
-            if timeout.is_zero() {
-                timed_out = true;
-            } else {
-                let readiness = match interrupt_sent_at {
-                    Some(sent_at) => ipc.wait_for_input_wait_or_fresh_ready(timeout, sent_at),
-                    None => ipc.wait_for_input_readiness(timeout),
-                };
-                match readiness {
-                    Ok(IpcInputReadiness::InputWait(value)) => {
-                        prompt = value;
-                    }
-                    Err(IpcWaitError::Timeout) => {
-                        timed_out = true;
-                    }
-                    Err(IpcWaitError::SessionEnd) => {
-                        self.note_session_end(true);
-                    }
-                    Err(IpcWaitError::Disconnected) => {}
-                    Err(IpcWaitError::Protocol(message)) => {
-                        return Err(WorkerError::Protocol(message));
-                    }
+            let readiness = match interrupt_sent_at {
+                Some(sent_at) => ipc.wait_for_input_wait_or_fresh_ready(timeout, sent_at),
+                None => ipc.wait_for_input_readiness(timeout),
+            };
+            match readiness {
+                Ok(IpcInputReadiness::InputWait(value)) => {
+                    prompt = value;
+                }
+                Err(IpcWaitError::Timeout) => {
+                    timed_out = true;
+                }
+                Err(IpcWaitError::SessionEnd) => {
+                    self.note_session_end(true);
+                }
+                Err(IpcWaitError::Disconnected) => {}
+                Err(IpcWaitError::Protocol(message)) => {
+                    return Err(WorkerError::Protocol(message));
                 }
             }
         }
