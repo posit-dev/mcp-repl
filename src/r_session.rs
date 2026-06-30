@@ -143,14 +143,13 @@ pub(crate) fn clear_pending_input() -> bool {
     had_pending
 }
 
-pub(crate) fn interrupt_pending_input() -> bool {
+pub(crate) fn discard_unconsumed_input_for_discard_ack() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
     };
     let mut guard = state.inner.lock().unwrap();
     let had_pending = !guard.input_queue.is_empty();
     drain_input_queue(&mut guard.input_queue);
-    state.cvar.notify_all();
     had_pending
 }
 

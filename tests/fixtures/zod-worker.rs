@@ -34,11 +34,12 @@ const LATE_SIDEBAND_MARKER_ENV: &str = "MCP_REPL_ZOD_LATE_SIDEBAND_MARKER";
 const UTF8_TAIL_RELEASE_ENV: &str = "MCP_REPL_ZOD_UTF8_TAIL_RELEASE";
 const STALL_CONTROL_READER_ENV: &str = "MCP_REPL_ZOD_STALL_CONTROL_READER";
 const DELAY_READY_AFTER_INTERRUPT_ENV: &str = "MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS";
-const DELAY_INTERRUPT_ACK_ENV: &str = "MCP_REPL_ZOD_DELAY_INTERRUPT_ACK_MS";
-const SKIP_INTERRUPT_ACK_ENV: &str = "MCP_REPL_ZOD_SKIP_INTERRUPT_ACK";
-const INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK_ENV: &str =
-    "MCP_REPL_ZOD_INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK";
-const PREEMPTIVE_INTERRUPT_ACK_MARKER_ENV: &str = "MCP_REPL_ZOD_PREEMPTIVE_INTERRUPT_ACK_MARKER";
+const DELAY_DISCARD_PENDING_INPUT_ACK_ENV: &str = "MCP_REPL_ZOD_DELAY_DISCARD_PENDING_INPUT_ACK_MS";
+const SKIP_DISCARD_PENDING_INPUT_ACK_ENV: &str = "MCP_REPL_ZOD_SKIP_DISCARD_PENDING_INPUT_ACK";
+const DISCARD_PENDING_INPUT_PROTOCOL_ERROR_BEFORE_ACK_ENV: &str =
+    "MCP_REPL_ZOD_DISCARD_PENDING_INPUT_PROTOCOL_ERROR_BEFORE_ACK";
+const PREEMPTIVE_DISCARD_PENDING_INPUT_ACK_MARKER_ENV: &str =
+    "MCP_REPL_ZOD_PREEMPTIVE_DISCARD_PENDING_INPUT_ACK_MARKER";
 const INVALID_OUTPUT_TEXT_BASE64: &str =
     r#"{"type":"output_text","stream":"stdout","data_b64":"***"}"#;
 const LATE_RAW_AFTER_SESSION_END: &[u8] = b"STALE_RAW_AFTER_SESSION_END\n";
@@ -62,11 +63,12 @@ fn run_worker(
     writer: IpcWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let control_log_path = std::env::var_os(CONTROL_LOG_ENV).map(PathBuf::from);
-    let skip_interrupt_ack = std::env::var_os(SKIP_INTERRUPT_ACK_ENV).is_some();
-    let interrupt_protocol_error_before_ack =
-        std::env::var_os(INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK_ENV).is_some();
-    let preemptive_interrupt_ack_marker =
-        std::env::var_os(PREEMPTIVE_INTERRUPT_ACK_MARKER_ENV).map(PathBuf::from);
+    let skip_discard_pending_input_ack =
+        std::env::var_os(SKIP_DISCARD_PENDING_INPUT_ACK_ENV).is_some();
+    let discard_pending_input_protocol_error_before_ack =
+        std::env::var_os(DISCARD_PENDING_INPUT_PROTOCOL_ERROR_BEFORE_ACK_ENV).is_some();
+    let preemptive_discard_pending_input_ack_marker =
+        std::env::var_os(PREEMPTIVE_DISCARD_PENDING_INPUT_ACK_MARKER_ENV).map(PathBuf::from);
     let delay_ready_after_interrupt_ms = std::env::var_os(DELAY_READY_AFTER_INTERRUPT_ENV)
         .map(|value| {
             value
@@ -75,7 +77,7 @@ fn run_worker(
                 .map_err(io::Error::other)
         })
         .transpose()?;
-    let delay_interrupt_ack_ms = std::env::var_os(DELAY_INTERRUPT_ACK_ENV)
+    let delay_discard_pending_input_ack_ms = std::env::var_os(DELAY_DISCARD_PENDING_INPUT_ACK_ENV)
         .map(|value| {
             value
                 .to_string_lossy()
@@ -95,7 +97,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 8,
+            version: 9,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -107,11 +109,11 @@ fn run_worker(
         writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64)?;
     }
     if std::env::var_os(STARTUP_READY_ENV).is_some() {
-        writer.send(&WorkerToServer::Ready {})?;
-        append_control_log(control_log_path.as_deref(), "ready")?;
+        writer.send(&WorkerToServer::InputWait { prompt: None })?;
+        append_control_log(control_log_path.as_deref(), "input_wait prompt=null")?;
     } else {
         writer.send(&WorkerToServer::InputWait {
-            prompt: "v5> ".to_string(),
+            prompt: Some("v5> ".to_string()),
         })?;
         append_control_log(control_log_path.as_deref(), "input_wait")?;
     }
@@ -132,9 +134,9 @@ fn run_worker(
         sideband_interrupted.clone(),
         ControlReaderConfig {
             control_log_path: control_log_path.clone(),
-            skip_interrupt_ack,
-            interrupt_protocol_error_before_ack,
-            delay_interrupt_ack_ms,
+            skip_discard_pending_input_ack,
+            discard_pending_input_protocol_error_before_ack,
+            delay_discard_pending_input_ack_ms,
         },
     );
 
@@ -145,7 +147,7 @@ fn run_worker(
         session_end_after_input_wait: false,
         bad_output_after_input_wait: None,
         ready_after_turn: false,
-        preemptive_interrupt_ack_marker,
+        preemptive_discard_pending_input_ack_marker,
     };
     while let Ok(message) = rx.recv() {
         match message {
@@ -160,14 +162,14 @@ fn run_worker(
                     return Ok(());
                 }
             }
-            ControlMessage::Interrupt => {
+            ControlMessage::DiscardPendingInput => {
                 if let Some(millis) = delay_ready_after_interrupt_ms {
                     thread::sleep(Duration::from_millis(millis));
                     match rx.try_recv() {
                         Ok(ControlMessage::InputBatch { input }) => {
                             append_control_log(
                                 control_log_path.as_deref(),
-                                "fresh_ready_after_interrupt_suppressed_for_pending_input",
+                                "fresh_input_wait_null_after_discard_suppressed_for_pending_input",
                             )?;
                             if run_turn(
                                 &writer,
@@ -184,12 +186,15 @@ fn run_worker(
                             send_session_end(&writer, "shutdown")?;
                             return Ok(());
                         }
-                        Ok(ControlMessage::Interrupt) => {}
+                        Ok(ControlMessage::DiscardPendingInput) => {}
                         Err(mpsc::TryRecvError::Empty) => {}
                         Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                     }
-                    append_control_log(control_log_path.as_deref(), "fresh_ready_after_interrupt")?;
-                    writer.send(&WorkerToServer::Ready {})?;
+                    append_control_log(
+                        control_log_path.as_deref(),
+                        "fresh_input_wait_null_after_discard",
+                    )?;
+                    writer.send(&WorkerToServer::InputWait { prompt: None })?;
                 }
             }
             ControlMessage::Shutdown => {
@@ -212,7 +217,7 @@ fn run_turn(
     for raw_line in runtime_lines(input) {
         let prompt = state.next_prompt.clone();
         writer.send(&WorkerToServer::InputLine {
-            prompt,
+            prompt: Some(prompt),
             text: raw_line.clone(),
         })?;
         append_control_log(
@@ -234,11 +239,13 @@ fn run_turn(
 
     if state.ready_after_turn {
         state.ready_after_turn = false;
-        writer.send(&WorkerToServer::Ready {})?;
-        append_control_log(control_log_path.as_deref(), "ready")?;
+        writer.send(&WorkerToServer::InputWait { prompt: None })?;
+        append_control_log(control_log_path.as_deref(), "input_wait prompt=null")?;
     } else {
         let prompt = std::mem::replace(&mut state.next_prompt, "v5> ".to_string());
-        writer.send(&WorkerToServer::InputWait { prompt })?;
+        writer.send(&WorkerToServer::InputWait {
+            prompt: Some(prompt),
+        })?;
         append_control_log(control_log_path.as_deref(), "input_wait")?;
     }
     emit_deferred_protocol_faults(writer, control_log_path, state)?;
@@ -275,30 +282,30 @@ fn run_command(
     }
 
     if let Some(millis) = command.strip_prefix("interrupt-report ") {
-        if let Some(marker) = state.preemptive_interrupt_ack_marker.take() {
+        if let Some(marker) = state.preemptive_discard_pending_input_ack_marker.take() {
             let writer = writer.clone();
             let control_log_path = control_log_path.clone();
             thread::spawn(move || {
                 let _ = append_control_log(
                     control_log_path.as_deref(),
-                    "preemptive_interrupt_ack_waiting",
+                    "preemptive_discard_pending_input_ack_waiting",
                 );
                 if wait_for_marker_path(&marker).is_err() {
                     return;
                 }
-                let _ = writer.send(&WorkerToServer::InterruptAck {
-                    interrupt_id: 1,
+                let _ = writer.send(&WorkerToServer::DiscardPendingInputAck {
+                    discard_id: 1,
                     discarded_input: false,
                 });
                 let _ = append_control_log(
                     control_log_path.as_deref(),
-                    "preemptive_interrupt_ack interrupt_id=1",
+                    "preemptive_discard_pending_input_ack discard_id=1",
                 );
             });
         }
         let report = observe_interrupts_for(parse_millis(millis)?, sideband_interrupted);
         let text = format!(
-            "sideband interrupt: {}\nos interrupt: {}\n",
+            "sideband discard: {}\nos interrupt: {}\n",
             if report.sideband {
                 "observed"
             } else {
@@ -452,7 +459,7 @@ fn run_command(
         io::stdout().flush()?;
         sleep_for(50, sideband_interrupted, false);
         writer.send(&WorkerToServer::InputWait {
-            prompt: "v5> ".to_string(),
+            prompt: Some("v5> ".to_string()),
         })?;
         append_control_log(control_log_path.as_deref(), "input_wait")?;
         sleep_for(200, sideband_interrupted, false);
@@ -500,7 +507,7 @@ fn run_command(
         output_text(writer, control_log_path, text.as_bytes())?;
         sleep_for(200, sideband_interrupted, false);
         writer.send(&WorkerToServer::InputLine {
-            prompt: "v5> ".to_string(),
+            prompt: Some("v5> ".to_string()),
             text: "refreshed-hidden-echo\n".to_string(),
         })?;
         append_control_log(control_log_path.as_deref(), "refresh_pager_input_line")?;
@@ -605,7 +612,7 @@ fn emit_deferred_protocol_faults(
         state.input_line_after_input_wait = false;
         append_control_log(control_log_path.as_deref(), "late_input_line")?;
         writer.send(&WorkerToServer::InputLine {
-            prompt: "v5> ".to_string(),
+            prompt: Some("v5> ".to_string()),
             text: "late\n".to_string(),
         })?;
     }
@@ -726,14 +733,14 @@ struct CommandState {
     session_end_after_input_wait: bool,
     bad_output_after_input_wait: Option<Duration>,
     ready_after_turn: bool,
-    preemptive_interrupt_ack_marker: Option<PathBuf>,
+    preemptive_discard_pending_input_ack_marker: Option<PathBuf>,
 }
 
 struct ControlReaderConfig {
     control_log_path: Option<PathBuf>,
-    skip_interrupt_ack: bool,
-    interrupt_protocol_error_before_ack: bool,
-    delay_interrupt_ack_ms: Option<u64>,
+    skip_discard_pending_input_ack: bool,
+    discard_pending_input_protocol_error_before_ack: bool,
+    delay_discard_pending_input_ack_ms: Option<u64>,
 }
 
 fn start_control_reader(
@@ -748,9 +755,9 @@ fn start_control_reader(
         let mut line = String::new();
         let ControlReaderConfig {
             control_log_path,
-            skip_interrupt_ack,
-            interrupt_protocol_error_before_ack,
-            delay_interrupt_ack_ms,
+            skip_discard_pending_input_ack,
+            discard_pending_input_protocol_error_before_ack,
+            delay_discard_pending_input_ack_ms,
         } = config;
         loop {
             line.clear();
@@ -770,45 +777,45 @@ fn start_control_reader(
                     );
                     let _ = turn_tx.send(ControlMessage::InputBatch { input });
                 }
-                Ok(ServerToWorker::Interrupt { interrupt_id }) => {
+                Ok(ServerToWorker::DiscardPendingInput { discard_id }) => {
                     interrupted.store(true, Ordering::SeqCst);
                     let _ = append_control_log(
                         control_log_path.as_deref(),
-                        &format!("interrupt interrupt_id={interrupt_id}"),
+                        &format!("discard_pending_input discard_id={discard_id}"),
                     );
-                    let notify_before_ack = delay_interrupt_ack_ms.is_some();
+                    let notify_before_ack = delay_discard_pending_input_ack_ms.is_some();
                     if notify_before_ack {
-                        let _ = turn_tx.send(ControlMessage::Interrupt);
+                        let _ = turn_tx.send(ControlMessage::DiscardPendingInput);
                     }
-                    if interrupt_protocol_error_before_ack {
+                    if discard_pending_input_protocol_error_before_ack {
                         let _ = append_control_log(
                             control_log_path.as_deref(),
-                            "interrupt_protocol_error_before_ack",
+                            "discard_pending_input_protocol_error_before_ack",
                         );
                         let _ = writer.send_raw_json(INVALID_OUTPUT_TEXT_BASE64);
                     }
-                    if skip_interrupt_ack {
+                    if skip_discard_pending_input_ack {
                         let _ = append_control_log(
                             control_log_path.as_deref(),
-                            "interrupt_ack_suppressed",
+                            "discard_pending_input_ack_suppressed",
                         );
                     } else {
-                        if let Some(millis) = delay_interrupt_ack_ms {
+                        if let Some(millis) = delay_discard_pending_input_ack_ms {
                             thread::sleep(Duration::from_millis(millis));
                         }
-                        let _ = writer.send(&WorkerToServer::InterruptAck {
-                            interrupt_id,
+                        let _ = writer.send(&WorkerToServer::DiscardPendingInputAck {
+                            discard_id,
                             discarded_input: false,
                         });
                         let _ = append_control_log(
                             control_log_path.as_deref(),
                             &format!(
-                                "interrupt_ack interrupt_id={interrupt_id} discarded_input=false"
+                                "discard_pending_input_ack discard_id={discard_id} discarded_input=false"
                             ),
                         );
                     }
                     if !notify_before_ack {
-                        let _ = turn_tx.send(ControlMessage::Interrupt);
+                        let _ = turn_tx.send(ControlMessage::DiscardPendingInput);
                     }
                 }
                 Ok(ServerToWorker::Shutdown {}) => {
@@ -843,7 +850,7 @@ fn start_stdin_observer(control_log_path: Option<PathBuf>) {
 #[derive(Debug)]
 enum ControlMessage {
     InputBatch { input: String },
-    Interrupt,
+    DiscardPendingInput,
     Shutdown,
 }
 
@@ -851,7 +858,7 @@ enum ControlMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerToWorker {
     InputBatch { input: String },
-    Interrupt { interrupt_id: u64 },
+    DiscardPendingInput { discard_id: u64 },
     Shutdown {},
 }
 
@@ -876,15 +883,14 @@ enum WorkerToServer {
         source: Option<String>,
     },
     InputLine {
-        prompt: String,
+        prompt: Option<String>,
         text: String,
     },
     InputWait {
-        prompt: String,
+        prompt: Option<String>,
     },
-    Ready {},
-    InterruptAck {
-        interrupt_id: u64,
+    DiscardPendingInputAck {
+        discard_id: u64,
         discarded_input: bool,
     },
     SessionEnd {

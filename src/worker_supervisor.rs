@@ -399,8 +399,7 @@ fn seed_initial_readiness_from_process(
         return Ok(Some(InitialWorkerPrompt::Immediate(raw_prompt)));
     }
     match ipc.wait_for_input_readiness(WORKER_READY_TIMEOUT) {
-        Ok(IpcInputReadiness::InputWait(prompt)) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
-        Ok(IpcInputReadiness::Ready) => Ok(None),
+        Ok(IpcInputReadiness::InputWait(prompt)) => Ok(prompt.map(InitialWorkerPrompt::Waited)),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
         Err(IpcWaitError::Timeout) => Ok(None),
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
@@ -815,16 +814,18 @@ impl WorkerProcess {
                 on_output_image: Some(Arc::new(move |image: IpcOutputImage| {
                     image_capture.append_image(image);
                 })),
-                on_input_wait: Some(Arc::new(move |prompt: String| {
+                on_input_wait: Some(Arc::new(move |prompt: Option<String>| {
                     sideband_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
                 })),
                 on_input_line: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move |event: IpcInputLineEvent| {
-                        sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
-                            prompt: event.prompt,
-                            line: event.line,
-                        });
+                        if let Some(prompt) = event.prompt {
+                            sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                                prompt,
+                                line: event.line,
+                            });
+                        }
                     }))
                 },
                 on_session_end: {
@@ -1165,7 +1166,7 @@ impl WorkerProcess {
         }
     }
 
-    pub(crate) fn send_interrupt(&mut self) -> Result<(), WorkerError> {
+    pub(crate) fn send_os_interrupt(&mut self) -> Result<(), WorkerError> {
         #[cfg(all(target_family = "unix", not(target_os = "linux")))]
         {
             self.send_signal(libc::SIGINT)
@@ -3039,10 +3040,12 @@ mod tests {
                 wait_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
             })),
             on_input_line: Some(Arc::new(move |event| {
-                result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
-                    prompt: event.prompt,
-                    line: event.line,
-                });
+                if let Some(prompt) = event.prompt {
+                    result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                        prompt,
+                        line: event.line,
+                    });
+                }
             })),
             on_output_image: Some(Arc::new(move |image| {
                 image_capture.append_image(image);
@@ -3056,7 +3059,7 @@ mod tests {
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
             })
             .expect("send initial input_wait");
         server
@@ -3072,7 +3075,7 @@ mod tests {
             .expect("send stdout output_text");
         worker
             .send(WorkerToServerIpcMessage::InputLine {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
                 text: "plot(1)\n".to_string(),
             })
             .expect("send input_line");
@@ -3093,7 +3096,7 @@ mod tests {
             .expect("send stderr output_text");
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
             })
             .expect("send completion input_wait");
         worker

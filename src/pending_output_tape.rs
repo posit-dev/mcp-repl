@@ -11,7 +11,7 @@ pub(crate) struct PendingOutputTape {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PendingSidebandKind {
-    InputWait { prompt: String },
+    InputWait { prompt: Option<String> },
     ReadlineResult { prompt: String, line: String },
     RequestBoundary,
     SessionEnd,

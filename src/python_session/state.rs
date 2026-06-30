@@ -29,7 +29,7 @@ pub(super) enum StdinReadAccounting {
 }
 
 impl StdinReadAccounting {
-    pub(super) fn discarded_after_interrupt(&self) -> bool {
+    pub(super) fn discarded_after_runtime_interrupt(&self) -> bool {
         false
     }
 }
@@ -61,7 +61,23 @@ impl SessionState {
         })
     }
 
-    pub(super) fn notify_all(&self) {
+    pub(super) fn notify_python_input_hook(&self) {
+        self.cvar.notify_all();
+    }
+
+    pub(super) fn notify_runtime_input_available(&self) {
+        self.notify_runtime_input_waiters();
+    }
+
+    pub(super) fn notify_runtime_input_closed(&self) {
+        self.notify_runtime_input_waiters();
+    }
+
+    pub(super) fn notify_runtime_input_consumer_released(&self) {
+        self.notify_runtime_input_waiters();
+    }
+
+    fn notify_runtime_input_waiters(&self) {
         self.cvar.notify_all();
         self.runtime_wake.wake_queue();
     }

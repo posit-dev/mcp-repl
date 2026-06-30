@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 8;
+pub const WORKER_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerToWorkerIpcMessage {
     InputBatch { input: String },
-    Interrupt { interrupt_id: u64 },
+    DiscardPendingInput { discard_id: u64 },
     Shutdown {},
 }
 
@@ -29,13 +29,14 @@ pub enum WorkerToServerIpcMessage {
         is_continuation: bool,
     },
     InputLine {
-        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
         text: String,
     },
     InputWait {
-        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
     },
-    Ready {},
     OutputImage {
         mime_type: String,
         data_b64: String,
@@ -49,8 +50,8 @@ pub enum WorkerToServerIpcMessage {
         #[serde(default)]
         message: Option<String>,
     },
-    InterruptAck {
-        interrupt_id: u64,
+    DiscardPendingInputAck {
+        discard_id: u64,
         discarded_input: bool,
     },
 }
@@ -78,7 +79,7 @@ pub struct WorkerCapabilities {
 
 #[derive(Debug, Clone)]
 pub struct IpcInputLineEvent {
-    pub prompt: String,
+    pub prompt: Option<String>,
     pub line: String,
 }
 
@@ -103,7 +104,7 @@ pub struct IpcOutputImage {
 pub struct IpcHandlers {
     pub on_output_text: Option<Arc<dyn Fn(IpcOutputText) + Send + Sync>>,
     pub on_output_image: Option<Arc<dyn Fn(IpcOutputImage) + Send + Sync>>,
-    pub on_input_wait: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub on_input_wait: Option<Arc<dyn Fn(Option<String>) + Send + Sync>>,
     pub on_input_line: Option<Arc<dyn Fn(IpcInputLineEvent) + Send + Sync>>,
     pub on_session_end: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -241,21 +242,21 @@ mod tests {
         assert!(parsed.is_err(), "output_text should require data_b64");
     }
     #[test]
-    fn interrupt_ack_protocol_reports_discarded_input() {
+    fn discard_pending_input_ack_protocol_reports_discarded_input() {
         let parsed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "interrupt_ack",
-            "interrupt_id": 7,
+            "type": "discard_pending_input_ack",
+            "discard_id": 7,
             "discarded_input": true
         }));
 
-        let Ok(WorkerToServerIpcMessage::InterruptAck {
-            interrupt_id,
+        let Ok(WorkerToServerIpcMessage::DiscardPendingInputAck {
+            discard_id,
             discarded_input,
         }) = parsed
         else {
-            panic!("interrupt_ack should deserialize");
+            panic!("discard_pending_input_ack should deserialize");
         };
-        assert_eq!(interrupt_id, 7);
+        assert_eq!(discard_id, 7);
         assert!(discarded_input);
     }
     #[test]
@@ -368,7 +369,7 @@ mod tests {
                 wait,
                 Ok(WorkerToServerIpcMessage::InputWait {
                     ref prompt
-                }) if prompt == "debug> "
+                }) if prompt.as_deref() == Some("debug> ")
             ),
             "input_wait should deserialize as a worker-to-server message"
         );
@@ -393,13 +394,17 @@ mod tests {
     }
 
     #[test]
-    fn ready_message_is_worker_to_server_only() {
+    fn input_wait_null_prompt_is_prompt_free_readiness() {
         let ready = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-            "type": "ready"
+            "type": "input_wait",
+            "prompt": null
         }));
         assert!(
-            matches!(ready, Ok(WorkerToServerIpcMessage::Ready {})),
-            "ready should deserialize as a worker-to-server message"
+            matches!(
+                ready,
+                Ok(WorkerToServerIpcMessage::InputWait { prompt: None })
+            ),
+            "input_wait with null prompt should deserialize as prompt-free readiness"
         );
 
         assert!(
@@ -529,33 +534,33 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_carries_server_interrupt_id() {
-        let interrupt = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
-            "type": "interrupt",
-            "interrupt_id": 7
+    fn discard_pending_input_carries_server_discard_id() {
+        let discard = serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+            "type": "discard_pending_input",
+            "discard_id": 7
         }));
         assert!(
             matches!(
-                interrupt,
-                Ok(ServerToWorkerIpcMessage::Interrupt { interrupt_id: 7 })
+                discard,
+                Ok(ServerToWorkerIpcMessage::DiscardPendingInput { discard_id: 7 })
             ),
-            "interrupt should deserialize with interrupt_id"
+            "discard_pending_input should deserialize with discard_id"
         );
 
         assert!(
             serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
-                "type": "interrupt",
+                "type": "discard_pending_input",
                 "input_id": 7
             }))
             .is_err(),
-            "interrupt should reject input_id under v5"
+            "discard_pending_input should reject input_id"
         );
         assert!(
             serde_json::from_value::<WorkerToServerIpcMessage>(json!({
-                "type": "interrupt"
+                "type": "discard_pending_input"
             }))
             .is_err(),
-            "interrupt should not deserialize as a worker-to-server message"
+            "discard_pending_input should not deserialize as a worker-to-server message"
         );
     }
 }

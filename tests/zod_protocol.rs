@@ -300,43 +300,46 @@ async fn spawn_zod_interrupt_ready_during_ack_server(
         vec![
             ("MCP_REPL_ZOD_STARTUP_READY", "1"),
             ("MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS", "0"),
-            ("MCP_REPL_ZOD_DELAY_INTERRUPT_ACK_MS", "200"),
+            ("MCP_REPL_ZOD_DELAY_DISCARD_PENDING_INPUT_ACK_MS", "200"),
         ],
         Vec::new(),
     )
     .await
 }
 
-async fn spawn_zod_without_interrupt_ack_server(
+async fn spawn_zod_without_discard_pending_input_ack_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
     spawn_zod_server_with_extra_env_and_extra_args(
         control_log,
-        vec![("MCP_REPL_ZOD_SKIP_INTERRUPT_ACK", "1")],
+        vec![("MCP_REPL_ZOD_SKIP_DISCARD_PENDING_INPUT_ACK", "1")],
         Vec::new(),
     )
     .await
 }
 
-async fn spawn_zod_protocol_error_before_interrupt_ack_server(
+async fn spawn_zod_protocol_error_before_discard_pending_input_ack_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
     spawn_zod_server_with_extra_env_and_extra_args(
         control_log,
-        vec![("MCP_REPL_ZOD_INTERRUPT_PROTOCOL_ERROR_BEFORE_ACK", "1")],
+        vec![(
+            "MCP_REPL_ZOD_DISCARD_PENDING_INPUT_PROTOCOL_ERROR_BEFORE_ACK",
+            "1",
+        )],
         Vec::new(),
     )
     .await
 }
 
-async fn spawn_zod_preemptive_interrupt_ack_server(
+async fn spawn_zod_preemptive_discard_pending_input_ack_server(
     control_log: &std::path::Path,
     marker: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
     spawn_zod_server_with_extra_env_and_extra_args(
         control_log,
         vec![(
-            "MCP_REPL_ZOD_PREEMPTIVE_INTERRUPT_ACK_MARKER",
+            "MCP_REPL_ZOD_PREEMPTIVE_DISCARD_PENDING_INPUT_ACK_MARKER",
             marker.to_str().ok_or("marker path must be valid UTF-8")?,
         )],
         Vec::new(),
@@ -565,10 +568,10 @@ async fn zod_worker_startup_ready_accepts_first_input_without_prompt_wait() -> T
         text.contains("v5-output: prompt-free startup\n"),
         "expected custom worker startup ready to accept first input, got: {text:?}"
     );
-    let log = wait_for_log_contains(&control_log, "ready")?;
+    let log = wait_for_log_contains(&control_log, "input_wait prompt=null")?;
     assert!(
         log.contains("input_batch input=prompt-free startup"),
-        "expected first input after startup ready, got log: {log:?}"
+        "expected first input after prompt-free startup input_wait, got log: {log:?}"
     );
 
     session.cancel().await?;
@@ -592,13 +595,13 @@ async fn zod_worker_interrupt_prefix_does_not_wait_for_fresh_ready() -> TestResu
 
     let log = wait_for_log_contains(
         &control_log,
-        "fresh_ready_after_interrupt_suppressed_for_pending_input",
+        "fresh_input_wait_null_after_discard_suppressed_for_pending_input",
     )?;
     let input_idx = log
         .find("input_batch input=after interrupt settle")
         .expect("interrupt tail input log should be present");
     let suppressed_idx = log
-        .find("fresh_ready_after_interrupt_suppressed_for_pending_input")
+        .find("fresh_input_wait_null_after_discard_suppressed_for_pending_input")
         .expect("delayed readiness should be suppressed by pending input");
     assert!(
         input_idx < suppressed_idx,
@@ -630,11 +633,11 @@ async fn zod_worker_interrupt_prefix_accepts_ready_during_ack_wait() -> TestResu
 
     let log = wait_for_log_contains(&control_log, "input_batch input=after ready during ack")?;
     let ready_idx = log
-        .find("fresh_ready_after_interrupt")
+        .find("fresh_input_wait_null_after_discard")
         .expect("fresh readiness log should be present");
     let ack_idx = log
-        .find("interrupt_ack interrupt_id=")
-        .expect("interrupt ack log should be present");
+        .find("discard_pending_input_ack discard_id=")
+        .expect("discard ack log should be present");
     let input_idx = log
         .find("input_batch input=after ready during ack")
         .expect("interrupt tail input log should be present");
@@ -644,7 +647,7 @@ async fn zod_worker_interrupt_prefix_accepts_ready_during_ack_wait() -> TestResu
     );
     assert!(
         ack_idx < input_idx,
-        "expected tail input only after interrupt ack wait finished, got log: {log:?}"
+        "expected tail input only after discard ack wait finished, got log: {log:?}"
     );
 
     session.cancel().await?;
@@ -672,13 +675,13 @@ async fn zod_worker_bare_interrupt_ignores_ready_during_ack_wait() -> TestResult
         "bare interrupt must not settle from readiness emitted before OS interrupt, got: {text:?}"
     );
 
-    let log = wait_for_log_contains(&control_log, "interrupt_ack interrupt_id=")?;
+    let log = wait_for_log_contains(&control_log, "discard_pending_input_ack discard_id=")?;
     let ready_idx = log
-        .find("fresh_ready_after_interrupt")
+        .find("fresh_input_wait_null_after_discard")
         .expect("fresh readiness log should be present");
     let ack_idx = log
-        .find("interrupt_ack interrupt_id=")
-        .expect("interrupt ack log should be present");
+        .find("discard_pending_input_ack discard_id=")
+        .expect("discard ack log should be present");
     assert!(
         ready_idx < ack_idx,
         "test must cover readiness observed during ack wait, got log: {log:?}"
@@ -2347,7 +2350,7 @@ async fn zod_worker_v5_busy_follow_up_does_not_send_second_input_batch() -> Test
         .await?;
     let interrupted_text = result_text(&interrupted);
     assert!(
-        interrupted_text.contains("sideband interrupt: observed"),
+        interrupted_text.contains("sideband discard: observed"),
         "expected active input to settle after interrupt, got: {interrupted_text:?}"
     );
 
@@ -2362,7 +2365,7 @@ async fn zod_worker_v5_busy_follow_up_does_not_send_second_input_batch() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_v5_interrupt_carries_interrupt_id() -> TestResult<()> {
+async fn zod_worker_v5_discard_pending_input_carries_discard_id() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -2393,8 +2396,8 @@ async fn zod_worker_v5_interrupt_carries_interrupt_id() -> TestResult<()> {
         .await?;
     let interrupted_text = result_text(&interrupted);
     assert!(
-        interrupted_text.contains("sideband interrupt: observed"),
-        "expected v5 worker to observe sideband interrupt, got: {interrupted_text:?}"
+        interrupted_text.contains("sideband discard: observed"),
+        "expected v5 worker to observe sideband discard, got: {interrupted_text:?}"
     );
     #[cfg(target_family = "unix")]
     assert!(
@@ -2402,14 +2405,14 @@ async fn zod_worker_v5_interrupt_carries_interrupt_id() -> TestResult<()> {
         "expected v5 worker to observe OS interrupt, got: {interrupted_text:?}"
     );
 
-    let log = wait_for_log_contains(&control_log, "interrupt")?;
+    let log = wait_for_log_contains(&control_log, "discard_pending_input")?;
     assert!(
-        log.contains("interrupt interrupt_id="),
-        "interrupt must carry an interrupt identity, got log: {log:?}"
+        log.contains("discard_pending_input discard_id="),
+        "discard_pending_input must carry a discard identity, got log: {log:?}"
     );
     assert!(
         !log.contains("interrupt input_id"),
-        "interrupt must not carry input identity, got log: {log:?}"
+        "discard_pending_input must not carry input identity, got log: {log:?}"
     );
 
     session.cancel().await?;
@@ -2417,7 +2420,8 @@ async fn zod_worker_v5_interrupt_carries_interrupt_id() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_interrupt_ack_precedes_os_interrupt_observation() -> TestResult<()> {
+async fn zod_worker_discard_pending_input_ack_precedes_os_interrupt_observation() -> TestResult<()>
+{
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let session = spawn_zod_server(&control_log).await?;
@@ -2448,8 +2452,8 @@ async fn zod_worker_interrupt_ack_precedes_os_interrupt_observation() -> TestRes
         .await?;
     let interrupted_text = result_text(&interrupted);
     assert!(
-        interrupted_text.contains("sideband interrupt: observed"),
-        "expected sideband interrupt observation, got: {interrupted_text:?}"
+        interrupted_text.contains("sideband discard: observed"),
+        "expected sideband discard observation, got: {interrupted_text:?}"
     );
     #[cfg(target_family = "unix")]
     assert!(
@@ -2459,8 +2463,8 @@ async fn zod_worker_interrupt_ack_precedes_os_interrupt_observation() -> TestRes
 
     let log = wait_for_log_contains(&control_log, "os_interrupt_observed")?;
     let ack_idx = log
-        .find("interrupt_ack interrupt_id=")
-        .expect("interrupt ack log should be present");
+        .find("discard_pending_input_ack discard_id=")
+        .expect("discard ack log should be present");
     let os_idx = log
         .find("os_interrupt_observed")
         .expect("OS interrupt observation log should be present");
@@ -2474,10 +2478,10 @@ async fn zod_worker_interrupt_ack_precedes_os_interrupt_observation() -> TestRes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_interrupt_ack_timeout_still_sends_os_interrupt() -> TestResult<()> {
+async fn zod_worker_discard_pending_input_ack_timeout_still_sends_os_interrupt() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_without_interrupt_ack_server(&control_log).await?;
+    let session = spawn_zod_without_discard_pending_input_ack_server(&control_log).await?;
 
     let first = session
         .call_tool_raw(
@@ -2510,10 +2514,10 @@ async fn zod_worker_interrupt_ack_timeout_still_sends_os_interrupt() -> TestResu
         "expected OS interrupt despite missing ack, got: {interrupted_text:?}"
     );
 
-    let log = wait_for_log_contains(&control_log, "interrupt_ack_suppressed")?;
+    let log = wait_for_log_contains(&control_log, "discard_pending_input_ack_suppressed")?;
     assert!(
-        log.contains("interrupt"),
-        "expected sideband interrupt to be received before ack suppression, got: {log:?}"
+        log.contains("discard_pending_input"),
+        "expected sideband discard to be received before ack suppression, got: {log:?}"
     );
 
     session.cancel().await?;
@@ -2521,10 +2525,11 @@ async fn zod_worker_interrupt_ack_timeout_still_sends_os_interrupt() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_interrupt_ack_wait_protocol_error_fails_closed() -> TestResult<()> {
+async fn zod_worker_discard_pending_input_ack_wait_protocol_error_fails_closed() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_protocol_error_before_interrupt_ack_server(&control_log).await?;
+    let session =
+        spawn_zod_protocol_error_before_discard_pending_input_ack_server(&control_log).await?;
 
     let first = session
         .call_tool_raw(
@@ -2553,17 +2558,20 @@ async fn zod_worker_interrupt_ack_wait_protocol_error_fails_closed() -> TestResu
     let interrupted_text = result_text(&interrupted);
     assert!(
         interrupted_text.contains("worker protocol error: invalid output_text base64"),
-        "expected ack wait protocol error to fail closed, got: {interrupted_text:?}"
+        "expected discard ack wait protocol error to fail closed, got: {interrupted_text:?}"
     );
     assert!(
         interrupted.is_error.unwrap_or(false),
         "expected protocol error interrupt result to set isError"
     );
 
-    let log = wait_for_log_contains(&control_log, "interrupt_protocol_error_before_ack")?;
+    let log = wait_for_log_contains(
+        &control_log,
+        "discard_pending_input_protocol_error_before_ack",
+    )?;
     assert!(
-        log.contains("interrupt"),
-        "expected worker to receive interrupt before protocol error, got: {log:?}"
+        log.contains("discard_pending_input"),
+        "expected worker to receive discard_pending_input before protocol error, got: {log:?}"
     );
 
     session.cancel().await?;
@@ -2571,11 +2579,12 @@ async fn zod_worker_interrupt_ack_wait_protocol_error_fails_closed() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_rejects_preemptive_interrupt_ack() -> TestResult<()> {
+async fn zod_worker_rejects_preemptive_discard_pending_input_ack() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
     let marker = tempdir.path().join("release-preemptive-ack");
-    let session = spawn_zod_preemptive_interrupt_ack_server(&control_log, &marker).await?;
+    let session =
+        spawn_zod_preemptive_discard_pending_input_ack_server(&control_log, &marker).await?;
 
     let first = session
         .call_tool_raw(
@@ -2593,10 +2602,13 @@ async fn zod_worker_rejects_preemptive_interrupt_ack() -> TestResult<()> {
     );
 
     fs::write(&marker, b"go")?;
-    let log = wait_for_log_contains(&control_log, "preemptive_interrupt_ack interrupt_id=1")?;
+    let log = wait_for_log_contains(
+        &control_log,
+        "preemptive_discard_pending_input_ack discard_id=1",
+    )?;
     assert!(
-        !log.contains("interrupt interrupt_id=1"),
-        "preemptive ack must be emitted before the server sends interrupt 1, got log: {log:?}"
+        !log.contains("discard_pending_input discard_id=1"),
+        "preemptive ack must be emitted before the server sends discard_pending_input 1, got log: {log:?}"
     );
 
     let interrupted = session
@@ -2610,12 +2622,14 @@ async fn zod_worker_rejects_preemptive_interrupt_ack() -> TestResult<()> {
         .await?;
     let interrupted_text = result_text(&interrupted);
     assert!(
-        interrupted_text.contains("worker protocol error: interrupt_ack for unsent interrupt"),
-        "expected preemptive ack to fail closed, got: {interrupted_text:?}"
+        interrupted_text.contains(
+            "worker protocol error: discard_pending_input_ack for unsent discard_pending_input"
+        ),
+        "expected preemptive discard ack to fail closed, got: {interrupted_text:?}"
     );
     assert!(
         interrupted.is_error.unwrap_or(false),
-        "expected preemptive ack interrupt result to set isError"
+        "expected preemptive discard ack interrupt result to set isError"
     );
 
     session.cancel().await?;
@@ -2623,10 +2637,10 @@ async fn zod_worker_rejects_preemptive_interrupt_ack() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn zod_worker_interrupt_ack_wait_respects_tiny_timeout() -> TestResult<()> {
+async fn zod_worker_discard_pending_input_ack_wait_respects_tiny_timeout() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_without_interrupt_ack_server(&control_log).await?;
+    let session = spawn_zod_without_discard_pending_input_ack_server(&control_log).await?;
 
     let first = session
         .call_tool_raw(
@@ -2657,7 +2671,7 @@ async fn zod_worker_interrupt_ack_wait_respects_tiny_timeout() -> TestResult<()>
     let interrupted_text = result_text(&interrupted);
     assert!(
         elapsed < Duration::from_millis(80),
-        "interrupt ack wait ignored tiny timeout; elapsed {elapsed:?}, reply {interrupted_text:?}"
+        "discard ack wait ignored tiny timeout; elapsed {elapsed:?}, reply {interrupted_text:?}"
     );
 
     session.cancel().await?;
@@ -2737,14 +2751,14 @@ async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> Te
         "input-wait Ctrl-C must use cached readiness instead of timing out, got: {interrupted_text:?}"
     );
 
-    let log = wait_for_log_contains(&control_log, "interrupt")?;
+    let log = wait_for_log_contains(&control_log, "discard_pending_input")?;
     assert!(
-        log.contains("interrupt"),
-        "input-wait Ctrl-C must send payload-free sideband interrupt, got log: {log:?}"
+        log.contains("discard_pending_input discard_id="),
+        "input-wait Ctrl-C must send payload-free sideband discard, got log: {log:?}"
     );
     assert!(
-        !log.contains("interrupt input_id"),
-        "input-wait Ctrl-C must not send an identity-bearing interrupt, got log: {log:?}"
+        !log.contains("discard_pending_input input_id"),
+        "input-wait Ctrl-C must not send an input identity on discard, got log: {log:?}"
     );
 
     session.cancel().await?;

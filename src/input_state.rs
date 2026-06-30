@@ -63,26 +63,17 @@ impl InputState {
         Ok(())
     }
 
-    pub(crate) fn record_input_wait(&mut self, observed_at: Instant) {
-        self.record_ready_at(observed_at, true);
-    }
-
-    pub(crate) fn record_ready(&mut self, observed_at: Instant) {
-        self.record_ready_at(observed_at, false);
-    }
-
-    fn record_ready_at(&mut self, observed_at: Instant, from_input_wait: bool) {
+    pub(crate) fn record_input_wait(
+        &mut self,
+        observed_at: Instant,
+        prompt_visible_for_existing_readiness: bool,
+    ) {
         self.ready_for_input = true;
-        self.ready_from_input_wait = from_input_wait;
+        self.ready_from_input_wait = prompt_visible_for_existing_readiness;
         self.ready_observed_at = Some(observed_at);
         if self.active {
             self.completed_observed_at = Some(observed_at);
         }
-    }
-
-    pub(crate) fn note_interrupt_sent(&mut self) {
-        // Readiness is a fact reported by input_wait and consumed by input_batch.
-        // Interrupt delivery does not change that state by itself.
     }
 
     pub(crate) fn request_completion_ready(&self) -> bool {

@@ -200,7 +200,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn r_interrupt_ack_does_not_wait_for_busy_main_thread() -> TestResult<()> {
+async fn r_discard_pending_input_ack_does_not_wait_for_busy_main_thread() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempfile::tempdir()?;
     let debug_dir = temp.path().join("debug");
@@ -239,7 +239,7 @@ x_stale_marker <- 42
     let timeout_result = session.write_stdin_raw_with(input, Some(0.1)).await?;
     let mut text = result_text(&timeout_result);
     if backend_unavailable(&text) {
-        eprintln!("R interrupt ack test backend unavailable in this environment; skipping");
+        eprintln!("R discard ack test backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -253,7 +253,7 @@ x_stale_marker <- 42
         let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
         text = result_text(&poll);
         if backend_unavailable(&text) {
-            eprintln!("R interrupt ack test backend unavailable in this environment; skipping");
+            eprintln!("R discard ack test backend unavailable in this environment; skipping");
             session.cancel().await?;
             return Ok(());
         }
@@ -268,14 +268,14 @@ x_stale_marker <- 42
         session.cancel().await?;
         return Ok(());
     }
-    let ack = wait_for_debug_event(&debug_dir, "worker_interrupt_ack_observed")?;
+    let ack = wait_for_debug_event(&debug_dir, "worker_discard_pending_input_ack_observed")?;
     assert_eq!(
         ack["payload"]["discarded_input"], true,
-        "queued stale R input should be discarded by interrupt ack"
+        "queued stale R input should be discarded by discard_pending_input ack"
     );
     assert!(
         !handler_done.exists(),
-        "interrupt ack should be observed before the busy R interrupt handler returns; interrupt reply: {interrupt_text:?}"
+        "discard ack should be observed before the busy R interrupt handler returns; interrupt reply: {interrupt_text:?}"
     );
 
     let done_deadline = Instant::now() + Duration::from_secs(10);

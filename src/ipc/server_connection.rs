@@ -34,9 +34,9 @@ struct ServerIpcInbox {
     output_source_image_ids: HashMap<String, String>,
     request_output_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
-    interrupt_acks: VecDeque<IpcInterruptAck>,
-    next_interrupt_id: u64,
-    last_sent_interrupt_id: u64,
+    discard_pending_input_acks: VecDeque<IpcDiscardPendingInputAck>,
+    next_discard_id: u64,
+    last_sent_discard_id: u64,
     disconnected: bool,
 }
 
@@ -51,13 +51,12 @@ pub struct ServerIpcConnection {
 
 #[derive(Debug)]
 pub enum IpcInputReadiness {
-    InputWait(String),
-    Ready,
+    InputWait(Option<String>),
 }
 
 #[derive(Debug, Clone)]
-pub struct IpcInterruptAck {
-    pub interrupt_id: u64,
+pub struct IpcDiscardPendingInputAck {
+    pub discard_id: u64,
     pub discarded_input: bool,
 }
 
@@ -196,7 +195,9 @@ impl ServerIpcConnection {
                             break;
                         }
                         guard.readline_result_count = guard.readline_result_count.saturating_add(1);
-                        push_prompt_history(&mut guard, prompt);
+                        if let Some(prompt) = prompt {
+                            push_prompt_history(&mut guard, prompt);
+                        }
                         guard.input_line_events.push_back(input_line_event.clone());
                         reader_cvar.notify_all();
                         drop(guard);
@@ -207,23 +208,26 @@ impl ServerIpcConnection {
                     WorkerToServerIpcMessage::InputWait { prompt } => {
                         let mut guard = reader_inbox.lock().unwrap();
                         let observed_at = Instant::now();
-                        guard.input_state.record_input_wait(observed_at);
-                        guard.last_prompt_observed_at = Some(observed_at);
-                        push_prompt_history(&mut guard, prompt.clone());
-                        guard.last_prompt = Some(prompt.clone());
+                        guard
+                            .input_state
+                            .record_input_wait(observed_at, prompt.is_some());
+                        match prompt.clone() {
+                            Some(prompt_text) => {
+                                guard.last_prompt_observed_at = Some(observed_at);
+                                push_prompt_history(&mut guard, prompt_text.clone());
+                                guard.last_prompt = Some(prompt_text);
+                            }
+                            None => {
+                                guard.last_prompt = None;
+                                guard.last_prompt_observed_at = None;
+                                guard.prompt_history.clear();
+                            }
+                        }
                         reader_cvar.notify_all();
                         drop(guard);
                         if let Some(handler) = input_wait_handler.as_ref() {
                             reader_handler_gate.dispatch(|| handler(prompt));
                         }
-                    }
-                    WorkerToServerIpcMessage::Ready {} => {
-                        let mut guard = reader_inbox.lock().unwrap();
-                        guard.input_state.record_ready(Instant::now());
-                        guard.last_prompt = None;
-                        guard.last_prompt_observed_at = None;
-                        guard.prompt_history.clear();
-                        reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::SessionEnd { reason, message } => {
                         if let Err(err) = validate_session_end(reason.as_deref()) {
@@ -243,22 +247,24 @@ impl ServerIpcConnection {
                             reader_handler_gate.dispatch(|| handler());
                         }
                     }
-                    WorkerToServerIpcMessage::InterruptAck {
-                        interrupt_id,
+                    WorkerToServerIpcMessage::DiscardPendingInputAck {
+                        discard_id,
                         discarded_input,
                     } => {
                         let mut guard = reader_inbox.lock().unwrap();
-                        if interrupt_id == 0 || interrupt_id > guard.last_sent_interrupt_id {
-                            guard
-                                .input_state
-                                .latch_protocol_error("interrupt_ack for unsent interrupt");
+                        if discard_id == 0 || discard_id > guard.last_sent_discard_id {
+                            guard.input_state.latch_protocol_error(
+                                "discard_pending_input_ack for unsent discard_pending_input",
+                            );
                             reader_cvar.notify_all();
                             break;
                         }
-                        guard.interrupt_acks.push_back(IpcInterruptAck {
-                            interrupt_id,
-                            discarded_input,
-                        });
+                        guard
+                            .discard_pending_input_acks
+                            .push_back(IpcDiscardPendingInputAck {
+                                discard_id,
+                                discarded_input,
+                            });
                         reader_cvar.notify_all();
                     }
                     WorkerToServerIpcMessage::OutputText {
@@ -459,27 +465,25 @@ impl ServerIpcConnection {
 
     #[cfg(test)]
     pub fn note_interrupt_sent_for_tests(&self) {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.input_state.note_interrupt_sent();
-    }
-
-    pub fn send_interrupt(&self) -> io::Result<u64> {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.next_interrupt_id += 1;
-        let interrupt_id = guard.next_interrupt_id;
-        self.writer
-            .send(ServerToWorkerIpcMessage::Interrupt { interrupt_id })?;
-        guard.last_sent_interrupt_id = interrupt_id;
-        guard.input_state.note_interrupt_sent();
         self.cvar.notify_all();
-        Ok(interrupt_id)
     }
 
-    pub fn wait_for_interrupt_ack(
+    pub fn send_discard_pending_input(&self) -> io::Result<u64> {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.next_discard_id += 1;
+        let discard_id = guard.next_discard_id;
+        self.writer
+            .send(ServerToWorkerIpcMessage::DiscardPendingInput { discard_id })?;
+        guard.last_sent_discard_id = discard_id;
+        self.cvar.notify_all();
+        Ok(discard_id)
+    }
+
+    pub fn wait_for_discard_pending_input_ack(
         &self,
         timeout: Duration,
-        interrupt_id: u64,
-    ) -> Result<Option<IpcInterruptAck>, IpcWaitError> {
+        discard_id: u64,
+    ) -> Result<Option<IpcDiscardPendingInputAck>, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
@@ -490,18 +494,18 @@ impl ServerIpcConnection {
                 return Err(IpcWaitError::Disconnected);
             }
             while guard
-                .interrupt_acks
+                .discard_pending_input_acks
                 .front()
-                .is_some_and(|ack| ack.interrupt_id < interrupt_id)
+                .is_some_and(|ack| ack.discard_id < discard_id)
             {
-                guard.interrupt_acks.pop_front();
+                guard.discard_pending_input_acks.pop_front();
             }
-            if let Some(ack) = guard.interrupt_acks.front() {
-                if ack.interrupt_id == interrupt_id {
-                    return Ok(guard.interrupt_acks.pop_front());
+            if let Some(ack) = guard.discard_pending_input_acks.front() {
+                if ack.discard_id == discard_id {
+                    return Ok(guard.discard_pending_input_acks.pop_front());
                 }
                 return Err(IpcWaitError::Protocol(
-                    "interrupt_ack for unsent interrupt".to_string(),
+                    "discard_pending_input_ack for unsent discard_pending_input".to_string(),
                 ));
             }
 
@@ -520,26 +524,26 @@ impl ServerIpcConnection {
                     return Err(IpcWaitError::Disconnected);
                 }
                 while guard
-                    .interrupt_acks
+                    .discard_pending_input_acks
                     .front()
-                    .is_some_and(|ack| ack.interrupt_id < interrupt_id)
+                    .is_some_and(|ack| ack.discard_id < discard_id)
                 {
-                    guard.interrupt_acks.pop_front();
+                    guard.discard_pending_input_acks.pop_front();
                 }
                 if guard
-                    .interrupt_acks
+                    .discard_pending_input_acks
                     .front()
-                    .is_some_and(|ack| ack.interrupt_id == interrupt_id)
+                    .is_some_and(|ack| ack.discard_id == discard_id)
                 {
-                    return Ok(guard.interrupt_acks.pop_front());
+                    return Ok(guard.discard_pending_input_acks.pop_front());
                 }
                 if guard
-                    .interrupt_acks
+                    .discard_pending_input_acks
                     .front()
-                    .is_some_and(|ack| ack.interrupt_id > interrupt_id)
+                    .is_some_and(|ack| ack.discard_id > discard_id)
                 {
                     return Err(IpcWaitError::Protocol(
-                        "interrupt_ack for unsent interrupt".to_string(),
+                        "discard_pending_input_ack for unsent discard_pending_input".to_string(),
                     ));
                 }
                 return Ok(None);
@@ -637,7 +641,7 @@ impl ServerIpcConnection {
     }
 
     #[cfg(test)]
-    pub fn wait_for_input_wait(&self, timeout: Duration) -> Result<String, IpcWaitError> {
+    pub fn wait_for_input_wait(&self, timeout: Duration) -> Result<Option<String>, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
@@ -652,7 +656,10 @@ impl ServerIpcConnection {
             }
             if let Some(prompt) = guard.last_prompt.take() {
                 guard.last_prompt_observed_at = None;
-                return Ok(prompt);
+                return Ok(Some(prompt));
+            }
+            if guard.input_state.ready_for_input() {
+                return Ok(None);
             }
 
             let now = Instant::now();
@@ -727,7 +734,7 @@ impl ServerIpcConnection {
                     let prompt = prompt.clone();
                     guard.last_prompt = None;
                     guard.last_prompt_observed_at = None;
-                    return Ok(IpcInputReadiness::InputWait(prompt));
+                    return Ok(IpcInputReadiness::InputWait(Some(prompt)));
                 }
                 guard.last_prompt = None;
                 guard.last_prompt_observed_at = None;
@@ -741,7 +748,7 @@ impl ServerIpcConnection {
                 None => guard.input_state.ready_for_input(),
             };
             if ready {
-                return Ok(IpcInputReadiness::Ready);
+                return Ok(IpcInputReadiness::InputWait(None));
             }
 
             let now = Instant::now();
@@ -1073,7 +1080,7 @@ mod tests {
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "zod> ".to_string(),
+                prompt: Some("zod> ".to_string()),
             })
             .expect("send initial input_wait");
         server
@@ -1082,13 +1089,13 @@ mod tests {
         server.begin_input().expect("begin input");
         worker
             .send(WorkerToServerIpcMessage::InputLine {
-                prompt: "zod> ".to_string(),
+                prompt: Some("zod> ".to_string()),
                 text: "done\n".to_string(),
             })
             .expect("send input_line");
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "zod> ".to_string(),
+                prompt: Some("zod> ".to_string()),
             })
             .expect("send input_wait");
         thread::sleep(stable_wait + Duration::from_millis(5));
@@ -1147,14 +1154,14 @@ mod tests {
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "ready> ".to_string(),
+                prompt: Some("ready> ".to_string()),
             })
             .expect("send input_wait");
 
         let prompt = server
             .wait_for_input_wait(Duration::from_millis(200))
             .expect("server observes input_wait");
-        assert_eq!(prompt, "ready> ");
+        assert_eq!(prompt.as_deref(), Some("ready> "));
         server
             .begin_input()
             .expect("input_wait should make worker ready for input");
@@ -1167,7 +1174,7 @@ mod tests {
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "ready> ".to_string(),
+                prompt: Some("ready> ".to_string()),
             })
             .expect("send input_wait");
         server
@@ -1182,41 +1189,43 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_ack_is_fresh_and_does_not_change_readiness() {
+    fn discard_pending_input_ack_is_fresh_and_does_not_change_readiness() {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "ready> ".to_string(),
+                prompt: Some("ready> ".to_string()),
             })
             .expect("send input_wait");
         server
             .wait_for_input_wait(Duration::from_millis(200))
             .expect("server observes input_wait");
 
-        let interrupt_id = server.send_interrupt().expect("send interrupt");
+        let discard_id = server
+            .send_discard_pending_input()
+            .expect("send discard_pending_input");
         worker
-            .send(WorkerToServerIpcMessage::InterruptAck {
-                interrupt_id,
+            .send(WorkerToServerIpcMessage::DiscardPendingInputAck {
+                discard_id,
                 discarded_input: false,
             })
-            .expect("send interrupt_ack");
+            .expect("send discard_pending_input_ack");
         let ack = server
-            .wait_for_interrupt_ack(Duration::from_millis(200), interrupt_id)
+            .wait_for_discard_pending_input_ack(Duration::from_millis(200), discard_id)
             .expect("ack wait should not fail")
             .expect("fresh ack should arrive");
-        assert_eq!(ack.interrupt_id, interrupt_id);
+        assert_eq!(ack.discard_id, discard_id);
         assert!(
             !ack.discarded_input,
             "no queued worker input should report discarded_input=false"
         );
         server
             .begin_input()
-            .expect("interrupt_ack must not change input_wait readiness");
+            .expect("discard_pending_input_ack must not change input_wait readiness");
 
         let stale = server
-            .wait_for_interrupt_ack(Duration::from_millis(20), interrupt_id)
+            .wait_for_discard_pending_input_ack(Duration::from_millis(20), discard_id)
             .expect("stale ack wait should not fail");
         assert!(
             stale.is_none(),
@@ -1225,36 +1234,40 @@ mod tests {
     }
 
     #[test]
-    fn delayed_interrupt_ack_is_not_reused_for_later_interrupt() {
+    fn delayed_discard_pending_input_ack_is_not_reused_for_later_discard() {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
-        let first_interrupt_id = server.send_interrupt().expect("send first interrupt");
+        let first_discard_id = server
+            .send_discard_pending_input()
+            .expect("send first discard_pending_input");
         worker
-            .send(WorkerToServerIpcMessage::InterruptAck {
-                interrupt_id: first_interrupt_id,
+            .send(WorkerToServerIpcMessage::DiscardPendingInputAck {
+                discard_id: first_discard_id,
                 discarded_input: false,
             })
-            .expect("send delayed interrupt_ack");
+            .expect("send delayed discard_pending_input_ack");
 
-        let second_interrupt_id = server.send_interrupt().expect("send second interrupt");
+        let second_discard_id = server
+            .send_discard_pending_input()
+            .expect("send second discard_pending_input");
         let stale = server
-            .wait_for_interrupt_ack(Duration::from_millis(20), second_interrupt_id)
+            .wait_for_discard_pending_input_ack(Duration::from_millis(20), second_discard_id)
             .expect("ack wait should not fail");
         assert!(
             stale.is_none(),
-            "delayed ack from an earlier interrupt must not satisfy a later interrupt"
+            "delayed ack from an earlier discard must not satisfy a later discard"
         );
     }
 
     #[test]
-    fn interrupt_ack_does_not_complete_active_input() {
+    fn discard_pending_input_ack_does_not_complete_active_input() {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "ready> ".to_string(),
+                prompt: Some("ready> ".to_string()),
             })
             .expect("send input_wait");
         server
@@ -1262,56 +1275,61 @@ mod tests {
             .expect("server observes input_wait");
         server.begin_input().expect("begin input");
 
-        let interrupt_id = server.send_interrupt().expect("send interrupt");
+        let discard_id = server
+            .send_discard_pending_input()
+            .expect("send discard_pending_input");
         worker
-            .send(WorkerToServerIpcMessage::InterruptAck {
-                interrupt_id,
+            .send(WorkerToServerIpcMessage::DiscardPendingInputAck {
+                discard_id,
                 discarded_input: true,
             })
-            .expect("send interrupt_ack");
+            .expect("send discard_pending_input_ack");
         let ack = server
-            .wait_for_interrupt_ack(Duration::from_millis(200), interrupt_id)
+            .wait_for_discard_pending_input_ack(Duration::from_millis(200), discard_id)
             .expect("ack wait should not fail")
             .expect("fresh ack should arrive");
-        assert_eq!(ack.interrupt_id, interrupt_id);
+        assert_eq!(ack.discard_id, discard_id);
         assert!(ack.discarded_input);
 
         let completion =
             server.wait_for_request_completion(Duration::from_millis(20), Duration::ZERO);
         assert!(
             matches!(completion, Err(IpcWaitError::Timeout)),
-            "interrupt_ack must not complete active input, got: {completion:?}"
+            "discard_pending_input_ack must not complete active input, got: {completion:?}"
         );
     }
 
     #[test]
-    fn unsolicited_interrupt_ack_latches_protocol_error() {
+    fn unsolicited_discard_pending_input_ack_latches_protocol_error() {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
         worker
-            .send(WorkerToServerIpcMessage::InterruptAck {
-                interrupt_id: 1,
+            .send(WorkerToServerIpcMessage::DiscardPendingInputAck {
+                discard_id: 1,
                 discarded_input: false,
             })
-            .expect("send unsolicited interrupt_ack");
+            .expect("send unsolicited discard_pending_input_ack");
 
-        let err =
-            wait_for_protocol_error(&server).expect("server should latch interrupt_ack error");
-        assert_eq!(err, "interrupt_ack for unsent interrupt");
+        let err = wait_for_protocol_error(&server)
+            .expect("server should latch discard_pending_input_ack error");
+        assert_eq!(
+            err,
+            "discard_pending_input_ack for unsent discard_pending_input"
+        );
     }
 
     #[test]
-    fn fresh_readiness_wait_ignores_cached_ready() {
+    fn fresh_readiness_wait_ignores_cached_prompt_free_input_wait() {
         let (server, worker) =
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
         worker
-            .send(WorkerToServerIpcMessage::Ready {})
-            .expect("send ready");
+            .send(WorkerToServerIpcMessage::InputWait { prompt: None })
+            .expect("send prompt-free input_wait");
         assert!(matches!(
             server.wait_for_input_readiness(Duration::from_millis(200)),
-            Ok(super::IpcInputReadiness::Ready)
+            Ok(super::IpcInputReadiness::InputWait(None))
         ));
 
         let after_cached_ready = Instant::now();
@@ -1323,11 +1341,11 @@ mod tests {
         );
 
         worker
-            .send(WorkerToServerIpcMessage::Ready {})
-            .expect("send fresh ready");
+            .send(WorkerToServerIpcMessage::InputWait { prompt: None })
+            .expect("send fresh prompt-free input_wait");
         assert!(matches!(
             server.wait_for_fresh_input_readiness(Duration::from_millis(200), after_cached_ready),
-            Ok(super::IpcInputReadiness::Ready)
+            Ok(super::IpcInputReadiness::InputWait(None))
         ));
 
         let observed_input_wait = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1343,7 +1361,7 @@ mod tests {
         .expect("ipc pair");
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "stale> ".to_string(),
+                prompt: Some("stale> ".to_string()),
             })
             .expect("send stale input_wait");
         let (lock, cvar) = &*observed_input_wait;
@@ -1365,7 +1383,7 @@ mod tests {
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "fresh> ".to_string(),
+                prompt: Some("fresh> ".to_string()),
             })
             .expect("send fresh input_wait");
         assert!(matches!(
@@ -1373,7 +1391,7 @@ mod tests {
                 Duration::from_millis(200),
                 after_cached_input_wait
             ),
-            Ok(super::IpcInputReadiness::InputWait(prompt)) if prompt == "fresh> "
+            Ok(super::IpcInputReadiness::InputWait(prompt)) if prompt.as_deref() == Some("fresh> ")
         ));
     }
 
@@ -1383,7 +1401,7 @@ mod tests {
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
             })
             .expect("send input_wait");
         server
@@ -1392,7 +1410,7 @@ mod tests {
 
         worker
             .send(WorkerToServerIpcMessage::InputLine {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
                 text: "orphan\n".to_string(),
             })
             .expect("send input_line");

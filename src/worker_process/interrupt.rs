@@ -30,7 +30,7 @@ struct InterruptPromptWait {
 }
 
 pub(super) const INTERRUPT_TAIL_SETTLE_WINDOW: Duration = Duration::from_millis(50);
-const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_millis(100);
+const DISCARD_PENDING_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(100);
 
 impl WorkerManager {
     pub(super) fn interrupt_files(
@@ -213,7 +213,7 @@ impl WorkerManager {
             .process
             .as_mut()
             .expect("worker process should be available");
-        match send_ordered_interrupt(process, timeout) {
+        match send_interrupt_with_pending_input_discard(process, timeout) {
             Ok(interrupt_sent_at) => Ok(Some(interrupt_sent_at)),
             Err(err) => {
                 self.reset()?;
@@ -283,10 +283,7 @@ impl WorkerManager {
                 };
                 match readiness {
                     Ok(IpcInputReadiness::InputWait(value)) => {
-                        prompt = Some(value);
-                    }
-                    Ok(IpcInputReadiness::Ready) => {
-                        prompt = None;
+                        prompt = value;
                     }
                     Err(IpcWaitError::Timeout) => {
                         timed_out = true;
@@ -442,22 +439,22 @@ impl WorkerManager {
     }
 }
 
-fn send_ordered_interrupt(
+fn send_interrupt_with_pending_input_discard(
     process: &mut crate::worker_supervisor::WorkerProcess,
     timeout: Duration,
 ) -> Result<Instant, WorkerError> {
     let mut protocol_error = None;
     if let Some(ipc) = process.ipc_connection() {
         let ack_wait_since = Instant::now();
-        match ipc.send_interrupt() {
-            Ok(interrupt_id) => {
-                let ack_timeout = timeout.min(INTERRUPT_ACK_TIMEOUT);
-                match ipc.wait_for_interrupt_ack(ack_timeout, interrupt_id) {
+        match ipc.send_discard_pending_input() {
+            Ok(discard_id) => {
+                let ack_timeout = timeout.min(DISCARD_PENDING_INPUT_ACK_TIMEOUT);
+                match ipc.wait_for_discard_pending_input_ack(ack_timeout, discard_id) {
                     Ok(Some(ack)) => {
                         crate::event_log::log(
-                            "worker_interrupt_ack_observed",
+                            "worker_discard_pending_input_ack_observed",
                             serde_json::json!({
-                                "interrupt_id": ack.interrupt_id,
+                                "discard_id": ack.discard_id,
                                 "discarded_input": ack.discarded_input,
                                 "elapsed_ms": ack_wait_since.elapsed().as_millis(),
                             }),
@@ -465,16 +462,16 @@ fn send_ordered_interrupt(
                     }
                     Ok(None) => {
                         crate::event_log::log(
-                            "worker_interrupt_ack_timeout",
+                            "worker_discard_pending_input_ack_timeout",
                             serde_json::json!({
-                                "interrupt_id": interrupt_id,
+                                "discard_id": discard_id,
                                 "timeout_ms": ack_timeout.as_millis(),
                             }),
                         );
                     }
                     Err(IpcWaitError::Protocol(message)) => {
                         crate::event_log::log(
-                            "worker_interrupt_ack_wait_error",
+                            "worker_discard_pending_input_ack_wait_error",
                             serde_json::json!({
                                 "error": format!("protocol: {message}"),
                             }),
@@ -483,7 +480,7 @@ fn send_ordered_interrupt(
                     }
                     Err(err) => {
                         crate::event_log::log(
-                            "worker_interrupt_ack_wait_error",
+                            "worker_discard_pending_input_ack_wait_error",
                             serde_json::json!({
                                 "error": ipc_wait_error_message(&err),
                             }),
@@ -493,7 +490,7 @@ fn send_ordered_interrupt(
             }
             Err(err) => {
                 crate::event_log::log(
-                    "worker_interrupt_sideband_send_error",
+                    "worker_discard_pending_input_send_error",
                     serde_json::json!({
                         "error": err.to_string(),
                     }),
@@ -502,12 +499,12 @@ fn send_ordered_interrupt(
         }
     }
 
-    process.send_interrupt()?;
+    process.send_os_interrupt()?;
     let os_interrupt_sent_at = Instant::now();
     crate::event_log::log(
         "worker_interrupt_os_sent",
         serde_json::json!({
-            "after_sideband_cleanup": true,
+            "after_discard_pending_input": true,
         }),
     );
     if let Some(message) = protocol_error {

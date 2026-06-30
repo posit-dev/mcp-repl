@@ -76,7 +76,7 @@ fn request_exit() {
     };
     let mut guard = state.inner.lock().unwrap();
     guard.exit_requested = true;
-    state.notify_all();
+    state.notify_runtime_input_closed();
 }
 
 fn take_exit_requested() -> bool {
@@ -89,13 +89,8 @@ fn take_exit_requested() -> bool {
     requested
 }
 
-pub(crate) fn discard_unconsumed_input_for_interrupt_ack() -> bool {
+pub(crate) fn discard_unconsumed_input_for_discard_ack() -> bool {
     discard_pending_stdin()
-}
-
-#[cfg(windows)]
-pub(crate) fn request_windows_python_sigint() {
-    let _ = unsafe { libc::raise(libc::SIGINT) };
 }
 
 pub(crate) fn begin_input(input: String) -> Result<(), String> {
@@ -119,7 +114,7 @@ pub(crate) fn begin_input(input: String) -> Result<(), String> {
         guard.request_active = true;
         guard.plot_reset_pending = true;
     }
-    state.notify_all();
+    state.notify_runtime_input_available();
     Ok(())
 }
 
@@ -131,7 +126,7 @@ pub(crate) fn request_shutdown() {
     // Preserve already accepted input; reset replies include output produced
     // while the old worker drains to a safe runtime boundary.
     guard.shutdown = true;
-    state.notify_all();
+    state.notify_runtime_input_closed();
 }
 
 #[cfg(target_family = "unix")]
@@ -167,7 +162,6 @@ fn discard_queued_input() -> bool {
     };
     let mut guard = state.inner.lock().unwrap();
     let discarded = guard.input_queue.discard_unconsumed_input();
-    state.notify_all();
     discarded
 }
 
@@ -323,7 +317,7 @@ fn configure_python_signal_wakeup_fd(
 
 fn run_cell_loop() -> Result<(), String> {
     let api = PythonApi::global();
-    emit_ready()?;
+    emit_top_level_input_wait()?;
     loop {
         let Some(cell) = wait_for_next_cell()? else {
             flush_original_stdio();
@@ -350,7 +344,7 @@ struct CellInput {
     source: String,
 }
 
-fn emit_ready() -> Result<(), String> {
+fn emit_top_level_input_wait() -> Result<(), String> {
     let api = PythonApi::global();
     {
         let _gil = GilGuard::acquire();
@@ -363,7 +357,7 @@ fn emit_ready() -> Result<(), String> {
         guard.cell_running = false;
         guard.visible_input_prompt = None;
     }
-    ipc::emit_ready();
+    ipc::emit_top_level_input_wait();
     Ok(())
 }
 
@@ -382,7 +376,7 @@ fn wait_for_next_cell() -> Result<Option<CellInput>, String> {
         }
         drop(guard);
         if check_python_signals_and_print() {
-            emit_ready()?;
+            emit_top_level_input_wait()?;
             guard = state.inner.lock().unwrap();
             continue;
         }
@@ -445,7 +439,7 @@ fn finish_cell_request() -> Result<(), String> {
         clear_python_stdin_buffers(api)?;
     }
     let state = session_state();
-    let emit_ready = {
+    let emit_top_level_input_wait = {
         let mut guard = state.inner.lock().unwrap();
         guard.cell_running = false;
         guard.input_queue.clear_after_cell_finish();
@@ -457,8 +451,8 @@ fn finish_cell_request() -> Result<(), String> {
             false
         }
     };
-    if emit_ready {
-        ipc::emit_ready();
+    if emit_top_level_input_wait {
+        ipc::emit_top_level_input_wait();
     }
     Ok(())
 }
@@ -507,7 +501,7 @@ fn handle_input_hook() {
     let Some(state) = SESSION_STATE.get() else {
         return;
     };
-    state.notify_all();
+    state.notify_python_input_hook();
 }
 
 unsafe extern "C" fn pyos_input_hook() -> c_int {
@@ -570,7 +564,7 @@ fn wait_for_queue_notification<'a>(
 fn release_read_consumer(state: &Arc<SessionState>) {
     let mut guard = state.inner.lock().unwrap();
     guard.input_queue.end_read_consumer();
-    state.notify_all();
+    state.notify_runtime_input_consumer_released();
 }
 
 fn next_queue_line_action(
@@ -587,7 +581,7 @@ fn next_queue_line_action(
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
             }
-            state.notify_all();
+            state.notify_runtime_input_closed();
             return QueueReadAction::Shutdown;
         }
         if !*owns_consumer {
@@ -605,7 +599,7 @@ fn next_queue_line_action(
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
             }
-            state.notify_all();
+            state.notify_runtime_input_consumer_released();
             return QueueReadAction::Interrupted;
         }
         guard = state.inner.lock().unwrap();
@@ -618,7 +612,7 @@ fn next_queue_line_action(
             if *owns_consumer {
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
-                state.notify_all();
+                state.notify_runtime_input_consumer_released();
             }
             return QueueReadAction::Line {
                 bytes: read.protocol_bytes,
@@ -632,7 +626,7 @@ fn next_queue_line_action(
                 guard.input_queue.end_read_consumer();
                 *owns_consumer = false;
             }
-            state.notify_all();
+            state.notify_runtime_input_closed();
             return QueueReadAction::Shutdown;
         }
         if !*prompt_wait_emitted {
@@ -723,7 +717,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 if guard.exit_requested {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
-                        state.notify_all();
+                        state.notify_runtime_input_closed();
                     }
                     return Ok(output);
                 }
@@ -744,7 +738,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
                     }
-                    state.notify_all();
+                    state.notify_runtime_input_consumer_released();
                     return Err(RawStdinReadError::Interrupted);
                 }
                 guard = state.inner.lock().unwrap();
@@ -756,7 +750,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
                         owns_consumer = false;
-                        state.notify_all();
+                        state.notify_runtime_input_consumer_released();
                     }
                     break QueueReadAction::Line {
                         bytes: read.protocol_bytes,
@@ -768,7 +762,7 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
                 if guard.shutdown {
                     if owns_consumer {
                         guard.input_queue.end_read_consumer();
-                        state.notify_all();
+                        state.notify_runtime_input_closed();
                     }
                     return Ok(output);
                 }
@@ -821,7 +815,7 @@ fn complete_detached_read_request() {
         guard.request_active = false;
         guard.visible_input_prompt = None;
     }
-    ipc::emit_ready();
+    ipc::emit_top_level_input_wait();
 }
 
 unsafe extern "C" fn mcp_repl_readline(
@@ -877,7 +871,7 @@ unsafe extern "C" fn mcp_repl_readline(
             return ptr::null_mut();
         }
     };
-    if accounting.discarded_after_interrupt() {
+    if accounting.discarded_after_runtime_interrupt() {
         return allocate_readline_result(b"\n");
     }
     allocate_readline_result(&read.bytes)
@@ -976,7 +970,7 @@ fn read_c_stdin_line(prompt: &str) -> CStdinLine {
                 return CStdinLine::Error;
             }
         };
-    if accounting.discarded_after_interrupt() {
+    if accounting.discarded_after_runtime_interrupt() {
         return CStdinLine::Line("\n".to_string());
     }
     if read.bytes.is_empty() {
@@ -1111,9 +1105,9 @@ fn finish_session_end() {
     guard.shutdown = true;
     guard.request_active = false;
     guard.cell_running = false;
-    guard.input_queue.clear_after_interrupt();
+    guard.input_queue.clear_for_session_end();
     drop(guard);
-    state.notify_all();
+    state.notify_runtime_input_closed();
     if should_emit {
         ipc::emit_session_end();
     }

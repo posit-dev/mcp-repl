@@ -15,7 +15,7 @@
 
 - State: active
 - Last updated: 2026-06-29
-- Current phase: planning
+- Current phase: implementation
 
 ## Motivating Scenario
 
@@ -294,16 +294,18 @@ R invariants:
 
 ## Phase Status
 
-- Phase 0: active - land this plan and use it as the review boundary.
-- Phase 1: pending - update protocol names and docs to `discard_pending_input`
+- Phase 0: complete - land this plan and use it as the review boundary.
+- Phase 1: complete - update protocol names and docs to `discard_pending_input`
   and nullable `input_wait`.
-- Phase 2: pending - update server interrupt flow so OS interrupt is always
+- Phase 2: complete - update server interrupt flow so OS interrupt is always
   sent after best-effort sideband cleanup.
-- Phase 3: pending - update worker queue handling so sideband cleanup cannot
-  wake or mutate runtime interrupt state.
-- Phase 4: pending - update Python and R waits to preserve runtime-native
+- Phase 3: active - update worker queue handling so sideband cleanup cannot
+  wake or mutate runtime interrupt state. Python and R sideband cleanup now
+  discard queued input only; remaining work is to audit any non-Unix signal
+  receptivity assumptions.
+- Phase 4: active - update Python and R waits to preserve runtime-native
   interrupt behavior without normal-operation busy polling.
-- Phase 5: pending - update public tests and protocol fixture tests to lock the
+- Phase 5: active - update public tests and protocol fixture tests to lock the
   boundary.
 
 ## Locked Decisions
@@ -319,23 +321,24 @@ R invariants:
 
 ## Open Questions
 
-- Whether Python needs a platform-specific signal-receptive blocking primitive
-  inside managed readline, or whether the existing embedded readline path can
-  provide that directly.
-- Whether R's current input wait needs any cleanup to make the no-sideband-leak
-  boundary as explicit as Python's.
+- Whether non-Unix Python needs a platform-specific signal-receptive blocking
+  primitive inside managed readline now that sideband discard no longer wakes
+  the condvar wait.
+- Whether R's timed `ReadConsole` interrupt check should be replaced in this
+  initiative or treated as an existing runtime-specific compromise outside the
+  sideband boundary.
 - Whether protocol versioning should reject all old `interrupt` and `ready`
   messages at the parser layer or only in protocol contract tests.
 
 ## Next Safe Slice
 
-- Add protocol fixture tests that fail if:
-  - sideband cleanup emits or observes runtime interrupt state;
-  - prompt-free readiness is sent as `ready` instead of `input_wait(null)`;
-  - the server skips OS interrupt after receiving cleanup ack;
-  - cleanup of an empty queue affects a later `input_batch`.
-- Then implement the protocol rename and server interrupt flow before touching
-  Python/R wait internals.
+- Run the full required local verification suite.
+- Audit the remaining R `ReadConsole` timeout loop against the no-polling
+  target and either replace it with a signal-receptive blocking primitive or
+  document why it is outside this slice.
+- If Windows support is in scope for this slice, add/adjust a Windows-specific
+  Python wait primitive so OS control events, not sideband cleanup, wake managed
+  waits.
 
 ## Stop Conditions
 
@@ -357,3 +360,7 @@ R invariants:
   semantics.
 - 2026-06-29: Chose backend-opaque server input dispatch. The worker owns where
   each `input_batch` is consumed.
+- 2026-06-29: Renamed the protocol to `discard_pending_input` and removed the
+  separate `ready` worker event in favor of `input_wait { prompt: null }`.
+- 2026-06-29: Split Python sideband cleanup from runtime input wakeups; discard
+  ack handling now clears queued input without waking the runtime wait.
