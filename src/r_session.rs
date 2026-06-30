@@ -540,7 +540,7 @@ fn install_windows_r_signal_wake_handler(state: &SessionState) -> Result<(), Str
 unsafe extern "system" fn windows_r_signal_wake_handler(event: u32) -> i32 {
     if event == windows_sys::Win32::System::Console::CTRL_C_EVENT {
         unsafe {
-            *libr::R_interrupts_pending = 1;
+            libr::set(libr::UserBreak, Rboolean_TRUE);
         }
         let handle = WINDOWS_R_SIGNAL_WAKE_EVENT.load(Ordering::SeqCst);
         if handle != 0 {
