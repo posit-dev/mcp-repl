@@ -311,8 +311,9 @@ R invariants:
   Ctrl-C through ConPTY input, are launched without `CREATE_NEW_PROCESS_GROUP`,
   and explicitly re-enable Ctrl-C processing after attaching to ConPTY so the
   console produces `CTRL_C_EVENT`. Runtime console-control handlers wake managed
-  waits when `CTRL_C_EVENT` arrives. Windows pipe workers do not have a supported
-  targeted Ctrl-C path.
+  waits when `CTRL_C_EVENT` arrives; the embedded R handler sets `UserBreak` so
+  the main R thread observes the interrupt through R's Windows event path.
+  Windows pipe workers do not have a supported targeted Ctrl-C path.
 - Phase 5: complete on Unix and protocol fixtures - update public tests and
   protocol fixture tests to lock the boundary. Windows runtime tests still need
   to be run on a Windows host.
@@ -392,5 +393,6 @@ R invariants:
   Windows runtime interruption now targets `CTRL_C_EVENT` by sending Ctrl-C to
   ConPTY input. ConPTY children are not launched with `CREATE_NEW_PROCESS_GROUP`,
   and built-in workers re-enable Ctrl-C processing after attaching to ConPTY so
-  the console can deliver `CTRL_C_EVENT`. Pipe-only Windows workers intentionally
-  have no targeted Ctrl-C interrupt path.
+  the console can deliver `CTRL_C_EVENT`. Embedded R records that event through
+  `UserBreak`, matching R's own Windows interruption path. Pipe-only Windows
+  workers intentionally have no targeted Ctrl-C interrupt path.
