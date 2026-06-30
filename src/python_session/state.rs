@@ -1,8 +1,13 @@
+#[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::python_input_queue::PythonInputQueue;
 
 pub(super) static SESSION_STATE: OnceLock<Arc<SessionState>> = OnceLock::new();
+
+#[cfg(windows)]
+static WINDOWS_SIGNAL_WAKE_EVENT: AtomicIsize = AtomicIsize::new(0);
 
 pub(super) struct SessionState {
     pub(super) inner: Mutex<SessionStateInner>,
@@ -241,10 +246,128 @@ fn close_fd(fd: libc::c_int) {
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(windows)]
+pub(super) struct RuntimeWake {
+    queue_event: isize,
+    signal_event: isize,
+}
+
+#[cfg(windows)]
+impl RuntimeWake {
+    fn new() -> std::io::Result<Self> {
+        let queue_event = create_event()?;
+        match create_event() {
+            Ok(signal_event) => Ok(Self {
+                queue_event,
+                signal_event,
+            }),
+            Err(err) => {
+                close_handle(queue_event);
+                Err(err)
+            }
+        }
+    }
+
+    pub(super) fn install_signal_wake_handler(&self) -> Result<(), String> {
+        WINDOWS_SIGNAL_WAKE_EVENT.store(self.signal_event, Ordering::SeqCst);
+        let ok = unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(windows_signal_wake_handler),
+                1,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "failed to install Python Windows signal wake handler: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    fn wake_queue(&self) {
+        set_event(self.queue_event);
+    }
+
+    pub(super) fn wait(&self) -> std::io::Result<()> {
+        let handles = [
+            self.queue_event as windows_sys::Win32::Foundation::HANDLE,
+            self.signal_event as windows_sys::Win32::Foundation::HANDLE,
+        ];
+        loop {
+            let result = unsafe {
+                windows_sys::Win32::System::Threading::WaitForMultipleObjects(
+                    handles.len() as u32,
+                    handles.as_ptr(),
+                    0,
+                    windows_sys::Win32::System::Threading::INFINITE,
+                )
+            };
+            if result == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                || result == windows_sys::Win32::Foundation::WAIT_OBJECT_0 + 1
+            {
+                return Ok(());
+            }
+            if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RuntimeWake {
+    fn drop(&mut self) {
+        close_handle(self.queue_event);
+        close_handle(self.signal_event);
+    }
+}
+
+#[cfg(windows)]
+fn create_event() -> std::io::Result<isize> {
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(handle as isize)
+}
+
+#[cfg(windows)]
+fn set_event(handle: isize) {
+    let _ = unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as _) };
+}
+
+#[cfg(windows)]
+fn close_handle(handle: isize) {
+    if handle != 0 {
+        let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle as _) };
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_signal_wake_handler(event: u32) -> i32 {
+    if event == windows_sys::Win32::System::Console::CTRL_BREAK_EVENT
+        || event == windows_sys::Win32::System::Console::CTRL_C_EVENT
+    {
+        let handle = WINDOWS_SIGNAL_WAKE_EVENT.load(Ordering::SeqCst);
+        if handle != 0 {
+            set_event(handle);
+        }
+    }
+    0
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
 pub(super) struct RuntimeWake;
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", windows)))]
 impl RuntimeWake {
     fn new() -> std::io::Result<Self> {
         Ok(Self)

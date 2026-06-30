@@ -4,10 +4,14 @@ use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::path::{Path, PathBuf};
 #[cfg(target_family = "unix")]
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::AtomicI32;
+#[cfg(windows)]
+use std::sync::atomic::AtomicIsize;
+#[cfg(any(target_family = "unix", windows))]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", windows)))]
 use std::time::Duration;
 
 use crate::ipc;
@@ -37,11 +41,13 @@ use std::mem::MaybeUninit;
 use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 
 const MCP_REPL_R_SCRIPT: &str = include_str!("../r/mcp_repl.R");
-#[cfg(not(target_family = "unix"))]
+#[cfg(not(any(target_family = "unix", windows)))]
 const R_READ_CONSOLE_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[cfg(target_family = "unix")]
 static R_SIGINT_WAKE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(windows)]
+static WINDOWS_R_SIGNAL_WAKE_EVENT: AtomicIsize = AtomicIsize::new(0);
 
 pub struct RSession {
     init: Arc<SessionInit>,
@@ -177,6 +183,8 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
     #[cfg(target_family = "unix")]
     install_r_sigint_wake_handler(&state)?;
+    #[cfg(windows)]
+    install_windows_r_signal_wake_handler(&state)?;
     crate::diagnostics::startup_log(format!(
         "r-session: init complete ({} ms)",
         crate::diagnostics::elapsed_ms(init_start.elapsed())
@@ -192,7 +200,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
 struct SessionState {
     inner: Mutex<SessionStateInner>,
     cvar: Condvar,
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", windows))]
     runtime_input_wake: RuntimeInputWake,
 }
 
@@ -225,6 +233,9 @@ impl SessionState {
             #[cfg(target_family = "unix")]
             runtime_input_wake: RuntimeInputWake::new()
                 .expect("failed to create R runtime input wake pipe"),
+            #[cfg(windows)]
+            runtime_input_wake: RuntimeInputWake::new()
+                .expect("failed to create R runtime input wake event"),
         }
     }
 
@@ -238,7 +249,7 @@ impl SessionState {
 
     fn notify_runtime_input_waiters(&self) {
         self.cvar.notify_all();
-        #[cfg(target_family = "unix")]
+        #[cfg(any(target_family = "unix", windows))]
         self.runtime_input_wake.notify();
     }
 }
@@ -313,6 +324,98 @@ impl Drop for RuntimeInputWake {
     fn drop(&mut self) {
         close_fd(self.read_fd);
         close_fd(self.write_fd);
+    }
+}
+
+#[cfg(windows)]
+struct RuntimeInputWake {
+    queue_event: isize,
+    signal_event: isize,
+}
+
+#[cfg(windows)]
+impl RuntimeInputWake {
+    fn new() -> std::io::Result<Self> {
+        let queue_event = create_event()?;
+        match create_event() {
+            Ok(signal_event) => Ok(Self {
+                queue_event,
+                signal_event,
+            }),
+            Err(err) => {
+                close_handle(queue_event);
+                Err(err)
+            }
+        }
+    }
+
+    fn notify(&self) {
+        set_event(self.queue_event);
+    }
+
+    fn signal_event(&self) -> isize {
+        self.signal_event
+    }
+
+    fn wait_interruptibly(&self) -> std::io::Result<()> {
+        let handles = [
+            self.queue_event as windows_sys::Win32::Foundation::HANDLE,
+            self.signal_event as windows_sys::Win32::Foundation::HANDLE,
+        ];
+        loop {
+            let result = unsafe {
+                windows_sys::Win32::System::Threading::WaitForMultipleObjects(
+                    handles.len() as u32,
+                    handles.as_ptr(),
+                    0,
+                    windows_sys::Win32::System::Threading::INFINITE,
+                )
+            };
+            if result == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                || result == windows_sys::Win32::Foundation::WAIT_OBJECT_0 + 1
+            {
+                return Ok(());
+            }
+            if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RuntimeInputWake {
+    fn drop(&mut self) {
+        close_handle(self.queue_event);
+        close_handle(self.signal_event);
+    }
+}
+
+#[cfg(windows)]
+fn create_event() -> std::io::Result<isize> {
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(handle as isize)
+}
+
+#[cfg(windows)]
+fn set_event(handle: isize) {
+    let _ = unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as _) };
+}
+
+#[cfg(windows)]
+fn close_handle(handle: isize) {
+    if handle != 0 {
+        let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle as _) };
     }
 }
 
@@ -413,6 +516,37 @@ extern "C" fn r_sigint_wake_handler(_signal: libc::c_int) {
     if fd >= 0 {
         write_wake_byte(fd);
     }
+}
+
+#[cfg(windows)]
+fn install_windows_r_signal_wake_handler(state: &SessionState) -> Result<(), String> {
+    WINDOWS_R_SIGNAL_WAKE_EVENT.store(state.runtime_input_wake.signal_event(), Ordering::SeqCst);
+    let ok = unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(windows_r_signal_wake_handler),
+            1,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "failed to install R Windows signal wake handler: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_r_signal_wake_handler(event: u32) -> i32 {
+    if event == windows_sys::Win32::System::Console::CTRL_BREAK_EVENT
+        || event == windows_sys::Win32::System::Console::CTRL_C_EVENT
+    {
+        let handle = WINDOWS_R_SIGNAL_WAKE_EVENT.load(Ordering::SeqCst);
+        if handle != 0 {
+            set_event(handle);
+        }
+    }
+    0
 }
 
 fn initialize_r(init: &SessionInit) -> Result<(), String> {
@@ -918,7 +1052,39 @@ fn wait_until_console_input_changes<'a>(
     }
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(windows)]
+fn wait_until_console_input_changes<'a>(
+    state: &'a SessionState,
+    mut guard: MutexGuard<'a, SessionStateInner>,
+) {
+    loop {
+        if guard.shutdown {
+            break;
+        }
+        if !guard.input_queue.is_empty() {
+            drop(guard);
+            unsafe {
+                libr::R_CheckUserInterrupt();
+            }
+            guard = state.inner.lock().unwrap();
+            if guard.shutdown || !guard.input_queue.is_empty() {
+                break;
+            }
+            continue;
+        }
+        drop(guard);
+        state
+            .runtime_input_wake
+            .wait_interruptibly()
+            .expect("R runtime input wake wait failed");
+        unsafe {
+            libr::R_CheckUserInterrupt();
+        }
+        guard = state.inner.lock().unwrap();
+    }
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
 fn wait_until_console_input_changes<'a>(
     state: &'a SessionState,
     mut guard: MutexGuard<'a, SessionStateInner>,

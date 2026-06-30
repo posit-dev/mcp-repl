@@ -15,8 +15,8 @@
 
 - State: active
 - Last updated: 2026-06-29
-- Current phase: Unix implementation complete; non-Unix input-wait shape still
-  needs an explicit merge-scope decision.
+- Current phase: Unix and Windows implementation complete; unsupported
+  non-Unix/non-Windows input-wait shape remains a fallback boundary.
 
 ## Motivating Scenario
 
@@ -303,13 +303,16 @@ R invariants:
 - Phase 3: complete - update worker queue handling so sideband cleanup cannot
   wake or mutate runtime interrupt state. Python and R sideband cleanup now
   discard queued input only.
-- Phase 4: complete on Unix - update Python and R waits to preserve runtime-native
-  interrupt behavior without normal-operation busy polling. Unix Python uses a
-  Python signal wake fd; Unix R uses a runtime input wake pipe plus a SIGINT
-  bridge that marks R's pending interrupt flag and lets the main R thread call
-  `R_CheckUserInterrupt()`.
-- Phase 5: complete on Unix - update public tests and protocol fixture tests to lock the
-  boundary.
+- Phase 4: complete on Unix and Windows - update Python and R waits to preserve
+  runtime-native interrupt behavior without normal-operation busy polling.
+  Unix Python uses a Python signal wake fd; Unix R uses a runtime input wake
+  pipe plus a SIGINT bridge that marks R's pending interrupt flag and lets the
+  main R thread call `R_CheckUserInterrupt()`. Windows Python and R use runtime
+  input events plus console-control event wake handlers; the handlers wake the
+  runtime wait and return control to the runtime's normal interrupt handling.
+- Phase 5: complete on Unix and protocol fixtures - update public tests and
+  protocol fixture tests to lock the boundary. Windows runtime tests still need
+  to be run on a Windows host.
 
 ## Locked Decisions
 
@@ -324,20 +327,14 @@ R invariants:
 
 ## Open Questions
 
-- Whether non-Unix Python needs a platform-specific signal-receptive blocking
-  primitive inside managed readline now that sideband discard no longer wakes
-  the condvar wait.
-- Whether non-Unix R needs the same input-wait shape as Unix R in this
-  initiative. The current non-Unix R wait still uses a timed
-  `R_CheckUserInterrupt()` loop, so the no-polling invariant is not yet portable.
+- Whether unsupported non-Unix/non-Windows platforms should keep the current
+  condvar/timed fallback or fail fast instead of pretending to satisfy the full
+  interrupt contract.
 
 ## Next Safe Slice
 
-- Decide whether the merge scope is Unix-only or portable.
-- If portable, design and implement non-Unix blocking waits that are woken by
-  runtime-native interrupt mechanisms, not by sideband discard.
-- If Unix-only, document that boundary in the PR and keep the non-Unix questions
-  tracked here.
+- Push the branch and run the Windows tests on a Windows host.
+- Decide whether to fail fast on unsupported non-Unix/non-Windows platforms.
 
 ## Verification
 
@@ -380,3 +377,6 @@ R invariants:
 - 2026-06-29: Chose parser-layer rejection for stale generic `interrupt`,
   `interrupt_ack`, and `ready` protocol messages so review cannot treat old
   interrupt sideband names as compatibility surfaces.
+- 2026-06-29: Added Windows runtime input wake events for Python and R. Queue
+  send/close sets the queue event; real console-control delivery sets the signal
+  event; sideband discard still only clears queued input and sends an ack.

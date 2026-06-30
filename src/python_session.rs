@@ -306,7 +306,15 @@ fn configure_python_signal_wakeup_fd(
     Ok(())
 }
 
-#[cfg(not(target_family = "unix"))]
+#[cfg(windows)]
+fn configure_python_signal_wakeup_fd(
+    _api: &'static PythonApi,
+    state: &Arc<SessionState>,
+) -> Result<(), String> {
+    state.runtime_wake.install_signal_wake_handler()
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
 fn configure_python_signal_wakeup_fd(
     _api: &'static PythonApi,
     _state: &Arc<SessionState>,
@@ -546,7 +554,26 @@ fn wait_for_queue_notification<'a>(
         state.inner.lock().unwrap()
     }
 
-    #[cfg(not(target_family = "unix"))]
+    #[cfg(windows)]
+    {
+        drop(guard);
+        if release_gil_while_waiting {
+            let allow_threads = PythonThreadsAllowed::new();
+            state
+                .runtime_wake
+                .wait()
+                .expect("Python runtime wake wait failed");
+            drop(allow_threads);
+        } else {
+            state
+                .runtime_wake
+                .wait()
+                .expect("Python runtime wake wait failed");
+        }
+        state.inner.lock().unwrap()
+    }
+
+    #[cfg(not(any(target_family = "unix", windows)))]
     {
         if release_gil_while_waiting {
             let allow_threads = PythonThreadsAllowed::new();
