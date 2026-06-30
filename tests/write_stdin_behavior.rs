@@ -549,7 +549,7 @@ async fn write_stdin_hidden_echo_quota_omission_keeps_later_visible_stdout() -> 
     session.cancel().await?;
 
     assert!(
-        text.contains("later content omitted"),
+        text.contains("later content past the output bundle quota"),
         "expected the bundle notice to report quota truncation, got: {text:?}"
     );
     assert!(
@@ -637,11 +637,11 @@ async fn write_stdin_hidden_only_echo_spill_uses_clean_bundle_notice() -> TestRe
     session.cancel().await?;
 
     assert!(
-        text.contains("full output:"),
+        text.contains("Full output:"),
         "expected a bundle disclosure in the reply, got: {text:?}"
     );
     assert!(
-        !text.contains("shown chars") && !text.contains("shown lines"),
+        !text.contains("Shown:"),
         "hidden-only spills should not claim to truncate visible output, got: {text:?}"
     );
     assert!(
@@ -1144,7 +1144,7 @@ async fn write_stdin_text_slightly_over_inline_budget_stays_inline() -> TestResu
         "did not expect transcript path for under-threshold text, got: {text:?}"
     );
     assert!(
-        !text.contains("full output:"),
+        !text.contains("Full output:"),
         "did not expect truncation marker for under-threshold text, got: {text:?}"
     );
 

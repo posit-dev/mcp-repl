@@ -1747,7 +1747,7 @@ async fn zod_files_bundle_preserves_image_after_large_hidden_input_echo() -> Tes
         "hidden echo image bundle returned an error: {text:?}"
     );
     assert!(
-        text.contains("later content omitted"),
+        text.contains("later content past the output bundle quota"),
         "expected tight bundle quota to report omitted hidden transcript tail, got: {text:?}"
     );
     assert_eq!(
@@ -1865,7 +1865,7 @@ async fn zod_files_bundle_reports_hidden_echo_dropped_for_later_raw_text() -> Te
         "raw-text echo eviction bundle returned an error: {text:?}"
     );
     assert!(
-        text.contains("later content omitted"),
+        text.contains("[repl] output omitted (later content omitted)"),
         "expected dropped input echoes to be reported, got: {text:?}"
     );
     assert!(
@@ -1925,7 +1925,7 @@ async fn zod_files_bundle_reports_omitted_input_echoes_past_timeline_capacity() 
         "oversized input echo bundle returned an error: {text:?}"
     );
     assert!(
-        text.contains("later content omitted"),
+        text.contains("later content past the output bundle quota"),
         "expected omitted input echoes to be reported, got: {text:?}"
     );
     assert!(

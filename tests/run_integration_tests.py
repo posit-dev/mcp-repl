@@ -638,9 +638,13 @@ def expected_large_text_preview(label: str, output_number: int) -> str:
     head = "".join(repeated_text_line(label, index) for index in range(1, 19))
     tail = "".join(repeated_text_line(label, index) for index in range(72, 81))
     return (
-        head
-        + "...[middle truncated; shown lines 1-18 and 72-81 of 81 total; "
-        f"full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt]...\n"
+        "Oversized output\n"
+        "Shown: lines 1-18 and 72-81 of 81\n"
+        f"Full output: <mcp-repl-output>/output-{output_number:04d}/transcript.txt\n\n"
+        "--- lines 1-18 ---\n"
+        + head
+        + "--- omitted lines 19-71 ---\n"
+        "--- lines 72-81 ---\n"
         + tail
         + "> "
     )
@@ -649,10 +653,11 @@ def expected_large_text_preview(label: str, output_number: int) -> str:
 def expected_capped_text_preview(label: str, output_number: int) -> str:
     lines = "".join(repeated_text_line(label, index) for index in range(1, 15))
     return (
-        lines
-        + f"{label}01\n"
-        + f"...[full output: <mcp-repl-output>/output-{output_number:04d}/events.log; "
-        "later content omitted]..."
+        "Oversized output\n"
+        f"Full output: <mcp-repl-output>/output-{output_number:04d}/events.log\n"
+        "Omitted: later content past the output bundle quota\n\n"
+        + lines
+        + f"{label}01"
     )
 
 
@@ -1368,7 +1373,7 @@ def r_output_bundle_above_timeline_capacity(client: McpStdioClient) -> None:
         raise SuiteFailure(
             f"did not expect capped transcript to contain omitted tail, got: {transcript!r}"
         )
-    if "later content omitted" not in received_text:
+    if "later content past the output bundle quota" not in received_text:
         raise SuiteFailure(
             f"expected capped output bundle reply to report omitted tail, got: {received_text!r}"
         )
