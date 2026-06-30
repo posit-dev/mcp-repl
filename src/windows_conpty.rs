@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::GetFileType;
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetStdHandle, HPCON,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -96,6 +96,7 @@ pub fn attach_stdio_to_conpty_if_attached() -> Result<(), String> {
         return Ok(());
     }
     crate::diagnostics::startup_log("windows-conpty: attaching stdio");
+    enable_ctrl_c_processing()?;
     rebind_crt_fd_to_conpty_device(0, "CONIN$", libc::O_RDONLY | libc::O_TEXT).map_err(|err| {
         crate::diagnostics::startup_log(format!("windows-conpty: attach stdin failed: {err}"));
         err
@@ -109,6 +110,16 @@ pub fn attach_stdio_to_conpty_if_attached() -> Result<(), String> {
         err
     })?;
     crate::diagnostics::startup_log("windows-conpty: attached stdio");
+    Ok(())
+}
+
+fn enable_ctrl_c_processing() -> Result<(), String> {
+    if unsafe { SetConsoleCtrlHandler(None, 0) } == 0 {
+        return Err(format!(
+            "failed to enable Windows Ctrl-C processing: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
     Ok(())
 }
 

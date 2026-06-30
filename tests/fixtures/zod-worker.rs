@@ -1146,8 +1146,10 @@ fn take_os_interrupt() -> bool {
 
 #[cfg(target_family = "windows")]
 fn install_signal_handler() -> io::Result<()> {
-    let ok = unsafe { SetConsoleCtrlHandler(Some(handle_console_ctrl), 1) };
-    if ok == 0 {
+    if unsafe { SetConsoleCtrlHandler(None, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { SetConsoleCtrlHandler(Some(handle_console_ctrl), 1) } == 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
