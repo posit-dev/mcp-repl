@@ -918,10 +918,20 @@ impl McpTestSession {
     }
 
     pub async fn cancel(self) -> TestResult<()> {
-        self.service.cancel().await?;
-        if let Some(pid) = self.server_pid {
+        let McpTestSession {
+            service,
+            server_pid,
+            ..
+        } = self;
+        let cancel_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), service.cancel()).await;
+        if let Some(pid) = server_pid {
             terminate_process_tree(pid);
         }
+        let Ok(cancel_result) = cancel_result else {
+            return Ok(());
+        };
+        cancel_result?;
         Ok(())
     }
 }
