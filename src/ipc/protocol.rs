@@ -414,6 +414,33 @@ mod tests {
             .is_err(),
             "ready should not deserialize as a server-to-worker message"
         );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "ready"
+            }))
+            .is_err(),
+            "ready should not deserialize as a worker-to-server message"
+        );
+    }
+
+    #[test]
+    fn stale_interrupt_messages_are_not_protocol() {
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "interrupt",
+                "interrupt_id": 7
+            }))
+            .is_err(),
+            "interrupt should not deserialize after discard_pending_input"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "interrupt_ack",
+                "interrupt_id": 7
+            }))
+            .is_err(),
+            "interrupt_ack should not deserialize after discard_pending_input_ack"
+        );
     }
 
     #[test]

@@ -63,6 +63,9 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Some(ServerToWorkerIpcMessage::DiscardPendingInput { discard_id }) => {
+                        // Sideband discard is queue cleanup only. Runtime
+                        // interruption comes from the OS signal sent by the
+                        // server, not from this IPC branch.
                         let discarded_input =
                             crate::r_session::discard_unconsumed_input_for_discard_ack();
                         crate::ipc::emit_discard_pending_input_ack(discard_id, discarded_input);
