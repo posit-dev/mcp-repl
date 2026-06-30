@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-repl"
-version = "0.3.0-dev"
+version = "0.3.0"
 dependencies = [
  "base64",
  "blake3",
