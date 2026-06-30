@@ -2664,9 +2664,13 @@ fn handle_windows_ipc_connect_result(
         Err(err) => {
             const WRAPPER_EXIT_GRACE: Duration = Duration::from_secs(2);
             let deadline = std::time::Instant::now() + WRAPPER_EXIT_GRACE;
+            let mut exit_status = None;
             loop {
                 match child.try_wait() {
-                    Ok(Some(_)) => break,
+                    Ok(Some(status)) => {
+                        exit_status = Some(status);
+                        break;
+                    }
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
                             let _ = child.kill();
@@ -2681,6 +2685,12 @@ fn handle_windows_ipc_connect_result(
                         break;
                     }
                 }
+            }
+            if let Some(status) = exit_status {
+                return Err(WorkerError::Protocol(format!(
+                    "{} before IPC named pipe connection",
+                    format_exit_status_message(&status)
+                )));
             }
             Err(WorkerError::Io(err))
         }
@@ -2818,6 +2828,14 @@ mod tests {
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
             .expect("spawn sleeping test child")
+    }
+
+    #[cfg(target_family = "windows")]
+    fn failing_test_child() -> Child {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "exit 7"])
+            .spawn()
+            .expect("spawn failing test child")
     }
 
     #[cfg(target_family = "unix")]
@@ -3499,6 +3517,23 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_error_reports_worker_exit_status() {
+        let mut child = WorkerChild::standard(failing_test_child());
+
+        let result = handle_windows_ipc_connect_result(
+            Err(std::io::Error::other("ipc connect failed")),
+            &mut child,
+        );
+
+        let message = result.expect_err("connect should fail").to_string();
+        assert!(
+            message.contains("worker exited with status 7"),
+            "expected worker exit status in error, got: {message}"
+        );
     }
 
     #[cfg(target_family = "windows")]
