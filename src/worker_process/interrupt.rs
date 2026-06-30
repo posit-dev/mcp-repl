@@ -499,8 +499,8 @@ fn send_interrupt_with_pending_input_discard(
         }
     }
 
-    process.send_os_interrupt()?;
     let os_interrupt_sent_at = Instant::now();
+    process.send_os_interrupt()?;
     crate::event_log::log(
         "worker_interrupt_os_sent",
         serde_json::json!({

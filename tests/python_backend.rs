@@ -4845,23 +4845,24 @@ print('CUSTOM_INPUT_VALUE', value, sigint_count)
     let interrupt = session
         .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
         .await?;
-    let _interrupt_text = result_text(&interrupt);
+    let interrupt_text = result_text(&interrupt);
 
     let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
     let answer_text = result_text(&answer);
     session.cancel().await?;
+    let combined_text = format!("{interrupt_text}{answer_text}");
 
     assert!(
-        answer_text.contains("CUSTOM_INPUT_INTERRUPT 1"),
-        "expected custom interrupt handler to run from real signal, got: {answer_text:?}"
+        combined_text.contains("CUSTOM_INPUT_INTERRUPT 1"),
+        "expected custom interrupt handler to run from real signal, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
     );
     assert!(
         answer_text.contains("CUSTOM_INPUT_VALUE answer 1"),
         "expected input to keep waiting and consume later answer, got: {answer_text:?}"
     );
     assert!(
-        !answer_text.contains("KeyboardInterrupt"),
-        "sideband should not force KeyboardInterrupt when custom handler returns: {answer_text:?}"
+        !combined_text.contains("KeyboardInterrupt"),
+        "sideband should not force KeyboardInterrupt when custom handler returns, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
     );
     Ok(())
 }
@@ -4925,7 +4926,7 @@ print('WINDOWS_INPUT_VALUE', value, interrupt_count)
     session.cancel().await?;
 
     assert!(
-        answer_text.contains("WINDOWS_INPUT_SIGINT 1"),
+        format!("{interrupt_text}{answer_text}").contains("WINDOWS_INPUT_SIGINT 1"),
         "expected Windows SIGINT handler to run from real terminal Ctrl-C, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
     );
     assert!(

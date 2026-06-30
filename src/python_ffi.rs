@@ -111,6 +111,8 @@ pub struct PythonApi {
     pub py_err_check_signals: unsafe extern "C" fn() -> c_int,
     #[cfg(windows)]
     pub py_err_set_interrupt_ex: unsafe extern "C" fn(c_int) -> c_int,
+    #[cfg(windows)]
+    py_os_sigint_event: unsafe extern "C" fn() -> *mut c_void,
     pub py_err_print: unsafe extern "C" fn(),
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
@@ -188,6 +190,8 @@ impl PythonApi {
             py_err_check_signals: unsafe { load_symbol(&library, b"PyErr_CheckSignals\0")? },
             #[cfg(windows)]
             py_err_set_interrupt_ex: unsafe { load_symbol(&library, b"PyErr_SetInterruptEx\0")? },
+            #[cfg(windows)]
+            py_os_sigint_event: unsafe { load_symbol(&library, b"_PyOS_SigintEvent\0")? },
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
@@ -365,6 +369,12 @@ impl PythonApi {
     #[cfg(windows)]
     pub fn set_interrupt_for_signal(&self, signum: c_int) {
         let _ = unsafe { (self.py_err_set_interrupt_ex)(signum) };
+        if signum == libc::SIGINT {
+            let event = unsafe { (self.py_os_sigint_event)() };
+            if !event.is_null() {
+                let _ = unsafe { windows_sys::Win32::System::Threading::SetEvent(event as _) };
+            }
+        }
     }
 
     pub fn install_input_hook(&self, callback: PyOsInputHookCallback) -> Result<(), String> {

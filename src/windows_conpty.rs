@@ -6,7 +6,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::Path;
 use std::thread;
 
@@ -16,8 +16,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::GetFileType;
 use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetStdHandle, HPCON,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    COORD, ClosePseudoConsole, CreatePseudoConsole, ENABLE_PROCESSED_INPUT, GetConsoleMode,
+    GetStdHandle, HPCON, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCtrlHandler, SetConsoleMode,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -26,7 +27,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
@@ -123,6 +124,25 @@ fn enable_ctrl_c_processing() -> Result<(), String> {
     Ok(())
 }
 
+fn enable_processed_input(handle: HANDLE) -> Result<(), String> {
+    let mut mode = 0u32;
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return Err(format!(
+            "failed to read Windows console input mode: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if mode & ENABLE_PROCESSED_INPUT == 0
+        && unsafe { SetConsoleMode(handle, mode | ENABLE_PROCESSED_INPUT) } == 0
+    {
+        return Err(format!(
+            "failed to enable Windows processed input: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 fn rebind_crt_fd_to_conpty_device(fd: i32, device: &str, flags: i32) -> Result<(), String> {
     let file = if flags & libc::O_WRONLY != 0 {
         OpenOptions::new()
@@ -135,6 +155,9 @@ fn rebind_crt_fd_to_conpty_device(fd: i32, device: &str, flags: i32) -> Result<(
             .open(device)
             .map_err(|err| format!("failed to open {device} for fd {fd}: {err}"))?
     };
+    if fd == 0 {
+        enable_processed_input(file.as_raw_handle() as HANDLE)?;
+    }
     let handle = file.into_raw_handle();
     let new_fd = unsafe { libc::open_osfhandle(handle as isize, flags) };
     if new_fd < 0 {
@@ -441,7 +464,7 @@ unsafe fn spawn_conpty_process(
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         0,
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP,
         env_block.as_ptr() as *const c_void,
         cwd_wide
             .as_ref()
@@ -492,7 +515,7 @@ unsafe fn spawn_conpty_process_with_token(
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         0,
-        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP,
         env_block.as_ptr() as *const c_void,
         cwd_wide.as_ptr(),
         &startup_info.StartupInfo,
