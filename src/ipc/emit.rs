@@ -10,7 +10,10 @@ use base64::Engine as _;
 
 use crate::worker_protocol::TextStream;
 
-use super::protocol::{WorkerToServerIpcMessage, worker_ready_message};
+use super::protocol::{
+    WorkerRuntimeInfo, WorkerToServerIpcMessage, worker_ready_message,
+    worker_ready_message_with_runtime,
+};
 use super::worker_connection::WorkerIpcConnection;
 
 #[cfg(target_family = "unix")]
@@ -118,6 +121,23 @@ pub fn emit_output_image(mime_type: &str, data_b64: &str, is_update: bool, sourc
 pub fn emit_worker_ready(worker_name: &str, supports_images: bool) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(worker_ready_message(worker_name, supports_images));
+    }
+}
+
+pub fn emit_worker_ready_with_runtime(
+    worker_name: &str,
+    supports_images: bool,
+    runtime_executable: Option<&std::path::Path>,
+) {
+    if let Some(ipc) = global_ipc() {
+        let runtime = runtime_executable.map(|executable| WorkerRuntimeInfo {
+            executable: Some(executable.to_string_lossy().into_owned()),
+        });
+        let _ = ipc.send(worker_ready_message_with_runtime(
+            worker_name,
+            supports_images,
+            runtime,
+        ));
     }
 }
 

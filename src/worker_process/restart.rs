@@ -23,6 +23,13 @@ enum RestartShutdownSnapshot {
 }
 
 impl WorkerManager {
+    pub(crate) fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        match self.oversized_output {
+            crate::oversized_output::OversizedOutputMode::Files => self.restart_files(timeout),
+            crate::oversized_output::OversizedOutputMode::Pager => self.restart_pager(timeout),
+        }
+    }
+
     pub(super) fn restart_files(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         self.restart_for_mode(RestartMode::Files, timeout)
     }

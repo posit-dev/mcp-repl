@@ -299,6 +299,7 @@ pub(crate) enum InitialWorkerPrompt {
 pub(crate) struct SupervisorSpawn {
     pub(crate) process: WorkerProcess,
     pub(crate) initial_prompt: Option<InitialWorkerPrompt>,
+    pub(crate) python_executable_hint: Option<PathBuf>,
 }
 
 pub(crate) struct WorkerSupervisor;
@@ -330,9 +331,10 @@ impl WorkerSupervisor {
         let ipc = process
             .ipc_connection()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
-        if let Err(err) = wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
-            return Err(Self::terminate_spawn_error(process, backend, err));
-        }
+        let ready = match wait_for_worker_ready(ipc, WORKER_READY_TIMEOUT) {
+            Ok(ready) => ready,
+            Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
+        };
         let initial_prompt = match seed_initial_readiness_from_process(&process) {
             Ok(prompt) => prompt,
             Err(err) => return Err(Self::terminate_spawn_error(process, backend, err)),
@@ -340,6 +342,7 @@ impl WorkerSupervisor {
         Ok(SupervisorSpawn {
             process,
             initial_prompt,
+            python_executable_hint: ready.python_executable,
         })
     }
 
@@ -360,9 +363,18 @@ impl WorkerSupervisor {
     }
 }
 
-fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<u32, WorkerError> {
+struct WorkerReadyInfo {
+    python_executable: Option<PathBuf>,
+}
+
+fn wait_for_worker_ready(
+    ipc: ServerIpcConnection,
+    timeout: Duration,
+) -> Result<WorkerReadyInfo, WorkerError> {
     match ipc.wait_for_worker_ready(timeout) {
-        Ok(WorkerToServerIpcMessage::WorkerReady { protocol, .. }) => {
+        Ok(WorkerToServerIpcMessage::WorkerReady {
+            protocol, runtime, ..
+        }) => {
             if protocol.name != "mcp-repl-worker"
                 || protocol.version != crate::ipc::WORKER_PROTOCOL_VERSION
             {
@@ -371,7 +383,12 @@ fn wait_for_worker_ready(ipc: ServerIpcConnection, timeout: Duration) -> Result<
                     protocol.name, protocol.version
                 )));
             }
-            Ok(protocol.version)
+            Ok(WorkerReadyInfo {
+                python_executable: runtime
+                    .and_then(|runtime| runtime.executable)
+                    .filter(|executable| !executable.is_empty())
+                    .map(PathBuf::from),
+            })
         }
         Ok(_) => Err(WorkerError::Protocol(
             "expected worker_ready before user input".to_string(),
@@ -445,7 +462,9 @@ enum ShutdownStdinPolicy {
 impl ShutdownStdinPolicy {
     fn for_worker_launch(worker_launch: &WorkerLaunch) -> Self {
         match worker_launch {
-            WorkerLaunch::Builtin(Backend::Python) => Self::CloseAfterWait,
+            WorkerLaunch::Builtin(Backend::Python) | WorkerLaunch::PythonExecutable { .. } => {
+                Self::CloseAfterWait
+            }
             WorkerLaunch::Builtin(Backend::R) | WorkerLaunch::Custom(_) => Self::CloseBeforeWait,
         }
     }
@@ -674,6 +693,26 @@ pub(crate) struct WorkerSpawnContext<'a> {
     pub(crate) prepared_windows_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct PythonLaunchConfig<'a> {
+    executable_override: Option<&'a Path>,
+    module_search_paths_override: Option<&'a [PathBuf]>,
+}
+
+struct EmbeddedWorkerSpawnConfig<'a, 'b> {
+    managed_network_proxy: Option<&'a crate::managed_network::ManagedNetworkProxy>,
+    live_output: LiveOutputCapture,
+    ipc_server: &'b mut IpcServer,
+    #[cfg(target_os = "windows")]
+    prepared_windows_launch: Option<&'a crate::windows_sandbox::PreparedSandboxLaunch>,
+}
+
+fn encode_python_module_search_paths(
+    paths: &[PathBuf],
+) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
+    std::env::join_paths(paths)
+}
+
 struct OutputReader {
     handle: std::thread::JoinHandle<()>,
     done_rx: mpsc::Receiver<()>,
@@ -751,7 +790,7 @@ impl WorkerProcess {
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(oversized_output, output_timeline.clone());
         #[cfg(target_os = "windows")]
-        let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
+        let live_output = if worker_launch.builtin_backend() == Some(Backend::Python) {
             live_output.with_windows_conpty_startup_noise_filter()
         } else {
             live_output
@@ -767,23 +806,48 @@ impl WorkerProcess {
         } = match &worker_launch {
             WorkerLaunch::Builtin(Backend::R) => Self::spawn_embedded_worker(
                 Backend::R,
+                PythonLaunchConfig::default(),
                 exe_path,
                 sandbox_state,
-                managed_network_proxy,
-                live_output.clone(),
-                &mut ipc_server,
-                #[cfg(target_os = "windows")]
-                prepared_windows_launch.as_ref(),
+                EmbeddedWorkerSpawnConfig {
+                    managed_network_proxy,
+                    live_output: live_output.clone(),
+                    ipc_server: &mut ipc_server,
+                    #[cfg(target_os = "windows")]
+                    prepared_windows_launch: prepared_windows_launch.as_ref(),
+                },
             )?,
             WorkerLaunch::Builtin(Backend::Python) => Self::spawn_embedded_worker(
                 Backend::Python,
+                PythonLaunchConfig::default(),
                 exe_path,
                 sandbox_state,
-                managed_network_proxy,
-                live_output.clone(),
-                &mut ipc_server,
-                #[cfg(target_os = "windows")]
-                prepared_windows_launch.as_ref(),
+                EmbeddedWorkerSpawnConfig {
+                    managed_network_proxy,
+                    live_output: live_output.clone(),
+                    ipc_server: &mut ipc_server,
+                    #[cfg(target_os = "windows")]
+                    prepared_windows_launch: prepared_windows_launch.as_ref(),
+                },
+            )?,
+            WorkerLaunch::PythonExecutable {
+                executable,
+                module_search_paths,
+            } => Self::spawn_embedded_worker(
+                Backend::Python,
+                PythonLaunchConfig {
+                    executable_override: Some(executable.as_path()),
+                    module_search_paths_override: Some(module_search_paths.as_slice()),
+                },
+                exe_path,
+                sandbox_state,
+                EmbeddedWorkerSpawnConfig {
+                    managed_network_proxy,
+                    live_output: live_output.clone(),
+                    ipc_server: &mut ipc_server,
+                    #[cfg(target_os = "windows")]
+                    prepared_windows_launch: prepared_windows_launch.as_ref(),
+                },
             )?,
             WorkerLaunch::Custom(spec) => Self::spawn_custom_worker(
                 spec,
@@ -884,15 +948,18 @@ impl WorkerProcess {
 
     fn spawn_embedded_worker(
         backend: Backend,
+        python_config: PythonLaunchConfig<'_>,
         exe_path: &Path,
         sandbox_state: &SandboxState,
-        managed_network_proxy: Option<&crate::managed_network::ManagedNetworkProxy>,
-        live_output: LiveOutputCapture,
-        ipc_server: &mut IpcServer,
-        #[cfg(target_os = "windows")] prepared_windows_launch: Option<
-            &crate::windows_sandbox::PreparedSandboxLaunch,
-        >,
+        spawn_config: EmbeddedWorkerSpawnConfig<'_, '_>,
     ) -> Result<SpawnedWorker, WorkerError> {
+        let EmbeddedWorkerSpawnConfig {
+            managed_network_proxy,
+            live_output,
+            ipc_server,
+            #[cfg(target_os = "windows")]
+            prepared_windows_launch,
+        } = spawn_config;
         let prepared = prepare_worker_command_with_managed_network(
             exe_path,
             vec![WORKER_MODE_ARG.to_string()],
@@ -929,14 +996,29 @@ impl WorkerProcess {
                 Backend::Python => "python",
             },
         );
-        if matches!(backend, Backend::Python)
-            && let Some(python_executable) =
-                std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV)
-        {
-            command.env(
-                crate::python_runtime::PYTHON_EXECUTABLE_ENV,
-                python_executable,
-            );
+        if matches!(backend, Backend::Python) {
+            let python_executable = python_config
+                .executable_override
+                .map(|path| path.as_os_str().to_os_string())
+                .or_else(|| std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV));
+            if let Some(python_executable) = python_executable {
+                command.env(
+                    crate::python_runtime::PYTHON_EXECUTABLE_ENV,
+                    python_executable,
+                );
+            }
+            if let Some(module_search_paths) = python_config.module_search_paths_override {
+                let module_search_paths = encode_python_module_search_paths(module_search_paths)
+                    .map_err(|err| {
+                        WorkerError::Protocol(format!(
+                            "failed to build prepared Python module search path: {err}"
+                        ))
+                    })?;
+                command.env(
+                    crate::python_runtime::PYTHON_MODULE_SEARCH_PATH_ENV,
+                    module_search_paths,
+                );
+            }
         }
         #[cfg(target_family = "unix")]
         let client_fds = ipc_server.take_child_fds().ok_or_else(|| {

@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 use serde::Deserialize;
 
 pub(crate) const PYTHON_EXECUTABLE_ENV: &str = "MCP_REPL_PYTHON_EXECUTABLE";
+pub(crate) const PYTHON_MODULE_SEARCH_PATH_ENV: &str = "MCP_REPL_PYTHON_MODULE_SEARCH_PATH";
 const PYTHON_PROGRAM: &str = "python3";
 const PYTHON_PROGRAM_FALLBACK: &str = "python";
 const PYTHON_CONFIG_SNIPPET: &str = r#"
@@ -18,6 +19,7 @@ def var(name):
 print(json.dumps({
     "executable": sys.executable,
     "base_executable": getattr(sys, "_base_executable", sys.executable),
+    "path": sys.path,
     "prefix": sys.prefix,
     "base_prefix": sys.base_prefix,
     "exec_prefix": sys.exec_prefix,
@@ -37,12 +39,30 @@ print(json.dumps({
 pub(crate) struct PythonRuntimeConfig {
     pub(crate) executable: PathBuf,
     pub(crate) libpython: PathBuf,
+    pub(crate) module_search_paths: Vec<PathBuf>,
+}
+
+pub(crate) trait PythonCommandRunner {
+    fn output(&mut self, program: &Path, args: &[String]) -> Result<Output, String>;
+}
+
+pub(crate) struct DirectPythonCommandRunner;
+
+impl PythonCommandRunner for DirectPythonCommandRunner {
+    fn output(&mut self, program: &Path, args: &[String]) -> Result<Output, String> {
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|err| err.to_string())
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct PythonRuntimeProbe {
     executable: String,
     base_executable: String,
+    path: Vec<String>,
     prefix: String,
     base_prefix: String,
     exec_prefix: String,
@@ -97,30 +117,63 @@ fn find_dot_venv_pythons(start: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn find_program_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_program_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if !candidate.is_file() {
-            continue;
-        }
+        for candidate in program_candidates_in_dir(&dir, name) {
+            if !candidate.is_file() {
+                continue;
+            }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&candidate)
-                && meta.permissions().mode() & 0o111 != 0
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&candidate)
+                    && meta.permissions().mode() & 0o111 != 0
+                {
+                    return Some(candidate);
+                }
+            }
+
+            #[cfg(not(unix))]
             {
                 return Some(candidate);
             }
         }
-
-        #[cfg(not(unix))]
-        {
-            return Some(candidate);
-        }
     }
     None
+}
+
+fn program_candidates_in_dir(dir: &Path, name: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let path = Path::new(name);
+        if path.extension().is_some() {
+            return vec![dir.join(name)];
+        }
+        let pathext = std::env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|ext| !ext.is_empty())
+                    .map(|ext| ext.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|exts| !exts.is_empty())
+            .unwrap_or_else(|| vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()]);
+        let mut candidates = vec![dir.join(name)];
+        candidates.extend(
+            pathext
+                .into_iter()
+                .map(|ext| dir.join(format!("{name}{ext}"))),
+        );
+        candidates
+    }
+    #[cfg(not(windows))]
+    {
+        vec![dir.join(name)]
+    }
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -148,13 +201,26 @@ fn python_program_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-fn query_python_runtime_config(executable: &Path) -> Result<PythonRuntimeConfig, String> {
-    let output = Command::new(executable)
-        .arg("-I")
-        .arg("-c")
-        .arg(PYTHON_CONFIG_SNIPPET)
-        .stdin(Stdio::null())
-        .output()
+pub(crate) fn query_python_runtime_config(
+    executable: &Path,
+) -> Result<PythonRuntimeConfig, String> {
+    let mut runner = DirectPythonCommandRunner;
+    query_python_runtime_config_with_runner(executable, &mut runner)
+}
+
+pub(crate) fn query_python_runtime_config_with_runner(
+    executable: &Path,
+    runner: &mut dyn PythonCommandRunner,
+) -> Result<PythonRuntimeConfig, String> {
+    let output = runner
+        .output(
+            executable,
+            &[
+                "-I".to_string(),
+                "-c".to_string(),
+                PYTHON_CONFIG_SNIPPET.to_string(),
+            ],
+        )
         .map_err(|err| {
             format!(
                 "failed to query Python runtime config from {}: {err}",
@@ -183,9 +249,15 @@ fn query_python_runtime_config(executable: &Path) -> Result<PythonRuntimeConfig,
     let executable = first_non_empty([probe.executable.as_str(), probe.base_executable.as_str()])
         .map(PathBuf::from)
         .unwrap_or_else(|| executable.to_path_buf());
+    let mut module_search_paths = Vec::new();
+    push_unique_path(&mut module_search_paths, PathBuf::new());
+    for path in &probe.path {
+        push_unique_path(&mut module_search_paths, PathBuf::from(path));
+    }
     Ok(PythonRuntimeConfig {
         executable,
         libpython,
+        module_search_paths,
     })
 }
 
@@ -232,11 +304,17 @@ fn select_python_runtime_config(
 }
 
 pub(crate) fn resolve_python_runtime_config() -> Result<PythonRuntimeConfig, String> {
-    select_python_runtime_config(
+    let mut config = select_python_runtime_config(
         std::env::var_os(PYTHON_EXECUTABLE_ENV).map(PathBuf::from),
         python_program_candidates(),
         query_python_runtime_config,
-    )
+    )?;
+    if let Some(paths) = std::env::var_os(PYTHON_MODULE_SEARCH_PATH_ENV) {
+        config.module_search_paths = std::env::split_paths(&paths).collect();
+    } else {
+        config.module_search_paths = Vec::new();
+    }
+    Ok(config)
 }
 
 fn resolve_libpython_path(probe: &PythonRuntimeProbe) -> Option<PathBuf> {
@@ -373,6 +451,7 @@ mod tests {
         PythonRuntimeConfig {
             executable: PathBuf::from(path),
             libpython: PathBuf::from("python.dll"),
+            module_search_paths: Vec::new(),
         }
     }
 
@@ -386,6 +465,7 @@ mod tests {
         PythonRuntimeProbe {
             executable: executable.to_string_lossy().into_owned(),
             base_executable: executable.to_string_lossy().into_owned(),
+            path: Vec::new(),
             prefix: prefix.to_string_lossy().into_owned(),
             base_prefix: prefix.to_string_lossy().into_owned(),
             exec_prefix: prefix.to_string_lossy().into_owned(),
@@ -481,6 +561,7 @@ mod tests {
             PythonRuntimeProbe {
                 executable: executable.to_string(),
                 base_executable: executable.to_string(),
+                path: Vec::new(),
                 prefix: String::new(),
                 base_prefix: String::new(),
                 exec_prefix: String::new(),

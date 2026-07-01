@@ -230,7 +230,11 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
             return Err(err);
         }
     };
-    let thread_state = match initialize_python(api, &runtime_config.executable) {
+    let thread_state = match initialize_python(
+        api,
+        &runtime_config.executable,
+        &runtime_config.module_search_paths,
+    ) {
         Ok(thread_state) => thread_state,
         Err(err) => {
             init.mark_failed(err.clone());
@@ -255,7 +259,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     }
 
     init.mark_ready();
-    ipc::emit_worker_ready("python", plot_capable());
+    ipc::emit_worker_ready_with_runtime("python", plot_capable(), Some(&runtime_config.executable));
 
     let result = run_cell_loop();
     // Py_FinalizeEx follows CPython shutdown semantics, including waiting for
@@ -280,6 +284,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
 fn initialize_python(
     api: &'static PythonApi,
     executable: &Path,
+    module_search_paths: &[std::path::PathBuf],
 ) -> Result<*mut PyThreadState, String> {
     let module_name = CString::new("_mcp_repl").expect("module name must not contain NUL");
     let module_name = module_name.into_raw();
@@ -292,13 +297,48 @@ fn initialize_python(
         if (api.py_is_initialized)() != 0 {
             return Err("embedded Python interpreter was already initialized".to_string());
         }
+        // macOS framework Python uses this during path init to find pyvenv.cfg
+        // for symlinked venv executables.
+        #[cfg(target_os = "macos")]
+        let _pyvenv_launcher = MacosPyvenvLauncherEnv::set(executable);
         api.set_program_name(executable)?;
         api.set_interactive_flags()?;
         (api.py_initialize_ex)(1);
+        api.set_module_search_paths(module_search_paths)?;
         api.install_readline_function(mcp_repl_readline)?;
         let thread_state = (api.py_eval_save_thread)();
         api.install_input_hook(pyos_input_hook)?;
         Ok(thread_state)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacosPyvenvLauncherEnv {
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosPyvenvLauncherEnv {
+    fn set(executable: &Path) -> Self {
+        let previous = std::env::var_os("__PYVENV_LAUNCHER__");
+        unsafe {
+            std::env::set_var("__PYVENV_LAUNCHER__", executable);
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosPyvenvLauncherEnv {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe {
+                std::env::set_var("__PYVENV_LAUNCHER__", value);
+            },
+            None => unsafe {
+                std::env::remove_var("__PYVENV_LAUNCHER__");
+            },
+        }
     }
 }
 

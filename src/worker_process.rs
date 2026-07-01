@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::Duration;
 
@@ -43,6 +44,9 @@ use self::backend_driver::{BackendDriver, new_backend_driver};
 use self::output_state::PrefixCapture;
 use self::request_lifecycle::RequestState;
 pub(crate) use self::write_flow::WriteStdinOptions;
+
+#[cfg(target_family = "unix")]
+use std::os::unix::process::CommandExt;
 
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const PREVIOUS_IMAGE_UPDATE_NOTICE: &str =
@@ -131,9 +135,22 @@ pub(crate) fn worker_context_event_payload(
     })
 }
 
+fn configured_python_executable_hint(worker_launch: &WorkerLaunch) -> Option<PathBuf> {
+    if worker_launch.builtin_backend() != Some(Backend::Python) {
+        return None;
+    }
+    worker_launch
+        .python_executable()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os(crate::python_runtime::PYTHON_EXECUTABLE_ENV).map(PathBuf::from)
+        })
+}
+
 pub struct WorkerManager {
     exe_path: PathBuf,
     worker_launch: WorkerLaunch,
+    active_python_executable_hint: Option<PathBuf>,
     backend: Backend,
     process: Option<WorkerProcess>,
     sandbox_plan: SandboxCliPlan,
@@ -152,6 +169,7 @@ pub struct WorkerManager {
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
     pending_request_input: Option<String>,
+    user_state_may_exist: bool,
     session_end_seen: bool,
     settled_pending_completion: Option<CompletionInfo>,
     settled_pending_error: Option<WorkerError>,
@@ -192,6 +210,7 @@ impl WorkerManager {
     ) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
         let backend = worker_launch.builtin_backend().unwrap_or(Backend::R);
+        let active_python_executable_hint = configured_python_executable_hint(&worker_launch);
         let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
         let initial_sandbox =
             sandbox_state::prepare_initial_sandbox_state(&sandbox_plan, &sandbox_defaults)?;
@@ -228,6 +247,7 @@ impl WorkerManager {
         Ok(Self {
             exe_path,
             worker_launch: worker_launch.clone(),
+            active_python_executable_hint,
             backend,
             process: None,
             sandbox_plan,
@@ -246,6 +266,7 @@ impl WorkerManager {
             pending_request: false,
             pending_request_started_at: None,
             pending_request_input: None,
+            user_state_may_exist: false,
             session_end_seen: false,
             settled_pending_completion: None,
             settled_pending_error: None,
@@ -333,6 +354,111 @@ impl WorkerManager {
     /// Exposes whether a timed-out logical request still owns future empty-input polls.
     pub fn pending_request(&self) -> bool {
         self.pending_request
+    }
+
+    pub fn user_state_may_exist(&self) -> bool {
+        self.user_state_may_exist
+    }
+
+    pub fn active_python_executable_hint(&self) -> Option<std::path::PathBuf> {
+        if self.backend != Backend::Python {
+            return None;
+        }
+        self.active_python_executable_hint.clone()
+    }
+
+    pub fn python_executable_hint_matches(&self, target: &std::path::Path) -> bool {
+        self.active_python_executable_hint()
+            .as_deref()
+            .is_some_and(|current| crate::python_prepare::same_python_executable(current, target))
+    }
+
+    pub fn prepare_command_sandbox_state(
+        &self,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<SandboxState, WorkerError> {
+        let Some(update) = update else {
+            self.require_inherited_sandbox_state()?;
+            return Ok(self.sandbox_state.clone());
+        };
+
+        let mut inherited_state = self.sandbox_defaults.clone();
+        inherited_state.apply_update(update);
+        #[cfg(target_os = "linux")]
+        self.apply_linux_bwrap_fallback_override(&mut inherited_state);
+        let resolved_state = crate::sandbox_cli::resolve_effective_sandbox_state_with_defaults(
+            &self.sandbox_plan,
+            Some(&inherited_state),
+            &self.sandbox_defaults,
+        )
+        .map_err(WorkerError::Sandbox)?;
+        #[cfg(target_os = "linux")]
+        {
+            let mut resolved_state = resolved_state;
+            self.apply_linux_bwrap_fallback_override(&mut resolved_state);
+            Ok(resolved_state)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(resolved_state)
+        }
+    }
+
+    pub fn run_sandboxed_prepare_command(
+        &mut self,
+        sandbox_state: &SandboxState,
+        program: &Path,
+        args: &[String],
+    ) -> Result<Output, WorkerError> {
+        let managed_network_proxy =
+            match sandbox_state::managed_network_proxy_config_for_state(sandbox_state)? {
+                Some(config) => Some(
+                    crate::managed_network::ManagedNetworkProxy::start(config)
+                        .map_err(|err| WorkerError::Sandbox(err.to_string()))?,
+                ),
+                None => None,
+            };
+        let prepared = crate::sandbox::prepare_worker_command_with_managed_network(
+            program,
+            args.to_vec(),
+            sandbox_state,
+            managed_network_proxy.as_ref(),
+        )
+        .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        #[cfg(target_os = "windows")]
+        let mut prepared = prepared;
+
+        #[cfg(target_os = "windows")]
+        let prepared_windows_launch = if sandbox_state.sandbox_policy.requires_sandbox() {
+            Some(
+                crate::windows_sandbox::prepare_sandbox_launch(
+                    &sandbox_state.sandbox_policy,
+                    &sandbox_state.sandbox_cwd,
+                    &sandbox_state.session_temp_dir,
+                )
+                .map_err(WorkerError::Sandbox)?,
+            )
+        } else {
+            None
+        };
+        #[cfg(target_os = "windows")]
+        if let Some(prepared_windows_launch) = prepared_windows_launch.as_ref() {
+            crate::sandbox::append_windows_prepared_capability_sid(
+                &mut prepared.args,
+                prepared_windows_launch.capability_sid(),
+            )
+            .map_err(WorkerError::Sandbox)?;
+        }
+
+        let mut command = Command::new(&prepared.program);
+        #[cfg(target_family = "unix")]
+        if let Some(arg0) = &prepared.arg0 {
+            command.arg0(arg0);
+        }
+        command.args(&prepared.args);
+        command.envs(prepared.env.iter());
+        command.stdin(Stdio::null());
+        command.output().map_err(WorkerError::Io)
     }
 
     pub fn refresh_timeout_marker_with_wait(&mut self, wait: Duration) {

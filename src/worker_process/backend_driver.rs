@@ -41,7 +41,9 @@ pub(super) trait BackendDriver: Send {
 pub(super) fn new_backend_driver(worker_launch: &WorkerLaunch) -> Box<dyn BackendDriver> {
     match worker_launch {
         WorkerLaunch::Builtin(Backend::R) => Box::new(RBackendDriver::new()),
-        WorkerLaunch::Builtin(Backend::Python) => Box::new(ProtocolBackendDriver::builtin_python()),
+        WorkerLaunch::Builtin(Backend::Python) | WorkerLaunch::PythonExecutable { .. } => {
+            Box::new(ProtocolBackendDriver::builtin_python())
+        }
         WorkerLaunch::Custom(_) => Box::new(ProtocolBackendDriver::new()),
     }
 }

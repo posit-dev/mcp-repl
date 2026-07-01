@@ -266,6 +266,7 @@ impl WorkerManager {
         server_timeout: Duration,
         options: WriteStdinOptions,
     ) -> Result<WorkerReply, WorkerError> {
+        let input_may_create_user_state = self.input_may_create_user_state(&text);
         self.write_in_progress = true;
         self.last_write_respawned = false;
         let result = match self.oversized_output {
@@ -277,7 +278,20 @@ impl WorkerManager {
             }
         };
         self.write_in_progress = false;
+        if result.is_ok() && input_may_create_user_state {
+            self.user_state_may_exist = true;
+        }
         result
+    }
+
+    fn input_may_create_user_state(&self, text: &str) -> bool {
+        if text.is_empty() || self.local_pager_follow_up_uses_existing_state(text) {
+            return false;
+        }
+        match split_write_stdin_control_prefix(text) {
+            Some((_control, remaining)) => !remaining.trim().is_empty(),
+            None => true,
+        }
     }
 
     /// Entry point for the public `repl` tool in default files mode.

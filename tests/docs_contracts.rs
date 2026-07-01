@@ -129,7 +129,7 @@ fn worker_sideband_protocol_keeps_images_one_way() {
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
         r#"{ "type": "output_image", "mime_type": <string>, "data_b64": <base64>, "is_update": <bool>, "source": <string|null> }"#,
-        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
+        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> }, "runtime": { "executable": <string, optional> } }"#,
         r#"{ "type": "input_batch", "input": <string> }"#,
         r#"{ "type": "input_line", "prompt": <string>, "text": <string> }"#,
         r#"{ "type": "input_wait", "prompt": <string> }"#,

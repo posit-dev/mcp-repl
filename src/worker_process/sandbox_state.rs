@@ -179,7 +179,7 @@ impl WorkerManager {
     }
 
     #[cfg(target_os = "linux")]
-    fn apply_linux_bwrap_fallback_override(&self, state: &mut SandboxState) {
+    pub(super) fn apply_linux_bwrap_fallback_override(&self, state: &mut SandboxState) {
         if self.linux_bwrap_fallback_disabled {
             state.use_linux_sandbox_bwrap = false;
         }

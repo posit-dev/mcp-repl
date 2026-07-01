@@ -711,6 +711,20 @@ impl McpTestSession {
         self.service.peer_info()
     }
 
+    pub async fn list_tool_names(&self) -> Result<Vec<String>, ServiceError> {
+        let tools = self.service.peer().list_tools(None).await?;
+        Ok(tools
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect())
+    }
+
+    pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>, ServiceError> {
+        let tools = self.service.peer().list_tools(None).await?;
+        Ok(tools.tools.into_iter().collect())
+    }
+
     pub fn server_stderr_text(&self) -> String {
         self.server_stderr.text()
     }

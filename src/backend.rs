@@ -26,6 +26,10 @@ impl Backend {
 #[derive(Debug, Clone)]
 pub enum WorkerLaunch {
     Builtin(Backend),
+    PythonExecutable {
+        executable: PathBuf,
+        module_search_paths: Vec<PathBuf>,
+    },
     Custom(CustomWorkerSpec),
 }
 
@@ -33,17 +37,26 @@ impl WorkerLaunch {
     pub fn builtin_backend(&self) -> Option<Backend> {
         match self {
             Self::Builtin(backend) => Some(*backend),
+            Self::PythonExecutable { .. } => Some(Backend::Python),
             Self::Custom(_) => None,
+        }
+    }
+
+    pub fn python_executable(&self) -> Option<&Path> {
+        match self {
+            Self::PythonExecutable { executable, .. } => Some(executable.as_path()),
+            _ => None,
         }
     }
 
     pub fn stdin_transport(&self) -> WorkerStdinTransport {
         match self {
-            Self::Builtin(Backend::Python)
+            Self::Builtin(Backend::Python) | Self::PythonExecutable { .. }
                 if cfg!(target_family = "unix") || cfg!(target_family = "windows") =>
             {
                 WorkerStdinTransport::Pty
             }
+            Self::PythonExecutable { .. } => WorkerStdinTransport::Pipe,
             Self::Builtin(_) => WorkerStdinTransport::Pipe,
             Self::Custom(spec) => spec.stdin.transport(),
         }
@@ -53,6 +66,9 @@ impl WorkerLaunch {
         match self {
             Self::Builtin(Backend::R) => "r".to_string(),
             Self::Builtin(Backend::Python) => "python".to_string(),
+            Self::PythonExecutable { executable, .. } => {
+                format!("python:{}", executable.display())
+            }
             Self::Custom(spec) => format!("custom:{}", spec.executable.display()),
         }
     }

@@ -4817,7 +4817,7 @@ async fn python_empty_poll_after_empty_input_prompt_uses_idle_poll_path() -> Tes
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_ctrl_d_unblocks_input_prompt() -> TestResult<()> {
+async fn python_ctrl_d_reset_unblocks_input_prompt() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -4859,7 +4859,7 @@ else:
     let reset_text = result_text(&reset);
     assert!(
         !is_busy_response(&reset_text),
-        "expected Ctrl-D while input() waits to complete, got: {reset_text:?}"
+        "expected Ctrl-D reset while input() waits to complete, got: {reset_text:?}"
     );
     assert!(
         reset_text.contains("new session started"),
@@ -4885,11 +4885,11 @@ else:
 
     assert!(
         follow_up_text.contains("AFTER_INPUT_RESET"),
-        "expected follow-up after Ctrl-D to run in the replacement worker, got: {follow_up_text:?}"
+        "expected follow-up after Ctrl-D reset to run in the replacement worker, got: {follow_up_text:?}"
     );
     assert!(
         !follow_up_text.contains("reset> "),
-        "did not expect the old input prompt to leak after Ctrl-D, got: {follow_up_text:?}"
+        "did not expect the old input prompt to leak after Ctrl-D reset, got: {follow_up_text:?}"
     );
     Ok(())
 }

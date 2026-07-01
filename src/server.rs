@@ -1,8 +1,8 @@
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ErrorData as McpError, JsonObject, Meta, ProtocolVersion, ServerCapabilities,
-    ServerInfo,
+    CallToolResult, Content, ErrorData as McpError, JsonObject, Meta, ProtocolVersion,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -38,6 +38,23 @@ use crate::worker_process::{
 
 const BUSY_FOLLOW_UP_RECHECK_WAIT: Duration = Duration::from_millis(25);
 
+struct PrepareCommandRunner<'a> {
+    worker: &'a mut WorkerManager,
+    sandbox_state: crate::sandbox::SandboxState,
+}
+
+impl crate::python_runtime::PythonCommandRunner for PrepareCommandRunner<'_> {
+    fn output(
+        &mut self,
+        program: &std::path::Path,
+        args: &[String],
+    ) -> Result<std::process::Output, String> {
+        self.worker
+            .run_sandboxed_prepare_command(&self.sandbox_state, program, args)
+            .map_err(|err| err.to_string())
+    }
+}
+
 #[cfg(test)]
 fn repl_tool_description_for_backend(
     backend: Backend,
@@ -69,6 +86,7 @@ struct ServerState {
     worker: WorkerManager,
     response: ResponseState,
     oversized_output: OversizedOutputMode,
+    python_requirements_manifest: crate::python_prepare::PythonRequirementsManifest,
 }
 
 impl SharedServer {
@@ -88,6 +106,8 @@ impl SharedServer {
                 )?,
                 response: ResponseState::new()?,
                 oversized_output,
+                python_requirements_manifest:
+                    crate::python_prepare::PythonRequirementsManifest::default(),
             })),
         })
     }
@@ -98,6 +118,13 @@ impl SharedServer {
 
     fn accepts_sandbox_state_meta(&self) -> bool {
         self.accepts_sandbox_state_meta
+    }
+
+    fn sandbox_state_update_for_tool_call(
+        &self,
+        meta: &Meta,
+    ) -> Result<Option<SandboxStateUpdate>, WorkerError> {
+        Self::sandbox_state_update_for_tool_call_meta(self.accepts_sandbox_state_meta(), meta)
     }
 
     /// Runs a closure with exclusive access to the combined worker/response state.
@@ -164,6 +191,17 @@ impl SharedServer {
         state
             .worker
             .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
+    }
+
+    fn stage_tool_call_sandbox_state_for_reset(
+        state: &mut ServerState,
+        update: Option<SandboxStateUpdate>,
+    ) -> Result<(), WorkerError> {
+        let Some(update) = update else {
+            return Ok(());
+        };
+
+        state.worker.stage_sandbox_state_update(update)
     }
 
     /// Executes one `repl` call and immediately finalizes the visible reply on the server side.
@@ -416,6 +454,326 @@ impl SharedServer {
         })
         .await
     }
+
+    async fn run_reset(&self, meta: Meta) -> Result<CallToolResult, McpError> {
+        let timeout = parse_timeout(None, "repl_reset", false)?;
+        let worker_timeout = apply_tool_call_margin(timeout);
+        let sandbox_state_update = self.sandbox_state_update_for_tool_call(&meta);
+        let result = self
+            .run_state(move |state| {
+                let sandbox_state_result = match &sandbox_state_update {
+                    Ok(update) => {
+                        SharedServer::stage_tool_call_sandbox_state_for_reset(state, update.clone())
+                    }
+                    Err(WorkerError::Sandbox(message)) => {
+                        Err(WorkerError::Sandbox(message.clone()))
+                    }
+                    Err(err) => Err(WorkerError::Sandbox(err.to_string())),
+                };
+                if let Err(err) = sandbox_state_result {
+                    let mut result = state.response.finalize_local_error(err, true);
+                    strip_text_stream_meta(&mut result);
+                    return result;
+                }
+                let result = state.worker.restart(worker_timeout);
+                let pending_request_after = state.worker.pending_request();
+                let mut result = finalize_visible_reply(
+                    state,
+                    result,
+                    pending_request_after,
+                    TimeoutBundleReuse::None,
+                    0,
+                    true,
+                );
+                strip_text_stream_meta(&mut result);
+                result
+            })
+            .await?;
+        Ok(result)
+    }
+
+    async fn run_prepare_python(
+        &self,
+        args: crate::python_prepare::ReplPrepareArgs,
+        meta: Meta,
+    ) -> Result<CallToolResult, McpError> {
+        let request = crate::python_prepare::validate_prepare_args(args)
+            .map_err(|message| McpError::invalid_params(message, None))?;
+        let accepts_sandbox_state_meta = self.accepts_sandbox_state_meta();
+        self.run_state(move |state| match request {
+            crate::python_prepare::ValidatedPrepareRequest::Requirements(operation) => {
+                let sandbox_state_update = || {
+                    SharedServer::sandbox_state_update_for_tool_call_meta(
+                        accepts_sandbox_state_meta,
+                        &meta,
+                    )
+                };
+                Self::run_prepare_python_requirements(state, operation, &sandbox_state_update)
+            }
+            crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable) => {
+                let sandbox_state_update = || {
+                    SharedServer::sandbox_state_update_for_tool_call_meta(
+                        accepts_sandbox_state_meta,
+                        &meta,
+                    )
+                };
+                Self::run_prepare_python_executable(state, executable, &sandbox_state_update)
+            }
+        })
+        .await
+    }
+
+    fn run_prepare_python_requirements(
+        state: &mut ServerState,
+        operation: crate::python_prepare::PrepareRequirementsOperation,
+        sandbox_state_update: &dyn Fn() -> Result<Option<SandboxStateUpdate>, WorkerError>,
+    ) -> CallToolResult {
+        let current_manifest = state.python_requirements_manifest.clone();
+        let candidate_manifest =
+            crate::python_prepare::apply_requirements_operation(&current_manifest, &operation);
+        let sandbox_state_update = match sandbox_state_update() {
+            Ok(update) => update,
+            Err(err) => return Self::prepare_python_local_error_reply(state, err),
+        };
+        let prepare_command_sandbox_state = match state
+            .worker
+            .prepare_command_sandbox_state(sandbox_state_update.clone())
+        {
+            Ok(sandbox_state) => sandbox_state,
+            Err(err) => return Self::prepare_python_local_error_reply(state, err),
+        };
+        let active_python_executable = state.worker.active_python_executable_hint();
+        let target_result = {
+            let mut runner = PrepareCommandRunner {
+                worker: &mut state.worker,
+                sandbox_state: prepare_command_sandbox_state,
+            };
+            crate::python_prepare::resolve_requirements_manifest(
+                &candidate_manifest,
+                operation.allows_current_runtime_shortcut(),
+                active_python_executable.as_deref(),
+                &mut runner,
+            )
+        };
+        let target = match target_result {
+            Ok(target) => target,
+            Err(err) => {
+                return Self::prepare_python_error_reply(
+                    format!("repl_prepare failed: {err}"),
+                    "session unchanged",
+                    "no user state discarded",
+                    &current_manifest,
+                );
+            }
+        };
+
+        let active_matches = target.matches_current_runtime
+            || state
+                .worker
+                .python_executable_hint_matches(&target.executable);
+        let restart_required = match operation.restart {
+            crate::python_prepare::PrepareRestartPolicy::IfNeeded => !active_matches,
+            crate::python_prepare::PrepareRestartPolicy::Yes => true,
+            crate::python_prepare::PrepareRestartPolicy::No => !active_matches,
+        };
+        let had_pending_work = state.worker.pending_request();
+        let user_state_may_exist = state.worker.user_state_may_exist() || had_pending_work;
+
+        if matches!(
+            operation.restart,
+            crate::python_prepare::PrepareRestartPolicy::No
+        ) && restart_required
+            && user_state_may_exist
+        {
+            return Self::prepare_python_error_reply(
+                "repl_prepare failed: satisfying the requirements would require restarting the current Python session",
+                "session unchanged",
+                "no user state discarded",
+                &current_manifest,
+            );
+        }
+
+        if !restart_required {
+            state
+                .worker
+                .record_worker_launch_for_next_spawn(WorkerLaunch::PythonExecutable {
+                    executable: target.executable,
+                    module_search_paths: target.module_search_paths,
+                });
+            state.python_requirements_manifest = candidate_manifest;
+            return Self::prepare_python_success_reply(
+                "session unchanged",
+                "no user state discarded",
+                &state.python_requirements_manifest,
+            );
+        }
+
+        let discarded = prepare_discard_status(had_pending_work, user_state_may_exist);
+        if let Err(err) = Self::stage_prepare_sandbox_state(state, Ok(sandbox_state_update)) {
+            return Self::prepare_python_local_error_reply(state, err);
+        }
+        match state
+            .worker
+            .replace_worker_launch(WorkerLaunch::PythonExecutable {
+                executable: target.executable,
+                module_search_paths: target.module_search_paths,
+            }) {
+            Ok(()) => {
+                Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
+                state.python_requirements_manifest = candidate_manifest;
+                Self::prepare_python_success_reply(
+                    "session restarted",
+                    discarded,
+                    &state.python_requirements_manifest,
+                )
+            }
+            Err(err) => {
+                if had_pending_work && !state.worker.pending_request() {
+                    Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
+                }
+                Self::prepare_python_local_error_reply(state, err)
+            }
+        }
+    }
+
+    fn run_prepare_python_executable(
+        state: &mut ServerState,
+        executable: std::path::PathBuf,
+        sandbox_state_update: &dyn Fn() -> Result<Option<SandboxStateUpdate>, WorkerError>,
+    ) -> CallToolResult {
+        let sandbox_state_update = match sandbox_state_update() {
+            Ok(update) => update,
+            Err(err) => return Self::prepare_python_local_error_reply(state, err),
+        };
+        let prepare_command_sandbox_state = match state
+            .worker
+            .prepare_command_sandbox_state(sandbox_state_update.clone())
+        {
+            Ok(sandbox_state) => sandbox_state,
+            Err(err) => return Self::prepare_python_local_error_reply(state, err),
+        };
+        let target_result = {
+            let mut runner = PrepareCommandRunner {
+                worker: &mut state.worker,
+                sandbox_state: prepare_command_sandbox_state,
+            };
+            crate::python_prepare::resolve_prepare_target(
+                &crate::python_prepare::ValidatedPrepareRequest::PythonExecutable(executable),
+                &mut runner,
+            )
+        };
+        let target = match target_result {
+            Ok(target) => target,
+            Err(err) => {
+                return Self::prepare_python_error_reply(
+                    format!("repl_prepare failed: {err}"),
+                    "session unchanged",
+                    "no user state discarded",
+                    &state.python_requirements_manifest,
+                );
+            }
+        };
+        let active_matches = state
+            .worker
+            .python_executable_hint_matches(&target.executable);
+        if active_matches {
+            state
+                .worker
+                .record_worker_launch_for_next_spawn(WorkerLaunch::PythonExecutable {
+                    executable: target.executable,
+                    module_search_paths: target.module_search_paths,
+                });
+            return Self::prepare_python_success_reply(
+                "session unchanged",
+                "no user state discarded",
+                &state.python_requirements_manifest,
+            );
+        }
+
+        let had_pending_work = state.worker.pending_request();
+        let user_state_may_exist = state.worker.user_state_may_exist() || had_pending_work;
+        let discarded = prepare_discard_status(had_pending_work, user_state_may_exist);
+        if let Err(err) = Self::stage_prepare_sandbox_state(state, Ok(sandbox_state_update)) {
+            return Self::prepare_python_local_error_reply(state, err);
+        }
+        match state
+            .worker
+            .replace_worker_launch(WorkerLaunch::PythonExecutable {
+                executable: target.executable,
+                module_search_paths: target.module_search_paths,
+            }) {
+            Ok(()) => {
+                Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
+                Self::prepare_python_success_reply(
+                    "session restarted",
+                    discarded,
+                    &state.python_requirements_manifest,
+                )
+            }
+            Err(err) => {
+                if had_pending_work && !state.worker.pending_request() {
+                    Self::clear_prepare_timeout_state_if_discarded(state, had_pending_work);
+                }
+                Self::prepare_python_local_error_reply(state, err)
+            }
+        }
+    }
+
+    fn stage_prepare_sandbox_state(
+        state: &mut ServerState,
+        update: Result<Option<SandboxStateUpdate>, WorkerError>,
+    ) -> Result<(), WorkerError> {
+        SharedServer::stage_tool_call_sandbox_state_for_reset(state, update?)
+    }
+
+    fn clear_prepare_timeout_state_if_discarded(state: &mut ServerState, had_pending_work: bool) {
+        if had_pending_work && let Err(err) = state.response.clear_active_timeout_bundle() {
+            eprintln!("dropping discarded timeout bundle after repl_prepare replacement: {err}");
+        }
+    }
+
+    fn prepare_python_local_error_reply(
+        state: &mut ServerState,
+        err: WorkerError,
+    ) -> CallToolResult {
+        let mut result = state.response.finalize_local_error(err, true);
+        strip_text_stream_meta(&mut result);
+        result
+    }
+
+    fn prepare_python_success_reply(
+        session_status: &str,
+        discard_status: &str,
+        manifest: &crate::python_prepare::PythonRequirementsManifest,
+    ) -> CallToolResult {
+        CallToolResult::success(vec![Content::text(format!(
+            "repl_prepare: {session_status}; {discard_status}\n{}\n",
+            crate::python_prepare::format_requirements_manifest(manifest)
+        ))])
+    }
+
+    fn prepare_python_error_reply(
+        message: impl Into<String>,
+        session_status: &str,
+        discard_status: &str,
+        manifest: &crate::python_prepare::PythonRequirementsManifest,
+    ) -> CallToolResult {
+        CallToolResult::error(vec![Content::text(format!(
+            "{}\nrepl_prepare: {session_status}; {discard_status}\n{}\n",
+            message.into(),
+            crate::python_prepare::format_requirements_manifest(manifest)
+        ))])
+    }
+}
+
+fn prepare_discard_status(had_pending_work: bool, user_state_may_exist: bool) -> &'static str {
+    if had_pending_work {
+        "pending work discarded"
+    } else if user_state_may_exist {
+        "user state discarded"
+    } else {
+        "no user state discarded"
+    }
 }
 
 fn input_uses_local_pager_state(state: &ServerState, input: &str) -> bool {
@@ -519,7 +877,7 @@ where
     }
 }
 
-macro_rules! define_backend_tool_server {
+macro_rules! define_repl_only_tool_server {
     ($server_ty:ident, $repl_doc_path:literal) => {
         #[derive(Clone)]
         struct $server_ty {
@@ -577,6 +935,156 @@ macro_rules! define_backend_tool_server {
     };
 }
 
+macro_rules! define_repl_reset_tool_server {
+    ($server_ty:ident, $repl_doc_path:literal) => {
+        #[derive(Clone)]
+        struct $server_ty {
+            shared: SharedServer,
+            tool_router: ToolRouter<Self>,
+        }
+
+        #[tool_router]
+        impl $server_ty {
+            fn new(
+                worker_launch: WorkerLaunch,
+                sandbox_plan: SandboxCliPlan,
+                oversized_output: OversizedOutputMode,
+            ) -> Result<Self, WorkerError> {
+                Ok(Self {
+                    shared: SharedServer::new(worker_launch, sandbox_plan, oversized_output)?,
+                    tool_router: Self::tool_router(),
+                })
+            }
+
+            fn get_info(&self) -> ServerInfo {
+                server_info(self.shared.accepts_sandbox_state_meta())
+            }
+
+            fn logged_tool_router(&self) -> LoggedToolRouter<'_, Self> {
+                LoggedToolRouter::new(&self.tool_router)
+            }
+
+            #[doc = include_str!($repl_doc_path)]
+            #[tool(
+                name = "repl",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
+            async fn repl(
+                &self,
+                meta: Meta,
+                params: Parameters<ReplArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                let ReplArgs { input, timeout_ms } = params.0;
+                let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
+                self.shared.run_write_input(input, timeout, meta).await
+            }
+
+            #[doc = include_str!("../docs/tool-descriptions/repl_reset_tool.md")]
+            #[tool(
+                name = "repl_reset",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
+            async fn repl_reset(
+                &self,
+                meta: Meta,
+                _params: Parameters<ReplResetArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                self.shared.run_reset(meta).await
+            }
+        }
+
+        #[tool_handler(router = self.logged_tool_router())]
+        impl ServerHandler for $server_ty {
+            fn get_info(&self) -> ServerInfo {
+                $server_ty::get_info(self)
+            }
+        }
+    };
+}
+
+macro_rules! define_python_prepare_tool_server {
+    ($server_ty:ident, $repl_doc_path:literal) => {
+        #[derive(Clone)]
+        struct $server_ty {
+            shared: SharedServer,
+            tool_router: ToolRouter<Self>,
+        }
+
+        #[tool_router]
+        impl $server_ty {
+            fn new(
+                worker_launch: WorkerLaunch,
+                sandbox_plan: SandboxCliPlan,
+                oversized_output: OversizedOutputMode,
+            ) -> Result<Self, WorkerError> {
+                Ok(Self {
+                    shared: SharedServer::new(worker_launch, sandbox_plan, oversized_output)?,
+                    tool_router: Self::tool_router(),
+                })
+            }
+
+            fn get_info(&self) -> ServerInfo {
+                server_info(self.shared.accepts_sandbox_state_meta())
+            }
+
+            fn logged_tool_router(&self) -> LoggedToolRouter<'_, Self> {
+                LoggedToolRouter::new(&self.tool_router)
+            }
+
+            #[doc = include_str!($repl_doc_path)]
+            #[tool(
+                name = "repl",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
+            async fn repl(
+                &self,
+                meta: Meta,
+                params: Parameters<ReplArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                let ReplArgs { input, timeout_ms } = params.0;
+                let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
+                self.shared.run_write_input(input, timeout, meta).await
+            }
+
+            #[doc = include_str!("../docs/tool-descriptions/repl_prepare_python.md")]
+            #[tool(
+                name = "repl_prepare",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
+            async fn repl_prepare(
+                &self,
+                meta: Meta,
+                params: Parameters<crate::python_prepare::ReplPrepareArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                self.shared.run_prepare_python(params.0, meta).await
+            }
+        }
+
+        #[tool_handler(router = self.logged_tool_router())]
+        impl ServerHandler for $server_ty {
+            fn get_info(&self) -> ServerInfo {
+                $server_ty::get_info(self)
+            }
+        }
+    };
+}
+
 fn finalize_visible_reply(
     state: &mut ServerState,
     result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
@@ -604,17 +1112,25 @@ fn finalize_visible_reply(
     }
 }
 
-define_backend_tool_server!(RFilesToolServer, "../docs/tool-descriptions/repl_tool_r.md");
-define_backend_tool_server!(
+define_repl_reset_tool_server!(RFilesToolServer, "../docs/tool-descriptions/repl_tool_r.md");
+define_repl_reset_tool_server!(
     RPagerToolServer,
     "../docs/tool-descriptions/repl_tool_r_pager.md"
 );
-define_backend_tool_server!(
+define_repl_only_tool_server!(
     PythonFilesToolServer,
     "../docs/tool-descriptions/repl_tool_python.md"
 );
-define_backend_tool_server!(
+define_repl_only_tool_server!(
     PythonPagerToolServer,
+    "../docs/tool-descriptions/repl_tool_python_pager.md"
+);
+define_python_prepare_tool_server!(
+    PythonPrepareFilesToolServer,
+    "../docs/tool-descriptions/repl_tool_python.md"
+);
+define_python_prepare_tool_server!(
+    PythonPreparePagerToolServer,
     "../docs/tool-descriptions/repl_tool_python_pager.md"
 );
 
@@ -625,6 +1141,10 @@ struct ReplArgs {
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
+
+#[derive(Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+struct ReplResetArgs {}
 
 fn resolve_timeout_ms(
     timeout_ms: Option<u64>,
@@ -729,14 +1249,32 @@ pub async fn run(
         },
         Backend::Python => match oversized_output {
             OversizedOutputMode::Files => {
-                let service =
-                    PythonFilesToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
-                run_backend_server(service.clone(), service.shared.state()).await
+                if crate::python_prepare::uv_available() {
+                    let service = PythonPrepareFilesToolServer::new(
+                        worker_launch,
+                        sandbox_plan,
+                        oversized_output,
+                    )?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                } else {
+                    let service =
+                        PythonFilesToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                }
             }
             OversizedOutputMode::Pager => {
-                let service =
-                    PythonPagerToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
-                run_backend_server(service.clone(), service.shared.state()).await
+                if crate::python_prepare::uv_available() {
+                    let service = PythonPreparePagerToolServer::new(
+                        worker_launch,
+                        sandbox_plan,
+                        oversized_output,
+                    )?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                } else {
+                    let service =
+                        PythonPagerToolServer::new(worker_launch, sandbox_plan, oversized_output)?;
+                    run_backend_server(service.clone(), service.shared.state()).await
+                }
             }
         },
     }

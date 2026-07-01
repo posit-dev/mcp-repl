@@ -1,11 +1,15 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::backend::WorkerLaunch;
 use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox::SandboxStateUpdate;
 use crate::worker_protocol::ContentOrigin;
 
-use super::{WORKER_SHUTDOWN_TIMEOUT, WorkerError, WorkerManager};
+use super::backend_driver::new_backend_driver;
+use super::{
+    WORKER_SHUTDOWN_TIMEOUT, WorkerError, WorkerManager, configured_python_executable_hint,
+};
 
 impl WorkerManager {
     pub(super) fn reset_preserving_detached_prefix_item_count(
@@ -242,6 +246,52 @@ impl WorkerManager {
             }),
         );
         Ok(())
+    }
+
+    pub(crate) fn replace_worker_launch(
+        &mut self,
+        worker_launch: WorkerLaunch,
+    ) -> Result<(), WorkerError> {
+        crate::event_log::log(
+            "worker_replace_launch_begin",
+            serde_json::json!({
+                "worker_launch": worker_launch.label(),
+            }),
+        );
+        self.require_inherited_sandbox_state()?;
+        if let Some(process) = self.process.take() {
+            let _ = process.kill();
+        }
+        self.worker_launch = worker_launch;
+        self.backend = self.worker_launch.builtin_backend().unwrap_or(self.backend);
+        self.active_python_executable_hint = configured_python_executable_hint(&self.worker_launch);
+        self.driver = new_backend_driver(&self.worker_launch);
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
+        }
+        self.process = Some(match self.oversized_output {
+            OversizedOutputMode::Files => self.spawn_process_files()?,
+            OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
+        });
+        crate::event_log::log(
+            "worker_replace_launch_end",
+            serde_json::json!({"status": "ok"}),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn record_worker_launch_for_next_spawn(&mut self, worker_launch: WorkerLaunch) {
+        crate::event_log::log(
+            "worker_record_launch_for_next_spawn",
+            serde_json::json!({
+                "worker_launch": worker_launch.label(),
+            }),
+        );
+        self.worker_launch = worker_launch;
+        self.backend = self.worker_launch.builtin_backend().unwrap_or(self.backend);
+        self.active_python_executable_hint = configured_python_executable_hint(&self.worker_launch);
+        self.driver = new_backend_driver(&self.worker_launch);
     }
 
     pub(super) fn spawn_worker_after_initial_sandbox_state(&mut self) -> Result<(), WorkerError> {

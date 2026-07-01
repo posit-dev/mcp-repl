@@ -5,9 +5,9 @@ This file is the entrypoint for deciding how to verify a change.
 
 ## Core Test Surface
 
-- `tests/run_integration_tests.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, Ctrl-D state clearing, and public sandbox policy behavior.
+- `tests/run_integration_tests.py`: external real-binary checks over MCP stdio, including basic R `repl`, pager command handling, files-mode output bundles, timeout/busy recovery, interrupt/restart prefixes, Ctrl-D state clearing, R `repl_reset` state clearing, and public sandbox policy behavior.
 - `tests/common/`: shared Rust MCP harness for public tool calls, transcript snapshots, sandbox assertions, and client-install fixtures.
-- `tests/repl_surface.rs`, `tests/server_smoke.rs`, `tests/mcp_transcripts.rs`, and `tests/write_stdin_*.rs`: core `repl` behavior, timeout polling, oversized text replies, transcript-file behavior, and snapshot coverage through the public tool API.
+- `tests/repl_surface.rs`, `tests/server_smoke.rs`, `tests/mcp_transcripts.rs`, and `tests/write_stdin_*.rs`: core `repl`, R `repl_reset`, timeout polling, oversized text replies, transcript-file behavior, and snapshot coverage through the public tool API.
 - `tests/pager*.rs` and `tests/oversized_output_cli.rs`: pager mode, files mode, and oversized-output CLI behavior.
 - `tests/python_*.rs`, `tests/r_*.rs`, `tests/plot_images.rs`, and `tests/python_plot_images.rs`: backend-specific public behavior, help/manual surfaces, queued stdin/readline behavior, and image output.
 - `tests/zod_protocol.rs`: IPC-queued custom worker conformance, including PTY launch with sideband IPC kept separate from visible PTY output.
