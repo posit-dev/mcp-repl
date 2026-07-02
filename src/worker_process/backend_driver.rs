@@ -4,7 +4,6 @@ use crate::backend::{Backend, WorkerLaunch};
 use crate::completion_reply::CompletionInfo;
 use crate::ipc::{IpcWaitError, ServerIpcConnection, ServerToWorkerIpcMessage};
 use crate::oversized_output::OversizedOutputMode;
-use crate::worker_supervisor::WorkerProcess;
 
 use super::WorkerError;
 use super::request_lifecycle::{REQUEST_COMPLETION_STABLE_WAIT, completion_info_from_ipc};
@@ -34,8 +33,6 @@ pub(super) trait BackendDriver: Send {
         timeout: Duration,
         ipc: ServerIpcConnection,
     ) -> Result<CompletionInfo, WorkerError>;
-
-    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError>;
 }
 
 pub(super) fn new_backend_driver(worker_launch: &WorkerLaunch) -> Box<dyn BackendDriver> {
@@ -70,15 +67,6 @@ fn driver_wait_for_completion(
         )),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
     }
-}
-
-#[cfg(not(any(target_family = "unix", target_family = "windows")))]
-fn driver_interrupt(process: &mut WorkerProcess) -> Result<(), WorkerError> {
-    if let Some(ipc) = process.ipc_connection() {
-        ipc.note_interrupt_sent();
-        let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt {});
-    }
-    process.send_interrupt()
 }
 
 fn normalize_input_newlines(text: &str) -> String {
@@ -168,14 +156,6 @@ impl BackendDriver for RBackendDriver {
     ) -> Result<CompletionInfo, WorkerError> {
         driver_wait_for_completion(timeout, ipc)
     }
-
-    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(ipc) = process.ipc_connection() {
-            ipc.note_interrupt_sent();
-            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt {});
-        }
-        process.send_r_interrupt()
-    }
 }
 
 struct ProtocolBackendDriver;
@@ -236,15 +216,6 @@ impl BackendDriver for ProtocolBackendDriver {
     ) -> Result<CompletionInfo, WorkerError> {
         driver_wait_for_completion(timeout, ipc)
     }
-
-    fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(ipc) = process.ipc_connection() {
-            ipc.note_interrupt_sent();
-            ipc.send(ServerToWorkerIpcMessage::Interrupt {})
-                .map_err(WorkerError::Io)?;
-        }
-        process.send_interrupt()
-    }
 }
 
 #[cfg(test)]
@@ -262,7 +233,7 @@ mod tests {
     ) {
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: prompt.to_string(),
+                prompt: Some(prompt.to_string()),
             })
             .expect("send input_wait");
         server
@@ -292,11 +263,11 @@ mod tests {
         make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
             text: "1+1\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -311,7 +282,7 @@ mod tests {
         make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            prompt: "debug> ".to_string(),
+            prompt: Some("debug> ".to_string()),
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -334,7 +305,7 @@ mod tests {
         ));
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "p> ".to_string(),
+                prompt: Some("p> ".to_string()),
             })
             .expect("send input_wait");
         let completion = driver
@@ -370,7 +341,7 @@ mod tests {
         ));
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "p> ".to_string(),
+                prompt: Some("p> ".to_string()),
             })
             .expect("send input_wait");
         let completion = driver
@@ -394,7 +365,7 @@ mod tests {
         make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin first input");
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
         });
         let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
             .expect("expected first completion");
@@ -402,11 +373,11 @@ mod tests {
 
         server.begin_input().expect("begin second input");
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
             text: "second()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
         });
 
         let second = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -422,11 +393,11 @@ mod tests {
         make_ready_for_input(&server, &worker, "> ");
         server.begin_input().expect("begin input");
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
             text: "first()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
         });
 
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
@@ -443,7 +414,7 @@ mod tests {
         server.begin_input().expect("begin input");
 
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
             text: "quit()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {
@@ -464,7 +435,7 @@ mod tests {
         server.begin_input().expect("begin input");
 
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            prompt: "> ".to_string(),
+            prompt: Some("> ".to_string()),
             text: "quit()\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::SessionEnd {

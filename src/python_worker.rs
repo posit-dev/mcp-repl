@@ -40,15 +40,13 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    Some(ServerToWorkerIpcMessage::Interrupt {}) => {
-                        #[cfg(windows)]
-                        {
-                            python_session::interrupt();
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            python_session::interrupt();
-                        }
+                    Some(ServerToWorkerIpcMessage::DiscardPendingInput { discard_id }) => {
+                        // Sideband discard is queue cleanup only. Runtime
+                        // interruption comes from the OS signal sent by the
+                        // server, not from this IPC branch.
+                        let discarded_input =
+                            python_session::discard_unconsumed_input_for_discard_ack();
+                        crate::ipc::emit_discard_pending_input_ack(discard_id, discarded_input);
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
                         python_session::request_shutdown();

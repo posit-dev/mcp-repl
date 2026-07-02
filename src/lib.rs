@@ -83,6 +83,10 @@ pub async fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     windows_conpty::attach_stdio_to_conpty_if_attached()?;
     #[cfg(target_os = "windows")]
+    if windows_conpty::invoked_as_windows_conpty_attach() {
+        windows_conpty::run_windows_conpty_attach_main();
+    }
+    #[cfg(target_os = "windows")]
     windows_conpty::emit_stdio_diagnostics_if_requested("main-entry");
     #[cfg(target_os = "linux")]
     if sandbox::invoked_as_codex_linux_sandbox() {

@@ -69,6 +69,29 @@ async fn poll_until_contains(
     Ok(text)
 }
 
+#[cfg(unix)]
+async fn poll_until_contains_ready(
+    session: &common::McpTestSession,
+    mut text: String,
+    expected: &str,
+    context: &str,
+    timeout: Duration,
+) -> TestResult<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(50)).await;
+        let poll = session
+            .write_stdin_raw_unterminated_with("", Some(1.0))
+            .await?;
+        let poll_text = result_text(&poll);
+        text.push_str(&poll_text);
+        if text.contains(expected) && !is_busy_response(&poll_text) {
+            return Ok(text);
+        }
+    }
+    Err(format!("expected {context}, got: {text:?}").into())
+}
+
 fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
     let end = text
         .find("transcript.txt")?
@@ -173,6 +196,64 @@ fn assert_no_pager_markers(text: &str, context: &str) {
 
 fn interrupt_recovery_deadline() -> Instant {
     Instant::now() + Duration::from_secs(20)
+}
+
+async fn write_python_after_interrupt_until_contains(
+    session: &common::McpTestSession,
+    input: &str,
+    expected: &str,
+    context: &str,
+) -> TestResult<String> {
+    let deadline = interrupt_recovery_deadline();
+    let mut keyboard_interrupts = 0usize;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!("{context} did not produce {expected:?} before timeout").into());
+        }
+        let result = session.write_stdin_raw_with(input, Some(5.0)).await?;
+        let text = result_text(&result);
+        if is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        if text.contains(expected) {
+            return Ok(text);
+        }
+        if text.contains("KeyboardInterrupt") && keyboard_interrupts < 2 {
+            keyboard_interrupts += 1;
+            continue;
+        }
+        return Err(format!("{context} failed; got: {text:?}").into());
+    }
+}
+
+async fn write_python_prompt_after_interrupt(
+    session: &common::McpTestSession,
+    input: &str,
+    prompt: &str,
+    context: &str,
+) -> TestResult<String> {
+    let deadline = interrupt_recovery_deadline();
+    let mut keyboard_interrupts = 0usize;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(format!("{context} did not reach prompt {prompt:?} before timeout").into());
+        }
+        let result = session.write_stdin_raw_with(input, Some(5.0)).await?;
+        let text = result_text(&result);
+        if is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        if text.contains(prompt) && !text.contains("Traceback") {
+            return Ok(text);
+        }
+        if text.contains("KeyboardInterrupt") && keyboard_interrupts < 2 {
+            keyboard_interrupts += 1;
+            continue;
+        }
+        return Err(format!("{context} failed; got: {text:?}").into());
+    }
 }
 
 fn python_startup_probe_budget() -> Duration {
@@ -644,6 +725,14 @@ struct DetachedHolderProbe {
 }
 
 #[cfg(unix)]
+fn path_literal(path: &Path, description: &str) -> TestResult<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("{description} path must be valid utf-8"))?;
+    Ok(serde_json::to_string(path)?)
+}
+
+#[cfg(unix)]
 impl DetachedHolderProbe {
     fn new() -> TestResult<Self> {
         let dir = tempdir()?;
@@ -654,11 +743,7 @@ impl DetachedHolderProbe {
     }
 
     fn marker_literal(&self) -> TestResult<String> {
-        let marker = self
-            .marker_path
-            .to_str()
-            .ok_or("detached holder marker path must be valid utf-8")?;
-        Ok(serde_json::to_string(marker)?)
+        path_literal(&self.marker_path, "detached holder marker")
     }
 
     async fn wait_for_exit(&self) -> TestResult<()> {
@@ -667,6 +752,216 @@ impl DetachedHolderProbe {
 
     fn has_exited(&self) -> bool {
         self.marker_path.exists()
+    }
+}
+
+#[cfg(unix)]
+struct BackgroundIpcLeakProbe {
+    _dir: tempfile::TempDir,
+    ready_path: PathBuf,
+    release_path: PathBuf,
+    exited_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl BackgroundIpcLeakProbe {
+    fn new() -> TestResult<Self> {
+        let dir = tempdir()?;
+        Ok(Self {
+            ready_path: dir.path().join("probe-ready"),
+            release_path: dir.path().join("probe-release"),
+            exited_path: dir.path().join("probe-exited"),
+            _dir: dir,
+        })
+    }
+
+    fn ready_literal(&self) -> TestResult<String> {
+        path_literal(&self.ready_path, "background IPC leak probe ready marker")
+    }
+
+    fn release_literal(&self) -> TestResult<String> {
+        path_literal(
+            &self.release_path,
+            "background IPC leak probe release marker",
+        )
+    }
+
+    fn exited_literal(&self) -> TestResult<String> {
+        path_literal(&self.exited_path, "background IPC leak probe exited marker")
+    }
+
+    async fn wait_for_ready(&self) -> TestResult<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_ready_error = None;
+        while Instant::now() < deadline {
+            if self.exited_path.exists() {
+                return Err(format!(
+                    "background IPC leak probe exited before ready: {}",
+                    self.exited_path.display()
+                )
+                .into());
+            }
+            if self.ready_path.exists() {
+                match self.probe_pid() {
+                    Ok(pid) if process_is_alive(pid) => return Ok(()),
+                    Ok(pid) => {
+                        return Err(format!(
+                            "background IPC leak probe was killed before ready completed: pid {pid}, ready marker {}",
+                            self.ready_path.display()
+                        )
+                        .into());
+                    }
+                    Err(err) => {
+                        last_ready_error = Some(err.to_string());
+                    }
+                }
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        let suffix = last_ready_error
+            .map(|err| format!("; last ready marker read error: {err}"))
+            .unwrap_or_default();
+        Err(format!(
+            "background IPC leak probe never started: {}{suffix}",
+            self.ready_path.display()
+        )
+        .into())
+    }
+
+    fn assert_running_before_release(&self, context: &str) -> TestResult<()> {
+        if !self.ready_path.exists() {
+            return Err(format!(
+                "{context}: background IPC leak probe never started: {}",
+                self.ready_path.display()
+            )
+            .into());
+        }
+        if self.exited_path.exists() {
+            return Err(format!(
+                "{context}: background IPC leak probe exited before release: {}",
+                self.exited_path.display()
+            )
+            .into());
+        }
+
+        let pid = self.probe_pid()?;
+        if !process_is_alive(pid) {
+            return Err(format!(
+                "{context}: background IPC leak probe was killed before release: pid {pid}, ready marker {}",
+                self.ready_path.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn release_and_wait_for_exit(&self) -> TestResult<()> {
+        let was_alive_before_release = self.probe_alive().unwrap_or(false);
+        self.write_release_marker()?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.exited_path.exists() {
+                sleep(Duration::from_millis(250)).await;
+                return Ok(());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+
+        if self.ready_path.exists() && !was_alive_before_release {
+            return Err(format!(
+                "background IPC leak probe was killed before release: ready marker {}, release marker {}, exited marker {}",
+                self.ready_path.display(),
+                self.release_path.display(),
+                self.exited_path.display()
+            )
+            .into());
+        }
+        Err(format!(
+            "background IPC leak probe failed to exit after release: release marker {}, exited marker {}",
+            self.release_path.display(),
+            self.exited_path.display()
+        )
+        .into())
+    }
+
+    fn write_release_marker(&self) -> TestResult<()> {
+        fs::write(&self.release_path, "go")?;
+        Ok(())
+    }
+
+    fn wait_for_exit_sync(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.exited_path.exists() {
+                std::thread::sleep(Duration::from_millis(250));
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn probe_alive(&self) -> TestResult<bool> {
+        if !self.ready_path.exists() {
+            return Ok(false);
+        }
+        Ok(process_is_alive(self.probe_pid()?))
+    }
+
+    fn probe_pid(&self) -> TestResult<i32> {
+        let pid_text = fs::read_to_string(&self.ready_path)?;
+        let pid = pid_text.trim().parse::<i32>().map_err(|err| {
+            format!(
+                "background IPC leak probe ready marker did not contain a pid: {}: {err}",
+                self.ready_path.display()
+            )
+        })?;
+        Ok(pid)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BackgroundIpcLeakProbe {
+    fn drop(&mut self) {
+        if self.exited_path.exists() {
+            return;
+        }
+
+        let _ = self.write_release_marker();
+        let _ = self.wait_for_exit_sync(Duration::from_secs(5));
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+async fn fail_background_ipc_leak_probe_test(
+    probe: &BackgroundIpcLeakProbe,
+    session: common::McpTestSession,
+    message: String,
+) -> TestResult<()> {
+    let probe_cleanup = probe.release_and_wait_for_exit().await;
+    let session_cleanup = session.cancel().await;
+    match (probe_cleanup, session_cleanup) {
+        (Ok(()), Ok(())) => Err(message.into()),
+        (Err(probe_err), Ok(())) => {
+            Err(format!("{message}; leak probe cleanup failed: {probe_err}").into())
+        }
+        (Ok(()), Err(session_err)) => {
+            Err(format!("{message}; session cleanup failed: {session_err}").into())
+        }
+        (Err(probe_err), Err(session_err)) => Err(format!(
+            "{message}; leak probe cleanup failed: {probe_err}; session cleanup failed: {session_err}"
+        )
+        .into()),
     }
 }
 
@@ -752,28 +1047,51 @@ print("detached ready")
 }
 
 #[cfg(unix)]
-async fn arm_background_ipc_holder(
+async fn arm_background_ipc_leak_probe(
     session: &mut common::McpTestSession,
-) -> TestResult<DetachedHolderProbe> {
-    let holder = DetachedHolderProbe::new()?;
-    let marker_literal = holder.marker_literal()?;
+) -> TestResult<BackgroundIpcLeakProbe> {
+    let probe = BackgroundIpcLeakProbe::new()?;
+    let ready_literal = probe.ready_literal()?;
+    let release_literal = probe.release_literal()?;
+    let exited_literal = probe.exited_literal()?;
     let setup = session
         .write_stdin_raw_with(
             format!(
                 r#"import subprocess, sys
-script = """import pathlib, time
-time.sleep({DETACHED_STDIO_HOLDER_SECS})
-pathlib.Path({marker_literal}).write_text('done')
-"""
+launcher_script = """import os, subprocess, sys
+holder_script = '''import os, pathlib, sys, time
+ready = pathlib.Path(sys.argv[1])
+release = pathlib.Path(sys.argv[2])
+exited = pathlib.Path(sys.argv[3])
+ready_tmp = ready.with_name(ready.name + ".tmp")
+ready_tmp.write_text(str(os.getpid()))
+os.replace(ready_tmp, ready)
+while not release.exists():
+    time.sleep(0.02)
+exited_tmp = exited.with_name(exited.name + ".tmp")
+exited_tmp.write_text("done")
+os.replace(exited_tmp, exited)
+'''
 subprocess.Popen(
-    [sys.executable, "-c", script],
+    [sys.executable, "-c", holder_script, sys.argv[1], sys.argv[2], sys.argv[3]],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=False,
     start_new_session=True,
 )
-print("ipc background ready")
+"""
+launcher = subprocess.Popen(
+    [sys.executable, "-c", launcher_script, {ready_literal}, {release_literal}, {exited_literal}],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=False,
+)
+launcher_status = launcher.wait()
+if launcher_status != 0:
+    raise SystemExit(launcher_status)
+print("ipc leak probe launcher exited")
 "#
             ),
             Some(5.0),
@@ -781,13 +1099,20 @@ print("ipc background ready")
         .await?;
     let setup_text = result_text(&setup);
     if is_busy_response(&setup_text) {
-        return Err("background-ipc setup remained busy".into());
+        let _ = probe.release_and_wait_for_exit().await;
+        return Err("background IPC leak probe setup remained busy".into());
     }
-    assert!(
-        setup_text.contains("ipc background ready"),
-        "expected background-ipc setup reply, got: {setup_text:?}"
-    );
-    Ok(holder)
+    if !setup_text.contains("ipc leak probe launcher exited") {
+        let _ = probe.release_and_wait_for_exit().await;
+        return Err(
+            format!("expected background IPC leak probe setup reply, got: {setup_text:?}").into(),
+        );
+    }
+    if let Err(err) = probe.wait_for_ready().await {
+        let _ = probe.release_and_wait_for_exit().await;
+        return Err(err);
+    }
+    Ok(probe)
 }
 
 #[cfg(unix)]
@@ -2150,11 +2475,11 @@ print("DETACHED_RAW_MAIN_DONE", flush=True)
     );
 
     fs::write(&release_path, "go")?;
-    let _wait_text = poll_until_contains(
+    let _wait_text = poll_until_contains_ready(
         &session,
         String::new(),
         "DETACHED_RAW_THREAD_WAITING",
-        "detached raw stdin reader to start before follow-up input",
+        "detached raw stdin reader to enter input wait before follow-up input",
         Duration::from_secs(5),
     )
     .await?;
@@ -2235,11 +2560,11 @@ print("DETACHED_RAW_PAIR_MAIN_DONE", flush=True)
     );
 
     fs::write(&release_path, "go")?;
-    let _wait_text = poll_until_contains(
+    let _wait_text = poll_until_contains_ready(
         &session,
         String::new(),
         "DETACHED_RAW_PAIR_WAITING",
-        "detached raw stdin reader to start before follow-up input",
+        "detached raw stdin reader to enter input wait before follow-up input",
         Duration::from_secs(5),
     )
     .await?;
@@ -2983,48 +3308,75 @@ print("detached respawn armed")
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+async fn python_quit_does_not_wait_for_background_process_ipc_leak_probe() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
-    let holder = arm_background_ipc_holder(&mut session).await?;
+    let probe = arm_background_ipc_leak_probe(&mut session).await?;
 
     let start = Instant::now();
     let quit = session.write_stdin_raw_with("quit()", Some(5.0)).await?;
     let elapsed = start.elapsed();
     let quit_text = result_text(&quit);
     if is_busy_response(&quit_text) {
-        eprintln!("python_quit_does_not_wait_for_background_ipc_holders remained busy on quit");
-        holder.wait_for_exit().await?;
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_leak_probe_test(
+            &probe,
+            session,
+            format!("server waited or returned busy unexpectedly on quit(): {quit_text:?}"),
+        )
+        .await;
+    }
+    if elapsed >= shutdown_completion_budget() {
+        return fail_background_ipc_leak_probe_test(
+            &probe,
+            session,
+            format!("server waited unexpectedly on quit(); elapsed {elapsed:?}: {quit_text:?}"),
+        )
+        .await;
     }
 
-    assert!(
-        !holder.has_exited(),
-        "expected quit() to finish before background IPC holder exit, got {elapsed:?}: {quit_text:?}"
-    );
+    if let Err(err) = probe.assert_running_before_release("after quit() returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
+    }
 
+    let follow_up_start = Instant::now();
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_IPC_QUIT')", Some(5.0))
+        .write_stdin_raw_with("print('AFTER_IPC_LEAK_PROBE_QUIT')", Some(5.0))
         .await?;
+    let follow_up_elapsed = follow_up_start.elapsed();
     let follow_up_text = result_text(&follow_up);
     if is_busy_response(&follow_up_text) {
-        eprintln!(
-            "python_quit_does_not_wait_for_background_ipc_holders remained busy after respawn"
-        );
-        holder.wait_for_exit().await?;
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_leak_probe_test(
+            &probe,
+            session,
+            format!(
+                "server waited or returned busy unexpectedly after quit() respawn: {follow_up_text:?}"
+            ),
+        )
+        .await;
+    }
+    if follow_up_elapsed >= shutdown_completion_budget() {
+        return fail_background_ipc_leak_probe_test(
+            &probe,
+            session,
+            format!(
+                "server waited unexpectedly after quit() respawn; elapsed {follow_up_elapsed:?}: {follow_up_text:?}"
+            ),
+        )
+        .await;
+    }
+    if let Err(err) = probe.assert_running_before_release("after quit() respawn returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
     }
 
-    holder.wait_for_exit().await?;
+    let probe_cleanup = probe.release_and_wait_for_exit().await;
     session.cancel().await?;
+    probe_cleanup?;
 
     assert!(
-        follow_up_text.contains("AFTER_IPC_QUIT"),
+        follow_up_text.contains("AFTER_IPC_LEAK_PROBE_QUIT"),
         "expected prompt recovery after quit() respawn, got: {follow_up_text:?}"
     );
     Ok(())
@@ -3032,69 +3384,83 @@ async fn python_quit_does_not_wait_for_background_ipc_holders() -> TestResult<()
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn python_respawn_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+async fn python_respawn_does_not_wait_for_background_process_ipc_leak_probe() -> TestResult<()> {
     let _guard = lock_test_mutex();
-    let Some(session) = start_python_session().await? else {
+    let Some(mut session) = start_python_session().await? else {
         return Ok(());
     };
 
+    let probe = arm_background_ipc_leak_probe(&mut session).await?;
+
     let arm = session
         .write_stdin_raw_with(
-            format!(
-                r#"import os, subprocess, sys, threading, time
-script = "import time; time.sleep({DETACHED_STDIO_HOLDER_SECS})"
-def leave_background_ipc_tail():
+            r#"import os, threading, time
+def exit_worker():
     time.sleep(0.2)
-    subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=False,
-        start_new_session=True,
-    )
     os._exit(0)
-threading.Thread(target=leave_background_ipc_tail, daemon=True).start()
+threading.Thread(target=exit_worker, daemon=True).start()
 print("ipc respawn armed")
-"#
-            ),
+"#,
             Some(5.0),
         )
         .await?;
     let arm_text = result_text(&arm);
     if is_busy_response(&arm_text) {
-        eprintln!("python_respawn_does_not_wait_for_background_ipc_holders remained busy");
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_leak_probe_test(
+            &probe,
+            session,
+            format!(
+                "server returned busy while arming background IPC leak probe respawn: {arm_text:?}"
+            ),
+        )
+        .await;
     }
     assert!(
         arm_text.contains("ipc respawn armed"),
-        "expected background-ipc respawn arming reply, got: {arm_text:?}"
+        "expected background IPC leak probe respawn arming reply, got: {arm_text:?}"
     );
+    if let Err(err) = probe.assert_running_before_release("after respawn arming returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
+    }
 
     sleep(Duration::from_millis(500)).await;
     let start = Instant::now();
     let follow_up = session
-        .write_stdin_raw_with("print('AFTER_IPC_RESPAWN')", Some(5.0))
+        .write_stdin_raw_with("print('AFTER_IPC_LEAK_PROBE_RESPAWN')", Some(5.0))
         .await?;
     let elapsed = start.elapsed();
     let follow_up_text = result_text(&follow_up);
     if is_busy_response(&follow_up_text) {
-        eprintln!(
-            "python_respawn_does_not_wait_for_background_ipc_holders remained busy after exit"
-        );
-        session.cancel().await?;
-        return Ok(());
+        return fail_background_ipc_leak_probe_test(
+            &probe,
+            session,
+            format!(
+                "server waited or returned busy unexpectedly after worker exit: {follow_up_text:?}"
+            ),
+        )
+        .await;
     }
 
+    if elapsed >= shutdown_completion_budget() {
+        return fail_background_ipc_leak_probe_test(
+            &probe,
+            session,
+            format!(
+                "server waited unexpectedly after worker exit; elapsed {elapsed:?}: {follow_up_text:?}"
+            ),
+        )
+        .await;
+    }
+    if let Err(err) = probe.assert_running_before_release("after respawn returned") {
+        return fail_background_ipc_leak_probe_test(&probe, session, err.to_string()).await;
+    }
+
+    let probe_cleanup = probe.release_and_wait_for_exit().await;
     session.cancel().await?;
+    probe_cleanup?;
 
     assert!(
-        elapsed < shutdown_completion_budget(),
-        "expected respawn to finish before background IPC holder exit, got {elapsed:?}: {follow_up_text:?}"
-    );
-    assert!(
-        follow_up_text.contains("AFTER_IPC_RESPAWN"),
+        follow_up_text.contains("AFTER_IPC_LEAK_PROBE_RESPAWN"),
         "expected prompt recovery after respawn, got: {follow_up_text:?}"
     );
     Ok(())
@@ -4331,7 +4697,7 @@ print('DELAYED_VALUE', value)
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
+async fn python_input_interrupt_tail_handles_signal_before_tail() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
@@ -4354,32 +4720,172 @@ async fn python_interrupt_unblocks_input_prompt() -> TestResult<()> {
         "expected input prompt, got: {text:?}"
     );
 
+    let tail = session
+        .write_stdin_raw_unterminated_with("\u{3}print('AFTER_INPUT_INTERRUPT_TAIL')", Some(5.0))
+        .await?;
+    let tail_text = result_text(&tail);
+    session.cancel().await?;
+
+    assert!(
+        !is_busy_response(&tail_text),
+        "expected interrupt tail to complete, got: {tail_text:?}"
+    );
+    assert!(
+        tail_text.contains("KeyboardInterrupt"),
+        "expected real Python interrupt before tail, got: {tail_text:?}"
+    );
+    assert!(
+        tail_text.contains("AFTER_INPUT_INTERRUPT_TAIL"),
+        "expected tail to run as a fresh cell after input interrupt, got: {tail_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_bare_input_interrupt_completes_after_os_signal() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let mut text = result_text(
+        &session
+            .write_stdin_raw_with("value = input('bare interrupt> ')", Some(1.0))
+            .await?,
+    );
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("bare interrupt> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        text.contains("bare interrupt> "),
+        "expected input prompt, got: {text:?}"
+    );
+
     let interrupt = session
         .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
         .await?;
     let interrupt_text = result_text(&interrupt);
-    if is_busy_response(&interrupt_text) {
-        eprintln!("input prompt interrupt stayed busy in this Python runtime; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
+
     assert!(
         !is_busy_response(&interrupt_text),
-        "expected input prompt interrupt to complete, got: {interrupt_text:?}"
+        "expected bare input interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with(
-            "print('AFTER_INPUT_INTERRUPT')\nprint('AFTER_INPUT_INTERRUPT_DONE')",
-            Some(5.0),
-        )
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_BARE_INPUT_INTERRUPT')",
+        "AFTER_BARE_INPUT_INTERRUPT",
+        "bare input interrupt follow-up",
+    )
+    .await?;
     session.cancel().await?;
 
     assert!(
-        !is_busy_response(&follow_up_text) && follow_up_text.contains("AFTER_INPUT_INTERRUPT_DONE"),
-        "expected immediate follow-up to complete after input prompt interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        follow_up_text.contains("AFTER_BARE_INPUT_INTERRUPT"),
+        "expected follow-up to run after bare input interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_bare_idle_interrupt_completes_after_os_signal() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected bare idle interrupt to complete, got: {interrupt_text:?}"
+    );
+    assert!(
+        interrupt_text.contains("KeyboardInterrupt"),
+        "expected bare idle interrupt to observe real Python interrupt, got: {interrupt_text:?}"
+    );
+
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_BARE_IDLE_INTERRUPT')",
+        "AFTER_BARE_IDLE_INTERRUPT",
+        "bare idle interrupt follow-up",
+    )
+    .await?;
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("AFTER_BARE_IDLE_INTERRUPT"),
+        "expected follow-up to run after bare idle interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_input_interrupt_custom_handler_continues_waiting_for_answer() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = r#"
+import signal
+sigint_count = 0
+def handle_sigint(signum, frame):
+    global sigint_count
+    sigint_count += 1
+    print("CUSTOM_INPUT_INTERRUPT", sigint_count)
+signal.signal(signal.SIGINT, handle_sigint)
+value = input('custom interrupt> ')
+print('CUSTOM_INPUT_VALUE', value, sigint_count)
+"#;
+    let mut text = result_text(&session.write_stdin_raw_with(setup, Some(1.0)).await?);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && is_busy_response(&text)
+            && !text.contains("custom interrupt> ")
+        {
+            sleep(Duration::from_millis(50)).await;
+            text = result_text(&session.write_stdin_raw_with("", Some(1.0)).await?);
+        }
+    }
+    assert!(
+        text.contains("custom interrupt> "),
+        "expected custom input prompt, got: {text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(1.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
+    session.cancel().await?;
+    let combined_text = format!("{interrupt_text}{answer_text}");
+
+    assert!(
+        combined_text.contains("CUSTOM_INPUT_INTERRUPT 1"),
+        "expected custom interrupt handler to run from real signal, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("CUSTOM_INPUT_VALUE answer 1"),
+        "expected input to keep waiting and consume later answer, got: {answer_text:?}"
+    );
+    assert!(
+        !combined_text.contains("KeyboardInterrupt"),
+        "sideband should not force KeyboardInterrupt when custom handler returns, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
     );
     Ok(())
 }
@@ -4394,7 +4900,20 @@ async fn python_windows_input_wait_interrupt_preserves_next_input_batch() -> Tes
 
     let mut text = result_text(
         &session
-            .write_stdin_raw_with("value = input('win interrupt> ')", Some(5.0))
+            .write_stdin_raw_with(
+                r#"
+import signal
+interrupt_count = 0
+def handle_sigint(signum, frame):
+    global interrupt_count
+    interrupt_count += 1
+    print("WINDOWS_INPUT_SIGINT", interrupt_count)
+signal.signal(signal.SIGINT, handle_sigint)
+value = input('win interrupt> ')
+print('WINDOWS_INPUT_VALUE', value, interrupt_count)
+"#,
+                Some(5.0),
+            )
             .await?,
     );
     if is_busy_response(&text) {
@@ -4425,15 +4944,17 @@ async fn python_windows_input_wait_interrupt_preserves_next_input_batch() -> Tes
         "expected input-wait interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_WINDOWS_STDIN_INTERRUPT')", Some(5.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let answer = session.write_stdin_raw_with("answer", Some(5.0)).await?;
+    let answer_text = result_text(&answer);
     session.cancel().await?;
 
     assert!(
-        follow_up_text.contains("AFTER_WINDOWS_STDIN_INTERRUPT"),
-        "expected follow-up to run after input-wait interrupt, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        format!("{interrupt_text}{answer_text}").contains("WINDOWS_INPUT_SIGINT 1"),
+        "expected Windows SIGINT handler to run from real terminal Ctrl-C, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
+    );
+    assert!(
+        answer_text.contains("WINDOWS_INPUT_VALUE answer 1"),
+        "expected input to keep waiting and consume later answer, got interrupt: {interrupt_text:?}; answer: {answer_text:?}"
     );
     Ok(())
 }
@@ -4485,10 +5006,13 @@ async fn python_interrupt_unblocks_primary_shaped_input_prompt() -> TestResult<(
         "expected primary-shaped input prompt interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT')", Some(5.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT')",
+        "AFTER_PRIMARY_SHAPED_INPUT_INTERRUPT",
+        "primary-shaped input prompt interrupt follow-up",
+    )
+    .await?;
     session.cancel().await?;
 
     assert!(
@@ -4545,17 +5069,17 @@ async fn python_sigint_handler_runs_once_for_interrupt() -> TestResult<()> {
         .write_stdin_raw_with(
             r#"exec("""
 import signal, time
-sigint_count = 0
-def handle_sigint(signum, frame):
-    global sigint_count
-    sigint_count += 1
-    print("SIGINT_COUNT", sigint_count)
-signal.signal(signal.SIGINT, handle_sigint)
-print("SIGINT_READY")
-while sigint_count == 0:
+interrupt_count = 0
+def handle_interrupt(signum, frame):
+    global interrupt_count
+    interrupt_count += 1
+    print("SIGNAL_COUNT", interrupt_count)
+signal.signal(signal.SIGINT, handle_interrupt)
+print("SIGNAL_READY")
+while interrupt_count == 0:
     pass
 time.sleep(0.2)
-print("SIGINT_FINAL", sigint_count)
+print("SIGNAL_FINAL", interrupt_count)
 """)
 "#,
             Some(0.2),
@@ -4564,7 +5088,7 @@ print("SIGINT_FINAL", sigint_count)
     let timeout_text = result_text(&timeout_result);
     assert!(
         timeout_text.contains("<<repl status: busy"),
-        "expected SIGINT handler loop to time out, got: {timeout_text:?}"
+        "expected signal handler loop to time out, got: {timeout_text:?}"
     );
 
     let interrupt = session
@@ -4573,18 +5097,76 @@ print("SIGINT_FINAL", sigint_count)
     let interrupt_text = result_text(&interrupt);
     assert!(
         !is_busy_response(&interrupt_text),
-        "expected idle SIGINT handler interrupt to complete, got: {interrupt_text:?}"
+        "expected idle signal handler interrupt to complete, got: {interrupt_text:?}"
     );
 
     let follow_up = session
-        .write_stdin_raw_with("print('SIGINT_FINAL', sigint_count)", Some(5.0))
+        .write_stdin_raw_with("print('SIGNAL_FINAL', interrupt_count)", Some(5.0))
         .await?;
     let follow_up_text = result_text(&follow_up);
     session.cancel().await?;
 
     assert!(
-        follow_up_text.contains("SIGINT_FINAL 1"),
-        "expected one SIGINT delivery, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+        follow_up_text.contains("SIGNAL_FINAL 1"),
+        "expected one signal delivery, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn python_windows_interrupt_delivers_sigint_to_running_cell() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let Some(session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let timeout_result = session
+        .write_stdin_raw_with(
+            r#"exec("""
+import signal
+sigint_count = 0
+def handle_sigint(signum, frame):
+    global sigint_count
+    sigint_count += 1
+signal.signal(signal.SIGINT, handle_sigint)
+print("WINDOWS_SIGINT_READY")
+while sigint_count == 0:
+    pass
+print("WINDOWS_SIGINT_DONE", sigint_count)
+""")
+"#,
+            Some(0.2),
+        )
+        .await?;
+    let timeout_text = result_text(&timeout_result);
+    assert!(
+        timeout_text.contains("<<repl status: busy"),
+        "expected Windows SIGINT handler loop to time out, got: {timeout_text:?}"
+    );
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(5.0))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    assert!(
+        !is_busy_response(&interrupt_text),
+        "expected Windows SIGINT interrupt to complete, got: {interrupt_text:?}"
+    );
+    assert!(
+        interrupt_text.contains("WINDOWS_SIGINT_DONE 1"),
+        "expected Windows interrupt reply to show Python SIGINT delivery, got: {interrupt_text:?}"
+    );
+
+    let follow_up = session
+        .write_stdin_raw_with("print('WINDOWS_SIGINT_FINAL', sigint_count)", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("WINDOWS_SIGINT_FINAL 1"),
+        "expected Windows Ctrl-C to deliver one Python SIGINT, got interrupt: {interrupt_text:?}; follow-up: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -4702,16 +5284,27 @@ async fn python_interrupt_aborts_running_cell_without_replaying_tail() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestResult<()> {
+async fn python_idle_interrupt_tail_handles_signal_before_tail_cell() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let Some(session) = start_python_session().await? else {
         return Ok(());
     };
 
-    let follow_up = session
+    let first = session
         .write_stdin_raw_with("\u{3}print('AFTER_IDLE_INTERRUPT')", Some(5.0))
         .await?;
-    let follow_up_text = result_text(&follow_up);
+    let first_text = result_text(&first);
+    let follow_up_text = if first_text.contains("AFTER_IDLE_INTERRUPT") {
+        first_text
+    } else {
+        write_python_after_interrupt_until_contains(
+            &session,
+            "print('AFTER_IDLE_INTERRUPT')",
+            "AFTER_IDLE_INTERRUPT",
+            "idle interrupt follow-up",
+        )
+        .await?
+    };
     session.cancel().await?;
 
     assert!(
@@ -4719,8 +5312,8 @@ async fn python_idle_interrupt_completes_without_poisoning_next_cell() -> TestRe
         "expected follow-up cell after idle Ctrl-C to run, got: {follow_up_text:?}"
     );
     assert!(
-        !follow_up_text.contains("KeyboardInterrupt"),
-        "idle Ctrl-C leaked into the follow-up cell, got: {follow_up_text:?}"
+        follow_up_text.contains("KeyboardInterrupt"),
+        "expected idle Ctrl-C to be handled before the tail cell, got: {follow_up_text:?}"
     );
     Ok(())
 }
@@ -4766,10 +5359,13 @@ async fn python_interrupt_unblocks_empty_input_prompt() -> TestResult<()> {
         "expected empty input prompt interrupt to complete, got: {interrupt_text:?}"
     );
 
-    let follow_up = session
-        .write_stdin_raw_with("print('AFTER_EMPTY_INPUT_INTERRUPT')", Some(5.0))
-        .await?;
-    let follow_up_text = result_text(&follow_up);
+    let follow_up_text = write_python_after_interrupt_until_contains(
+        &session,
+        "print('AFTER_EMPTY_INPUT_INTERRUPT')",
+        "AFTER_EMPTY_INPUT_INTERRUPT",
+        "empty input prompt interrupt follow-up",
+    )
+    .await?;
     session.cancel().await?;
 
     assert!(
@@ -5335,15 +5931,49 @@ async fn python_ctrl_c_prefix_preserves_followup_fresh_input_batch() -> TestResu
         text = result_text(&session.write_stdin_raw_with("", Some(0.5)).await?);
     }
 
-    assert!(
-        text.contains("after> "),
-        "expected fresh cell after ctrl-c prefix to reach input prompt, got: {text:?}"
-    );
-
-    let answer = session
-        .write_stdin_raw_with("queued-answer", Some(5.0))
+    if !text.contains("after> ") || text.contains("Traceback") {
+        text = write_python_prompt_after_interrupt(
+            &session,
+            "value = input('after> ')\nprint('AFTER_STALE_INTERRUPT', value.strip())",
+            "after> ",
+            "ctrl-c prefix follow-up input prompt",
+        )
         .await?;
-    let text = result_text(&answer);
+    }
+
+    let answer_deadline = interrupt_recovery_deadline();
+    let text = loop {
+        if Instant::now() >= answer_deadline {
+            session.cancel().await?;
+            return Err("ctrl-c prefix follow-up never consumed the prompt answer".into());
+        }
+        if !text.contains("after> ") || text.contains("Traceback") {
+            text = write_python_prompt_after_interrupt(
+                &session,
+                "value = input('after> ')\nprint('AFTER_STALE_INTERRUPT', value.strip())",
+                "after> ",
+                "ctrl-c prefix follow-up input prompt",
+            )
+            .await?;
+        }
+        let answer = session
+            .write_stdin_raw_with("queued-answer", Some(5.0))
+            .await?;
+        let answer_text = result_text(&answer);
+        if answer_text.contains("AFTER_STALE_INTERRUPT queued-answer") {
+            break answer_text;
+        }
+        if is_busy_response(&answer_text)
+            || answer_text.contains("KeyboardInterrupt")
+            || answer_text.contains("NameError")
+        {
+            text.clear();
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        session.cancel().await?;
+        return Err(format!("unexpected ctrl-c prefix answer response: {answer_text:?}").into());
+    };
     session.cancel().await?;
 
     assert!(
@@ -5364,11 +5994,11 @@ async fn python_interrupt_wakes_time_sleep_signal_handler() -> TestResult<()> {
         .write_stdin_raw_with(
             r#"exec("""
 import signal, time
-def handle_sigint(signum, frame):
-    print("PY_SLEEP_SIGINT")
+def handle_interrupt(signum, frame):
+    print("PY_SLEEP_INTERRUPT")
     raise KeyboardInterrupt
 
-signal.signal(signal.SIGINT, handle_sigint)
+signal.signal(signal.SIGINT, handle_interrupt)
 print("PY_SLEEP_READY", flush=True)
 try:
     time.sleep(30)
@@ -5423,8 +6053,8 @@ except KeyboardInterrupt:
     session.cancel().await?;
 
     assert!(
-        text.contains("PY_SLEEP_SIGINT") && text.contains("PY_SLEEP_INTERRUPTED"),
-        "expected SIGINT handler to wake sleep, got: {text:?}"
+        text.contains("PY_SLEEP_INTERRUPT") && text.contains("PY_SLEEP_INTERRUPTED"),
+        "expected signal handler to wake sleep, got: {text:?}"
     );
     assert!(
         follow_up_text.contains("PY_SLEEP_AFTER_INTERRUPT"),

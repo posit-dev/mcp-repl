@@ -44,6 +44,9 @@ impl WorkerLaunch {
             {
                 WorkerStdinTransport::Pty
             }
+            Self::Builtin(Backend::R) if cfg!(target_family = "windows") => {
+                WorkerStdinTransport::Pty
+            }
             Self::Builtin(_) => WorkerStdinTransport::Pipe,
             Self::Custom(spec) => spec.stdin.transport(),
         }
@@ -196,9 +199,15 @@ mod tests {
 
     #[test]
     fn builtin_worker_launches_default_to_pipe_stdin_transport() {
+        #[cfg(not(target_family = "windows"))]
         assert_eq!(
             WorkerLaunch::Builtin(Backend::R).stdin_transport(),
             WorkerStdinTransport::Pipe
+        );
+        #[cfg(target_family = "windows")]
+        assert_eq!(
+            WorkerLaunch::Builtin(Backend::R).stdin_transport(),
+            WorkerStdinTransport::Pty
         );
         #[cfg(not(target_family = "unix"))]
         {
