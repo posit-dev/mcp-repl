@@ -2454,7 +2454,10 @@ release_path = pathlib.Path({release_path_literal})
 def read_later():
     while not release_path.exists():
         time.sleep(0.01)
-    print("DETACHED_RAW_THREAD_WAITING", flush=True)
+    def announce_waiting():
+        time.sleep(0.05)
+        print("DETACHED_RAW_THREAD_WAITING", flush=True)
+    threading.Thread(target=announce_waiting, daemon=True).start()
     data = os.read(0, 5)
     print("DETACHED_RAW_THREAD_READ", data.decode("utf-8"), flush=True)
 threading.Thread(target=read_later, daemon=True).start()
@@ -2538,7 +2541,10 @@ release_path = pathlib.Path({release_path_literal})
 def read_later():
     while not release_path.exists():
         time.sleep(0.01)
-    print("DETACHED_RAW_PAIR_WAITING", flush=True)
+    def announce_waiting():
+        time.sleep(0.05)
+        print("DETACHED_RAW_PAIR_WAITING", flush=True)
+    threading.Thread(target=announce_waiting, daemon=True).start()
     first = os.read(0, 2)
     second = os.read(0, 2)
     print("DETACHED_RAW_PAIR_READ", first.decode("utf-8"), second.decode("utf-8"), flush=True)
