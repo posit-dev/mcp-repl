@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset, timeout_status_content};
-use crate::ipc::{IpcInputReadiness, IpcWaitError};
+use crate::ipc::IpcWaitError;
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -275,11 +275,11 @@ impl WorkerManager {
             && let Some(ipc) = process.ipc_connection()
         {
             let readiness = match interrupt_sent_at {
-                Some(sent_at) => ipc.wait_for_input_wait_or_fresh_ready(timeout, sent_at),
+                Some(sent_at) => ipc.wait_for_interrupt_input_readiness(timeout, sent_at),
                 None => ipc.wait_for_input_readiness(timeout),
             };
             match readiness {
-                Ok(IpcInputReadiness::InputWait(value)) => {
+                Ok(value) => {
                     prompt = value;
                 }
                 Err(IpcWaitError::Timeout) => {
@@ -442,9 +442,10 @@ fn send_interrupt_with_pending_input_discard(
     let mut protocol_error = None;
     if let Some(ipc) = process.ipc_connection() {
         let ack_wait_since = Instant::now();
-        match ipc.send_discard_pending_input() {
+        let ack_deadline = Instant::now() + timeout.min(DISCARD_PENDING_INPUT_ACK_TIMEOUT);
+        match ipc.send_discard_pending_input(remaining_until(ack_deadline)) {
             Ok(discard_id) => {
-                let ack_timeout = timeout.min(DISCARD_PENDING_INPUT_ACK_TIMEOUT);
+                let ack_timeout = remaining_until(ack_deadline);
                 match ipc.wait_for_discard_pending_input_ack(ack_timeout, discard_id) {
                     Ok(Some(ack)) => {
                         crate::event_log::log(

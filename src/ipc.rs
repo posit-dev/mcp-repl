@@ -23,7 +23,7 @@ pub use protocol::{
     WorkerToServerIpcMessage,
 };
 pub use server_connection::{
-    IpcDiscardPendingInputAck, IpcHandle, IpcInputReadiness, IpcWaitError, ServerIpcConnection,
+    IpcDiscardPendingInputAck, IpcHandle, IpcWaitError, ServerIpcConnection,
 };
 #[cfg(target_family = "windows")]
 pub use transport::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};

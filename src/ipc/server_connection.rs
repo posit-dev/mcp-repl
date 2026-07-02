@@ -49,11 +49,6 @@ pub struct ServerIpcConnection {
     handler_gate: Arc<IpcHandlerGate>,
 }
 
-#[derive(Debug)]
-pub enum IpcInputReadiness {
-    InputWait(Option<String>),
-}
-
 #[derive(Debug, Clone)]
 pub struct IpcDiscardPendingInputAck {
     pub discard_id: u64,
@@ -468,13 +463,18 @@ impl ServerIpcConnection {
         self.cvar.notify_all();
     }
 
-    pub fn send_discard_pending_input(&self) -> io::Result<u64> {
-        let mut guard = self.inbox.lock().unwrap();
-        guard.next_discard_id += 1;
-        let discard_id = guard.next_discard_id;
-        self.writer
-            .send(ServerToWorkerIpcMessage::DiscardPendingInput { discard_id })?;
-        guard.last_sent_discard_id = discard_id;
+    pub fn send_discard_pending_input(&self, timeout: Duration) -> io::Result<u64> {
+        let discard_id = {
+            let mut guard = self.inbox.lock().unwrap();
+            guard.next_discard_id += 1;
+            let discard_id = guard.next_discard_id;
+            guard.last_sent_discard_id = discard_id;
+            discard_id
+        };
+        self.writer.send_with_timeout(
+            ServerToWorkerIpcMessage::DiscardPendingInput { discard_id },
+            timeout,
+        )?;
         self.cvar.notify_all();
         Ok(discard_id)
     }
@@ -493,20 +493,8 @@ impl ServerIpcConnection {
             if guard.disconnected {
                 return Err(IpcWaitError::Disconnected);
             }
-            while guard
-                .discard_pending_input_acks
-                .front()
-                .is_some_and(|ack| ack.discard_id < discard_id)
-            {
-                guard.discard_pending_input_acks.pop_front();
-            }
-            if let Some(ack) = guard.discard_pending_input_acks.front() {
-                if ack.discard_id == discard_id {
-                    return Ok(guard.discard_pending_input_acks.pop_front());
-                }
-                return Err(IpcWaitError::Protocol(
-                    "discard_pending_input_ack for unsent discard_pending_input".to_string(),
-                ));
+            if let Some(ack) = take_discard_pending_input_ack(&mut guard, discard_id)? {
+                return Ok(Some(ack));
             }
 
             let now = Instant::now();
@@ -517,36 +505,7 @@ impl ServerIpcConnection {
             let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
             guard = next_guard;
             if timeout_res.timed_out() {
-                if let Some(message) = guard.input_state.take_protocol_error() {
-                    return Err(IpcWaitError::Protocol(message));
-                }
-                if guard.disconnected {
-                    return Err(IpcWaitError::Disconnected);
-                }
-                while guard
-                    .discard_pending_input_acks
-                    .front()
-                    .is_some_and(|ack| ack.discard_id < discard_id)
-                {
-                    guard.discard_pending_input_acks.pop_front();
-                }
-                if guard
-                    .discard_pending_input_acks
-                    .front()
-                    .is_some_and(|ack| ack.discard_id == discard_id)
-                {
-                    return Ok(guard.discard_pending_input_acks.pop_front());
-                }
-                if guard
-                    .discard_pending_input_acks
-                    .front()
-                    .is_some_and(|ack| ack.discard_id > discard_id)
-                {
-                    return Err(IpcWaitError::Protocol(
-                        "discard_pending_input_ack for unsent discard_pending_input".to_string(),
-                    ));
-                }
-                return Ok(None);
+                continue;
             }
         }
     }
@@ -684,7 +643,7 @@ impl ServerIpcConnection {
     pub fn wait_for_input_readiness(
         &self,
         timeout: Duration,
-    ) -> Result<IpcInputReadiness, IpcWaitError> {
+    ) -> Result<Option<String>, IpcWaitError> {
         self.wait_for_input_readiness_after(timeout, None, true)
     }
 
@@ -693,15 +652,15 @@ impl ServerIpcConnection {
         &self,
         timeout: Duration,
         since: Instant,
-    ) -> Result<IpcInputReadiness, IpcWaitError> {
+    ) -> Result<Option<String>, IpcWaitError> {
         self.wait_for_input_readiness_after(timeout, Some(since), false)
     }
 
-    pub fn wait_for_input_wait_or_fresh_ready(
+    pub fn wait_for_interrupt_input_readiness(
         &self,
         timeout: Duration,
         since: Instant,
-    ) -> Result<IpcInputReadiness, IpcWaitError> {
+    ) -> Result<Option<String>, IpcWaitError> {
         self.wait_for_input_readiness_after(timeout, Some(since), true)
     }
 
@@ -710,7 +669,7 @@ impl ServerIpcConnection {
         timeout: Duration,
         since: Option<Instant>,
         accept_existing_input_wait: bool,
-    ) -> Result<IpcInputReadiness, IpcWaitError> {
+    ) -> Result<Option<String>, IpcWaitError> {
         let deadline = Instant::now() + timeout;
         let mut guard = self.inbox.lock().unwrap();
         loop {
@@ -734,7 +693,7 @@ impl ServerIpcConnection {
                     let prompt = prompt.clone();
                     guard.last_prompt = None;
                     guard.last_prompt_observed_at = None;
-                    return Ok(IpcInputReadiness::InputWait(Some(prompt)));
+                    return Ok(Some(prompt));
                 }
                 guard.last_prompt = None;
                 guard.last_prompt_observed_at = None;
@@ -748,7 +707,7 @@ impl ServerIpcConnection {
                 None => guard.input_state.ready_for_input(),
             };
             if ready {
-                return Ok(IpcInputReadiness::InputWait(None));
+                return Ok(None);
             }
 
             let now = Instant::now();
@@ -819,6 +778,32 @@ fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
         guard.queue.remove(idx);
     }
     true
+}
+
+fn take_discard_pending_input_ack(
+    guard: &mut ServerIpcInbox,
+    discard_id: u64,
+) -> Result<Option<IpcDiscardPendingInputAck>, IpcWaitError> {
+    while guard
+        .discard_pending_input_acks
+        .front()
+        .is_some_and(|ack| ack.discard_id < discard_id)
+    {
+        guard.discard_pending_input_acks.pop_front();
+    }
+    match guard
+        .discard_pending_input_acks
+        .front()
+        .map(|ack| ack.discard_id)
+    {
+        Some(found_id) if found_id == discard_id => {
+            Ok(guard.discard_pending_input_acks.pop_front())
+        }
+        Some(_) => Err(IpcWaitError::Protocol(
+            "discard_pending_input_ack for unsent discard_pending_input".to_string(),
+        )),
+        None => Ok(None),
+    }
 }
 
 fn push_prompt_history(guard: &mut ServerIpcInbox, prompt: String) {
@@ -1203,7 +1188,7 @@ mod tests {
             .expect("server observes input_wait");
 
         let discard_id = server
-            .send_discard_pending_input()
+            .send_discard_pending_input(Duration::from_millis(200))
             .expect("send discard_pending_input");
         worker
             .send(WorkerToServerIpcMessage::DiscardPendingInputAck {
@@ -1239,7 +1224,7 @@ mod tests {
             test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
 
         let first_discard_id = server
-            .send_discard_pending_input()
+            .send_discard_pending_input(Duration::from_millis(200))
             .expect("send first discard_pending_input");
         worker
             .send(WorkerToServerIpcMessage::DiscardPendingInputAck {
@@ -1249,7 +1234,7 @@ mod tests {
             .expect("send delayed discard_pending_input_ack");
 
         let second_discard_id = server
-            .send_discard_pending_input()
+            .send_discard_pending_input(Duration::from_millis(200))
             .expect("send second discard_pending_input");
         let stale = server
             .wait_for_discard_pending_input_ack(Duration::from_millis(20), second_discard_id)
@@ -1276,7 +1261,7 @@ mod tests {
         server.begin_input().expect("begin input");
 
         let discard_id = server
-            .send_discard_pending_input()
+            .send_discard_pending_input(Duration::from_millis(200))
             .expect("send discard_pending_input");
         worker
             .send(WorkerToServerIpcMessage::DiscardPendingInputAck {
@@ -1329,7 +1314,7 @@ mod tests {
             .expect("send prompt-free input_wait");
         assert!(matches!(
             server.wait_for_input_readiness(Duration::from_millis(200)),
-            Ok(super::IpcInputReadiness::InputWait(None))
+            Ok(None)
         ));
 
         let after_cached_ready = Instant::now();
@@ -1345,7 +1330,7 @@ mod tests {
             .expect("send fresh prompt-free input_wait");
         assert!(matches!(
             server.wait_for_fresh_input_readiness(Duration::from_millis(200), after_cached_ready),
-            Ok(super::IpcInputReadiness::InputWait(None))
+            Ok(None)
         ));
 
         let observed_input_wait = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1391,7 +1376,7 @@ mod tests {
                 Duration::from_millis(200),
                 after_cached_input_wait
             ),
-            Ok(super::IpcInputReadiness::InputWait(prompt)) if prompt.as_deref() == Some("fresh> ")
+            Ok(Some(prompt)) if prompt == "fresh> "
         ));
     }
 

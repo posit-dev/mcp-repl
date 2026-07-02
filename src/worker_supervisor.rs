@@ -29,7 +29,7 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcHandle, IpcInputLineEvent, IpcInputReadiness, IpcServer, IpcWaitError, ServerIpcConnection,
+    IpcHandle, IpcInputLineEvent, IpcServer, IpcWaitError, ServerIpcConnection,
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
@@ -489,7 +489,7 @@ fn seed_initial_readiness_from_process(
         return Ok(Some(InitialWorkerPrompt::Immediate(raw_prompt)));
     }
     match ipc.wait_for_input_readiness(WORKER_READY_TIMEOUT) {
-        Ok(IpcInputReadiness::InputWait(prompt)) => Ok(prompt.map(InitialWorkerPrompt::Waited)),
+        Ok(prompt) => Ok(prompt.map(InitialWorkerPrompt::Waited)),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
         Err(IpcWaitError::Timeout) => Ok(None),
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(

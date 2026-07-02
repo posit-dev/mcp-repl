@@ -129,14 +129,14 @@ fn worker_sideband_protocol_keeps_images_one_way() {
     for required in [
         r#"{ "type": "output_text", "stream": <"stdout"|"stderr">, "data_b64": <base64>, "is_continuation": <bool, optional> }"#,
         r#"{ "type": "output_image", "mime_type": <string>, "data_b64": <base64>, "is_update": <bool>, "source": <string|null> }"#,
-        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 9 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
+        r#"{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 7 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }"#,
         r#"{ "type": "input_batch", "input": <string> }"#,
         r#"{ "type": "input_line", "prompt": <string|null>, "text": <string> }"#,
         r#"{ "type": "input_wait", "prompt": <string|null> }"#,
         r#"{ "type": "discard_pending_input_ack", "discard_id": <integer>, "discarded_input": <bool> }"#,
         r#"{ "type": "session_end", "reason": <string>, "message": <string, optional> }"#,
         r#"{ "type": "discard_pending_input", "discard_id": <integer> }"#,
-        "This document defines worker protocol version 9.",
+        "This document defines worker protocol version 7.",
         "The server rejects unsupported",
         "There is no image acknowledgement message.",
         "This message does not mark the worker ready",
@@ -180,7 +180,7 @@ fn futurework_stdin_transport_tracks_worker_protocol_version() {
     let futurework = read(&repo_root().join("docs/futurework/stdin-transport-single-owner.md"));
 
     assert!(
-        futurework.contains("Treat the protocol v8 `input_batch` payload"),
+        futurework.contains("Treat the protocol v7 `input_batch` payload"),
         "futurework stdin transport note should track the worker protocol version"
     );
 }

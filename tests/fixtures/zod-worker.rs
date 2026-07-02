@@ -97,7 +97,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 9,
+            version: 7,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),

@@ -1,6 +1,6 @@
 # Worker Sideband Protocol
 
-This document defines worker protocol version 9. The server rejects unsupported
+This document defines worker protocol version 7. The server rejects unsupported
 protocol versions before sending user input.
 
 The sideband is a UTF-8 JSON-lines IPC stream between the server and one worker
@@ -115,7 +115,7 @@ capture does not preserve separate stdout/stderr identity. Sideband
 - Built-in workers request runtime shutdown after receiving it. They may emit
   output from the active request before `session_end` and process exit.
 
-The server emits no other server-to-worker protocol messages in v9.
+The server emits no other server-to-worker protocol messages in v7.
 Built-in worker readers treat malformed or unknown server-to-worker messages as
 IPC loss and exit so the server can replace the worker.
 
@@ -126,9 +126,9 @@ invalid enum values, and invalid base64 payloads in base64 fields are protocol
 errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 9 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 7 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
 - Normal first worker message.
-- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `9`.
+- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `7`.
 - `worker.name` and `worker.version` are diagnostic metadata.
 - `capabilities.images` is advertised by workers that may emit image output; if
   the field is omitted inside `capabilities`, the server treats it as `false`.
@@ -204,7 +204,7 @@ errors.
 - This is terminal for the whole worker session, including any active input.
   After `session_end`, any later worker-to-server message is a protocol error.
 
-The worker emits no other worker-to-server protocol messages in v9.
+The worker emits no other worker-to-server protocol messages in v7.
 
 ## Readiness And Input
 
@@ -308,7 +308,7 @@ through the managed input path. Raw stdout/stderr remains authoritative for
 output that did not arrive through `output_text`; raw capture does not drive
 completion or readiness.
 
-The following older protocol concepts are not part of v9:
+The following older protocol concepts are not part of v7:
 
 - input IDs on `input_batch`, `input_line`, `input_wait`, or `session_end`
 - `ready`
