@@ -37,12 +37,11 @@ The repository is organized around a few concrete subsystems rather than deep pa
   Sideband named pipes still carry accepted input, readiness, and worker-owned
   output facts separately from ConPTY traffic.
 - Workers receive request payloads through `input_batch` and complete an input
-  batch with `input_wait`, `ready`, or `session_end`. Follow-up input after
-  `input_wait` or `ready` starts a fresh `input_batch`; the runtime decides
-  where it is consumed.
+  batch with `input_wait` or `session_end`. Follow-up input after `input_wait`
+  starts a fresh `input_batch`; the runtime decides where it is consumed.
 - After `worker_ready`, the worker is not ready for input until its first
-  `input_wait` or `ready`. The server treats these as readiness gates, not as
-  prompt classification.
+  `input_wait`. The server treats it as a readiness gate; a null prompt means
+  prompt-free readiness.
 - Server teardown uses the sideband `shutdown` lifecycle message first. For
   explicit restarts, the server requests sideband shutdown, applies the
   worker's stdin shutdown policy, waits for a bounded graceful window, then

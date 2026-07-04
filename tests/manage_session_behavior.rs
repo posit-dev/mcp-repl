@@ -193,12 +193,14 @@ async fn pager_restart_preserves_output_captured_during_shutdown() -> TestResult
     let session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let input = r#"
+{
 cat("WAITING_FOR_RESTART_EOF\n")
 flush.console()
 suppressWarnings(invisible(readLines("stdin", n = 1)))
-for (i in 1:80) cat(sprintf("RESTART_LINE_%03d\n", i))
+cat(paste0(sprintf("RESTART_LINE_%03d\n", 1:80), collapse = ""))
 flush.console()
-Sys.sleep(1.0)
+repeat {}
+}
 "#;
     let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
     let timeout_text = result_text(&timeout);
@@ -319,6 +321,7 @@ async fn restart_while_busy_returns_output_captured_during_shutdown() -> TestRes
     let session = spawn_manage_session().await?;
 
     let input = r#"
+{
 cat("WAITING_FOR_RESTART_EOF\n")
 flush.console()
 suppressWarnings(invisible(readLines("stdin", n = 1)))
@@ -327,6 +330,7 @@ flush.console()
 Sys.sleep(1.0)
 cat("TOO_LATE\n")
 flush.console()
+}
 "#;
     let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
     let timeout_text = result_text(&timeout);
@@ -380,11 +384,13 @@ async fn restart_tail_includes_output_captured_during_shutdown() -> TestResult<(
     let session = spawn_manage_session().await?;
 
     let input = r#"
+{
 cat("WAITING_FOR_RESTART_EOF\n")
 flush.console()
 suppressWarnings(invisible(readLines("stdin", n = 1)))
 cat("DURING_RESTART\n")
 flush.console()
+}
 "#;
     let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
     let timeout_text = result_text(&timeout);
@@ -434,12 +440,14 @@ async fn restart_tail_uses_remaining_timeout_budget() -> TestResult<()> {
     let session = spawn_manage_session().await?;
 
     let input = r#"
+{
 cat("WAITING_FOR_RESTART_EOF\n")
 flush.console()
 suppressWarnings(invisible(readLines("stdin", n = 1)))
 cat("DURING_RESTART\n")
 flush.console()
-Sys.sleep(1.0)
+repeat {}
+}
 "#;
     let timeout = session.write_stdin_raw_with(input, Some(0.5)).await?;
     let timeout_text = result_text(&timeout);

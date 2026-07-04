@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::completion_reply::{PagerCompletionPrompt, ReplyWithOffset, timeout_status_content};
-use crate::ipc::{IpcInputReadiness, IpcWaitError};
+use crate::ipc::IpcWaitError;
 use crate::output_snapshot::{SnapshotWithImages, snapshot_page_with_images};
 use crate::pager;
 use crate::pending_output_tape::FormattedPendingOutput;
@@ -29,6 +29,9 @@ struct InterruptPromptWait {
     prompt: Option<String>,
 }
 
+pub(super) const INTERRUPT_TAIL_SETTLE_WINDOW: Duration = Duration::from_millis(50);
+const DISCARD_PENDING_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(100);
+
 impl WorkerManager {
     pub(super) fn interrupt_files(
         &mut self,
@@ -36,11 +39,41 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            true,
+        )
+    }
+
+    pub(super) fn interrupt_files_for_tail(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_files_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            false,
+        )
+    }
+
+    fn interrupt_files_with_prompt_wait(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Files,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
+            wait_for_prompt,
         )
     }
 
@@ -50,11 +83,41 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            true,
+        )
+    }
+
+    pub(super) fn interrupt_pager_for_tail(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
+        self.interrupt_pager_with_prompt_wait(
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+            false,
+        )
+    }
+
+    fn interrupt_pager_with_prompt_wait(
+        &mut self,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         self.interrupt_for_mode(
             InterruptMode::Pager,
             timeout,
             deferred_sandbox_state_update,
             suppress_session_end_reset,
+            wait_for_prompt,
         )
     }
 
@@ -64,23 +127,32 @@ impl WorkerManager {
         timeout: Duration,
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
+        wait_for_prompt: bool,
     ) -> Result<WorkerReply, WorkerError> {
         Self::begin_interrupt(timeout);
+        let deadline = Instant::now() + timeout;
         let interrupt_drains_existing_completion =
             self.pending_request || self.settled_pending_completion.is_some();
-        let interrupt_sent_at = self.interrupt_worker_if_running()?;
+        let interrupt_sent_at = self.interrupt_worker_if_running(remaining_until(deadline))?;
         let mode = self.resolve_interrupt_mode(mode);
 
         if interrupt_drains_existing_completion {
             return self.drain_existing_completion_after_interrupt(
                 mode,
-                timeout,
+                remaining_until(deadline),
                 deferred_sandbox_state_update,
                 suppress_session_end_reset,
             );
         }
 
-        let prompt_wait = self.wait_for_interrupt_prompt(timeout, interrupt_sent_at)?;
+        let prompt_wait = if wait_for_prompt {
+            self.wait_for_interrupt_prompt(remaining_until(deadline), interrupt_sent_at)?
+        } else {
+            InterruptPromptWait {
+                timed_out: false,
+                prompt: None,
+            }
+        };
         let timed_out = prompt_wait.timed_out;
         let reply = self.build_interrupt_reply_for_mode(mode, prompt_wait, timeout);
         let session_end = self.session_end_seen;
@@ -129,7 +201,10 @@ impl WorkerManager {
         }
     }
 
-    fn interrupt_worker_if_running(&mut self) -> Result<Option<Instant>, WorkerError> {
+    fn interrupt_worker_if_running(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Instant>, WorkerError> {
         if !self.interrupt_target_running()? {
             return Ok(None);
         }
@@ -138,19 +213,19 @@ impl WorkerManager {
             .process
             .as_mut()
             .expect("worker process should be available");
-        let interrupt_sent_at = Instant::now();
-        let interrupt_result = self.driver.interrupt(process);
-        if let Err(err) = interrupt_result {
-            self.reset()?;
-            crate::event_log::log(
-                "worker_interrupt_error",
-                serde_json::json!({
-                    "error": err.to_string(),
-                }),
-            );
-            return Err(err);
+        match send_interrupt_with_pending_input_discard(process, timeout) {
+            Ok(interrupt_sent_at) => Ok(Some(interrupt_sent_at)),
+            Err(err) => {
+                self.reset()?;
+                crate::event_log::log(
+                    "worker_interrupt_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+                Err(err)
+            }
         }
-        Ok(Some(interrupt_sent_at))
     }
 
     fn drain_existing_completion_after_interrupt(
@@ -199,30 +274,23 @@ impl WorkerManager {
         if let Some(process) = self.process.as_ref()
             && let Some(ipc) = process.ipc_connection()
         {
-            if timeout.is_zero() {
-                timed_out = true;
-            } else {
-                let readiness = match interrupt_sent_at {
-                    Some(sent_at) => ipc.wait_for_input_wait_or_fresh_ready(timeout, sent_at),
-                    None => ipc.wait_for_input_readiness(timeout),
-                };
-                match readiness {
-                    Ok(IpcInputReadiness::InputWait(value)) => {
-                        prompt = Some(value);
-                    }
-                    Ok(IpcInputReadiness::Ready) => {
-                        prompt = None;
-                    }
-                    Err(IpcWaitError::Timeout) => {
-                        timed_out = true;
-                    }
-                    Err(IpcWaitError::SessionEnd) => {
-                        self.note_session_end(true);
-                    }
-                    Err(IpcWaitError::Disconnected) => {}
-                    Err(IpcWaitError::Protocol(message)) => {
-                        return Err(WorkerError::Protocol(message));
-                    }
+            let readiness = match interrupt_sent_at {
+                Some(sent_at) => ipc.wait_for_interrupt_input_readiness(timeout, sent_at),
+                None => ipc.wait_for_input_readiness(timeout),
+            };
+            match readiness {
+                Ok(value) => {
+                    prompt = value;
+                }
+                Err(IpcWaitError::Timeout) => {
+                    timed_out = true;
+                }
+                Err(IpcWaitError::SessionEnd) => {
+                    self.note_session_end(true);
+                }
+                Err(IpcWaitError::Disconnected) => {}
+                Err(IpcWaitError::Protocol(message)) => {
+                    return Err(WorkerError::Protocol(message));
                 }
             }
         }
@@ -364,6 +432,94 @@ impl WorkerManager {
                 prompt_variants: None,
             },
         }
+    }
+}
+
+fn send_interrupt_with_pending_input_discard(
+    process: &mut crate::worker_supervisor::WorkerProcess,
+    timeout: Duration,
+) -> Result<Instant, WorkerError> {
+    let mut protocol_error = None;
+    if let Some(ipc) = process.ipc_connection() {
+        let ack_wait_since = Instant::now();
+        let ack_deadline = Instant::now() + timeout.min(DISCARD_PENDING_INPUT_ACK_TIMEOUT);
+        match ipc.send_discard_pending_input(remaining_until(ack_deadline)) {
+            Ok(discard_id) => {
+                let ack_timeout = remaining_until(ack_deadline);
+                match ipc.wait_for_discard_pending_input_ack(ack_timeout, discard_id) {
+                    Ok(Some(ack)) => {
+                        crate::event_log::log(
+                            "worker_discard_pending_input_ack_observed",
+                            serde_json::json!({
+                                "discard_id": ack.discard_id,
+                                "discarded_input": ack.discarded_input,
+                                "elapsed_ms": ack_wait_since.elapsed().as_millis(),
+                            }),
+                        );
+                    }
+                    Ok(None) => {
+                        crate::event_log::log(
+                            "worker_discard_pending_input_ack_timeout",
+                            serde_json::json!({
+                                "discard_id": discard_id,
+                                "timeout_ms": ack_timeout.as_millis(),
+                            }),
+                        );
+                    }
+                    Err(IpcWaitError::Protocol(message)) => {
+                        crate::event_log::log(
+                            "worker_discard_pending_input_ack_wait_error",
+                            serde_json::json!({
+                                "error": format!("protocol: {message}"),
+                            }),
+                        );
+                        protocol_error = Some(message);
+                    }
+                    Err(err) => {
+                        crate::event_log::log(
+                            "worker_discard_pending_input_ack_wait_error",
+                            serde_json::json!({
+                                "error": ipc_wait_error_message(&err),
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                crate::event_log::log(
+                    "worker_discard_pending_input_send_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+    }
+
+    let os_interrupt_sent_at = Instant::now();
+    process.send_os_interrupt()?;
+    crate::event_log::log(
+        "worker_interrupt_os_sent",
+        serde_json::json!({
+            "after_discard_pending_input": true,
+        }),
+    );
+    if let Some(message) = protocol_error {
+        return Err(WorkerError::Protocol(message));
+    }
+    Ok(os_interrupt_sent_at)
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+fn ipc_wait_error_message(err: &IpcWaitError) -> String {
+    match err {
+        IpcWaitError::Timeout => "timeout".to_string(),
+        IpcWaitError::SessionEnd => "session_end".to_string(),
+        IpcWaitError::Disconnected => "disconnected".to_string(),
+        IpcWaitError::Protocol(message) => format!("protocol: {message}"),
     }
 }
 

@@ -79,7 +79,7 @@ pub(crate) fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd)
 pub fn emit_input_line(prompt: &str, text: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputLine {
-            prompt: prompt.to_string(),
+            prompt: Some(prompt.to_string()),
             text: text.to_string(),
         });
     }
@@ -88,14 +88,23 @@ pub fn emit_input_line(prompt: &str, text: &str) {
 pub fn emit_input_wait(prompt: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::InputWait {
-            prompt: prompt.to_string(),
+            prompt: Some(prompt.to_string()),
         });
     }
 }
 
-pub fn emit_ready() {
+pub fn emit_top_level_input_wait() {
     if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::Ready {});
+        let _ = ipc.send(WorkerToServerIpcMessage::InputWait { prompt: None });
+    }
+}
+
+pub fn emit_discard_pending_input_ack(discard_id: u64, discarded_input: bool) {
+    if let Some(ipc) = global_ipc() {
+        let _ = ipc.send(WorkerToServerIpcMessage::DiscardPendingInputAck {
+            discard_id,
+            discarded_input,
+        });
     }
 }
 

@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(target_family = "windows")]
+use std::sync::OnceLock;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -27,7 +29,7 @@ use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcHandle, IpcInputLineEvent, IpcInputReadiness, IpcServer, IpcWaitError, ServerIpcConnection,
+    IpcHandle, IpcInputLineEvent, IpcServer, IpcWaitError, ServerIpcConnection,
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
@@ -62,7 +64,9 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE, WAIT_FAILED, WAIT_TIMEOUT,
 };
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+use windows_sys::Win32::System::Console::{
+    AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 #[cfg(target_family = "windows")]
@@ -180,6 +184,11 @@ impl LiveOutputCapture {
 
     #[cfg(any(test, target_os = "windows"))]
     fn should_drop_windows_conpty_startup_noise(&self, bytes: &[u8]) -> bool {
+        if windows_conpty_terminal_reset_noise_only(bytes)
+            || windows_conpty_shutdown_noise_only(bytes)
+        {
+            return true;
+        }
         let Some(drop_startup_noise) = &self.drop_windows_conpty_startup_noise_before_input else {
             return false;
         };
@@ -268,11 +277,92 @@ impl LiveOutputCapture {
 
 #[cfg(any(test, target_os = "windows"))]
 fn windows_conpty_startup_noise_only(bytes: &[u8]) -> bool {
-    const STARTUP_NOISE: &[u8] = b"\x1b[?9001h\x1b[?1004h";
-    let Some(rest) = bytes.strip_prefix(STARTUP_NOISE) else {
-        return false;
+    const STARTUP_ENABLE: &[u8] = b"\x1b[?9001h\x1b[?1004h";
+    standalone_noise_bytes(bytes, STARTUP_ENABLE)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_conpty_shutdown_noise_only(bytes: &[u8]) -> bool {
+    const SHUTDOWN_DISABLE: &[u8] = b"\x1b[?9001l\x1b[?1004l";
+    standalone_noise_bytes(bytes, SHUTDOWN_DISABLE)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn standalone_noise_bytes(bytes: &[u8], noise: &[u8]) -> bool {
+    bytes
+        .strip_prefix(noise)
+        .is_some_and(|rest| rest.iter().all(|byte| matches!(byte, b'\r' | b'\n')))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_conpty_terminal_reset_noise_only(bytes: &[u8]) -> bool {
+    let mut remaining = trim_crlf(bytes);
+    let mut saw_clear = false;
+    let mut saw_cursor = false;
+    while !remaining.is_empty() {
+        let Some((token, rest)) = take_ansi_control_token(remaining) else {
+            return false;
+        };
+        saw_clear |= matches!(token, AnsiControlToken::ClearScreen);
+        saw_cursor |= matches!(token, AnsiControlToken::CursorPosition);
+        remaining = trim_crlf(rest);
+    }
+    saw_clear && saw_cursor
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn trim_crlf(bytes: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && matches!(bytes[start], b'\r' | b'\n') {
+        start += 1;
+    }
+    while end > start && matches!(bytes[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Clone, Copy)]
+enum AnsiControlToken {
+    ClearScreen,
+    CursorPosition,
+    OtherAllowed,
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn take_ansi_control_token(bytes: &[u8]) -> Option<(AnsiControlToken, &[u8])> {
+    if let Some(rest) = bytes.strip_prefix(b"\x1b]0;") {
+        let end = rest.iter().position(|byte| *byte == 0x07)?;
+        return Some((AnsiControlToken::OtherAllowed, &rest[end + 1..]));
+    }
+    let rest = bytes.strip_prefix(b"\x1b[")?;
+    let final_index = rest.iter().position(|byte| (0x40..=0x7e).contains(byte))?;
+    let params = &rest[..final_index];
+    let final_byte = rest[final_index];
+    let after = &rest[final_index + 1..];
+    let token = match final_byte {
+        b'J' if params == b"2" => AnsiControlToken::ClearScreen,
+        b'H' if ansi_cursor_position_params(params) => AnsiControlToken::CursorPosition,
+        b'm' if params.is_empty() => AnsiControlToken::OtherAllowed,
+        b'h' | b'l' if conpty_private_mode_params(params) => AnsiControlToken::OtherAllowed,
+        _ => return None,
     };
-    rest.iter().all(|byte| matches!(byte, b'\r' | b'\n'))
+    Some((token, after))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn conpty_private_mode_params(params: &[u8]) -> bool {
+    params == b"?25" || params == b"?9001" || params == b"?1004"
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn ansi_cursor_position_params(params: &[u8]) -> bool {
+    params.is_empty()
+        || params
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';')
 }
 
 #[cfg(target_family = "unix")]
@@ -399,8 +489,7 @@ fn seed_initial_readiness_from_process(
         return Ok(Some(InitialWorkerPrompt::Immediate(raw_prompt)));
     }
     match ipc.wait_for_input_readiness(WORKER_READY_TIMEOUT) {
-        Ok(IpcInputReadiness::InputWait(prompt)) => Ok(Some(InitialWorkerPrompt::Waited(prompt))),
-        Ok(IpcInputReadiness::Ready) => Ok(None),
+        Ok(prompt) => Ok(prompt.map(InitialWorkerPrompt::Waited)),
         Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
         Err(IpcWaitError::Timeout) => Ok(None),
         Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
@@ -416,6 +505,8 @@ pub(crate) struct WorkerProcess {
     child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
     shutdown_stdin_policy: ShutdownStdinPolicy,
+    #[cfg(target_family = "windows")]
+    windows_console_input_via_stdin: bool,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
     live_output: LiveOutputCapture,
@@ -493,6 +584,8 @@ fn send_stdin_command(
 struct SpawnedWorker {
     child: WorkerChild,
     stdin_tx: mpsc::Sender<StdinCommand>,
+    #[cfg(target_family = "windows")]
+    windows_console_input_via_stdin: bool,
     session_tmpdir: Option<PathBuf>,
     stdout_reader: Option<OutputReader>,
     stderr_reader: Option<OutputReader>,
@@ -529,11 +622,10 @@ impl WorkerChild {
         Self::Standard(child)
     }
 
+    #[cfg(target_family = "unix")]
     fn id(&self) -> u32 {
         match self {
             Self::Standard(child) => child.id(),
-            #[cfg(target_family = "windows")]
-            Self::DirectWindows(child) => child.id(),
         }
     }
 
@@ -576,6 +668,22 @@ impl WorkerChild {
             Self::DirectWindows(child) => child.close_job(),
         }
     }
+
+    #[cfg(target_family = "windows")]
+    fn close_conpty(&mut self) {
+        match self {
+            Self::Standard(_) => {}
+            Self::DirectWindows(child) => child.close_conpty(),
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn direct_windows_process_id(&self) -> Option<u32> {
+        match self {
+            Self::Standard(_) => None,
+            Self::DirectWindows(child) => Some(child.process_id()),
+        }
+    }
 }
 
 #[cfg(target_family = "windows")]
@@ -584,7 +692,7 @@ struct WindowsProcess {
     thread: HANDLE,
     process_id: u32,
     job: Option<crate::windows_conpty::JobHandle>,
-    _conpty: Option<crate::windows_conpty::Conpty>,
+    conpty: Option<crate::windows_conpty::Conpty>,
 }
 
 #[cfg(target_family = "windows")]
@@ -602,12 +710,8 @@ impl WindowsProcess {
             thread: proc_info.hThread,
             process_id: proc_info.dwProcessId,
             job,
-            _conpty: conpty,
+            conpty,
         }
-    }
-
-    fn id(&self) -> u32 {
-        self.process_id
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
@@ -645,6 +749,14 @@ impl WindowsProcess {
         self.job.take();
     }
 
+    fn close_conpty(&mut self) {
+        self.conpty.take();
+    }
+
+    fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
     fn exit_status(&self) -> std::io::Result<ExitStatus> {
         let mut exit_code = 0u32;
         if unsafe { GetExitCodeProcess(self.process, &mut exit_code) } == 0 {
@@ -660,6 +772,56 @@ impl Drop for WindowsProcess {
         unsafe {
             CloseHandle(self.thread);
             CloseHandle(self.process);
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn send_windows_console_interrupt_event(process_id: u32) -> std::io::Result<()> {
+    let _console_guard = windows_console_interrupt_mutex()
+        .lock()
+        .map_err(|_| std::io::Error::other("Windows console interrupt lock poisoned"))?;
+    unsafe {
+        let _ = FreeConsole();
+        if AttachConsole(process_id) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _guard = WindowsCtrlEventIgnoreGuard::new();
+        if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_id) == 0 {
+            let err = std::io::Error::last_os_error();
+            let _ = FreeConsole();
+            return Err(err);
+        }
+        thread::sleep(Duration::from_millis(100));
+        let _ = FreeConsole();
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "windows")]
+fn windows_console_interrupt_mutex() -> &'static Mutex<()> {
+    static INTERRUPT_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    INTERRUPT_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(target_family = "windows")]
+struct WindowsCtrlEventIgnoreGuard;
+
+#[cfg(target_family = "windows")]
+impl WindowsCtrlEventIgnoreGuard {
+    fn new() -> Self {
+        unsafe {
+            let _ = SetConsoleCtrlHandler(None, 1);
+        }
+        Self
+    }
+}
+
+#[cfg(target_family = "windows")]
+impl Drop for WindowsCtrlEventIgnoreGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetConsoleCtrlHandler(None, 0);
         }
     }
 }
@@ -751,7 +913,10 @@ impl WorkerProcess {
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let live_output = LiveOutputCapture::new(oversized_output, output_timeline.clone());
         #[cfg(target_os = "windows")]
-        let live_output = if matches!(&worker_launch, WorkerLaunch::Builtin(Backend::Python)) {
+        let live_output = if matches!(
+            &worker_launch,
+            WorkerLaunch::Builtin(Backend::Python | Backend::R)
+        ) {
             live_output.with_windows_conpty_startup_noise_filter()
         } else {
             live_output
@@ -759,6 +924,8 @@ impl WorkerProcess {
         let SpawnedWorker {
             child,
             stdin_tx,
+            #[cfg(target_family = "windows")]
+            windows_console_input_via_stdin,
             session_tmpdir,
             stdout_reader,
             stderr_reader,
@@ -815,16 +982,18 @@ impl WorkerProcess {
                 on_output_image: Some(Arc::new(move |image: IpcOutputImage| {
                     image_capture.append_image(image);
                 })),
-                on_input_wait: Some(Arc::new(move |prompt: String| {
+                on_input_wait: Some(Arc::new(move |prompt: Option<String>| {
                     sideband_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
                 })),
                 on_input_line: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move |event: IpcInputLineEvent| {
-                        sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
-                            prompt: event.prompt,
-                            line: event.line,
-                        });
+                        if let Some(prompt) = event.prompt {
+                            sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                                prompt,
+                                line: event.line,
+                            });
+                        }
                     }))
                 },
                 on_session_end: {
@@ -861,6 +1030,8 @@ impl WorkerProcess {
             child,
             stdin_tx,
             shutdown_stdin_policy,
+            #[cfg(target_family = "windows")]
+            windows_console_input_via_stdin,
             session_tmpdir,
             ipc,
             live_output,
@@ -959,6 +1130,8 @@ impl WorkerProcess {
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         let stdin_transport = WorkerLaunch::Builtin(backend).stdin_transport();
+        #[cfg(target_family = "windows")]
+        let windows_console_input_via_stdin = matches!(stdin_transport, WorkerStdinTransport::Pty);
         #[cfg(target_os = "windows")]
         let spawn_stdin_transport =
             windows_spawn_transport(&mut command, &prepared.args, stdin_transport);
@@ -970,6 +1143,8 @@ impl WorkerProcess {
             &mut command,
             spawn_stdin_transport,
             !matches!(backend, Backend::Python),
+            #[cfg(target_family = "windows")]
+            false,
         );
         #[cfg(target_family = "unix")]
         {
@@ -1012,6 +1187,8 @@ impl WorkerProcess {
         Ok(SpawnedWorker {
             child,
             stdin_tx,
+            #[cfg(target_family = "windows")]
+            windows_console_input_via_stdin,
             session_tmpdir,
             stdout_reader,
             stderr_reader,
@@ -1087,6 +1264,8 @@ impl WorkerProcess {
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         let stdin_transport = spec.stdin.transport();
+        #[cfg(target_family = "windows")]
+        let windows_console_input_via_stdin = matches!(stdin_transport, WorkerStdinTransport::Pty);
         #[cfg(target_os = "windows")]
         let spawn_stdin_transport =
             windows_spawn_transport(&mut command, &prepared.args, stdin_transport);
@@ -1094,7 +1273,13 @@ impl WorkerProcess {
         configure_command_process_group(&mut command, stdin_transport);
         #[cfg(not(target_os = "windows"))]
         let spawn_stdin_transport = stdin_transport;
-        let child_result = spawn_command_with_transport(&mut command, spawn_stdin_transport, true);
+        let child_result = spawn_command_with_transport(
+            &mut command,
+            spawn_stdin_transport,
+            true,
+            #[cfg(target_family = "windows")]
+            true,
+        );
         #[cfg(target_family = "unix")]
         {
             unsafe {
@@ -1136,6 +1321,8 @@ impl WorkerProcess {
         Ok(SpawnedWorker {
             child,
             stdin_tx,
+            #[cfg(target_family = "windows")]
+            windows_console_input_via_stdin,
             session_tmpdir,
             stdout_reader,
             stderr_reader,
@@ -1165,7 +1352,7 @@ impl WorkerProcess {
         }
     }
 
-    pub(crate) fn send_interrupt(&mut self) -> Result<(), WorkerError> {
+    pub(crate) fn send_os_interrupt(&mut self) -> Result<(), WorkerError> {
         #[cfg(all(target_family = "unix", not(target_os = "linux")))]
         {
             self.send_signal(libc::SIGINT)
@@ -1176,7 +1363,7 @@ impl WorkerProcess {
         }
         #[cfg(target_family = "windows")]
         {
-            self.send_windows_ctrl_break()
+            self.send_windows_interrupt()
         }
         #[cfg(not(any(target_family = "unix", target_family = "windows")))]
         {
@@ -1185,29 +1372,23 @@ impl WorkerProcess {
     }
 
     #[cfg(target_family = "windows")]
-    fn send_windows_ctrl_break(&mut self) -> Result<(), WorkerError> {
+    fn send_windows_interrupt(&mut self) -> Result<(), WorkerError> {
         if self.child.try_wait()?.is_some() {
             return Ok(());
         }
-        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.child.id()) };
-        if ok != 0 {
-            return Ok(());
+        if let Some(process_id) = self.child.direct_windows_process_id() {
+            return send_windows_console_interrupt_event(process_id).map_err(WorkerError::Io);
         }
-
-        match self.child.try_wait()? {
-            Some(_) => Ok(()),
-            None => Err(WorkerError::Io(std::io::Error::last_os_error())),
+        if self.windows_console_input_via_stdin {
+            return send_stdin_command(
+                &self.stdin_tx,
+                Some(vec![0x03]),
+                Duration::from_millis(200),
+            );
         }
-    }
-
-    #[cfg(target_family = "windows")]
-    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
-        self.send_windows_ctrl_break()
-    }
-
-    #[cfg(not(target_family = "windows"))]
-    pub(crate) fn send_r_interrupt(&mut self) -> Result<(), WorkerError> {
-        self.send_interrupt()
+        Err(WorkerError::Protocol(
+            "Windows Ctrl-C interrupts require PTY stdin transport".to_string(),
+        ))
     }
 
     fn send_sigterm(&mut self) -> Result<(), WorkerError> {
@@ -1358,8 +1539,25 @@ impl WorkerProcess {
 
     fn close_stdin_before_shutdown_wait(&mut self) {
         if self.shutdown_stdin_policy == ShutdownStdinPolicy::CloseBeforeWait {
+            #[cfg(target_family = "windows")]
+            if self.send_windows_console_shutdown_input_before_wait() {
+                return;
+            }
             let _ = self.close_stdin(Duration::from_millis(200));
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn send_windows_console_shutdown_input_before_wait(&mut self) -> bool {
+        if !self.windows_console_input_via_stdin {
+            return false;
+        }
+        let _ = send_stdin_command(
+            &self.stdin_tx,
+            Some(b"\r\n".to_vec()),
+            Duration::from_millis(200),
+        );
+        true
     }
 
     fn finish_timed_shutdown(mut self, timeout: Duration) -> Result<(), WorkerError> {
@@ -1452,6 +1650,7 @@ impl WorkerProcess {
         #[cfg(target_family = "windows")]
         {
             self.child.close_job();
+            self.child.close_conpty();
         }
         self.quiesce_raw_output_readers()?;
         self.detach_ipc_reader();
@@ -1479,6 +1678,7 @@ impl WorkerProcess {
         #[cfg(target_family = "windows")]
         {
             self.child.close_job();
+            self.child.close_conpty();
         }
         self.quiesce_output_producers()?;
         self.report_denials();
@@ -1596,6 +1796,8 @@ impl WorkerProcess {
             child: WorkerChild::standard(child),
             stdin_tx,
             shutdown_stdin_policy: ShutdownStdinPolicy::CloseBeforeWait,
+            #[cfg(target_family = "windows")]
+            windows_console_input_via_stdin: false,
             session_tmpdir: None,
             ipc: IpcHandle::new(),
             live_output: LiveOutputCapture::new(
@@ -2081,6 +2283,7 @@ fn spawn_command_with_transport(
     command: &mut Command,
     stdin_transport: WorkerStdinTransport,
     pty_echo: bool,
+    #[cfg(target_family = "windows")] wrap_custom_pty_stdio: bool,
 ) -> Result<SpawnedCommand, WorkerError> {
     match stdin_transport {
         WorkerStdinTransport::Pipe => {
@@ -2095,7 +2298,12 @@ fn spawn_command_with_transport(
                 pty_stdio: None,
             })
         }
-        WorkerStdinTransport::Pty => spawn_command_with_pty(command, pty_echo),
+        WorkerStdinTransport::Pty => spawn_command_with_pty(
+            command,
+            pty_echo,
+            #[cfg(target_family = "windows")]
+            wrap_custom_pty_stdio,
+        ),
     }
 }
 
@@ -2247,6 +2455,7 @@ fn remove_windows_conpty_env(env_map: &mut std::collections::HashMap<String, Str
 fn spawn_command_with_pty(
     command: &mut Command,
     _echo: bool,
+    wrap_custom_pty_stdio: bool,
 ) -> Result<SpawnedCommand, WorkerError> {
     let mut command_line = Vec::new();
     command_line.push(command.get_program().to_string_lossy().to_string());
@@ -2255,6 +2464,9 @@ fn spawn_command_with_pty(
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string()),
     );
+    if wrap_custom_pty_stdio {
+        command_line = windows_conpty_attach_command_line(&command_line)?;
+    }
     let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
     apply_command_env_overrides_for_windows_conpty(
         &mut env_map,
@@ -2288,6 +2500,18 @@ fn spawn_command_with_pty(
             writer: Box::new(writer),
         }),
     })
+}
+
+#[cfg(target_family = "windows")]
+fn windows_conpty_attach_command_line(command: &[String]) -> Result<Vec<String>, WorkerError> {
+    let exe = std::env::current_exe().map_err(WorkerError::Io)?;
+    let mut wrapped = vec![
+        exe.to_string_lossy().to_string(),
+        crate::windows_conpty::WINDOWS_CONPTY_ATTACH_ARG.to_string(),
+        "--".to_string(),
+    ];
+    wrapped.extend(command.iter().cloned());
+    Ok(wrapped)
 }
 
 #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -2470,9 +2694,13 @@ fn handle_windows_ipc_connect_result(
         Err(err) => {
             const WRAPPER_EXIT_GRACE: Duration = Duration::from_secs(2);
             let deadline = std::time::Instant::now() + WRAPPER_EXIT_GRACE;
+            let mut exit_status = None;
             loop {
                 match child.try_wait() {
-                    Ok(Some(_)) => break,
+                    Ok(Some(status)) => {
+                        exit_status = Some(status);
+                        break;
+                    }
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
                             let _ = child.kill();
@@ -2487,6 +2715,12 @@ fn handle_windows_ipc_connect_result(
                         break;
                     }
                 }
+            }
+            if let Some(status) = exit_status {
+                return Err(WorkerError::Protocol(format!(
+                    "{} before IPC named pipe connection",
+                    format_exit_status_message(&status)
+                )));
             }
             Err(WorkerError::Io(err))
         }
@@ -2624,6 +2858,14 @@ mod tests {
             .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
             .spawn()
             .expect("spawn sleeping test child")
+    }
+
+    #[cfg(target_family = "windows")]
+    fn failing_test_child() -> Child {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "exit 7"])
+            .spawn()
+            .expect("spawn failing test child")
     }
 
     #[cfg(target_family = "unix")]
@@ -2921,6 +3163,86 @@ mod tests {
     }
 
     #[test]
+    fn raw_windows_conpty_shutdown_noise_is_dropped_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.note_accepted_input_starting();
+        capture.append_raw_text(b"\x1b[?9001l\x1b[?1004l", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_output().contents.is_empty(),
+            "raw ConPTY shutdown toggles should not enter output bundles"
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_terminal_reset_is_dropped_before_input() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_raw_text(b"\x1b[2J\x1b[m\x1b[H\x1b[?25h", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_output().contents.is_empty(),
+            "raw ConPTY terminal reset should not enter output bundles before input"
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_terminal_reset_is_dropped_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.note_accepted_input_starting();
+        capture.append_raw_text(b"\x1b[2J\x1b[m\x1b[H\x1b[?25h", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_output().contents.is_empty(),
+            "raw ConPTY terminal reset should not enter output bundles after input"
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_title_reset_is_dropped_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.note_accepted_input_starting();
+        capture.append_raw_text(
+            b"\x1b[?25l\x1b[2J\x1b[m\x1b[2;1H\x1b]0;C:\\repo\\mcp-repl.exe\x07\x1b[?25h",
+            TextStream::Stdout,
+        );
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_output().contents.is_empty(),
+            "raw ConPTY title reset should not enter output bundles after input"
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_shutdown_and_title_reset_is_dropped_after_input_starts() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.note_accepted_input_starting();
+        capture.append_raw_text(
+            b"\x1b[?25l\x1b[?9001l\x1b[?1004l\x1b[2J\x1b[m\x1b[H\x1b]0;C:\\repo\\mcp-repl.exe\x07\x1b[?25h",
+            TextStream::Stdout,
+        );
+
+        assert_eq!(ring_bytes(&output_ring), b"");
+        assert!(
+            tape.drain_final_output().contents.is_empty(),
+            "raw ConPTY shutdown and title reset should not enter output bundles after input"
+        );
+    }
+
+    #[test]
     fn sideband_terminal_mode_toggles_are_preserved() {
         let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
         let capture = capture.with_windows_conpty_startup_noise_filter();
@@ -3049,10 +3371,12 @@ mod tests {
                 wait_capture.append_sideband(PendingSidebandKind::InputWait { prompt });
             })),
             on_input_line: Some(Arc::new(move |event| {
-                result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
-                    prompt: event.prompt,
-                    line: event.line,
-                });
+                if let Some(prompt) = event.prompt {
+                    result_capture.append_sideband(PendingSidebandKind::ReadlineResult {
+                        prompt,
+                        line: event.line,
+                    });
+                }
             })),
             on_output_image: Some(Arc::new(move |image| {
                 image_capture.append_image(image);
@@ -3066,7 +3390,7 @@ mod tests {
 
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
             })
             .expect("send initial input_wait");
         server
@@ -3082,7 +3406,7 @@ mod tests {
             .expect("send stdout output_text");
         worker
             .send(WorkerToServerIpcMessage::InputLine {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
                 text: "plot(1)\n".to_string(),
             })
             .expect("send input_line");
@@ -3103,7 +3427,7 @@ mod tests {
             .expect("send stderr output_text");
         worker
             .send(WorkerToServerIpcMessage::InputWait {
-                prompt: "> ".to_string(),
+                prompt: Some("> ".to_string()),
             })
             .expect("send completion input_wait");
         worker
@@ -3223,6 +3547,23 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_error_reports_worker_exit_status() {
+        let mut child = WorkerChild::standard(failing_test_child());
+
+        let result = handle_windows_ipc_connect_result(
+            Err(std::io::Error::other("ipc connect failed")),
+            &mut child,
+        );
+
+        let message = result.expect_err("connect should fail").to_string();
+        assert!(
+            message.contains("worker exited with status 7"),
+            "expected worker exit status in error, got: {message}"
+        );
     }
 
     #[cfg(target_family = "windows")]

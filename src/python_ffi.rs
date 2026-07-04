@@ -109,10 +109,13 @@ pub struct PythonApi {
     pub py_dec_ref: unsafe extern "C" fn(*mut PyObject),
     py_err_occurred: unsafe extern "C" fn() -> *mut PyObject,
     pub py_err_check_signals: unsafe extern "C" fn() -> c_int,
+    #[cfg(windows)]
+    pub py_err_set_interrupt_ex: unsafe extern "C" fn(c_int) -> c_int,
+    #[cfg(windows)]
+    py_os_sigint_event: unsafe extern "C" fn() -> *mut c_void,
     pub py_err_print: unsafe extern "C" fn(),
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
-    pub py_err_set_interrupt: unsafe extern "C" fn(),
 }
 
 static PYTHON_API: OnceLock<PythonApi> = OnceLock::new();
@@ -132,6 +135,11 @@ impl PythonApi {
 
     pub fn global() -> &'static Self {
         PYTHON_API.get().expect("Python C API was not initialized")
+    }
+
+    #[cfg(windows)]
+    pub fn try_global() -> Option<&'static Self> {
+        PYTHON_API.get()
     }
 
     unsafe fn load(lib_path: &Path) -> Result<Self, String> {
@@ -180,10 +188,13 @@ impl PythonApi {
             py_dec_ref: unsafe { load_symbol(&library, b"Py_DecRef\0")? },
             py_err_occurred: unsafe { load_symbol(&library, b"PyErr_Occurred\0")? },
             py_err_check_signals: unsafe { load_symbol(&library, b"PyErr_CheckSignals\0")? },
+            #[cfg(windows)]
+            py_err_set_interrupt_ex: unsafe { load_symbol(&library, b"PyErr_SetInterruptEx\0")? },
+            #[cfg(windows)]
+            py_os_sigint_event: unsafe { load_symbol(&library, b"_PyOS_SigintEvent\0")? },
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
-            py_err_set_interrupt: unsafe { load_symbol(&library, b"PyErr_SetInterrupt\0")? },
             _library: library,
         };
         Ok(api)
@@ -351,13 +362,18 @@ impl PythonApi {
         unsafe { (self.py_err_set_string)(exception, message.as_ptr()) };
     }
 
-    pub fn set_interrupt(&self) {
-        unsafe { (self.py_err_set_interrupt)() };
+    pub fn check_signals(&self) -> bool {
+        (unsafe { (self.py_err_check_signals)() }) == -1
     }
 
-    pub fn clear_pending_signals(&self) {
-        if unsafe { (self.py_err_check_signals)() } == -1 {
-            self.clear_error();
+    #[cfg(windows)]
+    pub fn set_interrupt_for_signal(&self, signum: c_int) {
+        let _ = unsafe { (self.py_err_set_interrupt_ex)(signum) };
+        if signum == libc::SIGINT {
+            let event = unsafe { (self.py_os_sigint_event)() };
+            if !event.is_null() {
+                let _ = unsafe { windows_sys::Win32::System::Threading::SetEvent(event as _) };
+            }
         }
     }
 

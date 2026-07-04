@@ -373,7 +373,7 @@ mod tests {
         let status = process.wait_child_for_test().expect("wait test child");
         process.set_exit_status_for_test(status);
         let _ = worker.send(WorkerToServerIpcMessage::InputWait {
-            prompt: ">>> ".to_string(),
+            prompt: Some(">>> ".to_string()),
         });
         server
             .wait_for_input_wait(Duration::from_millis(200))
@@ -387,7 +387,7 @@ mod tests {
 
         let prompt = ">>> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::InputLine {
-            prompt,
+            prompt: Some(prompt),
             text: "quit()\n".to_string(),
         });
         drop(worker);

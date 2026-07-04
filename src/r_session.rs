@@ -3,8 +3,16 @@ use std::ffi::{CStr, CString};
 use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::path::{Path, PathBuf};
+#[cfg(target_family = "unix")]
+use std::sync::atomic::AtomicI32;
+#[cfg(windows)]
+use std::sync::atomic::AtomicIsize;
+#[cfg(any(target_family = "unix", windows))]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
+#[cfg(not(any(target_family = "unix", windows)))]
+use std::time::Duration;
 
 use crate::ipc;
 #[cfg(target_family = "unix")]
@@ -33,6 +41,13 @@ use std::mem::MaybeUninit;
 use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 
 const MCP_REPL_R_SCRIPT: &str = include_str!("../r/mcp_repl.R");
+#[cfg(not(any(target_family = "unix", windows)))]
+const R_READ_CONSOLE_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[cfg(target_family = "unix")]
+static R_SIGINT_WAKE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(windows)]
+static WINDOWS_R_SIGNAL_WAKE_EVENT: AtomicIsize = AtomicIsize::new(0);
 
 pub struct RSession {
     init: Arc<SessionInit>,
@@ -68,7 +83,7 @@ impl RSession {
         }
         guard.active_input = true;
         queue_input(&mut guard.input_queue, &input);
-        state.cvar.notify_all();
+        state.notify_runtime_input_available();
         Ok(())
     }
 
@@ -79,8 +94,7 @@ impl RSession {
         // Preserve already accepted input; reset replies include output produced
         // while the old worker drains to a safe runtime boundary.
         guard.shutdown = true;
-        guard.read_interrupted = false;
-        state.cvar.notify_all();
+        state.notify_runtime_input_closed();
         Ok(())
     }
 }
@@ -142,19 +156,14 @@ pub(crate) fn clear_pending_input() -> bool {
     had_pending
 }
 
-pub(crate) fn interrupt_pending_input() -> bool {
+pub(crate) fn discard_unconsumed_input_for_discard_ack() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
     };
     let mut guard = state.inner.lock().unwrap();
     let had_pending = !guard.input_queue.is_empty();
     drain_input_queue(&mut guard.input_queue);
-    let interrupted_waiting_read = guard.waiting_for_input;
-    if interrupted_waiting_read {
-        guard.read_interrupted = true;
-    }
-    state.cvar.notify_all();
-    had_pending || interrupted_waiting_read
+    had_pending
 }
 
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
@@ -172,6 +181,10 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
         init.mark_failed(err.clone());
         return Err(err);
     }
+    #[cfg(target_family = "unix")]
+    install_r_sigint_wake_handler(&state)?;
+    #[cfg(windows)]
+    install_windows_r_signal_wake_handler(&state)?;
     crate::diagnostics::startup_log(format!(
         "r-session: init complete ({} ms)",
         crate::diagnostics::elapsed_ms(init_start.elapsed())
@@ -187,6 +200,8 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
 struct SessionState {
     inner: Mutex<SessionStateInner>,
     cvar: Condvar,
+    #[cfg(any(target_family = "unix", windows))]
+    runtime_input_wake: RuntimeInputWake,
 }
 
 struct SessionStateInner {
@@ -196,8 +211,6 @@ struct SessionStateInner {
     last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
-    waiting_for_input: bool,
-    read_interrupted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,12 +228,327 @@ impl SessionState {
                 last_prompt: None,
                 shutdown: false,
                 session_end_emitted: false,
-                waiting_for_input: false,
-                read_interrupted: false,
             }),
             cvar: Condvar::new(),
+            #[cfg(target_family = "unix")]
+            runtime_input_wake: RuntimeInputWake::new()
+                .expect("failed to create R runtime input wake pipe"),
+            #[cfg(windows)]
+            runtime_input_wake: RuntimeInputWake::new()
+                .expect("failed to create R runtime input wake event"),
         }
     }
+
+    fn notify_runtime_input_available(&self) {
+        self.notify_runtime_input_waiters();
+    }
+
+    fn notify_runtime_input_closed(&self) {
+        self.notify_runtime_input_waiters();
+    }
+
+    fn notify_runtime_input_waiters(&self) {
+        self.cvar.notify_all();
+        #[cfg(any(target_family = "unix", windows))]
+        self.runtime_input_wake.notify();
+    }
+}
+
+#[cfg(target_family = "unix")]
+struct RuntimeInputWake {
+    read_fd: libc::c_int,
+    write_fd: libc::c_int,
+}
+
+#[cfg(target_family = "unix")]
+impl RuntimeInputWake {
+    fn new() -> std::io::Result<Self> {
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if let Err(err) = configure_wake_fd(fds[0]).and_then(|()| configure_wake_fd(fds[1])) {
+            close_fd(fds[0]);
+            close_fd(fds[1]);
+            return Err(err);
+        }
+        Ok(Self {
+            read_fd: fds[0],
+            write_fd: fds[1],
+        })
+    }
+
+    fn notify(&self) {
+        write_wake_byte(self.write_fd);
+    }
+
+    fn write_fd(&self) -> libc::c_int {
+        self.write_fd
+    }
+
+    fn wait_interruptibly(&self) -> std::io::Result<()> {
+        loop {
+            let mut readfds = unsafe { std::mem::zeroed::<libc::fd_set>() };
+            unsafe {
+                libc::FD_ZERO(&mut readfds);
+                libc::FD_SET(self.read_fd, &mut readfds);
+            }
+            let result = unsafe {
+                libc::select(
+                    self.read_fd + 1,
+                    &mut readfds,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if result < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    drain_fd(self.read_fd);
+                    return Ok(());
+                }
+                return Err(err);
+            }
+            if result == 0 {
+                continue;
+            }
+            drain_fd(self.read_fd);
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(target_family = "unix")]
+impl Drop for RuntimeInputWake {
+    fn drop(&mut self) {
+        close_fd(self.read_fd);
+        close_fd(self.write_fd);
+    }
+}
+
+#[cfg(windows)]
+struct RuntimeInputWake {
+    queue_event: isize,
+    signal_event: isize,
+}
+
+#[cfg(windows)]
+impl RuntimeInputWake {
+    fn new() -> std::io::Result<Self> {
+        let queue_event = create_event()?;
+        match create_event() {
+            Ok(signal_event) => Ok(Self {
+                queue_event,
+                signal_event,
+            }),
+            Err(err) => {
+                close_handle(queue_event);
+                Err(err)
+            }
+        }
+    }
+
+    fn notify(&self) {
+        set_event(self.queue_event);
+    }
+
+    fn signal_event(&self) -> isize {
+        self.signal_event
+    }
+
+    fn wait_interruptibly(&self) -> std::io::Result<()> {
+        let handles = [
+            self.queue_event as windows_sys::Win32::Foundation::HANDLE,
+            self.signal_event as windows_sys::Win32::Foundation::HANDLE,
+        ];
+        loop {
+            let result = unsafe {
+                windows_sys::Win32::System::Threading::WaitForMultipleObjects(
+                    handles.len() as u32,
+                    handles.as_ptr(),
+                    0,
+                    windows_sys::Win32::System::Threading::INFINITE,
+                )
+            };
+            if result == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+                || result == windows_sys::Win32::Foundation::WAIT_OBJECT_0 + 1
+            {
+                return Ok(());
+            }
+            if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RuntimeInputWake {
+    fn drop(&mut self) {
+        close_handle(self.queue_event);
+        close_handle(self.signal_event);
+    }
+}
+
+#[cfg(windows)]
+fn create_event() -> std::io::Result<isize> {
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateEventW(
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(handle as isize)
+}
+
+#[cfg(windows)]
+fn set_event(handle: isize) {
+    let _ = unsafe { windows_sys::Win32::System::Threading::SetEvent(handle as _) };
+}
+
+#[cfg(windows)]
+fn close_handle(handle: isize) {
+    if handle != 0 {
+        let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle as _) };
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn configure_wake_fd(fd: libc::c_int) -> std::io::Result<()> {
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, status_flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn write_wake_byte(fd: libc::c_int) {
+    loop {
+        let rc = unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+        if rc == 1 {
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return,
+            _ => return,
+        }
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn drain_fd(fd: libc::c_int) {
+    let mut buffer = [0u8; 64];
+    loop {
+        let rc = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if rc > 0 {
+            continue;
+        }
+        if rc == 0 {
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return,
+            _ => return,
+        }
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn close_fd(fd: libc::c_int) {
+    if fd >= 0 {
+        let _ = unsafe { libc::close(fd) };
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn install_r_sigint_wake_handler(state: &SessionState) -> Result<(), String> {
+    R_SIGINT_WAKE_WRITE_FD.store(state.runtime_input_wake.write_fd(), Ordering::SeqCst);
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = r_sigint_wake_handler as *const () as libc::sighandler_t;
+    action.sa_flags = 0;
+    let mask_result = unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    if mask_result < 0 {
+        return Err(format!(
+            "failed to initialize R SIGINT wake handler mask: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = unsafe { libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) };
+    if result < 0 {
+        return Err(format!(
+            "failed to install R SIGINT wake handler: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+extern "C" fn r_sigint_wake_handler(_signal: libc::c_int) {
+    // Match R's default SIGINT handler by marking an interrupt pending, then
+    // wake our managed ReadConsole wait so the main R thread can check it.
+    unsafe {
+        *libr::R_interrupts_pending = 1;
+    }
+    let fd = R_SIGINT_WAKE_WRITE_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        write_wake_byte(fd);
+    }
+}
+
+#[cfg(windows)]
+fn install_windows_r_signal_wake_handler(state: &SessionState) -> Result<(), String> {
+    WINDOWS_R_SIGNAL_WAKE_EVENT.store(state.runtime_input_wake.signal_event(), Ordering::SeqCst);
+    let ok = unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(windows_r_signal_wake_handler),
+            1,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "failed to install R Windows signal wake handler: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_r_signal_wake_handler(event: u32) -> i32 {
+    if event == windows_sys::Win32::System::Console::CTRL_C_EVENT {
+        unsafe {
+            libr::set(libr::UserBreak, Rboolean_TRUE);
+        }
+        let handle = WINDOWS_R_SIGNAL_WAKE_EVENT.load(Ordering::SeqCst);
+        if handle != 0 {
+            set_event(handle);
+        }
+        return 1;
+    }
+    0
 }
 
 fn initialize_r(init: &SessionInit) -> Result<(), String> {
@@ -409,7 +737,7 @@ fn normalize_empty_r_home_env() {
 }
 
 #[cfg(windows)]
-fn discover_windows_r_home() -> Option<PathBuf> {
+pub(crate) fn discover_windows_r_home() -> Option<PathBuf> {
     let mut roots = Vec::new();
     for key in ["ProgramW6432", "ProgramFiles"] {
         if let Some(root) = std::env::var_os(key).map(PathBuf::from) {
@@ -694,14 +1022,102 @@ fn drain_input_queue(queue: &mut VecDeque<InputBatchLine>) -> String {
     drained
 }
 
-fn wait_until_console_input_changes(
-    state: &SessionState,
-    mut guard: MutexGuard<'_, SessionStateInner>,
+#[cfg(target_family = "unix")]
+fn wait_until_console_input_changes<'a>(
+    state: &'a SessionState,
+    mut guard: MutexGuard<'a, SessionStateInner>,
 ) {
-    while guard.input_queue.is_empty() && !guard.shutdown && !guard.read_interrupted {
-        guard = state.cvar.wait(guard).unwrap();
+    loop {
+        if guard.shutdown {
+            break;
+        }
+        if !guard.input_queue.is_empty() {
+            drop(guard);
+            unsafe {
+                libr::R_CheckUserInterrupt();
+            }
+            guard = state.inner.lock().unwrap();
+            if guard.shutdown || !guard.input_queue.is_empty() {
+                break;
+            }
+            continue;
+        }
+        drop(guard);
+        state
+            .runtime_input_wake
+            .wait_interruptibly()
+            .expect("R runtime input wake wait failed");
+        unsafe {
+            libr::R_CheckUserInterrupt();
+        }
+        guard = state.inner.lock().unwrap();
     }
-    guard.waiting_for_input = false;
+}
+
+#[cfg(windows)]
+fn wait_until_console_input_changes<'a>(
+    state: &'a SessionState,
+    mut guard: MutexGuard<'a, SessionStateInner>,
+) {
+    loop {
+        if guard.shutdown {
+            break;
+        }
+        if !guard.input_queue.is_empty() {
+            drop(guard);
+            unsafe {
+                libr::R_CheckUserInterrupt();
+            }
+            guard = state.inner.lock().unwrap();
+            if guard.shutdown || !guard.input_queue.is_empty() {
+                break;
+            }
+            continue;
+        }
+        drop(guard);
+        state
+            .runtime_input_wake
+            .wait_interruptibly()
+            .expect("R runtime input wake wait failed");
+        unsafe {
+            libr::R_CheckUserInterrupt();
+        }
+        guard = state.inner.lock().unwrap();
+    }
+}
+
+#[cfg(not(any(target_family = "unix", windows)))]
+fn wait_until_console_input_changes<'a>(
+    state: &'a SessionState,
+    mut guard: MutexGuard<'a, SessionStateInner>,
+) {
+    loop {
+        if guard.shutdown {
+            break;
+        }
+        if !guard.input_queue.is_empty() {
+            drop(guard);
+            unsafe {
+                libr::R_CheckUserInterrupt();
+            }
+            guard = state.inner.lock().unwrap();
+            if guard.shutdown || !guard.input_queue.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        let (next_guard, _) = state
+            .cvar
+            .wait_timeout(guard, R_READ_CONSOLE_INTERRUPT_POLL_INTERVAL)
+            .unwrap();
+        guard = next_guard;
+        drop(guard);
+        unsafe {
+            libr::R_CheckUserInterrupt();
+        }
+        guard = state.inner.lock().unwrap();
+    }
 }
 
 fn split_console_line(
@@ -1050,16 +1466,6 @@ pub extern "C-unwind" fn r_read_console(
             return 0;
         }
 
-        if guard.read_interrupted {
-            guard.read_interrupted = false;
-            guard.waiting_for_input = false;
-            drop(guard);
-            unsafe {
-                libr::Rf_onintr();
-            }
-            return 0;
-        }
-
         if let Some(line) = guard.input_queue.pop_front() {
             let max = (buflen as usize).saturating_sub(1);
             let (line_text, tail) = split_console_line(line, max);
@@ -1094,7 +1500,6 @@ pub extern "C-unwind" fn r_read_console(
         if guard.active_input {
             guard.active_input = false;
             guard.plot_hashes.clear();
-            guard.waiting_for_input = true;
             drop(guard);
             ipc::emit_input_wait(prompt);
             let guard = state.inner.lock().unwrap();
@@ -1103,7 +1508,6 @@ pub extern "C-unwind" fn r_read_console(
         }
 
         let prompt = prompt.to_string();
-        guard.waiting_for_input = true;
         drop(guard);
         ipc::emit_input_wait(&prompt);
         let guard = state.inner.lock().unwrap();

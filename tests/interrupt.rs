@@ -4,6 +4,12 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::{CallToolResult, RawContent};
+#[cfg(unix)]
+use serde_json::Value;
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(any(unix, windows))]
 use tokio::time::{Duration, Instant, sleep};
@@ -41,6 +47,44 @@ fn is_busy_response(text: &str) -> bool {
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
+}
+
+#[cfg(unix)]
+fn latest_debug_events(debug_dir: &Path) -> TestResult<Vec<Value>> {
+    let mut sessions = fs::read_dir(debug_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    sessions.sort();
+    let session_dir = sessions.last().ok_or("missing debug session directory")?;
+    let events_path = session_dir.join("events.jsonl");
+    let text = fs::read_to_string(&events_path)?;
+    Ok(text
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+#[cfg(unix)]
+fn wait_for_debug_event(debug_dir: &Path, event: &str) -> TestResult<Value> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut latest = Vec::new();
+    loop {
+        if let Ok(events) = latest_debug_events(debug_dir) {
+            latest = events;
+            if let Some(entry) = latest.iter().find(|entry| entry["event"] == event) {
+                return Ok(entry.clone());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "expected debug event {event:?} under {}, got {latest:?}",
+                debug_dir.display()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
@@ -151,6 +195,121 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
     }
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn r_discard_pending_input_ack_does_not_wait_for_busy_main_thread() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let temp = tempfile::tempdir()?;
+    let debug_dir = temp.path().join("debug");
+    let handler_done = temp.path().join("handler-done");
+    let handler_done_literal = serde_json::to_string(&handler_done.to_string_lossy())?;
+    let session = common::spawn_server_with_args_env(
+        vec!["--sandbox".to_string(), "danger-full-access".to_string()],
+        vec![(
+            "MCP_REPL_DEBUG_DIR".to_string(),
+            debug_dir.to_string_lossy().to_string(),
+        )],
+    )
+    .await?;
+
+    let input = format!(
+        r#"
+done_path <- {handler_done_literal}
+cat("R_INTERRUPT_READY\n")
+flush.console()
+tryCatch(
+  {{
+    Sys.sleep(30)
+  }},
+  interrupt = function(e) {{
+    cat("R_INTERRUPT_HANDLER_START\n")
+    flush.console()
+    Sys.sleep(1)
+    writeLines("done", done_path)
+    cat("R_INTERRUPT_HANDLER_DONE\n")
+    flush.console()
+  }}
+)
+x_stale_marker <- 42
+"#
+    );
+    let timeout_result = session.write_stdin_raw_with(input, Some(0.1)).await?;
+    let mut text = result_text(&timeout_result);
+    if backend_unavailable(&text) {
+        eprintln!("R discard ack test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while !text.contains("R_INTERRUPT_READY") {
+        if Instant::now() >= ready_deadline {
+            session.cancel().await?;
+            return Err(format!("R request did not reach interrupt-ready state: {text:?}").into());
+        }
+        sleep(Duration::from_millis(50)).await;
+        let poll = session.write_stdin_raw_with("", Some(0.5)).await?;
+        text = result_text(&poll);
+        if backend_unavailable(&text) {
+            eprintln!("R discard ack test backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+    }
+
+    let interrupt = session
+        .write_stdin_raw_unterminated_with("\u{3}", Some(0.2))
+        .await?;
+    let interrupt_text = result_text(&interrupt);
+    if backend_unavailable(&interrupt_text) {
+        eprintln!("R interrupt ack test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let ack = wait_for_debug_event(&debug_dir, "worker_discard_pending_input_ack_observed")?;
+    assert_eq!(
+        ack["payload"]["discarded_input"], true,
+        "queued stale R input should be discarded by discard_pending_input ack"
+    );
+    assert!(
+        !handler_done.exists(),
+        "discard ack should be observed before the busy R interrupt handler returns; interrupt reply: {interrupt_text:?}"
+    );
+
+    let done_deadline = Instant::now() + Duration::from_secs(10);
+    while !handler_done.exists() {
+        if Instant::now() >= done_deadline {
+            session.cancel().await?;
+            return Err("R interrupt handler did not finish".into());
+        }
+        sleep(Duration::from_millis(50)).await;
+        let _ = session.write_stdin_raw_with("", Some(0.5)).await?;
+    }
+
+    let probe_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() >= probe_deadline {
+            session.cancel().await?;
+            return Err("R worker stayed busy before stale-input probe".into());
+        }
+        let result = session
+            .write_stdin_raw_with("exists('x_stale_marker')", Some(1.0))
+            .await?;
+        let text = result_text(&result);
+        if is_busy_response(&text) {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        session.cancel().await?;
+        assert!(
+            text.contains("FALSE"),
+            "stale queued R input should have been discarded, got: {text:?}"
+        );
+        break;
+    }
+
     Ok(())
 }
 

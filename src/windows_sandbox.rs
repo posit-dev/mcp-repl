@@ -94,12 +94,10 @@ use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
-use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
-use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
 use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -318,21 +316,9 @@ struct WrapperWriteGuard<'a> {
     write_in_progress: &'a AtomicBool,
 }
 
-struct ConsoleCtrlHandlerGuard {
-    handler: unsafe extern "system" fn(u32) -> i32,
-}
-
 impl Drop for WrapperWriteGuard<'_> {
     fn drop(&mut self) {
         self.write_in_progress.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for ConsoleCtrlHandlerGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = SetConsoleCtrlHandler(Some(self.handler), 0);
-        }
     }
 }
 
@@ -356,23 +342,6 @@ impl Drop for PreparedLaunchLiveMarker {
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
     !policy.has_full_network_access()
-}
-
-unsafe extern "system" fn ignore_wrapper_ctrl_break(event: u32) -> i32 {
-    if event == CTRL_BREAK_EVENT { 1 } else { 0 }
-}
-
-fn install_wrapper_ctrl_break_handler() -> Result<ConsoleCtrlHandlerGuard, String> {
-    let ok = unsafe { SetConsoleCtrlHandler(Some(ignore_wrapper_ctrl_break), 1) };
-    if ok == 0 {
-        return Err(format!(
-            "SetConsoleCtrlHandler failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(ConsoleCtrlHandlerGuard {
-        handler: ignore_wrapper_ctrl_break,
-    })
 }
 
 fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
@@ -1202,7 +1171,10 @@ fn offline_identity_read_execute_paths(launch: &PreparedSandboxLaunch) -> HashSe
     let mut read_paths = HashSet::new();
     read_paths.insert(launch.sandbox_policy_cwd.clone());
     if let Ok(exe) = std::env::current_exe() {
-        insert_offline_read_path(&mut read_paths, exe);
+        insert_offline_read_path(&mut read_paths, exe.clone());
+        if let Some(parent) = exe.parent() {
+            insert_offline_read_path(&mut read_paths, parent.to_path_buf());
+        }
     }
     for env_key in [
         crate::python_runtime::PYTHON_EXECUTABLE_ENV,
@@ -1213,6 +1185,11 @@ fn offline_identity_read_execute_paths(launch: &PreparedSandboxLaunch) -> HashSe
         if let Some(value) = std::env::var_os(env_key) {
             insert_offline_read_path(&mut read_paths, PathBuf::from(value));
         }
+    }
+    if std::env::var_os("R_HOME").is_none_or(|value| value.is_empty())
+        && let Some(r_home) = crate::r_session::discover_windows_r_home()
+    {
+        insert_offline_read_path(&mut read_paths, r_home);
     }
     for env_key in ["PYTHONPATH", "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE"] {
         if let Some(value) = std::env::var_os(env_key) {
@@ -1760,7 +1737,6 @@ fn run_sandboxed_command_with_env_map(
             CloseHandle(base_token);
             return Err("prepared capability SID requires an unrestricted base token".to_string());
         }
-        let _ctrl_handler_guard = install_wrapper_ctrl_break_handler()?;
         let capability_sids =
             resolve_launch_capability_sids(policy, sandbox_policy_cwd, prepared_capability_sid)?;
         let psid_capability = convert_string_sid_to_sid(&capability_sids.filesystem_sid)
@@ -1894,7 +1870,7 @@ fn run_sandboxed_command_with_env_map(
                 sandbox_policy_cwd,
                 &mut env_map,
             );
-            let (proc_info, conpty, output_forwarder) = match spawn_result {
+            let (proc_info, mut conpty, output_forwarder) = match spawn_result {
                 Ok(value) => value,
                 Err(err) => {
                     cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
@@ -1907,6 +1883,13 @@ fn run_sandboxed_command_with_env_map(
                 }
             };
             crate::diagnostics::startup_log("windows-sandbox: conpty child spawned");
+            let input_forwarder = conpty.take_input_writer().ok().map(|mut input_write| {
+                thread::spawn(move || {
+                    let mut wrapper_stdin = io::stdin();
+                    let _ = io::copy(&mut wrapper_stdin, &mut input_write);
+                    let _ = input_write.flush();
+                })
+            });
 
             let job_handle = create_job_kill_on_close().ok();
             if let Some(job) = job_handle {
@@ -1919,6 +1902,7 @@ fn run_sandboxed_command_with_env_map(
                     CloseHandle(job);
                 }
                 drop(conpty);
+                drop(input_forwarder);
                 let _ = output_forwarder.join();
                 cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(proc_info.hThread);
@@ -1940,6 +1924,7 @@ fn run_sandboxed_command_with_env_map(
                     CloseHandle(job);
                 }
                 drop(conpty);
+                drop(input_forwarder);
                 let _ = output_forwarder.join();
                 cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                 CloseHandle(proc_info.hThread);
@@ -1962,6 +1947,7 @@ fn run_sandboxed_command_with_env_map(
                 "windows-sandbox: conpty child exited {exit_code}"
             ));
             drop(conpty);
+            drop(input_forwarder);
             let _ = output_forwarder.join();
             cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             drop(live_marker);
@@ -4070,6 +4056,7 @@ mod tests {
         let python_lib = tmp.path().join("python-lib");
         let r_lib_a = tmp.path().join("r-lib-a");
         let r_lib_b = tmp.path().join("r-lib-b");
+        let _r_home = ScopedEnvVar::set_os("R_HOME", OsStr::new(""));
         for path in [&cwd, &session_temp_dir, &python_lib, &r_lib_a, &r_lib_b] {
             std::fs::create_dir_all(path).expect("create test dir");
         }
@@ -4096,7 +4083,13 @@ mod tests {
         };
 
         let read_paths = offline_identity_read_execute_paths(&launch);
+        let current_exe = std::env::current_exe().expect("current exe");
+        let current_exe_dir = current_exe.parent().expect("current exe parent");
 
+        assert!(read_paths.contains(&canonicalize_or_identity(current_exe_dir)));
+        if let Some(r_home) = crate::r_session::discover_windows_r_home() {
+            assert!(read_paths.contains(&canonicalize_or_identity(&r_home)));
+        }
         assert!(read_paths.contains(&canonicalize_or_identity(&python_lib)));
         assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_a)));
         assert!(read_paths.contains(&canonicalize_or_identity(&r_lib_b)));
