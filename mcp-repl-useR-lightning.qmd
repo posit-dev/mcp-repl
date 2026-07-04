@@ -275,7 +275,9 @@ render_chat(
   "I'll inspect the data first, so I'll send R a quick one-off command.",
   list(
     chat_tool(bash_command(inline_command)),
-    chat_note("The result gives enough context to take the next step. This is turning into reusable setup, so I should move it into a script."),
+    chat_note(
+      "The result gives enough context to take the next step. This is turning into reusable setup, so I should move it into a script."
+    ),
     chat_tool(bash_command(heredoc_command))
   )
 )
@@ -366,14 +368,19 @@ needs somewhere to live, and writes a temporary script.
 
 ::: {.column width="42%"}
 
-```text
-run 1: load -> inspect
-run 2: load -> clean -> plot
-run 3: load -> clean -> fit
-run 4: load -> clean -> debug
+<br>
+
+```{.text code-line-numbers="false"}
+Run 1: load -> inspect
+Run 2: load -> clean -> plot
+Run 3: load -> clean -> fit
+Run 4: load -> clean -> debug
+Run 5: load -> clean -> fit -> plot
 ```
 
 ::: {.lede}
+<br>
+
 The chat remembers.
 
 R starts over.
@@ -429,7 +436,7 @@ r_surfaces <- list(
   Help = c("?lm", 'help("predict")', "vignette()"),
   Graphics = c("plot(fit)", "ggplot(df, aes(...))"),
   Debugging = c("browser()", "Browse[1]> n", "where"),
-  EDA = c("df, fit, res", "str(), ls(), glimpse()")
+  EDA = c("df(), fit(), res()", "str() ls() glimpse()")
 )
 
 surface_card <- function(title, lines) {

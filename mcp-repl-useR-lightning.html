@@ -272,11 +272,14 @@
 <p><img src="mcp-repl-useR-lightning-assets/chat-rerun-loop.png" alt="A chat interface where the assistant runs an Rscript file, edits it with an edit_file tool call, and runs it again."></p>
 </div>
 </div><div class="column" style="width:42%;">
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode numberSource text number-lines code-with-copy"><code class="sourceCode"><span id="cb1-1"><a href=""></a>run 1: load -&gt; inspect</span>
-<span id="cb1-2"><a href=""></a>run 2: load -&gt; clean -&gt; plot</span>
-<span id="cb1-3"><a href=""></a>run 3: load -&gt; clean -&gt; fit</span>
-<span id="cb1-4"><a href=""></a>run 4: load -&gt; clean -&gt; debug</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><br></p>
+<pre class="text"><code>Run 1: load -&gt; inspect
+Run 2: load -&gt; clean -&gt; plot
+Run 3: load -&gt; clean -&gt; fit
+Run 4: load -&gt; clean -&gt; debug
+Run 5: load -&gt; clean -&gt; fit -&gt; plot</code></pre>
 <div class="lede">
+<p><br></p>
 <p>The chat remembers.</p>
 <p>R starts over.</p>
 </div>
@@ -375,10 +378,10 @@ Objects disappear after each run, so the agent rebuilds the world from files.
 <div class="card">
 <h3>EDA</h3>
 <p>
-<code>df, fit, res</code>
+<code>df(), fit(), res()</code>
 </p>
 <p>
-<code>str(), ls(), glimpse()</code>
+<code>str() ls() glimpse()</code>
 </p>
 </div>
 </div>
