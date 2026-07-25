@@ -34,6 +34,8 @@ mod stdin_payload;
 #[cfg(target_os = "windows")]
 mod windows_conpty;
 #[cfg(target_os = "windows")]
+mod windows_interrupt_observer;
+#[cfg(target_os = "windows")]
 mod windows_sandbox;
 #[cfg(target_os = "windows")]
 mod windows_sandbox_setup;

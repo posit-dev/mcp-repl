@@ -28,7 +28,9 @@ fn run_r_worker() -> Result<(), Box<dyn std::error::Error>> {
 
     crate::diagnostics::startup_log("worker: starting R session");
     if let Err(err) = RSession::start_on_current_thread() {
-        eprintln!("failed to start R session: {err}");
+        if !crate::r_session::protocol_failure_recorded() {
+            eprintln!("failed to start R session: {err}");
+        }
         return Err(std::io::Error::other(err).into());
     }
     crate::diagnostics::startup_log("worker: R session exited");
@@ -45,6 +47,25 @@ fn wait_for_r_session() -> Result<&'static RSession, String> {
     }
 }
 
+#[cfg(windows)]
+fn arm_windows_interrupt_delivery(conn: &crate::ipc::WorkerIpcConnection) -> Result<(), String> {
+    crate::windows_interrupt_observer::notify_interrupt_cleanup_complete()
+        .map_err(|err| format!("failed to finish Windows interrupt cleanup: {err}"))?;
+    match crate::windows_interrupt_observer::rearm()
+        .map_err(|err| format!("failed to rearm Windows interrupt observer: {err}"))?
+    {
+        crate::windows_interrupt_observer::RearmOutcome::Rearmed => {}
+        crate::windows_interrupt_observer::RearmOutcome::InterruptInFlight => {
+            return Err(
+                "Windows interrupt observer found a native dispatch in flight before delivery"
+                    .to_string(),
+            );
+        }
+    }
+    conn.send(crate::ipc::WorkerToServerIpcMessage::InterruptArmed {})
+        .map_err(|err| format!("failed to acknowledge armed Windows interrupt: {err}"))
+}
+
 fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
     let conn = connect_from_env(Duration::from_secs(2))?;
     set_global_ipc(conn.clone());
@@ -57,16 +78,27 @@ fn init_ipc() -> Result<(), Box<dyn std::error::Error>> {
                         match wait_for_r_session().and_then(|session| session.begin_input(input)) {
                             Ok(()) => {}
                             Err(err) => {
-                                crate::output_stream::write_stderr_bytes(err.as_bytes());
-                                crate::ipc::emit_session_end_with_reason("protocol_error");
+                                crate::r_session::record_protocol_failure(&err);
+                                break;
                             }
                         }
                     }
                     Some(ServerToWorkerIpcMessage::Interrupt {}) => {
-                        crate::r_session::interrupt_pending_input();
+                        crate::r_session::discard_pending_input_after_interrupt();
+                        #[cfg(windows)]
+                        if let Err(err) = arm_windows_interrupt_delivery(&conn) {
+                            crate::r_session::record_protocol_failure(&format!(
+                                "failed to arm Windows interrupt delivery: {err}"
+                            ));
+                            break;
+                        }
                     }
                     Some(ServerToWorkerIpcMessage::Shutdown {}) => {
-                        let _ = wait_for_r_session().and_then(RSession::request_shutdown);
+                        if let Err(err) = wait_for_r_session().and_then(RSession::request_shutdown)
+                        {
+                            crate::r_session::record_protocol_failure(&err);
+                            break;
+                        }
                     }
                     None => {
                         // Without IPC, the worker cannot participate in input accounting (prompt,

@@ -6,7 +6,7 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 use std::path::Path;
 use std::thread;
 
@@ -16,8 +16,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::GetFileType;
 use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetStdHandle, HPCON,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    COORD, ClosePseudoConsole, CreatePseudoConsole, ENABLE_PROCESSED_INPUT, GetConsoleMode,
+    GetStdHandle, HPCON, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -100,6 +100,10 @@ pub fn attach_stdio_to_conpty_if_attached() -> Result<(), String> {
         crate::diagnostics::startup_log(format!("windows-conpty: attach stdin failed: {err}"));
         err
     })?;
+    enable_processed_console_input().map_err(|err| {
+        crate::diagnostics::startup_log(format!("windows-conpty: processed input failed: {err}"));
+        err
+    })?;
     rebind_crt_fd_to_conpty_device(1, "CONOUT$", libc::O_WRONLY | libc::O_TEXT).map_err(|err| {
         crate::diagnostics::startup_log(format!("windows-conpty: attach stdout failed: {err}"));
         err
@@ -144,6 +148,31 @@ fn rebind_crt_fd_to_conpty_device(fd: i32, device: &str, flags: i32) -> Result<(
     }
     unsafe {
         libc::close(new_fd);
+    }
+    Ok(())
+}
+
+fn enable_processed_console_input() -> Result<(), String> {
+    // Keep CRT stdin read-only. Some ConPTY hosts reject SetConsoleMode through
+    // that handle, so use a short-lived read/write mode-control handle instead.
+    let console_input = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONIN$")
+        .map_err(|err| format!("failed to open CONIN$ for mode control: {err}"))?;
+    let handle = console_input.as_raw_handle() as HANDLE;
+    let mut mode = 0u32;
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return Err(format!(
+            "GetConsoleMode failed for CONIN$: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { SetConsoleMode(handle, mode | ENABLE_PROCESSED_INPUT) } == 0 {
+        return Err(format!(
+            "SetConsoleMode failed for CONIN$: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -196,6 +225,8 @@ pub fn run_conpty_command_with_env_map(
         let proc_info = spawn_conpty_process(command, cwd, &env_map, conpty.hpc)?;
         conpty.close_child_side_handles();
         crate::diagnostics::startup_log("windows-conpty: child spawned");
+        let input_write = conpty.take_input_writer()?;
+        let _input_forwarder = spawn_conpty_input_forwarder(input_write);
         let _job_handle = JobHandle::kill_on_close()
             .ok()
             .and_then(|job| job.assign_process(proc_info.hProcess).ok().map(|()| job));
@@ -290,6 +321,8 @@ pub unsafe fn spawn_conpty_process_as_user(
     let output_forwarder = spawn_conpty_output_forwarder(output_read);
     let proc_info = spawn_conpty_process_with_token(token, command, cwd, env_map, conpty.hpc)?;
     conpty.close_child_side_handles();
+    let input_write = conpty.take_input_writer()?;
+    let _input_forwarder = spawn_conpty_input_forwarder(input_write);
     Ok((proc_info, conpty, output_forwarder))
 }
 
@@ -554,6 +587,37 @@ impl Drop for ProcThreadAttributeList {
     }
 }
 
+fn spawn_conpty_input_forwarder(mut input: File) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        forward_conpty_input(&mut stdin, &mut input);
+    })
+}
+
+fn forward_conpty_input<R, W>(stdin: &mut R, conpty_input: &mut W)
+where
+    R: Read,
+    W: Write,
+{
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stdin.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                if conpty_input
+                    .write_all(&buffer[..count])
+                    .and_then(|_| conpty_input.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 fn spawn_conpty_output_forwarder(mut output: File) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdout = io::stdout();
@@ -687,5 +751,17 @@ mod tests {
         forward_conpty_output(&mut reader, &mut output);
 
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn conpty_input_forwarder_preserves_ctrl_c_bytes() {
+        let input = b"before\x03after";
+        let mut reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+
+        forward_conpty_input(&mut reader, &mut output);
+
+        assert_eq!(output, input);
+        assert_eq!(output.iter().filter(|byte| **byte == 0x03).count(), 1);
     }
 }

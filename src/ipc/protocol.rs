@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker_protocol::TextStream;
 
-pub const WORKER_PROTOCOL_VERSION: u32 = 6;
+pub const WORKER_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -35,6 +35,13 @@ pub enum WorkerToServerIpcMessage {
     InputWait {
         prompt: String,
     },
+    /// Proof that the Windows worker IPC handler completed cleanup and made
+    /// the observer newest before the server delivers native Ctrl-C.
+    InterruptArmed {},
+    /// Observational proof that the Windows worker main thread joined native
+    /// handler completion with queued-input cleanup. This message never
+    /// requests or synthesizes a runtime interrupt.
+    InterruptComplete {},
     Ready {},
     OutputImage {
         mime_type: String,
@@ -530,6 +537,50 @@ mod tests {
             }))
             .is_err(),
             "interrupt should not deserialize as a worker-to-server message"
+        );
+    }
+
+    #[test]
+    fn interrupt_armed_is_payload_free_worker_acknowledgement() {
+        let armed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "interrupt_armed"
+        }));
+        assert!(
+            matches!(armed, Ok(WorkerToServerIpcMessage::InterruptArmed {})),
+            "interrupt_armed should deserialize without payload"
+        );
+        assert!(
+            serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+                "type": "interrupt_armed",
+                "sequence": 1
+            }))
+            .is_err(),
+            "interrupt_armed should reject payload fields"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "interrupt_armed"
+            }))
+            .is_err(),
+            "interrupt_armed must remain worker-to-server only"
+        );
+    }
+
+    #[test]
+    fn interrupt_complete_is_payload_free_worker_observation() {
+        let observed = serde_json::from_value::<WorkerToServerIpcMessage>(json!({
+            "type": "interrupt_complete"
+        }));
+        assert!(
+            matches!(observed, Ok(WorkerToServerIpcMessage::InterruptComplete {})),
+            "interrupt_complete should deserialize without payload"
+        );
+        assert!(
+            serde_json::from_value::<ServerToWorkerIpcMessage>(json!({
+                "type": "interrupt_complete"
+            }))
+            .is_err(),
+            "interrupt_complete must not become server-to-worker authority"
         );
     }
 }

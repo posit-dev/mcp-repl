@@ -1,11 +1,17 @@
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(all(windows, debug_assertions))]
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 use crate::completion_reply::CompletionInfo;
 use crate::ipc::{IpcWaitError, ServerIpcConnection};
 use crate::oversized_output::OversizedOutputMode;
 use crate::pending_output_tape::PendingSidebandKind;
+#[cfg(all(windows, debug_assertions))]
+use windows_sys::Win32::Foundation::CloseHandle;
+#[cfg(all(windows, debug_assertions))]
+use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
 
 use super::{WorkerError, WorkerManager};
 
@@ -30,9 +36,51 @@ pub(super) struct RequestState {
     pub(super) started_at: Instant,
 }
 
+pub(super) struct RequestStartError {
+    pub(super) error: WorkerError,
+    pub(super) reset_process: bool,
+}
+
+impl RequestStartError {
+    fn pre_admission(error: WorkerError) -> Self {
+        Self {
+            error,
+            reset_process: false,
+        }
+    }
+
+    fn worker_state_uncertain(error: WorkerError) -> Self {
+        Self {
+            error,
+            reset_process: true,
+        }
+    }
+}
+
 impl RequestState {
     pub(super) fn remaining_budget(&self) -> Duration {
         (self.started_at + self.timeout).saturating_duration_since(Instant::now())
+    }
+}
+
+#[cfg(all(windows, debug_assertions))]
+fn signal_test_interrupt_admission_gate() {
+    const EVENT_ENV: &str = "MCP_REPL_TEST_WINDOWS_INTERRUPT_ADMISSION_GATE_EVENT";
+
+    let Some(name) = std::env::var_os(EVENT_ENV).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let wide_name = OsStr::new(&name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide_name.as_ptr()) };
+    if event.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = SetEvent(event);
+        CloseHandle(event);
     }
 }
 
@@ -108,7 +156,7 @@ impl WorkerManager {
         text: String,
         worker_timeout: Duration,
         server_timeout: Duration,
-    ) -> Result<RequestState, WorkerError> {
+    ) -> Result<RequestState, RequestStartError> {
         let text = self.driver.prepare_input_text(text);
         let started_at = Instant::now();
         let prompt = self.current_prompt_hint();
@@ -118,24 +166,79 @@ impl WorkerManager {
             .process
             .as_ref()
             .and_then(|process| process.ipc_connection())
-            .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
+            .ok_or_else(|| {
+                RequestStartError::worker_state_uncertain(WorkerError::Protocol(
+                    "worker ipc unavailable".to_string(),
+                ))
+            })?;
         if server_timeout.is_zero() {
-            return Err(WorkerError::Timeout(server_timeout));
+            return Err(RequestStartError::pre_admission(WorkerError::Timeout(
+                server_timeout,
+            )));
         }
         let server_deadline = started_at + server_timeout;
-        let remaining = server_deadline.saturating_duration_since(Instant::now());
+        let mut remaining = server_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(WorkerError::Timeout(server_timeout));
+            return Err(RequestStartError::pre_admission(WorkerError::Timeout(
+                server_timeout,
+            )));
+        }
+        #[cfg(windows)]
+        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_)) {
+            match ipc.wait_for_pending_interrupt_transaction_with_wait_observer(remaining, || {
+                #[cfg(debug_assertions)]
+                signal_test_interrupt_admission_gate();
+            }) {
+                Ok(()) => {}
+                Err(IpcWaitError::Timeout) => {
+                    return Err(RequestStartError::pre_admission(WorkerError::Timeout(
+                        server_timeout,
+                    )));
+                }
+                Err(IpcWaitError::SessionEnd) => {
+                    self.note_session_end(true);
+                    return Err(RequestStartError::worker_state_uncertain(
+                        WorkerError::Protocol(
+                            "worker session ended before Windows interrupt transaction settled"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                Err(IpcWaitError::Disconnected) => {
+                    return Err(RequestStartError::worker_state_uncertain(
+                        WorkerError::Protocol(
+                            "ipc disconnected before Windows interrupt transaction settled"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                Err(IpcWaitError::Protocol(message)) => {
+                    return Err(RequestStartError::worker_state_uncertain(
+                        WorkerError::Protocol(message),
+                    ));
+                }
+            }
+            self.complete_interrupt_delivery_if_settled();
+            remaining = server_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(RequestStartError::pre_admission(WorkerError::Timeout(
+                    server_timeout,
+                )));
+            }
         }
         if let Some(process) = self.process.as_ref() {
             process.note_accepted_input_starting();
         }
-        self.driver.on_input_start(&text, &ipc, remaining)?;
+        self.driver
+            .on_input_start(&text, &ipc, remaining)
+            .map_err(RequestStartError::worker_state_uncertain)?;
         self.settled_pending_completion = None;
         self.guardrail.busy.store(true, Ordering::Relaxed);
         let remaining = server_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(WorkerError::Timeout(server_timeout));
+            return Err(RequestStartError::worker_state_uncertain(
+                WorkerError::Timeout(server_timeout),
+            ));
         }
         Ok(RequestState {
             timeout: worker_timeout,

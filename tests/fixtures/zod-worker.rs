@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(target_family = "unix")]
 use std::os::unix::io::FromRawFd;
+#[cfg(target_family = "windows")]
+use std::os::windows::io::{AsRawHandle, IntoRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -15,7 +17,12 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::Foundation::CloseHandle;
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, ENABLE_PROCESSED_INPUT, GetConsoleMode, SetConsoleCtrlHandler,
+    SetConsoleMode,
+};
 
 #[cfg(target_family = "unix")]
 const IPC_READ_FD_ENV: &str = "MCP_REPL_IPC_READ_FD";
@@ -77,7 +84,7 @@ fn run_worker(
     writer.send(&WorkerToServer::WorkerReady {
         protocol: Protocol {
             name: "mcp-repl-worker".to_string(),
-            version: 6,
+            version: 7,
         },
         worker: WorkerIdentity {
             name: "zod".to_string(),
@@ -1005,6 +1012,47 @@ fn take_os_interrupt() -> bool {
 
 #[cfg(target_family = "windows")]
 fn install_signal_handler() -> io::Result<()> {
+    // A custom ConPTY worker is responsible for enabling processed input so
+    // ETX is translated into CTRL_C_EVENT rather than surfaced as stdin data.
+    let console_mode_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONIN$")?;
+    let input_handle = console_mode_handle.as_raw_handle();
+    let mut mode = 0;
+    let ok = unsafe { GetConsoleMode(input_handle, &mut mode) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let ok = unsafe { SetConsoleMode(input_handle, mode | ENABLE_PROCESSED_INPUT) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(console_mode_handle);
+    let console_input = std::fs::OpenOptions::new().read(true).open("CONIN$")?;
+    let console_input = console_input.into_raw_handle();
+    let console_fd =
+        unsafe { libc::open_osfhandle(console_input as isize, libc::O_RDONLY | libc::O_TEXT) };
+    if console_fd < 0 {
+        unsafe {
+            CloseHandle(console_input);
+        }
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::dup2(console_fd, 0) } != 0 {
+        let error = io::Error::last_os_error();
+        unsafe { libc::close(console_fd) };
+        return Err(error);
+    }
+    unsafe { libc::close(console_fd) };
+
+    // CREATE_NEW_PROCESS_GROUP starts the child with Ctrl+C ignored. A custom
+    // ConPTY worker owns restoring normal Ctrl+C handling before registering
+    // its runtime-specific handler.
+    let ok = unsafe { SetConsoleCtrlHandler(None, 0) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
     let ok = unsafe { SetConsoleCtrlHandler(Some(handle_console_ctrl), 1) };
     if ok == 0 {
         Err(io::Error::last_os_error())

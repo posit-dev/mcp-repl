@@ -34,6 +34,10 @@ struct ServerIpcInbox {
     output_source_image_ids: HashMap<String, String>,
     request_output_source_image_ids: HashMap<String, String>,
     protocol_warnings: VecDeque<String>,
+    pending_interrupt_transaction_started_at: Option<Instant>,
+    interrupt_armed_at: Option<Instant>,
+    interrupt_complete_at: Option<Instant>,
+    readiness_after_interrupt_observation: bool,
     disconnected: bool,
 }
 
@@ -149,7 +153,7 @@ impl ServerIpcConnection {
                         break;
                     }
                 };
-                {
+                let first_worker_message = {
                     let mut guard = reader_inbox.lock().unwrap();
                     if guard.input_state.session_end_final() {
                         guard
@@ -158,7 +162,8 @@ impl ServerIpcConnection {
                         reader_cvar.notify_all();
                         break;
                     }
-                    if !guard.startup_message_seen {
+                    let first_worker_message = !guard.startup_message_seen;
+                    if first_worker_message {
                         let startup_message = matches!(
                             &message,
                             WorkerToServerIpcMessage::WorkerReady { .. }
@@ -173,7 +178,8 @@ impl ServerIpcConnection {
                         }
                         guard.startup_message_seen = true;
                     }
-                }
+                    first_worker_message
+                };
                 match message {
                     WorkerToServerIpcMessage::InputLine { prompt, text } => {
                         let input_line_event = IpcInputLineEvent {
@@ -199,6 +205,11 @@ impl ServerIpcConnection {
                         let mut guard = reader_inbox.lock().unwrap();
                         let observed_at = Instant::now();
                         guard.input_state.record_input_wait(observed_at);
+                        if guard.pending_interrupt_transaction_started_at.is_some()
+                            && guard.interrupt_complete_at.is_some()
+                        {
+                            guard.readiness_after_interrupt_observation = true;
+                        }
                         guard.last_prompt_observed_at = Some(observed_at);
                         push_prompt_history(&mut guard, prompt.clone());
                         guard.last_prompt = Some(prompt.clone());
@@ -208,9 +219,60 @@ impl ServerIpcConnection {
                             reader_handler_gate.dispatch(|| handler(prompt));
                         }
                     }
+                    WorkerToServerIpcMessage::InterruptArmed {} => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if guard.pending_interrupt_transaction_started_at.is_none() {
+                            guard.input_state.latch_protocol_error(
+                                "interrupt_armed reported with no pending interrupt transaction",
+                            );
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        if guard.interrupt_armed_at.is_some() {
+                            guard.input_state.latch_protocol_error(
+                                "duplicate interrupt_armed for pending interrupt transaction",
+                            );
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        guard.interrupt_armed_at = Some(Instant::now());
+                        reader_cvar.notify_all();
+                    }
+                    WorkerToServerIpcMessage::InterruptComplete {} => {
+                        let mut guard = reader_inbox.lock().unwrap();
+                        if guard.pending_interrupt_transaction_started_at.is_none() {
+                            guard.input_state.latch_protocol_error(
+                                "interrupt_complete reported with no pending interrupt transaction",
+                            );
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        if !interrupt_transaction_armed(&guard) {
+                            guard.input_state.latch_protocol_error(
+                                "interrupt_complete reported before interrupt_armed",
+                            );
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        if guard.interrupt_complete_at.is_some() {
+                            guard.input_state.latch_protocol_error(
+                                "duplicate interrupt_complete for pending interrupt transaction",
+                            );
+                            reader_cvar.notify_all();
+                            break;
+                        }
+                        guard.interrupt_complete_at = Some(Instant::now());
+                        guard.readiness_after_interrupt_observation = false;
+                        reader_cvar.notify_all();
+                    }
                     WorkerToServerIpcMessage::Ready {} => {
                         let mut guard = reader_inbox.lock().unwrap();
                         guard.input_state.record_ready(Instant::now());
+                        if guard.pending_interrupt_transaction_started_at.is_some()
+                            && guard.interrupt_complete_at.is_some()
+                        {
+                            guard.readiness_after_interrupt_observation = true;
+                        }
                         guard.last_prompt = None;
                         guard.last_prompt_observed_at = None;
                         guard.prompt_history.clear();
@@ -224,6 +286,12 @@ impl ServerIpcConnection {
                             break;
                         }
                         let mut guard = reader_inbox.lock().unwrap();
+                        if first_worker_message
+                            && reason.as_deref() == Some("protocol_error")
+                            && let Some(message) = message.as_ref()
+                        {
+                            guard.input_state.latch_protocol_error(message.clone());
+                        }
                         guard.input_state.note_session_end();
                         guard
                             .queue
@@ -439,6 +507,120 @@ impl ServerIpcConnection {
         guard.input_state.note_interrupt_sent();
     }
 
+    /// Opens one server-owned Windows interrupt transaction before sideband
+    /// cleanup or native console delivery is sent.
+    ///
+    /// Process replacement creates a new connection and therefore drops this
+    /// state. No wire identifier is needed because built-in delivery is
+    /// serialized to one in-flight transaction.
+    pub fn begin_interrupt_transaction(&self, started_at: Instant) {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.pending_interrupt_transaction_started_at = Some(started_at);
+        guard.interrupt_armed_at = None;
+        guard.interrupt_complete_at = None;
+        guard.readiness_after_interrupt_observation = false;
+    }
+
+    /// Waits for the worker IPC handler to confirm cleanup and observer
+    /// rearming before the server writes native Ctrl-C to ConPTY.
+    pub fn wait_for_interrupt_armed(&self, timeout: Duration) -> Result<(), IpcWaitError> {
+        self.wait_for_interrupt_armed_with_wait_observer(timeout, || {})
+    }
+
+    fn wait_for_interrupt_armed_with_wait_observer<F>(
+        &self,
+        timeout: Duration,
+        mut observe_wait: F,
+    ) -> Result<(), IpcWaitError>
+    where
+        F: FnMut(),
+    {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(message) = guard.input_state.take_protocol_error() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+            if guard.pending_interrupt_transaction_started_at.is_none() {
+                return Err(IpcWaitError::Protocol(
+                    "interrupt arm wait started with no pending interrupt transaction".to_string(),
+                ));
+            }
+            if interrupt_transaction_armed(&guard) {
+                return Ok(());
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            observe_wait();
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() && !interrupt_transaction_armed(&guard) {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
+    /// Gates later worker-bound input until `interrupt_complete` and a
+    /// pipe-later readiness fact have both arrived.
+    pub fn wait_for_pending_interrupt_transaction(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), IpcWaitError> {
+        self.wait_for_pending_interrupt_transaction_with_wait_observer(timeout, || {})
+    }
+
+    pub(crate) fn wait_for_pending_interrupt_transaction_with_wait_observer<F>(
+        &self,
+        timeout: Duration,
+        mut observe_wait: F,
+    ) -> Result<(), IpcWaitError>
+    where
+        F: FnMut(),
+    {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(message) = guard.input_state.take_protocol_error() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+            if guard.pending_interrupt_transaction_started_at.is_none() {
+                return Ok(());
+            }
+            if interrupt_transaction_settled(&guard) {
+                guard.pending_interrupt_transaction_started_at = None;
+                return Ok(());
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            observe_wait();
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() && !interrupt_transaction_settled(&guard) {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
     pub fn take_prompt_history(&self) -> Vec<String> {
         let mut guard = self.inbox.lock().unwrap();
         guard.prompt_history.drain(..).collect()
@@ -582,6 +764,99 @@ impl ServerIpcConnection {
         self.wait_for_input_readiness_after(timeout, Some(since), false)
     }
 
+    /// Waits for the worker main thread to report that native Windows handler
+    /// completion and sideband cleanup have both been observed.
+    ///
+    /// This is an ordering fact only. The server still delivers Ctrl-C through
+    /// the worker's native console input path.
+    pub fn wait_for_interrupt_observation(
+        &self,
+        timeout: Duration,
+        since: Instant,
+    ) -> Result<Instant, IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(message) = guard.input_state.take_protocol_error() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+            if let Some(observed_at) = guard.interrupt_complete_at
+                && observed_at >= since
+            {
+                return Ok(observed_at);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
+    /// Waits for readiness observed later on the worker-to-server pipe than
+    /// the most recent joined interrupt observation.
+    pub fn wait_for_interrupt_readiness(
+        &self,
+        timeout: Duration,
+    ) -> Result<IpcInputReadiness, IpcWaitError> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.inbox.lock().unwrap();
+        loop {
+            if let Some(message) = guard.input_state.take_protocol_error() {
+                return Err(IpcWaitError::Protocol(message));
+            }
+            if take_session_end(&mut guard) {
+                return Err(IpcWaitError::SessionEnd);
+            }
+            if guard.disconnected {
+                return Err(IpcWaitError::Disconnected);
+            }
+            if guard.readiness_after_interrupt_observation {
+                if let Some(prompt) = guard.last_prompt.take() {
+                    guard.last_prompt_observed_at = None;
+                    return Ok(IpcInputReadiness::InputWait(prompt));
+                }
+                return Ok(IpcInputReadiness::Ready);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(IpcWaitError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, timeout_res) = self.cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if timeout_res.timed_out() {
+                return Err(IpcWaitError::Timeout);
+            }
+        }
+    }
+
+    /// Returns whether a joined interrupt observation has already been
+    /// followed by readiness, even if a later input consumed that readiness.
+    pub fn interrupt_transaction_settled_since(&self, since: Instant) -> bool {
+        let guard = self.inbox.lock().unwrap();
+        guard
+            .interrupt_armed_at
+            .is_some_and(|observed_at| observed_at >= since)
+            && guard
+                .interrupt_complete_at
+                .is_some_and(|observed_at| observed_at >= since)
+            && guard.readiness_after_interrupt_observation
+    }
+
     pub fn wait_for_input_wait_or_fresh_ready(
         &self,
         timeout: Duration,
@@ -721,7 +996,32 @@ fn push_prompt_history(guard: &mut ServerIpcInbox, prompt: String) {
 
 fn request_completion_ready(guard: &ServerIpcInbox, stable_wait: Duration) -> bool {
     let _ = stable_wait;
-    guard.input_state.has_active_input() && guard.input_state.request_completion_ready()
+    !interrupt_transaction_blocks_request_completion(guard)
+        && guard.input_state.has_active_input()
+        && guard.input_state.request_completion_ready()
+}
+
+fn interrupt_transaction_armed(guard: &ServerIpcInbox) -> bool {
+    let Some(started_at) = guard.pending_interrupt_transaction_started_at else {
+        return false;
+    };
+    guard.interrupt_armed_at.is_some_and(|at| at >= started_at)
+}
+
+fn interrupt_transaction_settled(guard: &ServerIpcInbox) -> bool {
+    let Some(started_at) = guard.pending_interrupt_transaction_started_at else {
+        return false;
+    };
+    interrupt_transaction_armed(guard)
+        && guard
+            .interrupt_complete_at
+            .is_some_and(|at| at >= started_at)
+        && guard.readiness_after_interrupt_observation
+}
+
+fn interrupt_transaction_blocks_request_completion(guard: &ServerIpcInbox) -> bool {
+    guard.pending_interrupt_transaction_started_at.is_some()
+        && !interrupt_transaction_settled(guard)
 }
 
 fn validate_session_end(reason: Option<&str>) -> Result<(), String> {
@@ -750,7 +1050,8 @@ fn request_completion_precedes_latched_protocol_error(
     stable_wait: Duration,
 ) -> bool {
     let _ = stable_wait;
-    guard.input_state.has_active_input()
+    !interrupt_transaction_blocks_request_completion(guard)
+        && guard.input_state.has_active_input()
         && guard
             .input_state
             .request_completion_precedes_protocol_error()
@@ -770,7 +1071,8 @@ fn request_completion_observed_before_deadline(
     allow_completion_settle_after_deadline: bool,
 ) -> bool {
     let _ = allow_completion_settle_after_deadline;
-    guard.input_state.has_active_input()
+    !interrupt_transaction_blocks_request_completion(guard)
+        && guard.input_state.has_active_input()
         && guard
             .input_state
             .request_completion_observed_before(deadline)
@@ -921,6 +1223,39 @@ mod tests {
         assert!(
             matches!(result, Err(super::IpcWaitError::Protocol(ref message)) if message.starts_with("invalid worker sideband JSON:")),
             "invalid worker message should report a protocol error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn startup_protocol_error_session_end_surfaces_message() {
+        let (server_read, mut worker_write) = std::io::pipe().expect("server pipe");
+        let (_worker_read, server_write) = std::io::pipe().expect("worker pipe");
+        let server = ServerIpcConnection::new(
+            IpcTransport {
+                reader: Box::new(server_read),
+                writer: Box::new(server_write),
+            },
+            IpcHandlers::default(),
+        )
+        .expect("server connection");
+
+        let expected = "failed to initialize Windows Ctrl-C observer: injected failure";
+        writeln!(
+            worker_write,
+            "{}",
+            json!({
+                "type": "session_end",
+                "reason": "protocol_error",
+                "message": expected
+            })
+        )
+        .expect("startup session_end message");
+
+        let result = server.wait_for_worker_ready(Duration::from_millis(200));
+
+        assert!(
+            matches!(result, Err(IpcWaitError::Protocol(ref message)) if message == expected),
+            "startup protocol failure should preserve its diagnostic, got: {result:?}"
         );
     }
 
@@ -1147,6 +1482,219 @@ mod tests {
             ),
             Ok(super::IpcInputReadiness::InputWait(prompt)) if prompt == "fresh> "
         ));
+    }
+
+    #[test]
+    fn interrupt_arm_acknowledgement_wakes_bounded_waiter_and_resets_per_transaction() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+        server.begin_interrupt_transaction(Instant::now());
+
+        let wait_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let waiter_started = wait_started.clone();
+        let waiting_server = server.clone();
+        let waiter = thread::spawn(move || {
+            waiting_server.wait_for_interrupt_armed_with_wait_observer(
+                Duration::from_millis(200),
+                || {
+                    let (lock, cvar) = &*waiter_started;
+                    *lock.lock().expect("arm waiter mutex") = true;
+                    cvar.notify_all();
+                },
+            )
+        });
+
+        let (lock, cvar) = &*wait_started;
+        let started = lock.lock().expect("arm waiter mutex");
+        let started = cvar
+            .wait_timeout_while(started, Duration::from_millis(200), |started| !*started)
+            .expect("arm waiter cvar")
+            .0;
+        assert!(
+            *started,
+            "interrupt arm waiter did not block on its condvar"
+        );
+        drop(started);
+
+        worker
+            .send(WorkerToServerIpcMessage::InterruptArmed {})
+            .expect("send interrupt_armed");
+        waiter
+            .join()
+            .expect("join interrupt arm waiter")
+            .expect("interrupt_armed should wake the bounded waiter");
+
+        server.begin_interrupt_transaction(Instant::now());
+        assert!(matches!(
+            server.wait_for_interrupt_armed(Duration::ZERO),
+            Err(IpcWaitError::Timeout)
+        ));
+        worker
+            .send(WorkerToServerIpcMessage::InterruptComplete {})
+            .expect("send out-of-order interrupt_complete");
+        assert!(matches!(
+            server.wait_for_interrupt_armed(Duration::from_millis(200)),
+            Err(IpcWaitError::Protocol(ref message))
+                if message == "interrupt_complete reported before interrupt_armed"
+        ));
+    }
+
+    #[test]
+    fn interrupt_complete_without_pending_transaction_is_protocol_error() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+        worker
+            .send(WorkerToServerIpcMessage::InterruptComplete {})
+            .expect("send interrupt_complete without transaction");
+        assert!(matches!(
+            server.wait_for_input_readiness(Duration::from_millis(200)),
+            Err(IpcWaitError::Protocol(ref message))
+                if message
+                    == "interrupt_complete reported with no pending interrupt transaction"
+        ));
+    }
+
+    #[test]
+    fn duplicate_interrupt_complete_is_protocol_error() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+        let delivery_started_at = Instant::now();
+        server.begin_interrupt_transaction(delivery_started_at);
+        worker
+            .send(WorkerToServerIpcMessage::InterruptArmed {})
+            .expect("send interrupt_armed");
+        server
+            .wait_for_interrupt_armed(Duration::from_millis(200))
+            .expect("observe interrupt_armed");
+        worker
+            .send(WorkerToServerIpcMessage::InterruptComplete {})
+            .expect("send first interrupt_complete");
+        worker
+            .send(WorkerToServerIpcMessage::InterruptComplete {})
+            .expect("send duplicate interrupt_complete");
+        assert!(matches!(
+            server.wait_for_interrupt_readiness(Duration::from_millis(200)),
+            Err(IpcWaitError::Protocol(ref message))
+                if message
+                    == "duplicate interrupt_complete for pending interrupt transaction"
+        ));
+    }
+
+    #[test]
+    fn pending_interrupt_gates_stale_request_readiness_until_joined_later_readiness() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "initial> ".to_string(),
+            })
+            .expect("send initial input_wait");
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("observe initial input_wait");
+        server.begin_input().expect("begin active request");
+
+        let delivery_started_at = Instant::now();
+        server.begin_interrupt_transaction(delivery_started_at);
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "stale-before-etx> ".to_string(),
+            })
+            .expect("send stale request readiness");
+        server
+            .wait_for_input_wait(Duration::from_millis(200))
+            .expect("observe stale request readiness");
+        assert!(matches!(
+            server.wait_for_request_completion(Duration::ZERO, Duration::ZERO),
+            Err(IpcWaitError::Timeout)
+        ));
+
+        worker
+            .send(WorkerToServerIpcMessage::InterruptArmed {})
+            .expect("send interrupt_armed");
+        server
+            .wait_for_interrupt_armed(Duration::from_millis(200))
+            .expect("observe interrupt_armed");
+        worker
+            .send(WorkerToServerIpcMessage::InterruptComplete {})
+            .expect("send interrupt_complete");
+        server
+            .wait_for_interrupt_observation(Duration::from_millis(200), delivery_started_at)
+            .expect("observe interrupt_complete");
+        assert!(matches!(
+            server.wait_for_request_completion(Duration::ZERO, Duration::ZERO),
+            Err(IpcWaitError::Timeout)
+        ));
+
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "joined-later> ".to_string(),
+            })
+            .expect("send joined-later readiness");
+        server
+            .wait_for_request_completion(Duration::from_millis(200), Duration::ZERO)
+            .expect("joined interrupt plus later readiness should complete the request");
+        server
+            .wait_for_pending_interrupt_transaction(Duration::ZERO)
+            .expect("joined-later readiness should settle the interrupt transaction");
+    }
+
+    #[test]
+    fn interrupt_observation_requires_later_pipe_ordered_readiness() {
+        let (server, worker) =
+            test_connection_pair_with_handlers(IpcHandlers::default()).expect("ipc pair");
+
+        worker
+            .send(WorkerToServerIpcMessage::Ready {})
+            .expect("send stale ready");
+        assert!(matches!(
+            server.wait_for_input_readiness(Duration::from_millis(200)),
+            Ok(super::IpcInputReadiness::Ready)
+        ));
+
+        let delivery_started_at = Instant::now();
+        server.begin_interrupt_transaction(delivery_started_at);
+        worker
+            .send(WorkerToServerIpcMessage::InterruptArmed {})
+            .expect("send interrupt_armed");
+        server
+            .wait_for_interrupt_armed(Duration::from_millis(200))
+            .expect("observe interrupt_armed");
+        worker
+            .send(WorkerToServerIpcMessage::InterruptComplete {})
+            .expect("send interrupt observation");
+        server
+            .wait_for_interrupt_observation(Duration::from_millis(200), delivery_started_at)
+            .expect("observe joined interrupt");
+        assert!(matches!(
+            server.wait_for_interrupt_readiness(Duration::ZERO),
+            Err(super::IpcWaitError::Timeout)
+        ));
+        assert!(matches!(
+            server.wait_for_pending_interrupt_transaction(Duration::ZERO),
+            Err(super::IpcWaitError::Timeout)
+        ));
+
+        worker
+            .send(WorkerToServerIpcMessage::InputWait {
+                prompt: "after-interrupt> ".to_string(),
+            })
+            .expect("send post-interrupt input_wait");
+        assert!(matches!(
+            server.wait_for_interrupt_readiness(Duration::from_millis(200)),
+            Ok(super::IpcInputReadiness::InputWait(prompt))
+                if prompt == "after-interrupt> "
+        ));
+        server
+            .wait_for_pending_interrupt_transaction(Duration::ZERO)
+            .expect("pipe-later readiness should settle the admission gate");
+        server
+            .begin_input()
+            .expect("post-interrupt readiness should accept input");
+        assert!(
+            server.interrupt_transaction_settled_since(delivery_started_at),
+            "settled transaction must remain observable after readiness is consumed"
+        );
     }
 
     #[test]

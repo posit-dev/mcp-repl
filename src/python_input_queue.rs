@@ -50,9 +50,13 @@ impl PythonInputQueue {
         self.active_read_consumer = false;
     }
 
-    pub(crate) fn clear_after_interrupt(&mut self) {
+    pub(crate) fn discard_unconsumed_input(&mut self) {
         self.payloads.clear();
         self.stdin_bytes.clear();
+    }
+
+    pub(crate) fn clear_after_interrupt(&mut self) {
+        self.discard_unconsumed_input();
         self.active_read_consumer = false;
     }
 

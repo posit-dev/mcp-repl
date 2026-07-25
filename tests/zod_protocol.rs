@@ -214,6 +214,16 @@ async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
     server_env: Vec<(String, String)>,
     extra_args: Vec<String>,
 ) -> TestResult<common::McpTestSession> {
+    spawn_zod_server_with_transport(control_log, extra_env, server_env, extra_args, "pipe").await
+}
+
+async fn spawn_zod_server_with_transport(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+    server_env: Vec<(String, String)>,
+    extra_args: Vec<String>,
+    stdin_transport: &str,
+) -> TestResult<common::McpTestSession> {
     let tempdir = tempfile::tempdir()?;
     let spec_path = tempdir.path().join("zod-worker.json");
     let mut env = Map::new();
@@ -229,7 +239,7 @@ async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
         "args": [],
         "working_dir": "inherit",
         "env": env,
-        "stdin": "pipe",
+        "stdin": stdin_transport,
         "sandbox": "server"
     });
     std::fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
@@ -243,6 +253,21 @@ async fn spawn_zod_server_with_extra_env_server_env_and_extra_args(
     ];
     args.extend(extra_args);
     common::spawn_server_with_args_env(args, server_env).await
+}
+
+async fn spawn_zod_interrupt_server(
+    control_log: &std::path::Path,
+    extra_env: Vec<(&str, &str)>,
+) -> TestResult<common::McpTestSession> {
+    let stdin_transport = if cfg!(windows) { "pty" } else { "pipe" };
+    spawn_zod_server_with_transport(
+        control_log,
+        extra_env,
+        Vec::new(),
+        Vec::new(),
+        stdin_transport,
+    )
+    .await
 }
 
 async fn spawn_zod_server(control_log: &std::path::Path) -> TestResult<common::McpTestSession> {
@@ -281,13 +306,12 @@ async fn spawn_zod_startup_ready_server(
 async fn spawn_zod_delayed_interrupt_ready_server(
     control_log: &std::path::Path,
 ) -> TestResult<common::McpTestSession> {
-    spawn_zod_server_with_extra_env_and_extra_args(
+    spawn_zod_interrupt_server(
         control_log,
         vec![
             ("MCP_REPL_ZOD_STARTUP_READY", "1"),
             ("MCP_REPL_ZOD_DELAY_READY_AFTER_INTERRUPT_MS", "200"),
         ],
-        Vec::new(),
     )
     .await
 }
@@ -2170,7 +2194,7 @@ async fn zod_worker_v5_input_wait_completes_batch() -> TestResult<()> {
 async fn zod_worker_v5_busy_follow_up_does_not_send_second_input_batch() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let session = spawn_zod_interrupt_server(&control_log, Vec::new()).await?;
 
     let first = session
         .call_tool_raw(
@@ -2231,7 +2255,7 @@ async fn zod_worker_v5_busy_follow_up_does_not_send_second_input_batch() -> Test
 async fn zod_worker_v5_interrupt_is_payload_free() -> TestResult<()> {
     let tempdir = tempfile::tempdir()?;
     let control_log = tempdir.path().join("control.log");
-    let session = spawn_zod_server(&control_log).await?;
+    let session = spawn_zod_interrupt_server(&control_log, Vec::new()).await?;
 
     let first = session
         .call_tool_raw(
@@ -2262,7 +2286,7 @@ async fn zod_worker_v5_interrupt_is_payload_free() -> TestResult<()> {
         interrupted_text.contains("sideband interrupt: observed"),
         "expected v5 worker to observe sideband interrupt, got: {interrupted_text:?}"
     );
-    #[cfg(target_family = "unix")]
+    #[cfg(any(target_family = "unix", target_family = "windows"))]
     assert!(
         interrupted_text.contains("os interrupt: observed"),
         "expected v5 worker to observe OS interrupt, got: {interrupted_text:?}"
@@ -2309,25 +2333,51 @@ async fn zod_worker_v5_input_wait_interrupt_is_sent_without_active_input() -> Te
         )
         .await?;
     let interrupted_text = result_text(&interrupted);
-    assert_ne!(
-        interrupted.is_error,
-        Some(true),
-        "input-wait Ctrl-C must remain a non-error control reply, got: {interrupted_text:?}"
-    );
-    assert!(
-        !interrupted_text.contains("<<repl status: busy"),
-        "input-wait Ctrl-C must use cached readiness instead of timing out, got: {interrupted_text:?}"
-    );
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            interrupted.is_error,
+            Some(true),
+            "pipe-only Windows interrupt must fail explicitly: {interrupted_text:?}"
+        );
+        assert!(
+            interrupted_text.contains("requires ConPTY stdin")
+                && interrupted_text.contains("pipe stdin cannot be interrupted"),
+            "pipe-only Windows boundary was not explained: {interrupted_text:?}"
+        );
+        let log = read_optional(&control_log);
+        assert!(
+            !log.lines().any(|line| line == "interrupt"),
+            "pipe-only Windows rejection must happen before sending sideband interrupt: {log:?}"
+        );
+        assert_eq!(
+            log.lines().filter(|line| line.starts_with("pid ")).count(),
+            1,
+            "pipe-only Windows capability rejection must not reset the worker: {log:?}"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert_ne!(
+            interrupted.is_error,
+            Some(true),
+            "input-wait Ctrl-C must remain a non-error control reply, got: {interrupted_text:?}"
+        );
+        assert!(
+            !interrupted_text.contains("<<repl status: busy"),
+            "input-wait Ctrl-C must use cached readiness instead of timing out, got: {interrupted_text:?}"
+        );
 
-    let log = wait_for_log_contains(&control_log, "interrupt")?;
-    assert!(
-        log.contains("interrupt"),
-        "input-wait Ctrl-C must send payload-free sideband interrupt, got log: {log:?}"
-    );
-    assert!(
-        !log.contains("interrupt input_id"),
-        "input-wait Ctrl-C must not send an identity-bearing interrupt, got log: {log:?}"
-    );
+        let log = wait_for_log_contains(&control_log, "interrupt")?;
+        assert!(
+            log.contains("interrupt"),
+            "input-wait Ctrl-C must send payload-free sideband interrupt, got log: {log:?}"
+        );
+        assert!(
+            !log.contains("interrupt input_id"),
+            "input-wait Ctrl-C must not send an identity-bearing interrupt, got log: {log:?}"
+        );
+    }
 
     session.cancel().await?;
     Ok(())

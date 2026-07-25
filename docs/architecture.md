@@ -33,9 +33,67 @@ The repository is organized around a few concrete subsystems rather than deep pa
 - Worker launch chooses the raw process stdio or PTY transport up front, but
   accepted `repl` input is queued through IPC during steady-state execution.
   Runtime stdin surfaces are worker-owned implementation details.
-- On Windows, Python workers may use ConPTY as their raw terminal envelope.
-  Sideband named pipes still carry accepted input, readiness, and worker-owned
-  output facts separately from ConPTY traffic.
+- On Windows, built-in R and Python workers use ConPTY as their raw terminal
+  envelope. Sideband named pipes still carry accepted input, readiness, and
+  worker-owned output facts. ConPTY input is a separate control path: the
+  server writes one ETX byte for Ctrl-C only after the worker has flushed its
+  pipe-ordered pre-delivery acknowledgement, and processed console input
+  translates it into a real `CTRL_C_EVENT` in the worker's dedicated pseudo
+  console.
+- Worker initialization keeps CRT stdin attached to `CONIN$` as a read-only,
+  text-mode descriptor. It uses a separate, short-lived read/write `CONIN$`
+  handle only to enable processed input, then closes that mode-control handle.
+- `src/windows_interrupt_observer.rs` preserves runtime and package interrupt
+  policy while waking mcp-repl-managed input. Its newest-first console handler
+  handles only `CTRL_C_EVENT`, duplicates the Windows-created handler thread,
+  publishes that handle to a pre-existing watcher, and returns `FALSE`.
+  The watcher waits for the handler thread to terminate before signaling the
+  runtime main thread. The observer does not call R or Python APIs and does not
+  set runtime interrupt state.
+  The observer is re-registered before each managed wait and before readiness
+  is published, so package handlers installed during user code remain behind
+  it on the next event.
+- For built-in workers, the sideband reader performs cleanup, preserves live
+  managed-input ownership, serializes observer rearm, and flushes payload-free
+  `interrupt_armed`. The server's bounded condition-variable wait must observe
+  that fact before it writes ETX. Arm timeout/failure and terminal
+  post-delivery errors reset the worker.
+- Native handler completion and cleanup-only sideband processing are then
+  joined on the runtime main thread. R emits payload-free
+  `interrupt_complete` immediately before `R_CheckUserInterrupt()` because the
+  checkpoint may longjmp. Python reacquires the GIL, calls
+  `PyErr_CheckSignals()`, then emits `interrupt_complete` and clears pending
+  state under a readiness-publication barrier.
+- The transaction therefore has three ordered worker facts:
+  `interrupt_armed` before native delivery, `interrupt_complete` at the runtime
+  checkpoint boundary, and `input_wait` or `ready` later on the same
+  worker-to-server pipe. Cached or stale readiness cannot complete a request,
+  settle the transaction, or admit later input. Python also suppresses
+  runtime-main `ready` while a background managed-input consumer remains
+  active, allowing that consumer to republish `input_wait` after the
+  checkpoint.
+- A package handler that consumes Ctrl-C without scheduling a runtime interrupt
+  therefore leaves the managed input operation waiting; a handler that
+  schedules runtime state is observed only after the complete handler chain has
+  returned. Interrupt completion takes priority when queued input is also
+  available. Overlapping client Ctrl-C calls share the one in-flight native
+  transaction.
+- The sideband `interrupt` message remains cleanup-only on Windows: it may
+  discard queued input that the runtime has not consumed, but it does not wake
+  managed input as an interrupt and does not synthesize runtime state. This
+  keeps accepted-input ownership and native interrupt delivery separate.
+- Windows custom workers configured with ConPTY stdin receive the same ETX
+  control byte and remain responsible for attaching their CRT stdin to
+  `CONIN$`, enabling processed input, clearing inherited Ctrl-C-ignore state,
+  and installing their own native handler. Pipe-only Windows workers fail
+  interrupt requests explicitly because they have no isolated native Ctrl-C
+  delivery boundary. Custom ConPTY workers own their native-handler completion
+  policy; the built-in observer contract is not injected into them.
+- Nested Windows sandbox launch uses a byte-preserving ConPTY input bridge, so
+  the exact ETX control byte reaches the inner worker console. A native Ctrl-C
+  that is not paired with the server's cleanup transaction is outside the
+  built-in contract: the dedicated ConPTY input is server-owned, and there is
+  no polling or synthesized-state fallback for unpaired events.
 - Workers receive request payloads through `input_batch` and complete an input
   batch with `input_wait`, `ready`, or `session_end`. Follow-up input after
   `input_wait` or `ready` starts a fresh `input_batch`; the runtime decides

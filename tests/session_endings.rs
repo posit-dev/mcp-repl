@@ -186,3 +186,47 @@ async fn session_endings_smoke() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r_shutdown_returns_cleanup_output_before_session_end() -> TestResult<()> {
+    let session = common::spawn_server().await?;
+
+    let setup = session
+        .write_stdin_raw_with(
+            r#".Last <- function() {
+  cat("R_LAST_STDOUT\n")
+}"#,
+            Some(10.0),
+        )
+        .await?;
+    let setup_text = common::result_text(&setup);
+    if common::backend_unavailable(&setup_text) {
+        eprintln!("session_endings backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let result = session
+        .write_stdin_raw_unterminated_with("\u{4}", Some(10.0))
+        .await?;
+    let text = common::result_text(&result);
+
+    let stdout_position = text
+        .find("R_LAST_STDOUT")
+        .ok_or_else(|| format!("expected R .Last stdout during shutdown, got: {text:?}"))?;
+    let session_end_position = text
+        .find("new session started")
+        .ok_or_else(|| format!("expected reset notice after R cleanup, got: {text:?}"))?;
+
+    assert!(
+        stdout_position < session_end_position,
+        "R cleanup output must precede the post-session reset notice, got: {text:?}"
+    );
+    assert!(
+        !text.contains("worker protocol error"),
+        "R cleanup output must not be rejected as post-session_end output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}

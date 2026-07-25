@@ -29,6 +29,12 @@ struct InterruptPromptWait {
     prompt: Option<String>,
 }
 
+enum InterruptTransactionWait {
+    NotRequired { remaining: Duration },
+    TimedOut,
+    Settled { remaining: Duration },
+}
+
 impl WorkerManager {
     pub(super) fn interrupt_files(
         &mut self,
@@ -65,19 +71,73 @@ impl WorkerManager {
         deferred_sandbox_state_update: Option<SandboxStateUpdate>,
         suppress_session_end_reset: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        let result = self.interrupt_for_mode_inner(
+            mode,
+            timeout,
+            deferred_sandbox_state_update,
+            suppress_session_end_reset,
+        );
+
+        #[cfg(windows)]
+        {
+            let native_delivery_outstanding =
+                matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_))
+                    && self
+                        .process
+                        .as_ref()
+                        .and_then(|process| process.interrupt_delivery_started_at())
+                        .is_some();
+            if native_delivery_outstanding && let Err(err) = result {
+                self.reset()?;
+                crate::event_log::log(
+                    "worker_interrupt_post_delivery_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+                return Err(err);
+            }
+        }
+
+        result
+    }
+
+    fn interrupt_for_mode_inner(
+        &mut self,
+        mode: InterruptMode,
+        timeout: Duration,
+        deferred_sandbox_state_update: Option<SandboxStateUpdate>,
+        suppress_session_end_reset: bool,
+    ) -> Result<WorkerReply, WorkerError> {
         Self::begin_interrupt(timeout);
-        let interrupt_drains_existing_completion =
-            self.pending_request || self.settled_pending_completion.is_some();
-        let interrupt_sent_at = self.interrupt_worker_if_running()?;
+        let interrupt_drains_pending_request = self.pending_request;
+        let interrupt_drains_settled_completion =
+            !self.pending_request && self.settled_pending_completion.is_some();
+        let interrupt_sent_at = if interrupt_drains_settled_completion {
+            None
+        } else {
+            self.interrupt_worker_if_running()?
+        };
         let mode = self.resolve_interrupt_mode(mode);
 
-        if interrupt_drains_existing_completion {
-            return self.drain_existing_completion_after_interrupt(
+        if interrupt_drains_pending_request || interrupt_drains_settled_completion {
+            let drain_timeout = if interrupt_drains_pending_request {
+                match self.wait_for_interrupt_transaction_or_reset(timeout, interrupt_sent_at)? {
+                    InterruptTransactionWait::TimedOut => Duration::ZERO,
+                    InterruptTransactionWait::Settled { remaining }
+                    | InterruptTransactionWait::NotRequired { remaining } => remaining,
+                }
+            } else {
+                timeout
+            };
+            let reply = self.drain_existing_completion_after_interrupt(
                 mode,
-                timeout,
+                drain_timeout,
                 deferred_sandbox_state_update,
                 suppress_session_end_reset,
-            );
+            )?;
+            self.complete_interrupt_delivery_if_settled();
+            return Ok(reply);
         }
 
         let prompt_wait = self.wait_for_interrupt_prompt(timeout, interrupt_sent_at)?;
@@ -138,7 +198,30 @@ impl WorkerManager {
             .process
             .as_mut()
             .expect("worker process should be available");
+        #[cfg(windows)]
+        process.validate_interrupt_delivery()?;
+        #[cfg(windows)]
+        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_))
+            && let Some(started_at) = process.interrupt_delivery_started_at()
+        {
+            let settled = process
+                .ipc_connection()
+                .is_some_and(|ipc| ipc.interrupt_transaction_settled_since(started_at));
+            if !settled {
+                return Ok(Some(started_at));
+            }
+            process.clear_interrupt_delivery();
+        }
         let interrupt_sent_at = Instant::now();
+        #[cfg(windows)]
+        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_)) {
+            let ipc = process.ipc_connection().ok_or_else(|| {
+                WorkerError::Protocol(
+                    "worker ipc unavailable before Windows interrupt delivery".to_string(),
+                )
+            })?;
+            ipc.begin_interrupt_transaction(interrupt_sent_at);
+        }
         let interrupt_result = self.driver.interrupt(process);
         if let Err(err) = interrupt_result {
             self.reset()?;
@@ -150,7 +233,102 @@ impl WorkerManager {
             );
             return Err(err);
         }
+        #[cfg(windows)]
+        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_)) {
+            process.note_interrupt_delivery_started(interrupt_sent_at);
+        }
         Ok(Some(interrupt_sent_at))
+    }
+
+    fn wait_for_interrupt_transaction(
+        &mut self,
+        timeout: Duration,
+        interrupt_sent_at: Option<Instant>,
+    ) -> Result<InterruptTransactionWait, WorkerError> {
+        #[cfg(windows)]
+        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_))
+            && let Some(sent_at) = interrupt_sent_at
+        {
+            let Some(ipc) = self
+                .process
+                .as_ref()
+                .and_then(|process| process.ipc_connection())
+            else {
+                return Ok(InterruptTransactionWait::TimedOut);
+            };
+            let started = Instant::now();
+            match ipc.wait_for_interrupt_observation(timeout, sent_at) {
+                Ok(_) => {}
+                Err(IpcWaitError::Timeout) => return Ok(InterruptTransactionWait::TimedOut),
+                Err(IpcWaitError::SessionEnd) => {
+                    self.note_session_end(true);
+                    return Ok(InterruptTransactionWait::TimedOut);
+                }
+                Err(IpcWaitError::Disconnected) => {
+                    return Err(WorkerError::Protocol(
+                        "worker IPC disconnected before Windows interrupt completion".to_string(),
+                    ));
+                }
+                Err(IpcWaitError::Protocol(message)) => {
+                    return Err(WorkerError::Protocol(message));
+                }
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let readiness_started = Instant::now();
+            return match ipc.wait_for_pending_interrupt_transaction(remaining) {
+                Ok(()) => Ok(InterruptTransactionWait::Settled {
+                    remaining: remaining.saturating_sub(readiness_started.elapsed()),
+                }),
+                Err(IpcWaitError::Timeout) => Ok(InterruptTransactionWait::TimedOut),
+                Err(IpcWaitError::SessionEnd) => {
+                    self.note_session_end(true);
+                    Ok(InterruptTransactionWait::TimedOut)
+                }
+                Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+                    "worker IPC disconnected before Windows interrupt readiness".to_string(),
+                )),
+                Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+            };
+        }
+
+        Ok(InterruptTransactionWait::NotRequired { remaining: timeout })
+    }
+
+    fn wait_for_interrupt_transaction_or_reset(
+        &mut self,
+        timeout: Duration,
+        interrupt_sent_at: Option<Instant>,
+    ) -> Result<InterruptTransactionWait, WorkerError> {
+        match self.wait_for_interrupt_transaction(timeout, interrupt_sent_at) {
+            Ok(wait) => Ok(wait),
+            Err(err) => {
+                // Strict arm/completion ordering errors leave the IPC reader
+                // terminal and the transaction unsettled. Preserve no worker
+                // whose control-plane state can no longer make progress.
+                self.reset()?;
+                crate::event_log::log(
+                    "worker_interrupt_transaction_error",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                    }),
+                );
+                Err(err)
+            }
+        }
+    }
+
+    pub(super) fn complete_interrupt_delivery_if_settled(&mut self) {
+        #[cfg(windows)]
+        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_))
+            && let Some(process) = self.process.as_mut()
+            && let Some(started_at) = process.interrupt_delivery_started_at()
+            && process
+                .ipc_connection()
+                .is_some_and(|ipc| ipc.interrupt_transaction_settled_since(started_at))
+        {
+            process.clear_interrupt_delivery();
+        }
     }
 
     fn drain_existing_completion_after_interrupt(
@@ -196,33 +374,51 @@ impl WorkerManager {
     ) -> Result<InterruptPromptWait, WorkerError> {
         let mut timed_out = false;
         let mut prompt: Option<String> = None;
-        if let Some(process) = self.process.as_ref()
-            && let Some(ipc) = process.ipc_connection()
-        {
-            if timeout.is_zero() {
+        let transaction =
+            self.wait_for_interrupt_transaction_or_reset(timeout, interrupt_sent_at)?;
+        let Some(ipc) = self
+            .process
+            .as_ref()
+            .and_then(|process| process.ipc_connection())
+        else {
+            return Ok(InterruptPromptWait { timed_out, prompt });
+        };
+        let readiness = match transaction {
+            InterruptTransactionWait::TimedOut => {
                 timed_out = true;
-            } else {
-                let readiness = match interrupt_sent_at {
-                    Some(sent_at) => ipc.wait_for_input_wait_or_fresh_ready(timeout, sent_at),
-                    None => ipc.wait_for_input_readiness(timeout),
-                };
-                match readiness {
-                    Ok(IpcInputReadiness::InputWait(value)) => {
-                        prompt = Some(value);
-                    }
-                    Ok(IpcInputReadiness::Ready) => {
-                        prompt = None;
-                    }
-                    Err(IpcWaitError::Timeout) => {
-                        timed_out = true;
-                    }
-                    Err(IpcWaitError::SessionEnd) => {
-                        self.note_session_end(true);
-                    }
-                    Err(IpcWaitError::Disconnected) => {}
-                    Err(IpcWaitError::Protocol(message)) => {
-                        return Err(WorkerError::Protocol(message));
-                    }
+                None
+            }
+            InterruptTransactionWait::Settled { remaining } => {
+                Some(ipc.wait_for_interrupt_readiness(remaining))
+            }
+            InterruptTransactionWait::NotRequired { remaining } => Some(match interrupt_sent_at {
+                Some(sent_at) => ipc.wait_for_input_wait_or_fresh_ready(remaining, sent_at),
+                None => ipc.wait_for_input_readiness(remaining),
+            }),
+        };
+        if let Some(readiness) = readiness {
+            match readiness {
+                Ok(IpcInputReadiness::InputWait(value)) => {
+                    prompt = Some(value);
+                    self.complete_interrupt_delivery_if_settled();
+                }
+                Ok(IpcInputReadiness::Ready) => {
+                    prompt = None;
+                    self.complete_interrupt_delivery_if_settled();
+                }
+                Err(IpcWaitError::Timeout) => {
+                    timed_out = true;
+                }
+                Err(IpcWaitError::SessionEnd) => {
+                    self.note_session_end(true);
+                }
+                Err(IpcWaitError::Disconnected) => {
+                    return Err(WorkerError::Protocol(
+                        "worker IPC disconnected while waiting for interrupt readiness".to_string(),
+                    ));
+                }
+                Err(IpcWaitError::Protocol(message)) => {
+                    return Err(WorkerError::Protocol(message));
                 }
             }
         }

@@ -68,7 +68,11 @@ impl RSession {
         }
         guard.active_input = true;
         queue_input(&mut guard.input_queue, &input);
+        drop(guard);
         state.cvar.notify_all();
+        #[cfg(windows)]
+        crate::windows_interrupt_observer::notify_input()
+            .map_err(|err| format!("failed to wake R managed input: {err}"))?;
         Ok(())
     }
 
@@ -79,8 +83,15 @@ impl RSession {
         // Preserve already accepted input; reset replies include output produced
         // while the old worker drains to a safe runtime boundary.
         guard.shutdown = true;
-        guard.read_interrupted = false;
+        #[cfg(not(windows))]
+        {
+            guard.read_interrupted = false;
+        }
+        drop(guard);
         state.cvar.notify_all();
+        #[cfg(windows)]
+        crate::windows_interrupt_observer::notify_input()
+            .map_err(|err| format!("failed to wake R for shutdown: {err}"))?;
         Ok(())
     }
 }
@@ -142,19 +153,88 @@ pub(crate) fn clear_pending_input() -> bool {
     had_pending
 }
 
-pub(crate) fn interrupt_pending_input() -> bool {
+pub(crate) fn discard_pending_input_after_interrupt() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
     };
     let mut guard = state.inner.lock().unwrap();
     let had_pending = !guard.input_queue.is_empty();
     drain_input_queue(&mut guard.input_queue);
-    let interrupted_waiting_read = guard.waiting_for_input;
-    if interrupted_waiting_read {
-        guard.read_interrupted = true;
+    #[cfg(not(windows))]
+    {
+        let interrupted_waiting_read = guard.waiting_for_input;
+        if interrupted_waiting_read {
+            guard.read_interrupted = true;
+        }
+        state.cvar.notify_all();
+        return had_pending || interrupted_waiting_read;
     }
+    #[cfg(windows)]
+    had_pending
+}
+
+pub(crate) fn record_protocol_failure(message: &str) {
+    record_protocol_failure_state(message, true);
+}
+
+#[cfg(windows)]
+fn record_startup_protocol_failure(message: &str) {
+    record_protocol_failure_state(message, false);
+}
+
+fn record_protocol_failure_state(message: &str, emit_diagnostic: bool) {
+    let Some(state) = SESSION_STATE.get() else {
+        if emit_diagnostic {
+            emit_protocol_failure_diagnostic(message);
+        }
+        return;
+    };
+
+    let mut guard = state.inner.lock().unwrap();
+    if guard.session_end_emitted {
+        return;
+    }
+    if guard.protocol_failure.is_none() {
+        guard.protocol_failure = Some(message.to_string());
+        // Keep the state lock until any diagnostic is sent so the runtime
+        // thread cannot emit the terminal session_end first.
+        if emit_diagnostic {
+            emit_protocol_failure_diagnostic(message);
+        }
+    }
+    guard.shutdown = true;
+    guard.active_input = false;
+    drain_input_queue(&mut guard.input_queue);
+    #[cfg(not(windows))]
+    {
+        guard.waiting_for_input = false;
+        guard.read_interrupted = false;
+    }
+    drop(guard);
+
     state.cvar.notify_all();
-    had_pending || interrupted_waiting_read
+    #[cfg(windows)]
+    {
+        // Observer failures signal their own failure event. This best-effort
+        // wake also handles protocol failures discovered by the IPC reader.
+        let _ = crate::windows_interrupt_observer::notify_input();
+    }
+}
+
+pub(crate) fn protocol_failure_recorded() -> bool {
+    SESSION_STATE
+        .get()
+        .is_some_and(|state| state.inner.lock().unwrap().protocol_failure.is_some())
+}
+
+fn emit_protocol_failure_diagnostic(message: &str) {
+    let mut bytes = message.as_bytes().to_vec();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    if ipc::emit_output_text(TextStream::Stderr, &bytes).is_err() {
+        crate::output_stream::write_stderr_bytes(&bytes);
+    }
 }
 
 fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
@@ -162,6 +242,15 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     let state = Arc::new(SessionState::new());
     if SESSION_STATE.set(state.clone()).is_err() {
         let message = "R session state already initialized".to_string();
+        init.mark_failed(message.clone());
+        return Err(message);
+    }
+
+    #[cfg(windows)]
+    if let Err(err) = crate::windows_interrupt_observer::initialize_after_console_attach() {
+        let message = format!("failed to initialize Windows Ctrl-C observer: {err}");
+        record_startup_protocol_failure(&message);
+        finish_session_end_immediately();
         init.mark_failed(message.clone());
         return Err(message);
     }
@@ -180,6 +269,7 @@ fn run_session_on_current_thread(init: Arc<SessionInit>) -> Result<(), String> {
     unsafe {
         libr::run_Rmainloop();
     }
+    finish_session_end_after_mainloop();
 
     Ok(())
 }
@@ -196,7 +286,10 @@ struct SessionStateInner {
     last_prompt: Option<String>,
     shutdown: bool,
     session_end_emitted: bool,
+    protocol_failure: Option<String>,
+    #[cfg(not(windows))]
     waiting_for_input: bool,
+    #[cfg(not(windows))]
     read_interrupted: bool,
 }
 
@@ -215,7 +308,10 @@ impl SessionState {
                 last_prompt: None,
                 shutdown: false,
                 session_end_emitted: false,
+                protocol_failure: None,
+                #[cfg(not(windows))]
                 waiting_for_input: false,
+                #[cfg(not(windows))]
                 read_interrupted: false,
             }),
             cvar: Condvar::new(),
@@ -694,14 +790,67 @@ fn drain_input_queue(queue: &mut VecDeque<InputBatchLine>) -> String {
     drained
 }
 
+#[cfg(not(windows))]
 fn wait_until_console_input_changes(
     state: &SessionState,
     mut guard: MutexGuard<'_, SessionStateInner>,
-) {
+) -> Result<bool, String> {
     while guard.input_queue.is_empty() && !guard.shutdown && !guard.read_interrupted {
         guard = state.cvar.wait(guard).unwrap();
     }
     guard.waiting_for_input = false;
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn wait_until_console_input_changes(
+    _state: &SessionState,
+    guard: MutexGuard<'_, SessionStateInner>,
+) -> Result<bool, String> {
+    drop(guard);
+    match crate::windows_interrupt_observer::wait_for_activity()
+        .map_err(|err| format!("Windows Ctrl-C observer wait failed: {err}"))?
+    {
+        crate::windows_interrupt_observer::WaitOutcome::Input => Ok(false),
+        crate::windows_interrupt_observer::WaitOutcome::InterruptCompleted => Ok(true),
+    }
+}
+
+#[cfg(windows)]
+fn checkpoint_joined_windows_interrupt() -> Result<(), String> {
+    crate::ipc::emit_interrupt_complete()
+        .map_err(|err| format!("failed to report joined Windows interrupt: {err}"))?;
+    unsafe {
+        libr::R_CheckUserInterrupt();
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn process_completed_windows_interrupt() -> Result<(), String> {
+    let completed = crate::windows_interrupt_observer::finish_in_flight_interrupt()
+        .map_err(|err| format!("Windows Ctrl-C observer failed: {err}"))?;
+    if completed {
+        checkpoint_joined_windows_interrupt()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn rearm_windows_interrupt_observer() -> Result<(), String> {
+    loop {
+        match crate::windows_interrupt_observer::rearm()
+            .map_err(|err| format!("Windows Ctrl-C observer failed while rearming: {err}"))?
+        {
+            crate::windows_interrupt_observer::RearmOutcome::Rearmed => return Ok(()),
+            crate::windows_interrupt_observer::RearmOutcome::InterruptInFlight => {
+                // Only the runtime main thread reaches this path. Join and
+                // checkpoint there, then retry so readiness is published only
+                // after the observer is newest again.
+                process_completed_windows_interrupt()?;
+            }
+        }
+    }
 }
 
 fn split_console_line(
@@ -931,8 +1080,34 @@ fn decode_console_bytes_for_channel(_otype: c_int, bytes: &[u8]) -> Vec<u8> {
     bytes.to_vec()
 }
 
-fn complete_session_if_needed(emit_session_end: bool) {
-    if emit_session_end {
+fn finish_session_end_after_mainloop() {
+    // R can emit console output while unwinding and running cleanup hooks.
+    // Publishing the terminal sideband marker belongs after run_Rmainloop()
+    // returns so none of that output can follow session_end.
+    finish_session_end_immediately();
+}
+
+fn finish_session_end_immediately() {
+    // This lower-level path is reserved for callbacks or startup failures
+    // where control cannot reach the post-mainloop boundary (notably
+    // r_suicide).
+    let state = session_state();
+    let mut guard = state.inner.lock().unwrap();
+    let should_emit = !guard.session_end_emitted;
+    let protocol_failure = guard.protocol_failure.clone();
+    guard.session_end_emitted = true;
+    guard.shutdown = true;
+    guard.active_input = false;
+    drain_input_queue(&mut guard.input_queue);
+    drop(guard);
+    state.cvar.notify_all();
+
+    if !should_emit {
+        return;
+    }
+    if let Some(message) = protocol_failure {
+        ipc::emit_session_end_with_reason_and_message("protocol_error", &message);
+    } else {
         ipc::emit_session_end();
     }
 }
@@ -978,12 +1153,7 @@ pub extern "C-unwind" fn r_suicide(buf: *const c_char) {
             .to_str()
             .unwrap_or("R requested shutdown.")
     };
-    let state = session_state();
-    let mut guard = state.inner.lock().unwrap();
-    let should_emit = !guard.session_end_emitted;
-    guard.session_end_emitted = true;
-    drop(guard);
-    complete_session_if_needed(should_emit);
+    finish_session_end_immediately();
     panic!("{message}");
 }
 
@@ -1022,15 +1192,18 @@ pub extern "C-unwind" fn r_read_console(
     }
 
     loop {
+        #[cfg(windows)]
+        if let Err(err) = process_completed_windows_interrupt() {
+            record_protocol_failure(&err);
+            if !buf.is_null() {
+                unsafe { *buf = 0 };
+            }
+            return 0;
+        }
         let mut guard = state.inner.lock().unwrap();
 
         if is_save_prompt {
-            let should_emit = guard.shutdown && !guard.session_end_emitted;
-            if guard.shutdown {
-                guard.session_end_emitted = true;
-            }
             drop(guard);
-            complete_session_if_needed(should_emit);
             if !buf.is_null() {
                 let response = b"n\n";
                 let max = (buflen as usize).saturating_sub(1);
@@ -1050,6 +1223,7 @@ pub extern "C-unwind" fn r_read_console(
             return 0;
         }
 
+        #[cfg(not(windows))]
         if guard.read_interrupted {
             guard.read_interrupted = false;
             guard.waiting_for_input = false;
@@ -1081,10 +1255,7 @@ pub extern "C-unwind" fn r_read_console(
         }
 
         if guard.shutdown {
-            let should_emit = !guard.session_end_emitted;
-            guard.session_end_emitted = true;
             drop(guard);
-            complete_session_if_needed(should_emit);
             if !buf.is_null() {
                 unsafe { *buf = 0 };
             }
@@ -1094,20 +1265,78 @@ pub extern "C-unwind" fn r_read_console(
         if guard.active_input {
             guard.active_input = false;
             guard.plot_hashes.clear();
-            guard.waiting_for_input = true;
+            #[cfg(not(windows))]
+            {
+                guard.waiting_for_input = true;
+            }
             drop(guard);
+            #[cfg(windows)]
+            if let Err(err) = rearm_windows_interrupt_observer() {
+                record_protocol_failure(&format!("failed to arm Windows Ctrl-C observer: {err}"));
+                if !buf.is_null() {
+                    unsafe { *buf = 0 };
+                }
+                return 0;
+            }
             ipc::emit_input_wait(prompt);
             let guard = state.inner.lock().unwrap();
-            wait_until_console_input_changes(state, guard);
+            match wait_until_console_input_changes(state, guard) {
+                Ok(true) => {
+                    if let Err(err) = checkpoint_joined_windows_interrupt() {
+                        record_protocol_failure(&err);
+                        if !buf.is_null() {
+                            unsafe { *buf = 0 };
+                        }
+                        return 0;
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    record_protocol_failure(&err);
+                    if !buf.is_null() {
+                        unsafe { *buf = 0 };
+                    }
+                    return 0;
+                }
+            }
             continue;
         }
 
         let prompt = prompt.to_string();
-        guard.waiting_for_input = true;
+        #[cfg(not(windows))]
+        {
+            guard.waiting_for_input = true;
+        }
         drop(guard);
+        #[cfg(windows)]
+        if let Err(err) = rearm_windows_interrupt_observer() {
+            record_protocol_failure(&format!("failed to arm Windows Ctrl-C observer: {err}"));
+            if !buf.is_null() {
+                unsafe { *buf = 0 };
+            }
+            return 0;
+        }
         ipc::emit_input_wait(&prompt);
         let guard = state.inner.lock().unwrap();
-        wait_until_console_input_changes(state, guard);
+        match wait_until_console_input_changes(state, guard) {
+            Ok(true) => {
+                if let Err(err) = checkpoint_joined_windows_interrupt() {
+                    record_protocol_failure(&err);
+                    if !buf.is_null() {
+                        unsafe { *buf = 0 };
+                    }
+                    return 0;
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                record_protocol_failure(&err);
+                if !buf.is_null() {
+                    unsafe { *buf = 0 };
+                }
+                return 0;
+            }
+        }
     }
 }
 
