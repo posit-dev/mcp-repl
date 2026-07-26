@@ -607,9 +607,7 @@ impl WindowsConptyShutdownResetFilter {
                         continue;
                     }
                     self.pending.drain(..length);
-                    visible.append(&mut self.pending);
-                    self.finished = true;
-                    break;
+                    continue;
                 }
                 WindowsConptyShutdownResetMatch::Prefix if !at_eof => break,
                 WindowsConptyShutdownResetMatch::Prefix if self.armed => {
@@ -3636,6 +3634,37 @@ mod tests {
     }
 
     #[test]
+    fn raw_windows_conpty_multiple_shutdown_resets_are_dropped_until_finalization() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+        let first_reset = [
+            WindowsConptyShutdownResetFilter::TITLED_PREFIX,
+            b"C:\\mcp-repl\\target\\debug\\mcp-repl.exe",
+            WindowsConptyShutdownResetFilter::TITLED_SUFFIX,
+        ]
+        .concat();
+        let second_reset = WindowsConptyShutdownResetFilter::LF_PREFIXED_SIMPLE_SEQUENCE;
+        let mut between_and_second_prefix = b"between".to_vec();
+        between_and_second_prefix.extend_from_slice(&second_reset[..1]);
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"ready", TextStream::Stdout);
+        capture.note_windows_conpty_shutdown_starting();
+        capture.append_raw_text(&first_reset, TextStream::Stdout);
+        capture.append_raw_text(&between_and_second_prefix, TextStream::Stdout);
+        capture.append_raw_text(&second_reset[1..8], TextStream::Stdout);
+        capture.append_raw_text(&second_reset[8..], TextStream::Stdout);
+        capture.finish_raw_text(TextStream::Stdout);
+        capture.finalize_windows_conpty_raw_text();
+
+        assert_eq!(ring_bytes(&output_ring), b"readybetween");
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout("readybetween")]
+        );
+    }
+
+    #[test]
     fn raw_windows_conpty_lf_prefixed_shutdown_reset_split_across_session_end_is_dropped() {
         let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
         let capture = capture.with_windows_conpty_startup_noise_filter();
@@ -3846,6 +3875,10 @@ mod tests {
         capture.append_raw_text(&reset[27..reset.len() - 4], TextStream::Stdout);
         capture.append_raw_text(&reset[reset.len() - 4..], TextStream::Stdout);
         capture.append_raw_text(b"after\n", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"before\nshutdown-outputafter");
+        capture.finish_raw_text(TextStream::Stdout);
+        capture.finalize_windows_conpty_raw_text();
 
         assert_eq!(ring_bytes(&output_ring), b"before\nshutdown-outputafter\n");
         assert_eq!(

@@ -513,6 +513,7 @@ impl ServerIpcConnection {
     /// Process replacement creates a new connection and therefore drops this
     /// state. No wire identifier is needed because built-in delivery is
     /// serialized to one in-flight transaction.
+    #[cfg(any(test, windows))]
     pub fn begin_interrupt_transaction(&self, started_at: Instant) {
         let mut guard = self.inbox.lock().unwrap();
         guard.pending_interrupt_transaction_started_at = Some(started_at);
@@ -523,10 +524,12 @@ impl ServerIpcConnection {
 
     /// Waits for the worker IPC handler to confirm cleanup and observer
     /// rearming before the server writes native Ctrl-C to ConPTY.
+    #[cfg(any(test, windows))]
     pub fn wait_for_interrupt_armed(&self, timeout: Duration) -> Result<(), IpcWaitError> {
         self.wait_for_interrupt_armed_with_wait_observer(timeout, || {})
     }
 
+    #[cfg(any(test, windows))]
     fn wait_for_interrupt_armed_with_wait_observer<F>(
         &self,
         timeout: Duration,
@@ -572,6 +575,7 @@ impl ServerIpcConnection {
 
     /// Gates later worker-bound input until `interrupt_complete` and a
     /// pipe-later readiness fact have both arrived.
+    #[cfg(any(test, windows))]
     pub fn wait_for_pending_interrupt_transaction(
         &self,
         timeout: Duration,
@@ -579,6 +583,7 @@ impl ServerIpcConnection {
         self.wait_for_pending_interrupt_transaction_with_wait_observer(timeout, || {})
     }
 
+    #[cfg(any(test, windows))]
     pub(crate) fn wait_for_pending_interrupt_transaction_with_wait_observer<F>(
         &self,
         timeout: Duration,
@@ -769,6 +774,7 @@ impl ServerIpcConnection {
     ///
     /// This is an ordering fact only. The server still delivers Ctrl-C through
     /// the worker's native console input path.
+    #[cfg(any(test, windows))]
     pub fn wait_for_interrupt_observation(
         &self,
         timeout: Duration,
@@ -807,6 +813,7 @@ impl ServerIpcConnection {
 
     /// Waits for readiness observed later on the worker-to-server pipe than
     /// the most recent joined interrupt observation.
+    #[cfg(any(test, windows))]
     pub fn wait_for_interrupt_readiness(
         &self,
         timeout: Duration,
@@ -846,6 +853,7 @@ impl ServerIpcConnection {
 
     /// Returns whether a joined interrupt observation has already been
     /// followed by readiness, even if a later input consumed that readiness.
+    #[cfg(any(test, windows))]
     pub fn interrupt_transaction_settled_since(&self, since: Instant) -> bool {
         let guard = self.inbox.lock().unwrap();
         guard

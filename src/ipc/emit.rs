@@ -106,6 +106,7 @@ pub fn emit_ready_checked() -> io::Result<()> {
     ipc.send(WorkerToServerIpcMessage::Ready {})
 }
 
+#[cfg(windows)]
 pub fn emit_interrupt_complete() -> io::Result<()> {
     let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
     ipc.send(WorkerToServerIpcMessage::InterruptComplete {})

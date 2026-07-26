@@ -30,9 +30,15 @@ struct InterruptPromptWait {
 }
 
 enum InterruptTransactionWait {
-    NotRequired { remaining: Duration },
+    NotRequired {
+        remaining: Duration,
+    },
+    #[cfg(windows)]
     TimedOut,
-    Settled { remaining: Duration },
+    #[cfg(windows)]
+    Settled {
+        remaining: Duration,
+    },
 }
 
 impl WorkerManager {
@@ -123,9 +129,11 @@ impl WorkerManager {
         if interrupt_drains_pending_request || interrupt_drains_settled_completion {
             let drain_timeout = if interrupt_drains_pending_request {
                 match self.wait_for_interrupt_transaction_or_reset(timeout, interrupt_sent_at)? {
+                    #[cfg(windows)]
                     InterruptTransactionWait::TimedOut => Duration::ZERO,
-                    InterruptTransactionWait::Settled { remaining }
-                    | InterruptTransactionWait::NotRequired { remaining } => remaining,
+                    #[cfg(windows)]
+                    InterruptTransactionWait::Settled { remaining } => remaining,
+                    InterruptTransactionWait::NotRequired { remaining } => remaining,
                 }
             } else {
                 timeout
@@ -384,10 +392,12 @@ impl WorkerManager {
             return Ok(InterruptPromptWait { timed_out, prompt });
         };
         let readiness = match transaction {
+            #[cfg(windows)]
             InterruptTransactionWait::TimedOut => {
                 timed_out = true;
                 None
             }
+            #[cfg(windows)]
             InterruptTransactionWait::Settled { remaining } => {
                 Some(ipc.wait_for_interrupt_readiness(remaining))
             }

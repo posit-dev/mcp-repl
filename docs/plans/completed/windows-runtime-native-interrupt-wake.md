@@ -346,6 +346,15 @@ until shutdown arms the filter; an unarmed candidate is restored during
 finalization. All ConPTY filter mutation and its corresponding timeline
 insertion are serialized under the shared filter mutex.
 
+Hosted teardown can emit more than one exact console-reset envelope. Once the
+armed filter matches its first envelope, it continues recognizing consecutive
+exact envelopes, including an LF-prefixed envelope split across later raw
+reads, until raw finalization. Ordinary non-candidate output remains visible
+immediately except for the longest trailing suffix that could begin another
+exact envelope; finalization restores that suffix when no envelope completes.
+This keeps matching lifecycle-scoped and byte-exact rather than turning it into
+a general ANSI scrubber.
+
 Before shutdown is armed, matching stages an ambiguous lone LF until the next
 raw byte. A non-session sideband, IPC output-text, or image boundary flushes an
 ordinary staged LF through startup filtering before inserting that event.
@@ -456,15 +465,30 @@ Linux and macOS warning-denied checks found cross-platform cfg errors around a
 Windows-only label and helper, an otherwise-unused parameter, and an
 unnecessarily mutable binding; these were repaired structurally rather than
 suppressed. Its Windows job found that two R restart cases leaked the exact
-hosted LF-prefixed reset frame. After correcting that exact lifecycle match,
-six focused LF/reset tests, the separate deterministic
-`session_end_output_reader_allows_bounded_natural_drain` regression, the
-separate `raw_windows_conpty_session_end_marker_queue_is_idempotent` unit
-regression, the existing startup/terminal tests, and all 21 integration-runner
-scenarios passed locally. A local Linux cross-target check
-could not reach this crate because `harp`'s build script attempted a
-host-Windows resource-compiler step, so the hosted Linux and macOS checks remain
-authoritative. The hosted rerun was still pending when this record was updated.
+hosted LF-prefixed reset frame. The initial follow-up added that exact
+lifecycle match, serialized lifecycle filtering, and made session-end
+finalization bounded and deterministic.
+
+The next hosted run, `30222574492`, exposed the remaining root causes. Linux and
+macOS still compiled unused Windows-only interrupt-completion APIs in normal
+non-test builds. Their definitions and re-exports are now `cfg(windows)`, while
+server transaction helpers stay available under `cfg(any(test, windows))` so
+cross-platform protocol tests retain coverage. Windows still leaked the same
+LF-prefixed frame because the armed raw filter was one-shot: after dropping the
+first exact reset envelope it marked itself finished and appended all remaining
+bytes. A hosted ConPTY teardown that emitted a titled envelope followed by the
+LF-prefixed envelope therefore exposed the second one.
+
+The deterministic
+`raw_windows_conpty_multiple_shutdown_resets_are_dropped_until_finalization`
+regression reproduced that failure before the production fix with a titled
+reset followed by an LF-prefixed reset split across raw reads. The filter now
+continues scanning exact teardown envelopes after its first match and stops
+only at finalization; all 19 focused raw-ConPTY tests and both affected public
+R restart cases pass locally. A local Linux cross-target check still cannot
+reach this crate because `harp`'s build script attempts a host-Windows
+resource-compiler step, so the hosted Linux and macOS checks remain
+authoritative.
 
 ## Relationship To Other Work
 
@@ -502,7 +526,8 @@ authoritative. The hosted rerun was still pending when this record was updated.
 
 ## Next Safe Slice
 
-- Monitor the hosted rerun and make only in-scope fixes if it exposes another
+- Complete the warning-denied repository matrix, push the second CI follow-up,
+  and monitor the hosted rerun. Make only in-scope fixes if it exposes another
   branch-specific failure.
 
 ## Stop Conditions
@@ -589,3 +614,12 @@ authoritative. The hosted rerun was still pending when this record was updated.
   continues with the normal reset and spawn. The deterministic
   `session_end_output_reader_allows_bounded_natural_drain` regression proves a
   queued reader can finish naturally without receiving the stop request.
+- 2026-07-26: Scoped the remaining Linux/macOS dead-code failures with
+  `cfg(windows)` definitions/re-exports and `cfg(any(test, windows))` server
+  transaction helpers instead of warning suppression. Kept protocol messages,
+  inbox ordering state, and cross-platform unit coverage intact.
+- 2026-07-26: Reproduced the hosted Windows leak as a one-shot filter defect:
+  after one titled reset matched, a later LF-prefixed reset bypassed filtering.
+  Added a red regression with the second envelope split across raw reads, then
+  kept exact lifecycle matching active through raw finalization while
+  preserving ordinary surrounding output immediately.
