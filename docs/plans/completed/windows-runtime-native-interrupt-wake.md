@@ -490,6 +490,32 @@ reach this crate because `harp`'s build script attempts a host-Windows
 resource-compiler step, so the hosted Linux and macOS checks remain
 authoritative.
 
+Hosted run `30223994656` disproved the one-shot defect as the complete Windows
+root cause. The armed scanner necessarily removes the logged byte-exact frame,
+but the retained ConPTY handle was still closed only after the raw reader had
+joined and its lifecycle filter had finalized. Windows shutdown now explicitly
+closes that ConPTY after process termination while the raw reader is active,
+then drains the reader to EOF and finalizes the filter. This structurally
+encloses the late console repaint in the same armed raw lifecycle.
+When a live Windows worker has already published `session_end`, respawn now
+waits for the same bounded shutdown sequence instead of finalizing its reader
+before a detached reaper closes ConPTY. Other platforms retain the existing
+detached-reaper behavior.
+
+The same run completed warning-denied check, build, and the public API suite on
+Linux and macOS, then encountered three Rust 1.97 clippy diagnostics. Two were
+new `question_mark` lints in unchanged pager parsing code that had passed main's
+last Rust 1.96 CI; one was a branch-local `needless_return` in the non-Windows R
+interrupt cleanup path. All three received semantics-preserving rewrites rather
+than lint suppression.
+
+The close-before-drain follow-up passed the complete local gate: warning-denied
+check, build, and full test discovery with 487 library tests and every
+integration binary; all 21 public API scenarios; all 19 focused raw-ConPTY
+tests; all 12 Windows native-interrupt tests; the real reticulate regression;
+clippy; nightly formatting; 20 docs contracts; and the warning-denied locked
+release build.
+
 ## Relationship To Other Work
 
 - PR #122: this supersedes its Windows interrupt implementation. It does not
@@ -526,7 +552,7 @@ authoritative.
 
 ## Next Safe Slice
 
-- Complete the warning-denied repository matrix, push the second CI follow-up,
+- Complete the warning-denied repository matrix, push the third CI follow-up,
   and monitor the hosted rerun. Make only in-scope fixes if it exposes another
   branch-specific failure.
 
@@ -622,4 +648,14 @@ authoritative.
   after one titled reset matched, a later LF-prefixed reset bypassed filtering.
   Added a red regression with the second envelope split across raw reads, then
   kept exact lifecycle matching active through raw finalization while
-  preserving ordinary surrounding output immediately.
+  preserving ordinary surrounding output without losing an ambiguous trailing
+  candidate prefix.
+- 2026-07-26: Run `30223994656` proved matching through the old finalization
+  boundary was insufficient. Reordered terminated Windows teardown to close
+  the retained ConPTY while its raw reader is still active, drain the resulting
+  repaint and EOF, and only then finalize the byte-exact lifecycle filter.
+  Applied the same bounded ordering before Windows session-end respawn instead
+  of detaching a reaper after the raw reader was already finalized.
+- 2026-07-26: Adapted three clippy findings to hosted Rust 1.97: two
+  `question_mark` rewrites in unchanged pager parsing code and one
+  branch-local `needless_return`, without suppressions or behavior changes.

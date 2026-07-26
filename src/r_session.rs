@@ -167,7 +167,7 @@ pub(crate) fn discard_pending_input_after_interrupt() -> bool {
             guard.read_interrupted = true;
         }
         state.cvar.notify_all();
-        return had_pending || interrupted_waiting_read;
+        had_pending || interrupted_waiting_read
     }
     #[cfg(windows)]
     had_pending

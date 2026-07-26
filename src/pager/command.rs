@@ -189,12 +189,11 @@ fn parse_search_flags(raw: &str, n_flag: SearchCountFlag) -> Option<(SearchFlags
                 if let Some(value) = token.strip_prefix("-n") {
                     flags.n_value = Some(value.to_string());
                     rest = next;
-                } else if let Some(value) = token.strip_prefix("-C") {
+                } else {
+                    let value = token.strip_prefix("-C")?;
                     let parsed = parse_number_token(value)?;
                     flags.context = Some(parsed as usize);
                     rest = next;
-                } else {
-                    return None;
                 }
             }
         }
@@ -281,14 +280,13 @@ impl PagerCommand {
 
         // Pager commands are explicit to avoid collisions with backend code while pager is active.
         // Non-empty inputs must be prefixed with `:` to be interpreted as pager commands.
-        let trimmed = if let Some(rest) = trimmed.strip_prefix(':') {
+        let trimmed = {
+            let rest = trimmed.strip_prefix(':')?;
             let rest = rest.trim_start();
             if rest.is_empty() {
                 return None;
             }
             rest
-        } else {
-            return None;
         };
 
         if trimmed == "help" {

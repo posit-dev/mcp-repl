@@ -1056,6 +1056,14 @@ impl WorkerChild {
             Self::DirectWindows(child) => child.close_job(),
         }
     }
+
+    #[cfg(target_family = "windows")]
+    fn close_conpty(&mut self) {
+        match self {
+            Self::Standard(_) => {}
+            Self::DirectWindows(child) => child.close_conpty(),
+        }
+    }
 }
 
 #[cfg(target_family = "windows")]
@@ -1117,6 +1125,10 @@ impl WindowsProcess {
 
     fn close_job(&mut self) {
         self.job.take();
+    }
+
+    fn close_conpty(&mut self) {
+        drop(self._conpty.take());
     }
 
     fn exit_status(&self) -> std::io::Result<ExitStatus> {
@@ -1938,17 +1950,27 @@ impl WorkerProcess {
             match self.child.try_wait()? {
                 Some(status) => self.exit_status = Some(status),
                 None => {
-                    self.quiesce_raw_output_readers()?;
-                    // The next spawn resets and reuses this stable session temp path.
-                    // The old background reaper must not remove the respawned worker's TMPDIR.
-                    self.session_tmpdir = None;
-                    let _ = thread::Builder::new()
-                        .name("worker-session-end-reaper".to_string())
-                        .spawn(move || {
-                            let _ =
-                                self.shutdown_graceful(WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT);
-                        });
-                    return Ok(());
+                    #[cfg(target_family = "windows")]
+                    {
+                        // Keep the old ConPTY lifecycle wholly ahead of
+                        // respawn. A detached reaper would close ConPTY only
+                        // after its raw reader and reset filter were finalized.
+                        return self.shutdown_graceful(WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT);
+                    }
+                    #[cfg(not(target_family = "windows"))]
+                    {
+                        self.quiesce_raw_output_readers()?;
+                        // The next spawn resets and reuses this stable session temp path.
+                        // The old background reaper must not remove the respawned worker's TMPDIR.
+                        self.session_tmpdir = None;
+                        let _ = thread::Builder::new()
+                            .name("worker-session-end-reaper".to_string())
+                            .spawn(move || {
+                                let _ = self
+                                    .shutdown_graceful(WORKER_SESSION_END_RESPAWN_SHUTDOWN_TIMEOUT);
+                            });
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1959,6 +1981,7 @@ impl WorkerProcess {
         #[cfg(target_family = "windows")]
         {
             self.child.close_job();
+            self.child.close_conpty();
         }
         self.quiesce_raw_output_readers()?;
         self.detach_ipc_reader();
@@ -2027,6 +2050,11 @@ impl WorkerProcess {
         // sideband fds. Backend startup strips the bootstrap env vars, marks the fds
         // close-on-exec, and closes them again in forked children, so EOF should track the root
         // worker lifetime.
+        // Close the retained ConPTY while its reader is still active so the
+        // final console repaint is captured inside the armed raw-output
+        // lifecycle instead of appearing after filter finalization.
+        #[cfg(target_family = "windows")]
+        self.child.close_conpty();
         if let Some(reader) = self.stdout_reader.take() {
             reader.stop_and_join("worker stdout reader thread panicked")?;
         }
