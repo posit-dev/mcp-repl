@@ -1322,8 +1322,9 @@ fn read_queue_raw_bytes(size: usize) -> Result<Vec<u8>, RawStdinReadError> {
             } else {
                 None
             };
+            #[cfg(not(windows))]
+            let completed_interrupt: Option<bool> = None;
             let mut guard = state.inner.lock().unwrap();
-            #[cfg(windows)]
             if let Some(signal_pending) = completed_interrupt {
                 if signal_pending {
                     if owns_consumer {

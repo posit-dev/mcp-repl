@@ -48,51 +48,59 @@ impl WorkerManager {
 
     pub(super) fn note_session_end(&mut self, include_notice: bool) {
         self.session_end_seen = true;
+        let had_process = self.process.is_some();
+        let mut status_message = None;
         if let Some(process) = self.process.as_mut() {
             process.note_expected_exit();
             if include_notice {
-                let status_message = process.exit_status_message().ok().flatten();
-                if let Some(mut message) = status_message {
-                    if !message.ends_with('\n') {
-                        message.push('\n');
+                status_message = process.exit_status_message().ok().flatten();
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_))
+            && let Some(process) = self.process.take()
+        {
+            let _ = process.finish_session_end_for_respawn();
+        }
+
+        if include_notice && had_process {
+            if let Some(mut message) = status_message {
+                if !message.ends_with('\n') {
+                    message.push('\n');
+                }
+                match self.oversized_output {
+                    OversizedOutputMode::Files => self
+                        .pending_output_tape
+                        .append_server_stderr_status_line(message.as_bytes()),
+                    OversizedOutputMode::Pager => {
+                        self.output_timeline.append_text(
+                            message.as_bytes(),
+                            true,
+                            ContentOrigin::Server,
+                        );
                     }
-                    match self.oversized_output {
-                        OversizedOutputMode::Files => self
-                            .pending_output_tape
-                            .append_server_stderr_status_line(message.as_bytes()),
-                        OversizedOutputMode::Pager => {
+                }
+            } else {
+                let message = "[repl] session ended\n".to_string();
+                match self.oversized_output {
+                    OversizedOutputMode::Files => self
+                        .pending_output_tape
+                        .append_stdout_status_line(message.as_bytes()),
+                    OversizedOutputMode::Pager => {
+                        self.output_timeline.seal_utf8_tails();
+                        if self.output_timeline.last_text_ends_with_newline() {
                             self.output_timeline.append_text(
                                 message.as_bytes(),
-                                true,
+                                false,
                                 ContentOrigin::Server,
                             );
-                        }
-                    }
-                } else {
-                    let message = "[repl] session ended\n".to_string();
-                    match self.oversized_output {
-                        OversizedOutputMode::Files => self
-                            .pending_output_tape
-                            .append_stdout_status_line(message.as_bytes()),
-                        OversizedOutputMode::Pager => {
-                            self.output_timeline.seal_utf8_tails();
-                            if self.output_timeline.last_text_ends_with_newline() {
-                                self.output_timeline.append_text(
-                                    message.as_bytes(),
-                                    false,
-                                    ContentOrigin::Server,
-                                );
-                            } else {
-                                let mut status =
-                                    Vec::with_capacity(message.len().saturating_add(1));
-                                status.push(b'\n');
-                                status.extend_from_slice(message.as_bytes());
-                                self.output_timeline.append_text(
-                                    &status,
-                                    false,
-                                    ContentOrigin::Server,
-                                );
-                            }
+                        } else {
+                            let mut status = Vec::with_capacity(message.len().saturating_add(1));
+                            status.push(b'\n');
+                            status.extend_from_slice(message.as_bytes());
+                            self.output_timeline
+                                .append_text(&status, false, ContentOrigin::Server);
                         }
                     }
                 }

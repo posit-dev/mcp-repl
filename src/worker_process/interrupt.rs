@@ -243,11 +243,11 @@ impl WorkerManager {
     fn wait_for_interrupt_transaction(
         &mut self,
         timeout: Duration,
-        interrupt_sent_at: Option<Instant>,
+        _interrupt_sent_at: Option<Instant>,
     ) -> Result<InterruptTransactionWait, WorkerError> {
         #[cfg(windows)]
         if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_))
-            && let Some(sent_at) = interrupt_sent_at
+            && let Some(sent_at) = _interrupt_sent_at
         {
             let Some(ipc) = self
                 .process

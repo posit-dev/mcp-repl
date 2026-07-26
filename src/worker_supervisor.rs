@@ -158,26 +158,35 @@ impl LiveOutputCapture {
         stream: TextStream,
         is_continuation: bool,
     ) {
+        #[cfg(any(test, target_os = "windows"))]
+        if let Some(filter) = &self.windows_conpty_startup_noise_filter {
+            let mut filter = filter.lock().unwrap();
+            self.flush_unarmed_windows_conpty_ambiguous_lf_locked(&mut filter);
+            self.append_text(bytes, stream, is_continuation, true);
+            drop(filter);
+            return;
+        }
         self.append_text(bytes, stream, is_continuation, true);
     }
 
     fn append_raw_text(&self, bytes: &[u8], stream: TextStream) {
         #[cfg(any(test, target_os = "windows"))]
-        if matches!(stream, TextStream::Stdout) {
-            let Some(filter) = &self.windows_conpty_startup_noise_filter else {
+        if let Some(filter) = &self.windows_conpty_startup_noise_filter {
+            let mut filter = filter.lock().unwrap();
+            if matches!(stream, TextStream::Stdout) {
+                match filter.filter(bytes) {
+                    None => {}
+                    Some(Cow::Borrowed(bytes)) => {
+                        self.append_text(bytes, stream, false, false);
+                    }
+                    Some(Cow::Owned(bytes)) => {
+                        self.append_text(&bytes, stream, false, false);
+                    }
+                }
+            } else {
                 self.append_text(bytes, stream, false, false);
-                return;
-            };
-            let filtered = filter.lock().unwrap().filter(bytes);
-            match filtered {
-                None => {}
-                Some(Cow::Borrowed(bytes)) => {
-                    self.append_text(bytes, stream, false, false);
-                }
-                Some(Cow::Owned(bytes)) => {
-                    self.append_text(&bytes, stream, false, false);
-                }
             }
+            drop(filter);
             return;
         }
         self.append_text(bytes, stream, false, false);
@@ -186,19 +195,46 @@ impl LiveOutputCapture {
     fn note_windows_conpty_shutdown_starting(&self) {
         #[cfg(any(test, target_os = "windows"))]
         if let Some(filter) = &self.windows_conpty_startup_noise_filter {
-            let pending = filter.lock().unwrap().arm_shutdown_reset();
+            let mut filter = filter.lock().unwrap();
+            let pending = filter.arm_shutdown_reset();
             if let Some(bytes) = pending {
                 self.append_text(&bytes, TextStream::Stdout, false, false);
             }
+            drop(filter);
+        }
+    }
+
+    #[cfg(test)]
+    fn flush_unarmed_windows_conpty_ambiguous_lf(&self) {
+        #[cfg(any(test, target_os = "windows"))]
+        if let Some(filter) = &self.windows_conpty_startup_noise_filter {
+            let mut filter = filter.lock().unwrap();
+            self.flush_unarmed_windows_conpty_ambiguous_lf_locked(&mut filter);
+            drop(filter);
+        }
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn flush_unarmed_windows_conpty_ambiguous_lf_locked(
+        &self,
+        filter: &mut WindowsConptyStartupNoiseFilter,
+    ) {
+        if let Some(bytes) = filter.flush_unarmed_ambiguous_lf() {
+            self.append_text(&bytes, TextStream::Stdout, false, false);
         }
     }
 
     fn finalize_windows_conpty_raw_text(&self) {
         #[cfg(any(test, target_os = "windows"))]
-        if let Some(filter) = &self.windows_conpty_startup_noise_filter
-            && let Some(bytes) = filter.lock().unwrap().finalize()
-        {
-            self.append_text(&bytes, TextStream::Stdout, false, false);
+        if let Some(filter) = &self.windows_conpty_startup_noise_filter {
+            let mut filter = filter.lock().unwrap();
+            if let Some(bytes) = filter.finalize() {
+                self.append_text(&bytes, TextStream::Stdout, false, false);
+            }
+            if filter.take_pending_session_end() {
+                self.output_timeline.append_session_end();
+            }
+            drop(filter);
         }
     }
 
@@ -208,10 +244,12 @@ impl LiveOutputCapture {
             let Some(filter) = &self.windows_conpty_startup_noise_filter else {
                 return;
             };
-            let pending = filter.lock().unwrap().finish_reader();
+            let mut filter = filter.lock().unwrap();
+            let pending = filter.finish_reader();
             if let Some(bytes) = pending {
                 self.append_text(&bytes, stream, false, false);
             }
+            drop(filter);
         }
         #[cfg(not(any(test, target_os = "windows")))]
         let _ = stream;
@@ -265,6 +303,18 @@ impl LiveOutputCapture {
     }
 
     pub(crate) fn append_image(&self, image: IpcOutputImage) {
+        #[cfg(any(test, target_os = "windows"))]
+        if let Some(filter) = &self.windows_conpty_startup_noise_filter {
+            let mut filter = filter.lock().unwrap();
+            self.flush_unarmed_windows_conpty_ambiguous_lf_locked(&mut filter);
+            self.append_image_inner(&image);
+            drop(filter);
+            return;
+        }
+        self.append_image_inner(&image);
+    }
+
+    fn append_image_inner(&self, image: &IpcOutputImage) {
         if image.updates_previous_image {
             self.output_timeline.append_text_event(
                 PREVIOUS_IMAGE_UPDATE_NOTICE.to_string(),
@@ -283,6 +333,27 @@ impl LiveOutputCapture {
     }
 
     pub(crate) fn append_sideband(&self, kind: PendingSidebandKind) {
+        #[cfg(any(test, target_os = "windows"))]
+        if let Some(filter) = &self.windows_conpty_startup_noise_filter {
+            let mut filter = filter.lock().unwrap();
+            if matches!(&kind, PendingSidebandKind::SessionEnd) {
+                if let Some(bytes) = filter.arm_shutdown_reset() {
+                    self.append_text(&bytes, TextStream::Stdout, false, false);
+                }
+                if filter.defer_session_end() {
+                    self.output_timeline.append_session_end();
+                }
+            } else {
+                self.flush_unarmed_windows_conpty_ambiguous_lf_locked(&mut filter);
+                self.append_sideband_inner(kind);
+            }
+            drop(filter);
+            return;
+        }
+        self.append_sideband_inner(kind);
+    }
+
+    fn append_sideband_inner(&self, kind: PendingSidebandKind) {
         match kind {
             PendingSidebandKind::InputWait { .. } => self.output_timeline.append_input_wait(),
             PendingSidebandKind::ReadlineResult { prompt, line } => {
@@ -300,6 +371,8 @@ struct WindowsConptyStartupNoiseFilter {
     matched: bool,
     finished: bool,
     shutdown_reset: Option<WindowsConptyShutdownResetFilter>,
+    session_end_pending: bool,
+    raw_output_finalized: bool,
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -310,6 +383,8 @@ impl Default for WindowsConptyStartupNoiseFilter {
             matched: false,
             finished: false,
             shutdown_reset: Some(WindowsConptyShutdownResetFilter::default()),
+            session_end_pending: false,
+            raw_output_finalized: false,
         }
     }
 }
@@ -336,6 +411,11 @@ impl WindowsConptyStartupNoiseFilter {
         self.filter_startup(&pending).map(Cow::into_owned)
     }
 
+    fn flush_unarmed_ambiguous_lf(&mut self) -> Option<Vec<u8>> {
+        let pending = self.shutdown_reset.as_mut()?.flush_unarmed_ambiguous_lf()?;
+        self.filter_startup(&pending).map(Cow::into_owned)
+    }
+
     fn finish_reader(&mut self) -> Option<Vec<u8>> {
         let pending = self
             .shutdown_reset
@@ -344,12 +424,27 @@ impl WindowsConptyStartupNoiseFilter {
         self.finish_at_eof(pending)
     }
 
+    fn defer_session_end(&mut self) -> bool {
+        if self.raw_output_finalized {
+            true
+        } else {
+            self.session_end_pending = true;
+            false
+        }
+    }
+
+    fn take_pending_session_end(&mut self) -> bool {
+        std::mem::take(&mut self.session_end_pending)
+    }
+
     fn finalize(&mut self) -> Option<Vec<u8>> {
         let pending = self
             .shutdown_reset
             .as_mut()
             .and_then(WindowsConptyShutdownResetFilter::finalize);
-        self.finish_at_eof(pending)
+        let visible = self.finish_at_eof(pending);
+        self.raw_output_finalized = true;
+        visible
     }
 
     fn finish_at_eof(&mut self, pending: Option<Vec<u8>>) -> Option<Vec<u8>> {
@@ -421,6 +516,7 @@ enum WindowsConptyShutdownResetMatch {
 #[cfg(any(test, target_os = "windows"))]
 impl WindowsConptyShutdownResetFilter {
     const START: &'static [u8] = b"\x1b[?25l";
+    const LF_PREFIXED_SIMPLE_SEQUENCE: &'static [u8] = b"\n\x1b[2J\x1b[m\x1b[H\x1b[?25h";
     const SIMPLE_SEQUENCE: &'static [u8] = b"\x1b[?25l\x1b[2J\x1b[m\x1b[H\x1b[?25h";
     const SIMPLE_WITH_TRAILING_MODES: &'static [u8] =
         b"\x1b[?25l\x1b[2J\x1b[m\x1b[H\x1b[?25h\x1b[?9001l\x1b[?1004l";
@@ -470,6 +566,14 @@ impl WindowsConptyShutdownResetFilter {
         (!visible.is_empty()).then_some(visible)
     }
 
+    fn flush_unarmed_ambiguous_lf(&mut self) -> Option<Vec<u8>> {
+        if !self.armed && !self.finished && self.pending == b"\n" {
+            Some(std::mem::take(&mut self.pending))
+        } else {
+            None
+        }
+    }
+
     fn drain_pending(&mut self, at_eof: bool) -> Vec<u8> {
         let mut visible = Vec::new();
         loop {
@@ -477,16 +581,17 @@ impl WindowsConptyShutdownResetFilter {
                 break;
             }
 
-            if !self.pending.starts_with(Self::START) {
-                if let Some(start) = self
-                    .pending
-                    .windows(Self::START.len())
-                    .position(|window| window == Self::START)
-                {
+            if !Self::starts_with_candidate(&self.pending) {
+                if let Some(start) = Self::first_candidate_start(&self.pending) {
                     visible.extend(self.pending.drain(..start));
                     continue;
                 }
-                let retained = longest_suffix_matching_prefix(&self.pending, Self::START);
+                let start_retained = longest_suffix_matching_prefix(&self.pending, Self::START);
+                let lf_retained = longest_suffix_matching_prefix(
+                    &self.pending,
+                    Self::LF_PREFIXED_SIMPLE_SEQUENCE,
+                );
+                let retained = start_retained.max(lf_retained);
                 let visible_len = self.pending.len().saturating_sub(retained);
                 visible.extend(self.pending.drain(..visible_len));
                 break;
@@ -524,6 +629,7 @@ impl WindowsConptyShutdownResetFilter {
         let mut complete = None;
         let mut longer_prefix = false;
         for candidate in [
+            Self::LF_PREFIXED_SIMPLE_SEQUENCE,
             Self::SIMPLE_WITH_TRAILING_MODES,
             Self::MODES_FIRST_SEQUENCE,
             Self::SIMPLE_SEQUENCE,
@@ -550,6 +656,21 @@ impl WindowsConptyShutdownResetFilter {
             None if longer_prefix => WindowsConptyShutdownResetMatch::Prefix,
             None => WindowsConptyShutdownResetMatch::NoMatch,
         }
+    }
+
+    fn starts_with_candidate(bytes: &[u8]) -> bool {
+        bytes.starts_with(Self::START) || bytes.starts_with(Self::LF_PREFIXED_SIMPLE_SEQUENCE)
+    }
+
+    fn first_candidate_start(bytes: &[u8]) -> Option<usize> {
+        [Self::START, Self::LF_PREFIXED_SIMPLE_SEQUENCE]
+            .into_iter()
+            .filter_map(|prefix| {
+                bytes
+                    .windows(prefix.len())
+                    .position(|window| window == prefix)
+            })
+            .min()
     }
 
     fn match_titled_sequence(bytes: &[u8]) -> WindowsConptyShutdownResetMatch {
@@ -1051,14 +1172,6 @@ impl OutputReader {
             .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
     }
 
-    fn stop_now_and_join(mut self, panic_message: &'static str) -> Result<(), WorkerError> {
-        self.request_stop();
-        let _ = self.done_rx.recv();
-        self.handle
-            .join()
-            .map_err(|_| WorkerError::Protocol(panic_message.to_string()))
-    }
-
     fn request_stop(&mut self) {
         self.stop_requested.store(true, Ordering::Relaxed);
         #[cfg(target_family = "unix")]
@@ -1187,7 +1300,6 @@ impl WorkerProcess {
                 on_session_end: {
                     let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
-                        sideband_capture.note_windows_conpty_shutdown_starting();
                         sideband_capture.append_sideband(PendingSidebandKind::SessionEnd);
                     }))
                 },
@@ -1821,7 +1933,8 @@ impl WorkerProcess {
     }
 
     pub(crate) fn finish_session_end_for_respawn(mut self) -> Result<(), WorkerError> {
-        self.live_output.note_windows_conpty_shutdown_starting();
+        self.live_output
+            .append_sideband(PendingSidebandKind::SessionEnd);
         self.disable_ipc_handlers();
         if self.exit_status.is_none() {
             match self.child.try_wait()? {
@@ -1895,11 +2008,14 @@ impl WorkerProcess {
     }
 
     fn quiesce_raw_output_readers(&mut self) -> Result<(), WorkerError> {
+        // Sideband session_end can overtake bytes already queued in the raw
+        // ConPTY stream. Give both readers the normal bounded drain grace
+        // before forcing them to stop, then finalize the lifecycle filter.
         if let Some(reader) = self.stdout_reader.take() {
-            reader.stop_now_and_join("worker stdout reader thread panicked")?;
+            reader.stop_and_join("worker stdout reader thread panicked")?;
         }
         if let Some(reader) = self.stderr_reader.take() {
-            reader.stop_now_and_join("worker stderr reader thread panicked")?;
+            reader.stop_and_join("worker stderr reader thread panicked")?;
         }
         self.live_output.finalize_windows_conpty_raw_text();
         Ok(())
@@ -2953,6 +3069,41 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
+    fn session_end_output_reader_allows_bounded_natural_drain() {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop_requested.clone();
+        let drained = Arc::new(AtomicBool::new(false));
+        let thread_drained = drained.clone();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            release_rx.recv().expect("release output reader");
+            if !thread_stop.load(Ordering::Relaxed) {
+                thread_drained.store(true, Ordering::Relaxed);
+            }
+            done_tx.send(()).expect("finish output reader");
+        });
+        let reader = OutputReader {
+            handle,
+            done_rx,
+            stop_requested: stop_requested.clone(),
+        };
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            release_tx.send(()).expect("release output reader");
+        });
+
+        reader
+            .stop_and_join("test output reader thread panicked")
+            .expect("join output reader after bounded drain");
+        release.join().expect("join output reader release");
+
+        assert!(drained.load(Ordering::Relaxed));
+        assert!(!stop_requested.load(Ordering::Relaxed));
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
     fn windows_pty_interrupt_payload_is_exact_etx() {
         assert_eq!(
             windows_interrupt_payload(WorkerStdinTransport::Pty).expect("ConPTY interrupt"),
@@ -3384,6 +3535,7 @@ mod tests {
         capture.note_accepted_input_starting();
         capture.append_raw_text(b"h\x1b[?1004h\r\n", TextStream::Stdout);
         capture.append_raw_text(b"visible\n", TextStream::Stdout);
+        capture.flush_unarmed_windows_conpty_ambiguous_lf();
 
         assert_eq!(ring_bytes(&output_ring), b"visible\n");
         assert_eq!(
@@ -3416,6 +3568,7 @@ mod tests {
         let capture = capture.with_windows_conpty_startup_noise_filter();
 
         capture.append_raw_text(b"\x1b[?9001hvisible\n", TextStream::Stdout);
+        capture.flush_unarmed_windows_conpty_ambiguous_lf();
 
         assert_eq!(ring_bytes(&output_ring), b"\x1b[?9001hvisible\n");
         assert_eq!(
@@ -3431,6 +3584,7 @@ mod tests {
 
         capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
         capture.append_raw_text(b"user:\x1b[?9001h\x1b[?1004h\n", TextStream::Stdout);
+        capture.flush_unarmed_windows_conpty_ambiguous_lf();
 
         assert_eq!(ring_bytes(&output_ring), b"user:\x1b[?9001h\x1b[?1004h\n");
         assert_eq!(
@@ -3458,6 +3612,166 @@ mod tests {
         assert_eq!(
             tape.drain_final_output().contents,
             vec![WorkerContent::worker_stdout("ready")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_lf_prefixed_shutdown_reset_is_dropped_when_armed() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"ready", TextStream::Stdout);
+        capture.note_windows_conpty_shutdown_starting();
+        capture.append_raw_text(
+            WindowsConptyShutdownResetFilter::LF_PREFIXED_SIMPLE_SEQUENCE,
+            TextStream::Stdout,
+        );
+
+        assert_eq!(ring_bytes(&output_ring), b"ready");
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout("ready")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_lf_prefixed_shutdown_reset_split_across_session_end_is_dropped() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+        let reset = WindowsConptyShutdownResetFilter::LF_PREFIXED_SIMPLE_SEQUENCE;
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"ready", TextStream::Stdout);
+        capture.append_raw_text(&reset[..1], TextStream::Stdout);
+        assert_eq!(ring_bytes(&output_ring), b"ready");
+
+        capture.append_sideband(PendingSidebandKind::SessionEnd);
+        capture.append_raw_text(&reset[1..], TextStream::Stdout);
+        capture.finish_raw_text(TextStream::Stdout);
+        capture.finalize_windows_conpty_raw_text();
+
+        assert_eq!(ring_bytes(&output_ring), b"ready");
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout("ready")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_unarmed_ambiguous_lf_is_flushed_before_non_session_sideband() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"ready\n", TextStream::Stdout);
+        assert_eq!(ring_bytes(&output_ring), b"ready");
+
+        capture.append_sideband(PendingSidebandKind::RequestBoundary);
+
+        assert_eq!(ring_bytes(&output_ring), b"ready\n");
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout("ready\n")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_ordinary_lf_precedes_deferred_session_end_marker() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"cleanup\n", TextStream::Stdout);
+        assert_eq!(ring_bytes(&output_ring), b"cleanup");
+
+        capture.append_sideband(PendingSidebandKind::SessionEnd);
+        capture.finish_raw_text(TextStream::Stdout);
+        assert_eq!(ring_bytes(&output_ring), b"cleanup");
+
+        capture.finalize_windows_conpty_raw_text();
+        capture.append_raw_text(b"after", TextStream::Stdout);
+
+        let range = output_ring.read_range(0, output_ring.end_offset());
+        assert_eq!(ring_bytes(&output_ring), b"cleanup\nafter");
+        assert!(range.events.iter().any(|event| {
+            event.offset == b"cleanup\n".len() as u64
+                && matches!(&event.kind, OutputEventKind::SessionEnd)
+        }));
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout("cleanup\nafter")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_session_end_marker_queue_is_idempotent() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"ready", TextStream::Stdout);
+        capture.append_sideband(PendingSidebandKind::SessionEnd);
+        capture.append_sideband(PendingSidebandKind::SessionEnd);
+        capture.finish_raw_text(TextStream::Stdout);
+        capture.finalize_windows_conpty_raw_text();
+
+        let range = output_ring.read_range(0, output_ring.end_offset());
+        assert_eq!(
+            range
+                .events
+                .iter()
+                .filter(|event| matches!(&event.kind, OutputEventKind::SessionEnd))
+                .count(),
+            1
+        );
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout("ready")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_lf_prefixed_shutdown_reset_handles_split_reads() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+        let reset = WindowsConptyShutdownResetFilter::LF_PREFIXED_SIMPLE_SEQUENCE;
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"before", TextStream::Stdout);
+        capture.note_windows_conpty_shutdown_starting();
+        capture.append_raw_text(&reset[..1], TextStream::Stdout);
+        capture.append_raw_text(&reset[1..8], TextStream::Stdout);
+        capture.append_raw_text(&reset[8..], TextStream::Stdout);
+        capture.append_raw_text(b"after", TextStream::Stdout);
+
+        assert_eq!(ring_bytes(&output_ring), b"beforeafter");
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout("beforeafter")]
+        );
+    }
+
+    #[test]
+    fn raw_windows_conpty_lf_prefixed_shutdown_reset_is_preserved_when_unarmed() {
+        let (capture, output_ring, tape) = capture_with_ring(OversizedOutputMode::Files);
+        let capture = capture.with_windows_conpty_startup_noise_filter();
+        let reset = WindowsConptyShutdownResetFilter::LF_PREFIXED_SIMPLE_SEQUENCE;
+
+        capture.append_raw_text(b"\x1b[?9001h\x1b[?1004h", TextStream::Stdout);
+        capture.append_raw_text(b"ready", TextStream::Stdout);
+        capture.append_raw_text(reset, TextStream::Stdout);
+        capture.finish_raw_text(TextStream::Stdout);
+        capture.finalize_windows_conpty_raw_text();
+
+        let mut expected = b"ready".to_vec();
+        expected.extend_from_slice(reset);
+        assert_eq!(ring_bytes(&output_ring), expected);
+        assert_eq!(
+            tape.drain_final_output().contents,
+            vec![WorkerContent::worker_stdout(
+                String::from_utf8(expected).expect("test reset sequence is UTF-8")
+            )]
         );
     }
 

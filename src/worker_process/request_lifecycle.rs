@@ -177,14 +177,14 @@ impl WorkerManager {
             )));
         }
         let server_deadline = started_at + server_timeout;
-        let mut remaining = server_deadline.saturating_duration_since(Instant::now());
+        let remaining = server_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(RequestStartError::pre_admission(WorkerError::Timeout(
                 server_timeout,
             )));
         }
         #[cfg(windows)]
-        if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_)) {
+        let remaining = if matches!(self.worker_launch, crate::backend::WorkerLaunch::Builtin(_)) {
             match ipc.wait_for_pending_interrupt_transaction_with_wait_observer(remaining, || {
                 #[cfg(debug_assertions)]
                 signal_test_interrupt_admission_gate();
@@ -219,13 +219,16 @@ impl WorkerManager {
                 }
             }
             self.complete_interrupt_delivery_if_settled();
-            remaining = server_deadline.saturating_duration_since(Instant::now());
+            let remaining = server_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(RequestStartError::pre_admission(WorkerError::Timeout(
                     server_timeout,
                 )));
             }
-        }
+            remaining
+        } else {
+            remaining
+        };
         if let Some(process) = self.process.as_ref() {
             process.note_accepted_input_starting();
         }

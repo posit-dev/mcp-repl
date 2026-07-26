@@ -339,13 +339,33 @@ kept separate from runtime output: the exact ConPTY startup mode toggles and
 the exact console-reset sequence emitted during shutdown are removed only from
 the built-in worker's raw terminal stream. Matching is byte-exact and
 split-read tolerant; later user/runtime terminal bytes pass through unchanged.
-Windows emits both a plain cursor/screen reset and a mode-reset/title-frame
-variant. A complete candidate that races ahead of the sideband `session_end`
-callback is held until that callback arms the filter; an unarmed candidate is
-restored during finalization. This preserves identical user output while
-removing only a lifecycle frame joined to the session-end boundary. R shutdown
-writes console EOF before waiting but leaves the ConPTY open until R returns,
-so `.Last` and other cleanup output remains ordered before `session_end`.
+Windows emits cursor-hide-prefixed plain and mode-reset/title-frame variants;
+hosted ConPTY also emits the exact LF-prefixed clear/reset/home/show-cursor
+frame. A complete candidate arriving before the sideband `session_end` is held
+until shutdown arms the filter; an unarmed candidate is restored during
+finalization. All ConPTY filter mutation and its corresponding timeline
+insertion are serialized under the shared filter mutex.
+
+Before shutdown is armed, matching stages an ambiguous lone LF until the next
+raw byte. A non-session sideband, IPC output-text, or image boundary flushes an
+ordinary staged LF through startup filtering before inserting that event.
+`session_end` instead atomically arms reset matching and defers its timeline
+marker until the raw reader quiesces and the filter finalizes. This lets a reset
+split exactly after LF complete and be removed byte-exactly; if the staged LF
+is ordinary output, finalization emits it before the deferred marker.
+
+For the Windows built-in session-end transition, the optional sideband callback
+remains the fast path. Synchronous teardown idempotently queues and arms
+`PendingSidebandKind::SessionEnd` before disabling IPC handlers, guaranteeing
+the marker even if the callback loses the publish/dispatch race. The server
+then gives the old worker's raw readers the existing 120 ms natural-drain grace
+before forcing them to stop and finalizing the filter. This prevents queued
+ConPTY bytes from being lost while keeping teardown bounded. The finalized raw
+output lands before the reply snapshot and restart status notice; normal reset
+and spawn then follow.
+R shutdown writes console EOF before waiting but leaves the ConPTY open until R
+returns, so `.Last` and other cleanup output remains ordered before
+`session_end`.
 
 A custom Windows worker using ConPTY receives ETX and owns its own CRT
 `CONIN$`, processed-input, native-handler, and completion policy. A pipe-only
@@ -431,6 +451,21 @@ suite. The actual reticulate regression passed separately with its explicit
 library and Python runtime. The final unrestricted run completed without Code
 Integrity interruption.
 
+The first hosted Actions run, `30152034299`, exposed two follow-up gaps. Its
+Linux and macOS warning-denied checks found cross-platform cfg errors around a
+Windows-only label and helper, an otherwise-unused parameter, and an
+unnecessarily mutable binding; these were repaired structurally rather than
+suppressed. Its Windows job found that two R restart cases leaked the exact
+hosted LF-prefixed reset frame. After correcting that exact lifecycle match,
+six focused LF/reset tests, the separate deterministic
+`session_end_output_reader_allows_bounded_natural_drain` regression, the
+separate `raw_windows_conpty_session_end_marker_queue_is_idempotent` unit
+regression, the existing startup/terminal tests, and all 21 integration-runner
+scenarios passed locally. A local Linux cross-target check
+could not reach this crate because `harp`'s build script attempted a
+host-Windows resource-compiler step, so the hosted Linux and macOS checks remain
+authoritative. The hosted rerun was still pending when this record was updated.
+
 ## Relationship To Other Work
 
 - PR #122: this supersedes its Windows interrupt implementation. It does not
@@ -467,9 +502,8 @@ Integrity interruption.
 
 ## Next Safe Slice
 
-- Publish the draft PR and monitor GitHub Actions on its clean Windows runner.
-- If hosted checks expose a branch-specific failure, fix it in scope and update
-  this completed record.
+- Monitor the hosted rerun and make only in-scope fixes if it exposes another
+  branch-specific failure.
 
 ## Stop Conditions
 
@@ -532,3 +566,26 @@ Integrity interruption.
   tests, every integration binary including all 12 Windows native cases, the
   actual reticulate regression, clippy, formatting, docs contracts, integration
   runner, and locked release build all passed.
+- 2026-07-25: Repaired the first hosted run's non-Windows cfg failures
+  structurally by removing the Windows-only label shape, wrapping the
+  Windows-only checkpoint behind a cross-platform helper, and making parameter
+  use and mutability cfg-correct without warning suppressions.
+- 2026-07-25: Added an exact match for hosted ConPTY's LF-prefixed
+  clear/reset/home/show-cursor lifecycle frame and staged an ambiguous lone LF
+  before shutdown arm until the next raw byte or a non-session
+  sideband/output/image boundary flushes it through startup filtering.
+  Serialized all ConPTY filter mutation with its corresponding timeline
+  insertion under the shared filter mutex. Made `session_end` atomically arm
+  reset matching and defer its marker until raw-reader finalization, so an
+  ordinary staged LF precedes the marker while a reset split after LF completes
+  and is removed byte-exactly. Kept the callback as the fast path while making
+  synchronous teardown idempotently queue and arm `SessionEnd` before disabling
+  IPC handlers. The idempotence unit regression
+  `raw_windows_conpty_session_end_marker_queue_is_idempotent`
+  proves duplicate fast-path/teardown publication yields one marker. The
+  built-in session-end transition gives each old-worker raw reader the existing
+  120 ms natural-drain grace before forced stop and filter finalization, then
+  places finalized output before the reply snapshot and restart notice and
+  continues with the normal reset and spawn. The deterministic
+  `session_end_output_reader_allows_bounded_natural_drain` regression proves a
+  queued reader can finish naturally without receiving the stop request.

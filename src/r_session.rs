@@ -827,6 +827,19 @@ fn checkpoint_joined_windows_interrupt() -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn checkpoint_completed_console_interrupt(completed: bool) -> Result<(), String> {
+    if completed {
+        checkpoint_joined_windows_interrupt()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn checkpoint_completed_console_interrupt(_completed: bool) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
 fn process_completed_windows_interrupt() -> Result<(), String> {
     let completed = crate::windows_interrupt_observer::finish_in_flight_interrupt()
         .map_err(|err| format!("Windows Ctrl-C observer failed: {err}"))?;
@@ -1281,8 +1294,8 @@ pub extern "C-unwind" fn r_read_console(
             ipc::emit_input_wait(prompt);
             let guard = state.inner.lock().unwrap();
             match wait_until_console_input_changes(state, guard) {
-                Ok(true) => {
-                    if let Err(err) = checkpoint_joined_windows_interrupt() {
+                Ok(completed) => {
+                    if let Err(err) = checkpoint_completed_console_interrupt(completed) {
                         record_protocol_failure(&err);
                         if !buf.is_null() {
                             unsafe { *buf = 0 };
@@ -1290,7 +1303,6 @@ pub extern "C-unwind" fn r_read_console(
                         return 0;
                     }
                 }
-                Ok(false) => {}
                 Err(err) => {
                     record_protocol_failure(&err);
                     if !buf.is_null() {
@@ -1319,8 +1331,8 @@ pub extern "C-unwind" fn r_read_console(
         ipc::emit_input_wait(&prompt);
         let guard = state.inner.lock().unwrap();
         match wait_until_console_input_changes(state, guard) {
-            Ok(true) => {
-                if let Err(err) = checkpoint_joined_windows_interrupt() {
+            Ok(completed) => {
+                if let Err(err) = checkpoint_completed_console_interrupt(completed) {
                     record_protocol_failure(&err);
                     if !buf.is_null() {
                         unsafe { *buf = 0 };
@@ -1328,7 +1340,6 @@ pub extern "C-unwind" fn r_read_console(
                     return 0;
                 }
             }
-            Ok(false) => {}
             Err(err) => {
                 record_protocol_failure(&err);
                 if !buf.is_null() {
