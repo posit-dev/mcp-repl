@@ -467,10 +467,21 @@ mod unix_impl {
         driver.send_line("/permissions")?;
         driver.wait_for_contains("Update Model Permissions", Duration::from_secs(15))?;
         driver.send("3")?;
-        driver.wait_for_contains(
-            "Permissions updated to Full Access",
-            Duration::from_secs(15),
-        )?;
+        let permissions_updated = "Permissions updated to Full Access";
+        let full_access_confirmation = "Enable full access?";
+        if !driver.wait_for_screen(Duration::from_secs(15), |screen| {
+            screen.contains(permissions_updated) || screen.contains(full_access_confirmation)
+        }) {
+            return Err(format!(
+                "timeout waiting for full-access selection to complete\n{}",
+                normalize_screen(&driver.snapshot_screen())
+            )
+            .into());
+        }
+        if driver.snapshot_screen().contains(full_access_confirmation) {
+            driver.send("\r")?;
+            driver.wait_for_contains(permissions_updated, Duration::from_secs(15))?;
+        }
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write after full access"
@@ -1053,6 +1064,7 @@ mod unix_impl {
         text = normalize_json_string_field(&text, "thread_id", "<THREAD_ID>");
         text = normalize_json_number_field(&text, "input_tokens", "\"<N>\"");
         text = normalize_json_number_field(&text, "cached_input_tokens", "\"<N>\"");
+        text = remove_json_number_field(&text, "cache_write_input_tokens");
         text = normalize_json_number_field(&text, "output_tokens", "\"<N>\"");
         text = remove_json_number_field(&text, "reasoning_output_tokens");
         text = normalize_ms_duration(&text);
@@ -1354,6 +1366,21 @@ mod unix_impl {
             codex_home,
         );
         assert_eq!(normalized, "");
+    }
+
+    #[test]
+    fn normalize_exec_text_drops_optional_cache_write_usage() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let normalized = normalize_exec_text(
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":5,"cache_write_input_tokens":0,"output_tokens":2}}"#,
+            workspace,
+            codex_home,
+        );
+        assert_eq!(
+            normalized,
+            r#"{"type":"turn.completed","usage":{"input_tokens":"<N>","cached_input_tokens":"<N>","output_tokens":"<N>"}}"#
+        );
     }
 
     #[test]
@@ -2034,6 +2061,23 @@ tryCatch({
                     .eq(suffix.iter().copied())
         }
 
+        fn canonicalize_known_key_order(
+            map: &mut serde_json::Map<String, Value>,
+            known_keys: &[&str],
+        ) {
+            let original = std::mem::take(map);
+            for key in known_keys {
+                if let Some(value) = original.get(*key) {
+                    map.insert((*key).to_string(), value.clone());
+                }
+            }
+            for (key, value) in original {
+                if !known_keys.contains(&key.as_str()) {
+                    map.insert(key, value);
+                }
+            }
+        }
+
         fn normalize_wire_string(text: &str, workspace: &Path, codex_home: &Path) -> String {
             let workspace_display = workspace.display().to_string();
             let workspace_private = format!("/private{workspace_display}");
@@ -2159,8 +2203,19 @@ tryCatch({
                         path.pop();
                         map.insert(normalized_key, child);
                     }
-                    if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
+                    if path_matches(path, &["capabilities", "elicitation"]) {
+                        map.clear();
                         map.insert("form".to_string(), Value::Object(serde_json::Map::new()));
+                    }
+                    if path_matches(path, &["_meta"]) {
+                        canonicalize_known_key_order(
+                            map,
+                            &[
+                                "progressToken",
+                                "x-codex-turn-metadata",
+                                "codex/sandbox-state-meta",
+                            ],
+                        );
                     }
                 }
                 Value::Array(items) => {
@@ -2284,12 +2339,15 @@ tryCatch({
     }
 
     #[test]
-    fn normalize_wire_snapshot_normalizes_empty_elicitation_capability() {
+    fn normalize_wire_snapshot_canonicalizes_elicitation_capability() {
         let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
         let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
         let mut value = serde_json::json!({
             "capabilities": {
-                "elicitation": {}
+                "elicitation": {
+                    "form": {},
+                    "url": {}
+                }
             }
         });
 
@@ -2305,6 +2363,41 @@ tryCatch({
                 }
             }),
             "wire snapshots should normalize Codex elicitation capability shape"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_canonicalizes_meta_key_order() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "params": {
+                "_meta": {
+                    "x-codex-turn-metadata": {},
+                    "future-field": true,
+                    "codex/sandbox-state-meta": {},
+                    "progressToken": 1
+                }
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        let keys = value["params"]["_meta"]
+            .as_object()
+            .expect("expected normalized _meta object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "progressToken",
+                "x-codex-turn-metadata",
+                "codex/sandbox-state-meta",
+                "future-field"
+            ],
+            "wire snapshots should retain a stable order for known _meta fields"
         );
     }
 
@@ -2881,6 +2974,7 @@ tryCatch({
                 "supported_in_api": true,
                 "priority": 1,
                 "upgrade": null,
+                "availability_nux": null,
                 "base_instructions": "test instructions",
                 "model_instructions_template": null,
                 "supports_reasoning_summaries": false,
@@ -2896,6 +2990,23 @@ tryCatch({
             }]
         })
         .to_string()
+    }
+
+    #[test]
+    fn mock_models_response_includes_required_availability_nux() {
+        let response: Value =
+            serde_json::from_str(&models_response()).expect("mock models response should be JSON");
+        let model = response["models"][0]
+            .as_object()
+            .expect("mock models response should contain one model");
+        assert!(
+            model.contains_key("availability_nux"),
+            "Codex 0.145 requires availability_nux in model metadata"
+        );
+        assert!(
+            model["availability_nux"].is_null(),
+            "mock model should not advertise an availability NUX"
+        );
     }
 
     fn response_for_request(body: &Value, state: &mut MockState) -> String {

@@ -516,6 +516,25 @@ tests; all 12 Windows native-interrupt tests; the real reticulate regression;
 clippy; nightly formatting; 20 docs contracts; and the warning-denied locked
 release build.
 
+Hosted run `30225690096` disproved close-before-drain ordering as the remaining
+Windows explanation: both restart cases still exposed the same byte-exact
+LF-prefixed reset frame. Twenty consecutive local runs of those two public
+cases pass, so the next hosted follow-up records whether the bytes entered
+through raw ConPTY capture or sideband `output_text`, the raw filter's
+arm/finalization state, and each exact-match decision. The diagnostics are
+environment-gated to those two cases, write only to server stderr, and are
+included in a failed runner result after the server has closed; they will be
+removed after the hosted origin is proven.
+
+The same run's Linux and macOS failures are unrelated installed-client drift in
+Codex 0.145. The mock `/models` fixture omitted its newly required nullable
+`availability_nux` field, so Codex rejected the fixture and emitted a fallback
+metadata error. The fixture now supplies that field. Snapshot normalization
+also ignores the new optional cache-write token counter, canonicalizes
+non-semantic `_meta` key order and the growing elicitation capability shape,
+and drives the new Full Access confirmation without changing the checked-in
+sandbox-contract snapshots.
+
 ## Relationship To Other Work
 
 - PR #122: this supersedes its Windows interrupt implementation. It does not
@@ -552,9 +571,9 @@ release build.
 
 ## Next Safe Slice
 
-- Complete the warning-denied repository matrix, push the third CI follow-up,
-  and monitor the hosted rerun. Make only in-scope fixes if it exposes another
-  branch-specific failure.
+- Push the origin-diagnostic and Codex 0.145 compatibility follow-up, inspect
+  the hosted Windows stderr with `gh`, remove the temporary diagnostics after
+  applying the proven lifecycle fix, and rerun the complete required gate.
 
 ## Stop Conditions
 
@@ -659,3 +678,9 @@ release build.
 - 2026-07-26: Adapted three clippy findings to hosted Rust 1.97: two
   `question_mark` rewrites in unchanged pager parsing code and one
   branch-local `needless_return`, without suppressions or behavior changes.
+- 2026-07-26: Run `30225690096` disproved retained-ConPTY close ordering as the
+  complete reset-leak explanation. Added an environment-gated route/state
+  trace for the two hosted-only failures and made failed public-suite cases
+  disclose the fully drained server-stderr tail. Repaired independent Codex
+  0.145 fixture, normalization, and Full Access confirmation drift without
+  accepting changed sandbox-contract snapshots.

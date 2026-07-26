@@ -161,7 +161,22 @@ impl LiveOutputCapture {
         #[cfg(any(test, target_os = "windows"))]
         if let Some(filter) = &self.windows_conpty_startup_noise_filter {
             let mut filter = filter.lock().unwrap();
+            if matches!(stream, TextStream::Stdout) {
+                log_windows_conpty_reset_diag("output-text-before", bytes, &filter, None);
+            }
             self.flush_unarmed_windows_conpty_ambiguous_lf_locked(&mut filter);
+            if matches!(stream, TextStream::Stdout) {
+                log_windows_conpty_reset_diag(
+                    "output-text-after-flush",
+                    bytes,
+                    &filter,
+                    Some(if is_continuation {
+                        "continuation"
+                    } else {
+                        "complete"
+                    }),
+                );
+            }
             self.append_text(bytes, stream, is_continuation, true);
             drop(filter);
             return;
@@ -174,7 +189,19 @@ impl LiveOutputCapture {
         if let Some(filter) = &self.windows_conpty_startup_noise_filter {
             let mut filter = filter.lock().unwrap();
             if matches!(stream, TextStream::Stdout) {
-                match filter.filter(bytes) {
+                log_windows_conpty_reset_diag("raw-before", bytes, &filter, None);
+                let filtered = filter.filter(bytes);
+                log_windows_conpty_reset_diag(
+                    "raw-after",
+                    bytes,
+                    &filter,
+                    Some(if filtered.is_some() {
+                        "visible"
+                    } else {
+                        "held"
+                    }),
+                );
+                match filtered {
                     None => {}
                     Some(Cow::Borrowed(bytes)) => {
                         self.append_text(bytes, stream, false, false);
@@ -497,6 +524,36 @@ impl WindowsConptyStartupNoiseFilter {
 }
 
 #[cfg(any(test, target_os = "windows"))]
+fn windows_conpty_reset_diag_enabled() -> bool {
+    std::env::var("MCP_REPL_DIAG_CONPTY_RESET").as_deref() == Ok("1")
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn log_windows_conpty_reset_diag(
+    route: &str,
+    bytes: &[u8],
+    filter: &WindowsConptyStartupNoiseFilter,
+    outcome: Option<&str>,
+) {
+    if !windows_conpty_reset_diag_enabled() {
+        return;
+    }
+    let shutdown = filter.shutdown_reset.as_ref();
+    let pending = shutdown.map_or(&[][..], |state| state.pending.as_slice());
+    eprintln!(
+        "[conpty-reset-diag] route={route} outcome={} bytes={} startup_matched={} startup_finished={} shutdown_armed={} shutdown_finished={} reader_finished={} pending={}",
+        outcome.unwrap_or("none"),
+        String::from_utf8_lossy(bytes).escape_debug(),
+        filter.matched,
+        filter.finished,
+        shutdown.is_some_and(|state| state.armed),
+        shutdown.is_some_and(|state| state.finished),
+        shutdown.is_some_and(|state| state.reader_finished),
+        String::from_utf8_lossy(pending).escape_debug(),
+    );
+}
+
+#[cfg(any(test, target_os = "windows"))]
 #[derive(Default)]
 struct WindowsConptyShutdownResetFilter {
     pending: Vec<u8>,
@@ -597,7 +654,17 @@ impl WindowsConptyShutdownResetFilter {
                 break;
             }
 
-            match Self::match_at_start(&self.pending, at_eof) {
+            let reset_match = Self::match_at_start(&self.pending, at_eof);
+            if windows_conpty_reset_diag_enabled() {
+                eprintln!(
+                    "[conpty-reset-diag] route=raw-filter match={reset_match:?} armed={} finished={} reader_finished={} at_eof={at_eof} pending={}",
+                    self.armed,
+                    self.finished,
+                    self.reader_finished,
+                    String::from_utf8_lossy(&self.pending).escape_debug(),
+                );
+            }
+            match reset_match {
                 WindowsConptyShutdownResetMatch::Complete(length) => {
                     if !self.armed {
                         if at_eof || self.pending.len() == length {
