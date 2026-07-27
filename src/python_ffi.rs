@@ -112,6 +112,7 @@ pub struct PythonApi {
     pub py_err_print: unsafe extern "C" fn(),
     pub py_err_clear: unsafe extern "C" fn(),
     pub py_err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
+    #[cfg(not(windows))]
     pub py_err_set_interrupt: unsafe extern "C" fn(),
 }
 
@@ -183,6 +184,7 @@ impl PythonApi {
             py_err_print: unsafe { load_symbol(&library, b"PyErr_Print\0")? },
             py_err_clear: unsafe { load_symbol(&library, b"PyErr_Clear\0")? },
             py_err_set_string: unsafe { load_symbol(&library, b"PyErr_SetString\0")? },
+            #[cfg(not(windows))]
             py_err_set_interrupt: unsafe { load_symbol(&library, b"PyErr_SetInterrupt\0")? },
             _library: library,
         };
@@ -351,12 +353,21 @@ impl PythonApi {
         unsafe { (self.py_err_set_string)(exception, message.as_ptr()) };
     }
 
+    #[cfg(not(windows))]
     pub fn set_interrupt(&self) {
         unsafe { (self.py_err_set_interrupt)() };
     }
 
+    pub fn check_signals(&self) -> Result<(), ()> {
+        match unsafe { (self.py_err_check_signals)() } {
+            -1 => Err(()),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(not(windows))]
     pub fn clear_pending_signals(&self) {
-        if unsafe { (self.py_err_check_signals)() } == -1 {
+        if self.check_signals().is_err() {
             self.clear_error();
         }
     }

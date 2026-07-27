@@ -86,17 +86,30 @@ pub fn emit_input_line(prompt: &str, text: &str) {
 }
 
 pub fn emit_input_wait(prompt: &str) {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::InputWait {
-            prompt: prompt.to_string(),
-        });
-    }
+    let _ = emit_input_wait_checked(prompt);
 }
 
+pub fn emit_input_wait_checked(prompt: &str) -> io::Result<()> {
+    let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
+    ipc.send(WorkerToServerIpcMessage::InputWait {
+        prompt: prompt.to_string(),
+    })
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 pub fn emit_ready() {
-    if let Some(ipc) = global_ipc() {
-        let _ = ipc.send(WorkerToServerIpcMessage::Ready {});
-    }
+    let _ = emit_ready_checked();
+}
+
+pub fn emit_ready_checked() -> io::Result<()> {
+    let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
+    ipc.send(WorkerToServerIpcMessage::Ready {})
+}
+
+#[cfg(windows)]
+pub fn emit_interrupt_complete() -> io::Result<()> {
+    let ipc = global_ipc().ok_or_else(|| io::Error::other("worker IPC is unavailable"))?;
+    ipc.send(WorkerToServerIpcMessage::InterruptComplete {})
 }
 
 pub fn emit_output_text(stream: TextStream, bytes: &[u8]) -> io::Result<()> {
@@ -130,11 +143,11 @@ pub fn emit_session_end() {
     }
 }
 
-pub fn emit_session_end_with_reason(reason: &str) {
+pub fn emit_session_end_with_reason_and_message(reason: &str, message: &str) {
     if let Some(ipc) = global_ipc() {
         let _ = ipc.send(WorkerToServerIpcMessage::SessionEnd {
             reason: Some(reason.to_string()),
-            message: None,
+            message: Some(message.to_string()),
         });
     }
 }

@@ -337,8 +337,8 @@ class McpStdioClient:
                 )
             return message
 
-    def stderr_tail(self) -> str:
-        tail = [line for line in self.stderr_lines[-20:] if line]
+    def stderr_tail(self, limit: int = 20) -> str:
+        tail = [line for line in self.stderr_lines[-limit:] if line]
         if not tail:
             return "server stderr: <empty>"
         return "server stderr:\n" + "\n".join(tail)
@@ -1658,6 +1658,7 @@ def main(argv: Sequence[str]) -> int:
     selected = args.case or sorted(CANONICAL_CASES)
     failures = 0
     for case_name in selected:
+        client: McpStdioClient | None = None
         case = CASES[case_name]
         if case.platforms and sys.platform not in case.platforms:
             print(f"ok {case_name} # skip unsupported platform {sys.platform}")
@@ -1669,19 +1670,27 @@ def main(argv: Sequence[str]) -> int:
                 server_cwd = Path.cwd() / server_cwd
             server_cwd.mkdir(parents=True, exist_ok=True)
         try:
-            with McpStdioClient(
+            client = McpStdioClient(
                 binary,
                 ["--sandbox", args.sandbox, *case.server_args],
                 case.server_env,
                 server_cwd,
                 args.timeout,
-            ) as client:
+            )
+            with client:
                 case.run(client)
         except SuiteSkip as exc:
             print(f"ok {case_name} # skip {exc}")
         except SuiteFailure as exc:
             failures += 1
-            print(f"not ok {case_name}: {exc}", file=sys.stderr)
+            if client is not None:
+                client.close()
+            details = str(exc)
+            if client is not None:
+                stderr_tail = client.stderr_tail(limit=100)
+                if stderr_tail not in details:
+                    details = f"{details}\n{stderr_tail}"
+            print(f"not ok {case_name}: {details}", file=sys.stderr)
         else:
             print(f"ok {case_name}")
 

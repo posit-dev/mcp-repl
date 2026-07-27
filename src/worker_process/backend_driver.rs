@@ -9,6 +9,9 @@ use crate::worker_supervisor::WorkerProcess;
 use super::WorkerError;
 use super::request_lifecycle::{REQUEST_COMPLETION_STABLE_WAIT, completion_info_from_ipc};
 
+#[cfg(target_family = "windows")]
+const WINDOWS_INTERRUPT_ARM_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(super) trait BackendDriver: Send {
     fn prepare_input_text(&self, text: String) -> String {
         text
@@ -113,6 +116,21 @@ fn begin_input_when_ready(ipc: &ServerIpcConnection, timeout: Duration) -> Resul
     }
 }
 
+#[cfg(target_family = "windows")]
+fn wait_for_windows_interrupt_arm(ipc: &ServerIpcConnection) -> Result<(), WorkerError> {
+    match ipc.wait_for_interrupt_armed(WINDOWS_INTERRUPT_ARM_TIMEOUT) {
+        Ok(()) => Ok(()),
+        Err(IpcWaitError::Timeout) => Err(WorkerError::Timeout(WINDOWS_INTERRUPT_ARM_TIMEOUT)),
+        Err(IpcWaitError::SessionEnd) => Err(WorkerError::Protocol(
+            "worker session ended before Windows interrupt delivery was armed".to_string(),
+        )),
+        Err(IpcWaitError::Disconnected) => Err(WorkerError::Protocol(
+            "ipc disconnected before Windows interrupt delivery was armed".to_string(),
+        )),
+        Err(IpcWaitError::Protocol(message)) => Err(WorkerError::Protocol(message)),
+    }
+}
+
 impl BackendDriver for RBackendDriver {
     fn prepare_input_text(&self, text: String) -> String {
         normalize_input_newlines(&text)
@@ -170,23 +188,40 @@ impl BackendDriver for RBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(ipc) = process.ipc_connection() {
+        let ipc = process.ipc_connection();
+        if let Some(ipc) = ipc.as_ref() {
             ipc.note_interrupt_sent();
-            let _ = ipc.send(ServerToWorkerIpcMessage::Interrupt {});
+            ipc.send(ServerToWorkerIpcMessage::Interrupt {})
+                .map_err(WorkerError::Io)?;
         }
+        #[cfg(target_family = "windows")]
+        wait_for_windows_interrupt_arm(ipc.as_ref().ok_or_else(|| {
+            WorkerError::Protocol(
+                "worker ipc unavailable while arming Windows interrupt delivery".to_string(),
+            )
+        })?)?;
         process.send_r_interrupt()
     }
 }
 
-struct ProtocolBackendDriver;
+struct ProtocolBackendDriver {
+    #[cfg(target_family = "windows")]
+    requires_interrupt_arm_ack: bool,
+}
 
 impl ProtocolBackendDriver {
     fn new() -> Self {
-        Self
+        Self {
+            #[cfg(target_family = "windows")]
+            requires_interrupt_arm_ack: false,
+        }
     }
 
     fn builtin_python() -> Self {
-        Self
+        Self {
+            #[cfg(target_family = "windows")]
+            requires_interrupt_arm_ack: true,
+        }
     }
 }
 
@@ -238,10 +273,19 @@ impl BackendDriver for ProtocolBackendDriver {
     }
 
     fn interrupt(&mut self, process: &mut WorkerProcess) -> Result<(), WorkerError> {
-        if let Some(ipc) = process.ipc_connection() {
+        let ipc = process.ipc_connection();
+        if let Some(ipc) = ipc.as_ref() {
             ipc.note_interrupt_sent();
             ipc.send(ServerToWorkerIpcMessage::Interrupt {})
                 .map_err(WorkerError::Io)?;
+        }
+        #[cfg(target_family = "windows")]
+        if self.requires_interrupt_arm_ack {
+            wait_for_windows_interrupt_arm(ipc.as_ref().ok_or_else(|| {
+                WorkerError::Protocol(
+                    "worker ipc unavailable while arming Windows interrupt delivery".to_string(),
+                )
+            })?)?;
         }
         process.send_interrupt()
     }

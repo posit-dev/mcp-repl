@@ -40,7 +40,11 @@ impl WorkerManager {
             input.server_timeout,
         ) {
             Ok(request) => request,
-            Err(err) => {
+            Err(request_error) => {
+                let super::request_lifecycle::RequestStartError {
+                    error: err,
+                    reset_process,
+                } = request_error;
                 self.guardrail.busy.store(false, Ordering::Relaxed);
                 let reply = self.build_write_dispatch_worker_error_reply_from_context(
                     &err,
@@ -48,7 +52,11 @@ impl WorkerManager {
                     mode,
                     page_bytes,
                 );
-                self.reset_after_write_dispatch_send_error(mode);
+                if reset_process {
+                    self.reset_after_write_dispatch_send_error(mode);
+                } else {
+                    self.pending_request_input = None;
+                }
                 return Ok(self.finalize_reply(reply));
             }
         };

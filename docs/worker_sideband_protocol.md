@@ -1,6 +1,6 @@
 # Worker Sideband Protocol
 
-This document defines worker protocol version 6. The server rejects unsupported
+This document defines worker protocol version 7. The server rejects unsupported
 protocol versions before sending user input.
 
 The sideband is a UTF-8 JSON-lines IPC stream between the server and one worker
@@ -61,9 +61,11 @@ callback does not currently implement that EOF policy in fork children; aligning
 it is pending implementation work. Raw inherited fd0 that bypasses managed stdin
 is unsupported by the worker protocol.
 
-PTY-backed Unix workers expose one raw terminal stream to the server, so raw PTY
-capture does not preserve separate stdout/stderr identity. Sideband
-`output_text` still preserves its declared stream.
+PTY- and ConPTY-backed workers expose one raw terminal stream to the server, so
+raw capture does not preserve separate stdout/stderr identity. This includes
+built-in R and Python on Windows after their move to ConPTY. Sideband
+`output_text` still preserves its declared stream, including R's worker-owned
+console callbacks.
 
 ## Server To Worker
 
@@ -81,12 +83,32 @@ capture does not preserve separate stdout/stderr identity. Sideband
 - The server must also deliver a platform interrupt to the worker process or
   process group when a worker process exists.
 - The IPC message carries no input and does not complete a batch. It tells the
-  worker to discard pending managed input that has not yet been consumed by the
-  runtime.
+  worker to discard pending managed input that has not yet been consumed by
+  the runtime. It must not set runtime interrupt flags, synthesize a runtime
+  exception, or wake managed input as though the IPC message were the native
+  interrupt.
 - Sending `interrupt` does not change server-side readiness. Readiness changes
   only when the server sends `input_batch` or receives `input_wait` or `ready`.
-- While servicing an interrupt request, the server waits for `input_wait`,
-  `session_end`, process exit, or timeout.
+- For a built-in Windows worker, the server opens one interrupt transaction
+  before sending cleanup or native ETX. It first sends cleanup-only
+  `interrupt`, then waits on a bounded condition-variable barrier for the
+  worker's pipe-ordered `interrupt_armed` observation. Only after that
+  acknowledgement does it write exact ETX to ConPTY.
+- After native delivery, the server waits for `interrupt_complete` and then for
+  `input_wait` or `ready` later on the same worker-to-server pipe. Cached or
+  stale readiness may update prompt/readiness state, but it cannot complete the
+  active request or settle the interrupt transaction.
+- Arm timeout, arm failure, malformed arm/completion ordering, IPC disconnect,
+  and other terminal post-delivery errors fail closed and reset the worker.
+  Only a client timeout after native delivery leaves the transaction
+  outstanding. A later client Ctrl-C coalesces with it, and later worker-bound
+  `input_batch` delivery waits for the same transaction. Process replacement
+  discards it.
+- Version 7 adds the strict, payload-free `interrupt_armed` and
+  `interrupt_complete` worker observations described below. They are ordering
+  facts, not discard acknowledgements, input IDs, interrupt requests, or a
+  second source of runtime interrupt authority. There is no compatibility path
+  for version 6 workers.
 
 `shutdown`
 - `{ "type": "shutdown" }`
@@ -105,7 +127,7 @@ capture does not preserve separate stdout/stderr identity. Sideband
 - Built-in workers request runtime shutdown after receiving it. They may emit
   output from the active request before `session_end` and process exit.
 
-The server emits no other server-to-worker protocol messages in v6.
+The server emits no other server-to-worker protocol messages in v7.
 Built-in worker readers treat malformed or unknown server-to-worker messages as
 IPC loss and exit so the server can replace the worker.
 
@@ -116,30 +138,41 @@ invalid enum values, and invalid base64 payloads in base64 fields are protocol
 errors.
 
 `worker_ready`
-- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 6 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
+- `{ "type": "worker_ready", "protocol": { "name": "mcp-repl-worker", "version": 7 }, "worker": { "name": <string>, "version": <string> }, "capabilities": { "images": <bool> } }`
 - Normal first worker message.
-- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `6`.
+- `protocol.name` must be `mcp-repl-worker`, and `protocol.version` must be `7`.
 - `worker.name` and `worker.version` are diagnostic metadata.
 - `capabilities.images` is advertised by workers that may emit image output; if
   the field is omitted inside `capabilities`, the server treats it as `false`.
 - A worker may instead end before readiness; the server treats early
   `session_end`, IPC EOF, or process exit as startup failure.
+- An early `session_end` with `reason: "protocol_error"` and a diagnostic
+  `message` is surfaced as that startup protocol error rather than being
+  replaced by a generic missing-`worker_ready` diagnostic.
 - Any other first worker-to-server message is a protocol error.
 
 `input_wait`
 - `{ "type": "input_wait", "prompt": <string> }`
 - Marks the worker ready for the next `input_batch`.
-- If an input batch is active, this is the successful same-worker completion
-  signal for that batch.
+- If an input batch is active and no built-in Windows interrupt transaction is
+  unsettled, this is the successful same-worker completion signal for that
+  batch.
 - If no input batch is active, this only refreshes readiness and the prompt
   cache. Built-in workers use this for the initial ready prompt.
+- During an unsettled built-in Windows interrupt transaction, this may refresh
+  state and prompt metadata, but only an occurrence pipe-ordered later than
+  `interrupt_complete` can complete the request or settle the transaction.
 
 `ready`
 - `{ "type": "ready" }`
 - Marks the worker ready for the next `input_batch` without a visible prompt.
-- If an input batch is active, this is the successful same-worker completion
-  signal for that batch.
+- If an input batch is active and no built-in Windows interrupt transaction is
+  unsettled, this is the successful same-worker completion signal for that
+  batch.
 - If no input batch is active, this permits prompt-free startup readiness.
+- During an unsettled built-in Windows interrupt transaction, this may refresh
+  state, but only an occurrence pipe-ordered later than `interrupt_complete`
+  can complete the request or settle the transaction.
 
 `input_line`
 - `{ "type": "input_line", "prompt": <string>, "text": <string> }`
@@ -180,6 +213,36 @@ errors.
   event. Plotting is runtime behavior, not a separate protocol category.
 - There is no image acknowledgement message.
 
+`interrupt_armed`
+- `{ "type": "interrupt_armed" }`
+- A built-in Windows worker emits this only after it has processed the
+  cleanup-only `interrupt`, preserved any live managed-input consumer while
+  discarding queued unconsumed data, serialized observer rearm, and made the
+  pass-through observer newest.
+- It is a payload-free, pipe-ordered pre-delivery fact. It carries no input,
+  interrupt request, runtime state, or authority to deliver Ctrl-C.
+- The server's bounded wait must observe it before the server writes ETX.
+  Reporting it with no pending transaction or reporting it twice is a protocol
+  error; failure or timeout before it is observed resets the worker.
+
+`interrupt_complete`
+- `{ "type": "interrupt_complete" }`
+- A built-in Windows worker emits this only on the runtime main thread after
+  the native handler thread has terminated and cleanup has completed.
+- It carries no ID, input, acknowledgement payload, or runtime state. It does
+  not request or synthesize interruption.
+- R emits it immediately before `R_CheckUserInterrupt()` because that
+  checkpoint may non-locally jump. Python calls `PyErr_CheckSignals()` first,
+  then emits it while holding the readiness-publication barrier before clearing
+  pending checkpoint state.
+- The server requires both this fact and pipe-later `input_wait` or `ready`
+  before the transaction is settled or later worker-bound input is admitted.
+- Reporting it with no pending transaction, before `interrupt_armed`, or twice
+  for one transaction is a protocol error and resets the worker.
+- Custom workers still advertise protocol version 7 but do not participate in
+  the built-in arm/completion transaction. Their native-handler completion
+  policy is their own responsibility.
+
 `session_end`
 - `{ "type": "session_end", "reason": <string>, "message": <string, optional> }`
 - Indicates the worker session is terminating.
@@ -189,7 +252,7 @@ errors.
 - This is terminal for the whole worker session, including any active input.
   After `session_end`, any later worker-to-server message is a protocol error.
 
-The worker emits no other worker-to-server protocol messages in v6.
+The worker emits no other worker-to-server protocol messages in v7.
 
 ## Readiness And Input
 
@@ -206,11 +269,21 @@ the worker emits `input_wait`; a prompt-free top-level loop may instead emit
 Built-in R and Python use the same ownership model: a worker-owned managed input
 queue feeds runtime input callbacks and managed stdin surfaces. The sideband IPC
 reader runs independently from the runtime thread. It receives `input_batch`,
-`interrupt`, and `shutdown`, mutates worker-owned queue/session state, and wakes
-the runtime when needed. The runtime thread consumes queued input only when the
-runtime calls its managed input boundary. A `shutdown` message asks built-in
-workers to stop accepting new input, preserve already accepted input until it
-is consumed, wake managed input readers with EOF after that queue drains, and
+`interrupt`, and `shutdown`, and mutates worker-owned queue/session state.
+`input_batch` and `shutdown` may wake managed input after changing their durable
+predicates. On Windows, `interrupt` performs queued-input cleanup only; it does
+not independently wake the runtime as an interrupt or revoke a live managed
+input consumer. A readiness-publication barrier orders cleanup against the
+final pending-state check and pipe write, so a background publisher either
+commits before cleanup or defers until the runtime-main checkpoint. The native
+completion observer supplies the runtime wake after joining handler termination
+with cleanup. Python suppresses runtime-main `ready` while a background input
+consumer remains active; that consumer republishes `input_wait` after the
+checkpoint.
+The runtime thread consumes queued input only when the runtime calls its managed
+input boundary. A `shutdown` message asks built-in workers to stop accepting new
+input, preserve already accepted input until it is consumed, wake managed input
+readers with EOF after that queue drains, and
 exit after the active runtime request reaches a safe boundary or the server's
 bounded shutdown window expires. The server still applies the worker's process
 stdin shutdown policy so stdin-backed readers can be unblocked without making
@@ -237,9 +310,13 @@ non-empty tool call, an existing `input_wait` means the payload is stdin for the
 waiting Python reader; otherwise the payload is one complete Python cell.
 `ready` with no prompt is normal cell readiness, not a missing prompt.
 `input_wait` is the only public signal that the next non-empty payload is
-stdin. After interrupt, the server must wait for fresh `ready`, but an already
-pending `input_wait` remains actionable because it still denotes a waiting
-stdin reader.
+stdin. After interrupt, the server normally accepts a pending `input_wait` but
+requires a fresh `ready`. Built-in Windows workers instead require either
+readiness event to occur later on the pipe than `interrupt_complete`, after the
+pre-delivery `interrupt_armed` barrier. These narrow ordering facts were
+required by public native-handler, finish-to-rearm, and background-publication
+regressions. They replace neither normal readiness nor the cleanup-only
+`interrupt` shape.
 
 Python may still use PTY or ConPTY process stdio for terminal behavior, but
 accepted request input is sent over sideband IPC, not by server writes to
@@ -248,9 +325,22 @@ runtime stdin.
 Custom workers must implement the same readiness contract themselves. The test
 Zod worker exercises the custom-worker input/readiness path: it sends
 `worker_ready`, sends an initial `input_wait` or `ready`, accepts `input_batch`,
+advertises protocol version 7, but does not emit the built-in-only
+`interrupt_armed` or `interrupt_complete` observations. The server bypasses
+that transaction for custom workers. The fixture
 emits `input_line` for consumed lines, and emits a later `input_wait` or `ready`
 when it is ready again. It is not a full implementation of every optional
 protocol surface.
+
+On Windows, a custom worker that selects ConPTY stdin may receive ETX for the
+platform interrupt. It is responsible for binding its runtime's stdin to
+`CONIN$`, enabling `ENABLE_PROCESSED_INPUT`, clearing the Ctrl-C-ignore state
+inherited from `CREATE_NEW_PROCESS_GROUP`, and installing its own native
+handler. A custom worker configured with pipe stdin cannot receive an isolated
+native Ctrl-C event; the server fails its interrupt request explicitly instead
+of treating the sideband cleanup message as interruption. The Zod ConPTY
+fixture exercises this boundary by reattaching stdin and installing its own
+handler; a custom worker does not inherit the built-in completion observer.
 
 ## Interrupts
 
@@ -263,8 +353,9 @@ it according to its own rules.
 
 When the worker receives sideband `interrupt`, it must discard managed input
 that is still queued and has not yet been consumed by the runtime. The discard
-is triggered by the IPC message, not by the OS interrupt. The worker must not
-emit `input_wait` again until it is actually ready for input.
+is triggered by the IPC message, not by the OS interrupt. Cleanup does not set
+runtime interrupt state or independently wake a managed runtime wait. The
+worker must not emit `input_wait` again until it is actually ready for input.
 
 Current built-in behavior:
 
@@ -274,8 +365,37 @@ Current built-in behavior:
 - For Python, those boundaries are `PyOS_ReadlineFunctionPointer`, managed
   `sys.stdin`, and raw-stdin shims, so already-returned bytes are owned by
   CPython or the Python code that read them.
-- The server sends `SIGINT` on Unix and `CTRL_BREAK_EVENT` on Windows to the
-  worker process group.
+- The server sends `SIGINT` on Unix.
+- On Windows, both built-in workers use a dedicated ConPTY. The server writes
+  exact ETX (`0x03`) only after the worker has processed cleanup, serialized
+  pass-through-observer rearm, and flushed `interrupt_armed`. Processed ConPTY
+  input then produces `CTRL_C_EVENT`; `CTRL_BREAK_EVENT` and direct
+  `GenerateConsoleCtrlEvent()` are not fallback paths.
+- The complete built-in transaction order is: open the server transaction;
+  send cleanup-only `interrupt`; discard queued, unconsumed data while
+  preserving a live reader; serialize observer rearm; flush
+  `interrupt_armed`; complete the server's bounded condition-variable wait;
+  write ETX; join handler completion with cleanup; checkpoint on the runtime
+  main thread; and publish pipe-later readiness.
+- The pass-through observer is also re-registered newest-first before each
+  managed wait and readiness publication. It returns `FALSE`, duplicates the
+  Windows-created handler-thread handle, and hands it to a pre-existing watcher
+  which waits for termination before waking the runtime main thread.
+- R emits `interrupt_complete` after handler/cleanup join and immediately
+  before `R_CheckUserInterrupt()`, whose longjmp may not return. Python
+  reacquires the GIL, runs `PyErr_CheckSignals()`, then emits
+  `interrupt_complete` and clears pending state under its publication barrier.
+- Only readiness pipe-ordered after `interrupt_complete` closes the
+  transaction. Input and a second Ctrl-C cannot overtake it; overlapping
+  Ctrl-C requests coalesce to the one native dispatch already in flight.
+- mcp-repl does not set `UserBreak`, `R_interrupts_pending`,
+  `PyErr_SetInterrupt*()`, or a Windows-specific synthetic interrupt flag.
+- Observer setup, handoff, overlap, arm, wait, protocol-ordering, and terminal
+  post-delivery failures fail closed and reset the worker. There is no polling
+  timer, fixed handler delay, fallback delivery chain, or additional process.
+- The dedicated ConPTY input is server-owned. Unpaired native events are not a
+  supported built-in input path, while custom ConPTY workers own their own
+  handler and completion behavior.
 
 If cleanup is uncertain because old input may still be buffered in PTY, libc,
 readline, or interpreter state, the worker must not emit `input_wait`. It should
@@ -289,7 +409,7 @@ through the managed input path. Raw stdout/stderr remains authoritative for
 output that did not arrive through `output_text`; raw capture does not drive
 completion or readiness.
 
-The following older protocol concepts are not part of v6:
+The following older protocol concepts are not part of v7:
 
 - input IDs on `input_batch`, `input_line`, `input_wait`, `interrupt`, or
   `session_end`
@@ -308,5 +428,9 @@ the existing `output_image` event, but the built-in R and Python workers
 currently emit images only through their plot adapters.
 
 Platform note: Windows Python support depends on a loadable CPython runtime and
-uses ConPTY for terminal behavior. Sideband named pipes remain separate from
-ConPTY traffic.
+both built-in Windows runtimes use ConPTY for native Ctrl-C delivery and
+terminal behavior. Sideband named pipes remain the accepted-input and
+worker-owned-event transport; ETX on ConPTY is a platform control event, not
+accepted request input. Nested Windows sandbox ConPTY launch forwards stdin
+bytes unchanged, including ETX, before the inner console translates the control
+byte.

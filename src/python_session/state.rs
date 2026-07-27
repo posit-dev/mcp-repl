@@ -1,4 +1,6 @@
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(windows)]
+use std::thread::ThreadId;
 
 use crate::python_input_queue::PythonInputQueue;
 
@@ -7,6 +9,10 @@ pub(super) static SESSION_STATE: OnceLock<Arc<SessionState>> = OnceLock::new();
 pub(super) struct SessionState {
     pub(super) inner: Mutex<SessionStateInner>,
     pub(super) cvar: Condvar,
+    #[cfg(windows)]
+    runtime_main_thread: ThreadId,
+    #[cfg(windows)]
+    pub(super) publication_guard: Mutex<()>,
 }
 
 pub(super) struct SessionStateInner {
@@ -20,8 +26,14 @@ pub(super) struct SessionStateInner {
     pub(super) exit_requested: bool,
     pub(super) shutdown: bool,
     pub(super) session_end_emitted: bool,
+    pub(super) protocol_failure: Option<String>,
     pub(super) plot_reset_pending: bool,
+    #[cfg(not(windows))]
     pub(super) interrupt_requested: bool,
+    #[cfg(windows)]
+    pub(super) windows_interrupt_checkpoint_pending: bool,
+    #[cfg(windows)]
+    pub(super) windows_interrupt_target_active: Option<bool>,
 }
 
 pub(super) enum StdinReadAccounting {
@@ -53,11 +65,26 @@ impl SessionState {
                 exit_requested: false,
                 shutdown: false,
                 session_end_emitted: false,
+                protocol_failure: None,
                 plot_reset_pending: false,
+                #[cfg(not(windows))]
                 interrupt_requested: false,
+                #[cfg(windows)]
+                windows_interrupt_checkpoint_pending: false,
+                #[cfg(windows)]
+                windows_interrupt_target_active: None,
             }),
             cvar: Condvar::new(),
+            #[cfg(windows)]
+            runtime_main_thread: std::thread::current().id(),
+            #[cfg(windows)]
+            publication_guard: Mutex::new(()),
         }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn on_runtime_main_thread(&self) -> bool {
+        std::thread::current().id() == self.runtime_main_thread
     }
 }
 

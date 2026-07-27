@@ -676,12 +676,6 @@ where
     const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
     let deadline = Instant::now() + max_wait;
     loop {
-        if child_exited()? {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "worker exited before IPC named pipe connection",
-            ));
-        }
         let now = Instant::now();
         if now >= deadline {
             return Err(io::Error::new(
@@ -692,7 +686,15 @@ where
         let timeout = CONNECT_ATTEMPT_TIMEOUT.min(deadline.saturating_duration_since(now));
         match connect_attempt(timeout) {
             Ok(()) => return Ok(()),
-            Err(err) if is_retryable_connect_timeout(&err) => continue,
+            Err(err) if is_retryable_connect_timeout(&err) => {
+                if child_exited()? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "worker exited before IPC named pipe connection",
+                    ));
+                }
+                continue;
+            }
             Err(err) => return Err(err),
         }
     }
@@ -881,6 +883,44 @@ mod tests {
             "timeout path blocked too long: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn connect_retry_accepts_pending_connection_after_child_exit() {
+        let attempts = AtomicUsize::new(0);
+        let result = connect_named_pipe_with_process_retry_impl(
+            |_| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            || Ok(true),
+            Duration::from_millis(10),
+        );
+
+        assert!(
+            result.is_ok(),
+            "pending client connection should win: {result:?}"
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn connect_retry_reports_exit_after_retryable_attempt() {
+        let attempts = AtomicUsize::new(0);
+        let result = connect_named_pipe_with_process_retry_impl(
+            |_| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "retryable connect timeout",
+                ))
+            },
+            || Ok(true),
+            Duration::from_millis(10),
+        );
+
+        assert!(matches!(result, Err(err) if err.kind() == io::ErrorKind::BrokenPipe));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[test]

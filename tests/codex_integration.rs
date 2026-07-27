@@ -138,7 +138,6 @@ mod unix_impl {
             )
             .into());
         }
-
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -292,6 +291,16 @@ mod unix_impl {
             return Err(format!(
                 "codex exec failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
                 status = output.status
+            )
+            .into());
+        }
+        let request_paths = mock_server.request_paths().await;
+        if !request_paths
+            .iter()
+            .any(|request| request.starts_with("GET ") && request.contains("/models"))
+        {
+            return Err(format!(
+                "expected mock Codex provider to refresh /models\nrequest_paths: {request_paths:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
             )
             .into());
         }
@@ -467,10 +476,21 @@ mod unix_impl {
         driver.send_line("/permissions")?;
         driver.wait_for_contains("Update Model Permissions", Duration::from_secs(15))?;
         driver.send("3")?;
-        driver.wait_for_contains(
-            "Permissions updated to Full Access",
-            Duration::from_secs(15),
-        )?;
+        let permissions_updated = "Permissions updated to Full Access";
+        let full_access_confirmation = "Enable full access?";
+        if !driver.wait_for_screen(Duration::from_secs(15), |screen| {
+            screen.contains(permissions_updated) || screen.contains(full_access_confirmation)
+        }) {
+            return Err(format!(
+                "timeout waiting for full-access selection to complete\n{}",
+                normalize_screen(&driver.snapshot_screen())
+            )
+            .into());
+        }
+        if driver.snapshot_screen().contains(full_access_confirmation) {
+            driver.send("\r")?;
+            driver.wait_for_contains(permissions_updated, Duration::from_secs(15))?;
+        }
 
         driver.send_line(&format!(
             "{FULL_ACCESS_MARKER}: probe write after full access"
@@ -1017,6 +1037,9 @@ mod unix_impl {
     }
 
     fn normalize_exec_text(text: &str, workspace: &Path, codex_home: &Path) -> String {
+        if is_nonfatal_skill_description_budget_advisory(text) {
+            return String::new();
+        }
         if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
             return String::new();
         }
@@ -1053,6 +1076,7 @@ mod unix_impl {
         text = normalize_json_string_field(&text, "thread_id", "<THREAD_ID>");
         text = normalize_json_number_field(&text, "input_tokens", "\"<N>\"");
         text = normalize_json_number_field(&text, "cached_input_tokens", "\"<N>\"");
+        text = remove_json_number_field(&text, "cache_write_input_tokens");
         text = normalize_json_number_field(&text, "output_tokens", "\"<N>\"");
         text = remove_json_number_field(&text, "reasoning_output_tokens");
         text = normalize_ms_duration(&text);
@@ -1079,6 +1103,27 @@ mod unix_impl {
             }
         }
         text
+    }
+
+    fn is_nonfatal_skill_description_budget_advisory(text: &str) -> bool {
+        let Ok(event) = serde_json::from_str::<Value>(text) else {
+            return false;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("item.completed") {
+            return false;
+        }
+        let Some(item) = event.get("item") else {
+            return false;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("error") {
+            return false;
+        }
+        item.get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.starts_with("Skill descriptions were shortened to fit the ")
+                    && message.contains("skills context budget.")
+            })
     }
 
     fn renumber_exec_item_ids(text: &str) -> String {
@@ -1357,6 +1402,66 @@ mod unix_impl {
     }
 
     #[test]
+    fn normalize_exec_text_drops_optional_cache_write_usage() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let normalized = normalize_exec_text(
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":5,"cache_write_input_tokens":0,"output_tokens":2}}"#,
+            workspace,
+            codex_home,
+        );
+        assert_eq!(
+            normalized,
+            r#"{"type":"turn.completed","usage":{"input_tokens":"<N>","cached_input_tokens":"<N>","output_tokens":"<N>"}}"#
+        );
+    }
+
+    #[test]
+    fn normalize_exec_text_drops_only_nonfatal_skill_budget_advisories() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        for message in [
+            "Skill descriptions were shortened to fit the 2% skills context budget.",
+            "Skill descriptions were shortened to fit the skills context budget.",
+        ] {
+            let event = serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "error",
+                    "message": message
+                }
+            })
+            .to_string();
+            assert_eq!(normalize_exec_text(&event, workspace, codex_home), "");
+        }
+
+        let real_error = r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"MCP tool failed"}}"#;
+        assert_eq!(
+            normalize_exec_text(real_error, workspace, codex_home),
+            real_error
+        );
+    }
+
+    #[test]
+    fn render_exec_snapshot_renumbers_items_after_skill_budget_advisory() -> TestResult<()> {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let stdout = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"Skill descriptions were shortened to fit the 2% skills context budget.\"}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"item_1\",\"type\":\"mcp_tool_call\"}}\n"
+        );
+
+        let snapshot =
+            render_exec_snapshot(ExecSnapshotMode::Json, stdout, "", workspace, codex_home)?;
+
+        assert!(!snapshot.contains("Skill descriptions were shortened"));
+        assert!(snapshot.contains(r#""id":"item_0""#));
+        assert!(!snapshot.contains(r#""id":"item_1""#));
+        Ok(())
+    }
+
+    #[test]
     fn render_exec_snapshot_ignores_stderr() -> TestResult<()> {
         let workspace = Path::new("/tmp/workspace");
         let codex_home = Path::new("/tmp/codex-home");
@@ -1372,10 +1477,58 @@ mod unix_impl {
         Ok(())
     }
 
+    #[test]
+    fn mock_codex_configs_enable_remote_model_refresh_with_command_auth() -> TestResult<()> {
+        let mcp_repl = Path::new("/tmp/mcp-repl");
+        let workspace = Path::new("/tmp/workspace");
+        let configs = vec![
+            codex_config(mcp_repl, workspace, "http://127.0.0.1:1234/v1"),
+            codex_install_base_config(workspace, "http://127.0.0.1:1234/v1"),
+        ];
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let configs = {
+            let mut configs = configs;
+            configs.push(codex_traced_config(
+                mcp_repl,
+                Path::new("/tmp/trace.py"),
+                "python3",
+                workspace,
+                "http://127.0.0.1:1234/v1",
+            ));
+            configs
+        };
+        let expected = format!("[auth]\n{}", mock_command_auth_config()).parse::<DocumentMut>()?;
+        for config in configs {
+            let doc = config.parse::<DocumentMut>()?;
+            let auth = &doc["model_providers"]["mock-openai"]["auth"];
+            assert_eq!(
+                auth["command"].as_str(),
+                expected["auth"]["command"].as_str()
+            );
+            assert_eq!(
+                auth["args"].to_string(),
+                expected["auth"]["args"].to_string()
+            );
+        }
+        Ok(())
+    }
+
+    fn mock_command_auth_config() -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "command = \"cmd\"\nargs = [\"/C\", \"echo mock-token\"]"
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            "command = \"sh\"\nargs = [\"-c\", \"printf mock-token\"]"
+        }
+    }
+
     fn codex_config(mcp_repl: &Path, repo_root: &Path, openai_base_url: &str) -> String {
         let mcp_repl = toml_escape(&mcp_repl.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
+        let mock_command_auth = mock_command_auth_config();
         format!(
             r#"model_provider = "mock-openai"
 model = "{CODEX_MODEL}"
@@ -1388,6 +1541,9 @@ base_url = "{openai_base_url}"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+
+[model_providers.mock-openai.auth]
+{mock_command_auth}
 
 [notice]
 hide_full_access_warning = true
@@ -1462,6 +1618,7 @@ trust_level = "trusted"
         let mcp_repl = toml_escape(&mcp_repl.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
+        let mock_command_auth = mock_command_auth_config();
         format!(
             r#"model_provider = "mock-openai"
 model = "{CODEX_MODEL}"
@@ -1474,6 +1631,9 @@ base_url = "{openai_base_url}"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+
+[model_providers.mock-openai.auth]
+{mock_command_auth}
 
 [notice]
 hide_full_access_warning = true
@@ -1500,6 +1660,7 @@ trust_level = "trusted"
     fn codex_install_base_config(repo_root: &Path, openai_base_url: &str) -> String {
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
+        let mock_command_auth = mock_command_auth_config();
         format!(
             r#"model_provider = "mock-openai"
 model = "{CODEX_MODEL}"
@@ -1512,6 +1673,9 @@ base_url = "{openai_base_url}"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+
+[model_providers.mock-openai.auth]
+{mock_command_auth}
 
 [notice]
 hide_full_access_warning = true
@@ -2034,6 +2198,23 @@ tryCatch({
                     .eq(suffix.iter().copied())
         }
 
+        fn canonicalize_known_key_order(
+            map: &mut serde_json::Map<String, Value>,
+            known_keys: &[&str],
+        ) {
+            let original = std::mem::take(map);
+            for key in known_keys {
+                if let Some(value) = original.get(*key) {
+                    map.insert((*key).to_string(), value.clone());
+                }
+            }
+            for (key, value) in original {
+                if !known_keys.contains(&key.as_str()) {
+                    map.insert(key, value);
+                }
+            }
+        }
+
         fn normalize_wire_string(text: &str, workspace: &Path, codex_home: &Path) -> String {
             let workspace_display = workspace.display().to_string();
             let workspace_private = format!("/private{workspace_display}");
@@ -2159,8 +2340,19 @@ tryCatch({
                         path.pop();
                         map.insert(normalized_key, child);
                     }
-                    if path_matches(path, &["capabilities", "elicitation"]) && map.is_empty() {
+                    if path_matches(path, &["capabilities", "elicitation"]) {
+                        map.clear();
                         map.insert("form".to_string(), Value::Object(serde_json::Map::new()));
+                    }
+                    if path_matches(path, &["_meta"]) {
+                        canonicalize_known_key_order(
+                            map,
+                            &[
+                                "progressToken",
+                                "x-codex-turn-metadata",
+                                "codex/sandbox-state-meta",
+                            ],
+                        );
                     }
                 }
                 Value::Array(items) => {
@@ -2284,12 +2476,15 @@ tryCatch({
     }
 
     #[test]
-    fn normalize_wire_snapshot_normalizes_empty_elicitation_capability() {
+    fn normalize_wire_snapshot_canonicalizes_elicitation_capability() {
         let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
         let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
         let mut value = serde_json::json!({
             "capabilities": {
-                "elicitation": {}
+                "elicitation": {
+                    "form": {},
+                    "url": {}
+                }
             }
         });
 
@@ -2305,6 +2500,41 @@ tryCatch({
                 }
             }),
             "wire snapshots should normalize Codex elicitation capability shape"
+        );
+    }
+
+    #[test]
+    fn normalize_wire_snapshot_canonicalizes_meta_key_order() {
+        let workspace = std::env::temp_dir().join("mcp-repl-wire-workspace");
+        let codex_home = std::env::temp_dir().join("mcp-repl-wire-codex-home");
+        let mut value = serde_json::json!({
+            "params": {
+                "_meta": {
+                    "x-codex-turn-metadata": {},
+                    "future-field": true,
+                    "codex/sandbox-state-meta": {},
+                    "progressToken": 1
+                }
+            }
+        });
+
+        normalize_wire_snapshot_value(&mut value, &workspace, &codex_home);
+
+        let keys = value["params"]["_meta"]
+            .as_object()
+            .expect("expected normalized _meta object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "progressToken",
+                "x-codex-turn-metadata",
+                "codex/sandbox-state-meta",
+                "future-field"
+            ],
+            "wire snapshots should retain a stable order for known _meta fields"
         );
     }
 
@@ -2881,6 +3111,7 @@ tryCatch({
                 "supported_in_api": true,
                 "priority": 1,
                 "upgrade": null,
+                "availability_nux": null,
                 "base_instructions": "test instructions",
                 "model_instructions_template": null,
                 "supports_reasoning_summaries": false,
@@ -2896,6 +3127,23 @@ tryCatch({
             }]
         })
         .to_string()
+    }
+
+    #[test]
+    fn mock_models_response_includes_required_availability_nux() {
+        let response: Value =
+            serde_json::from_str(&models_response()).expect("mock models response should be JSON");
+        let model = response["models"][0]
+            .as_object()
+            .expect("mock models response should contain one model");
+        assert!(
+            model.contains_key("availability_nux"),
+            "Codex 0.145 requires availability_nux in model metadata"
+        );
+        assert!(
+            model["availability_nux"].is_null(),
+            "mock model should not advertise an availability NUX"
+        );
     }
 
     fn response_for_request(body: &Value, state: &mut MockState) -> String {
