@@ -20,7 +20,7 @@
 ## Status
 
 - State: completed
-- Last updated: 2026-07-25
+- Last updated: 2026-07-26
 - Current phase: complete
 - Branch: `fix/windows-native-interrupt-observer`
 - Base: `origin/main` at `f072158c6f86398d663d3d6abfdb0176842daad0`
@@ -535,6 +535,62 @@ non-semantic `_meta` key order and the growing elicitation capability shape,
 and drives the new Full Access confirmation without changing the checked-in
 sandbox-contract snapshots.
 
+Hosted run `30226316301` proved that the remaining Windows frame crossed the
+two output routes. While shutdown filtering was armed, sideband `output_text`
+supplied the exact leading LF; raw ConPTY capture then supplied only the bare
+clear/reset/home/show-cursor suffix
+(`ESC[2J ESC[m ESC[H ESC[?25h`). The raw filter therefore never saw the
+complete LF-prefixed candidate. Its trace also showed that neither raw-reader
+finalization nor retained-ConPTY close ordering was responsible: both readers
+were still active when the split frame was assembled in the reply.
+
+The production follow-up pairs those two byte-exact route fragments without
+turning the lifecycle filter into a general ANSI scrubber. After shutdown arm,
+an exact non-continuation stdout LF may be staged until raw capture either
+supplies the bare reset suffix or proves the LF ordinary; the reverse
+raw-suffix-before-IPC-LF ordering is covered as well. Pairing is transactional:
+neither fragment is discarded alone. A raw-first bare suffix is retained until
+an eligible LF arrives and is otherwise emitted at the next boundary or
+finalization; a staged LF is emitted if intervening output disproves the pair.
+Ordinary raw output, substantive sideband cleanup output, images, other
+sideband boundaries, and EOF therefore preserve unpaired bytes. Deterministic
+unit regressions cover every raw split point, both route orders, substantive
+cleanup, ordinary output, unarmed input, boundary invalidation, standalone
+fragments, and trailing raw bytes. The temporary Rust trace and diagnostic
+environment switches are removed. The integration runner retains only the
+generally useful behavior of attaching its fully drained server-stderr tail to
+a failed case.
+
+The same run showed that adding nullable `availability_nux` fixed the Codex
+0.145 `/models` response schema but did not make that request occur. Codex
+0.145 no longer refreshes remote models for this unauthenticated custom mock
+provider, so it selected bundled metadata and rejected the legacy fixture model
+before the corrected response could be read. Giving the mock provider a
+deterministic command-auth fixture re-enables `/models` refresh on Linux,
+macOS, and Windows; the existing schema, normalization, elicitation, and Full
+Access adaptations then apply to the installed client.
+
+The final cross-route implementation carries the staged LF as a structural
+boundary through startup and shutdown filtering. Exact startup matching remains
+raw-stream-local when stderr, images, or sideband events overtake an ambiguous
+raw prefix, so a truly split startup sequence is still removed. Already
+classified startup whitespace is compacted to the one trailing LF needed for
+reset recognition; a 1 MiB blank-line regression proves the candidate buffer
+stays bounded. Shutdown-boundary adjustment accounts for lifecycle bytes that
+are emitted or removed, and one staged LF can consume at most one exact bare
+reset suffix. All 56 focused `windows_conpty_` regressions pass.
+
+The post-fix local gate passed warning-denied check and build, all-target
+clippy, all 21 public integration-runner cases, 523 library tests and every
+discovered integration binary, 20 docs contracts, 15 integration-runner unit
+tests, the Codex command-auth and model-response fixture tests, nightly
+formatting, `git diff --check`, and the warning-denied locked release build.
+Windows Application Control blocked only the freshly relinked
+`RUSTFLAGS=-Dwarnings` test executable before it could start (`os error 4551`);
+the same final sources compiled under that setting and then completed the full
+suite through Cargo's already-approved test artifact. Hosted CI remains the
+final warning-denied execution check for that artifact.
+
 ## Relationship To Other Work
 
 - PR #122: this supersedes its Windows interrupt implementation. It does not
@@ -571,9 +627,9 @@ sandbox-contract snapshots.
 
 ## Next Safe Slice
 
-- Push the origin-diagnostic and Codex 0.145 compatibility follow-up, inspect
-  the hosted Windows stderr with `gh`, remove the temporary diagnostics after
-  applying the proven lifecycle fix, and rerun the complete required gate.
+- Commit and push the verified cross-route ConPTY filter and Codex 0.145
+  command-auth fixture to `fix/windows-native-interrupt-observer`, then monitor
+  the new hosted Actions run with `gh` through a terminal result.
 
 ## Stop Conditions
 
@@ -684,3 +740,18 @@ sandbox-contract snapshots.
   disclose the fully drained server-stderr tail. Repaired independent Codex
   0.145 fixture, normalization, and Full Access confirmation drift without
   accepting changed sandbox-contract snapshots.
+- 2026-07-26: Run `30226316301` proved the hosted reset frame was assembled
+  across routes: sideband `output_text` supplied its leading LF and raw ConPTY
+  supplied the bare reset suffix while both readers were active. Replaced the
+  temporary diagnostics with a byte-exact cross-route pairing state and
+  deterministic split/order/preservation regressions, while retaining generic
+  failed-suite stderr-tail reporting.
+- 2026-07-26: Kept nullable `availability_nux` in the Codex 0.145 model fixture
+  but added deterministic mock-provider command auth after the hosted run
+  showed that schema compatibility alone did not trigger `/models` refresh for
+  a custom unauthenticated provider.
+- 2026-07-26: Preserved startup matching across observable cross-route
+  boundaries after a final audit found that force-flushing an ambiguous prefix
+  could leak the exact ConPTY startup sequence. Bounded matched-startup
+  whitespace to one trailing LF, retained byte-exact and one-to-one shutdown
+  pairing, and covered both findings with deterministic regressions.

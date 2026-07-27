@@ -138,7 +138,6 @@ mod unix_impl {
             )
             .into());
         }
-
         let saw_write_ok = outputs.iter().any(|out| out.contains("WRITE_OK"));
         if !saw_write_ok {
             let request_paths = mock_server.request_paths().await;
@@ -292,6 +291,16 @@ mod unix_impl {
             return Err(format!(
                 "codex exec failed with status {status}\nrequest_paths: {request_paths:?}\nlast_request: {last_request:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
                 status = output.status
+            )
+            .into());
+        }
+        let request_paths = mock_server.request_paths().await;
+        if !request_paths
+            .iter()
+            .any(|request| request.starts_with("GET ") && request.contains("/models"))
+        {
+            return Err(format!(
+                "expected mock Codex provider to refresh /models\nrequest_paths: {request_paths:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
             )
             .into());
         }
@@ -1399,10 +1408,58 @@ mod unix_impl {
         Ok(())
     }
 
+    #[test]
+    fn mock_codex_configs_enable_remote_model_refresh_with_command_auth() -> TestResult<()> {
+        let mcp_repl = Path::new("/tmp/mcp-repl");
+        let workspace = Path::new("/tmp/workspace");
+        let configs = vec![
+            codex_config(mcp_repl, workspace, "http://127.0.0.1:1234/v1"),
+            codex_install_base_config(workspace, "http://127.0.0.1:1234/v1"),
+        ];
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let configs = {
+            let mut configs = configs;
+            configs.push(codex_traced_config(
+                mcp_repl,
+                Path::new("/tmp/trace.py"),
+                "python3",
+                workspace,
+                "http://127.0.0.1:1234/v1",
+            ));
+            configs
+        };
+        let expected = format!("[auth]\n{}", mock_command_auth_config()).parse::<DocumentMut>()?;
+        for config in configs {
+            let doc = config.parse::<DocumentMut>()?;
+            let auth = &doc["model_providers"]["mock-openai"]["auth"];
+            assert_eq!(
+                auth["command"].as_str(),
+                expected["auth"]["command"].as_str()
+            );
+            assert_eq!(
+                auth["args"].to_string(),
+                expected["auth"]["args"].to_string()
+            );
+        }
+        Ok(())
+    }
+
+    fn mock_command_auth_config() -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "command = \"cmd\"\nargs = [\"/C\", \"echo mock-token\"]"
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            "command = \"sh\"\nargs = [\"-c\", \"printf mock-token\"]"
+        }
+    }
+
     fn codex_config(mcp_repl: &Path, repo_root: &Path, openai_base_url: &str) -> String {
         let mcp_repl = toml_escape(&mcp_repl.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
+        let mock_command_auth = mock_command_auth_config();
         format!(
             r#"model_provider = "mock-openai"
 model = "{CODEX_MODEL}"
@@ -1415,6 +1472,9 @@ base_url = "{openai_base_url}"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+
+[model_providers.mock-openai.auth]
+{mock_command_auth}
 
 [notice]
 hide_full_access_warning = true
@@ -1489,6 +1549,7 @@ trust_level = "trusted"
         let mcp_repl = toml_escape(&mcp_repl.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
+        let mock_command_auth = mock_command_auth_config();
         format!(
             r#"model_provider = "mock-openai"
 model = "{CODEX_MODEL}"
@@ -1501,6 +1562,9 @@ base_url = "{openai_base_url}"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+
+[model_providers.mock-openai.auth]
+{mock_command_auth}
 
 [notice]
 hide_full_access_warning = true
@@ -1527,6 +1591,7 @@ trust_level = "trusted"
     fn codex_install_base_config(repo_root: &Path, openai_base_url: &str) -> String {
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
+        let mock_command_auth = mock_command_auth_config();
         format!(
             r#"model_provider = "mock-openai"
 model = "{CODEX_MODEL}"
@@ -1539,6 +1604,9 @@ base_url = "{openai_base_url}"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
+
+[model_providers.mock-openai.auth]
+{mock_command_auth}
 
 [notice]
 hide_full_access_warning = true

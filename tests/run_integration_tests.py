@@ -1517,10 +1517,7 @@ CANONICAL_CASES: dict[str, SuiteCase] = {
         server_args=("--sandbox", "danger-full-access"),
         server_cwd=Path("target/test-scratch/run-integration-tests/r-full-access-sandbox"),
     ),
-    "r-interrupt-restart-prefixes": r_suite_case(
-        r_interrupt_restart_prefixes,
-        server_env=(("MCP_REPL_DIAG_CONPTY_RESET", "1"),),
-    ),
+    "r-interrupt-restart-prefixes": r_suite_case(r_interrupt_restart_prefixes),
     "r-output-bundle-files": r_suite_case(
         r_output_bundle_files,
         server_args=("--oversized-output", "files"),
@@ -1558,10 +1555,7 @@ CANONICAL_CASES: dict[str, SuiteCase] = {
         server_args=("--sandbox", "read-only"),
         server_cwd=Path("target/test-scratch/run-integration-tests/r-read-only-sandbox"),
     ),
-    "r-ctrl-d-clears-state": r_suite_case(
-        r_ctrl_d_clears_state,
-        server_env=(("MCP_REPL_DIAG_CONPTY_RESET", "1"),),
-    ),
+    "r-ctrl-d-clears-state": r_suite_case(r_ctrl_d_clears_state),
     "r-timeout-busy-recovers": r_suite_case(r_timeout_busy_recovers),
     "r-write-stdin-bundles-huge-assignment-input-echoes": r_suite_case(
         r_write_stdin_files_bundle_includes_huge_assignment_input_echoes,
