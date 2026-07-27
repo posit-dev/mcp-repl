@@ -591,6 +591,36 @@ the same final sources compiled under that setting and then completed the full
 suite through Cargo's already-approved test artifact. Hosted CI remains the
 final warning-denied execution check for that artifact.
 
+Hosted run `30232581338` made both original Windows public regressions green,
+and every platform passed warning-denied check, build, the public API suite,
+and clippy before reaching `cargo test`. Linux and macOS then recorded a new
+nonfatal Codex skills-context-budget advisory in the initial-sandbox snapshot.
+Snapshot normalization now parses JSON lines and removes only that narrowly
+identified advisory event; unrelated error events remain visible, and a
+regression proves item IDs are renumbered after the removed event.
+
+The same run's Windows `session_endings` snapshot showed four terminal-close
+repaints as bare reset tails: three exact clear/reset/home/show-cursor suffixes
+and one titled variant. The filter now receives an explicit signal immediately
+before the retained ConPTY is closed. That authority is usable only during
+finalization, after raw-reader EOF, for an exact pending tail with no
+intervening observable boundary. It therefore cannot discard ordinary
+lookalike output, and raw EOF does not prevent a late sideband LF from pairing
+with the suffix first. The focused matrix now has 63 `windows_conpty_`
+regressions covering simple and titled tails, every split, intervening output,
+cross-stream boundaries, and both late-LF orders.
+
+The follow-up local gate passed warning-denied check and build, all 21 public
+integration-runner cases, all-target clippy, nightly formatting, 20 docs
+contracts, 15 integration-runner unit tests, both Codex advisory regressions,
+the exact session-endings snapshot, all 63 focused ConPTY tests, and the
+warning-denied locked release build. The warning-denied full Rust run executed
+and passed its first 571 tests, including all 530 library tests, before Windows
+Application Control blocked the next freshly linked integration executable
+from starting (`os error 4551`). A fresh ordinary full-suite artifact was
+likewise blocked before its library tests could start. Hosted CI remains the
+authoritative execution environment for those final linked artifacts.
+
 ## Relationship To Other Work
 
 - PR #122: this supersedes its Windows interrupt implementation. It does not
@@ -627,9 +657,10 @@ final warning-denied execution check for that artifact.
 
 ## Next Safe Slice
 
-- Commit and push the verified cross-route ConPTY filter and Codex 0.145
-  command-auth fixture to `fix/windows-native-interrupt-observer`, then monitor
-  the new hosted Actions run with `gh` through a terminal result.
+- Commit and push the verified terminal-close tail filter and Codex advisory
+  normalization to `fix/windows-native-interrupt-observer`, then monitor the
+  new hosted Actions run with `gh` through a terminal result. If it is green,
+  no additional code slice remains.
 
 ## Stop Conditions
 
@@ -755,3 +786,9 @@ final warning-denied execution check for that artifact.
   could leak the exact ConPTY startup sequence. Bounded matched-startup
   whitespace to one trailing LF, retained byte-exact and one-to-one shutdown
   pairing, and covered both findings with deterministic regressions.
+- 2026-07-26: Run `30232581338` proved the original Windows public regressions
+  fixed and isolated three cargo-test-only follow-ups: a nonfatal Codex
+  skills-budget advisory on Unix and bare simple/titled ConPTY close tails on
+  Windows. Added narrow structured advisory filtering plus explicit,
+  finalization-only close-tail authority, preserving late cross-route pairing
+  through raw EOF and all unpaired lookalike output.

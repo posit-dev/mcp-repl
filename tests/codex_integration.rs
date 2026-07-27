@@ -1037,6 +1037,9 @@ mod unix_impl {
     }
 
     fn normalize_exec_text(text: &str, workspace: &Path, codex_home: &Path) -> String {
+        if is_nonfatal_skill_description_budget_advisory(text) {
+            return String::new();
+        }
         if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
             return String::new();
         }
@@ -1100,6 +1103,27 @@ mod unix_impl {
             }
         }
         text
+    }
+
+    fn is_nonfatal_skill_description_budget_advisory(text: &str) -> bool {
+        let Ok(event) = serde_json::from_str::<Value>(text) else {
+            return false;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("item.completed") {
+            return false;
+        }
+        let Some(item) = event.get("item") else {
+            return false;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("error") {
+            return false;
+        }
+        item.get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.starts_with("Skill descriptions were shortened to fit the ")
+                    && message.contains("skills context budget.")
+            })
     }
 
     fn renumber_exec_item_ids(text: &str) -> String {
@@ -1390,6 +1414,51 @@ mod unix_impl {
             normalized,
             r#"{"type":"turn.completed","usage":{"input_tokens":"<N>","cached_input_tokens":"<N>","output_tokens":"<N>"}}"#
         );
+    }
+
+    #[test]
+    fn normalize_exec_text_drops_only_nonfatal_skill_budget_advisories() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        for message in [
+            "Skill descriptions were shortened to fit the 2% skills context budget.",
+            "Skill descriptions were shortened to fit the skills context budget.",
+        ] {
+            let event = serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "item_0",
+                    "type": "error",
+                    "message": message
+                }
+            })
+            .to_string();
+            assert_eq!(normalize_exec_text(&event, workspace, codex_home), "");
+        }
+
+        let real_error = r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"MCP tool failed"}}"#;
+        assert_eq!(
+            normalize_exec_text(real_error, workspace, codex_home),
+            real_error
+        );
+    }
+
+    #[test]
+    fn render_exec_snapshot_renumbers_items_after_skill_budget_advisory() -> TestResult<()> {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+        let stdout = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"Skill descriptions were shortened to fit the 2% skills context budget.\"}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"item_1\",\"type\":\"mcp_tool_call\"}}\n"
+        );
+
+        let snapshot =
+            render_exec_snapshot(ExecSnapshotMode::Json, stdout, "", workspace, codex_home)?;
+
+        assert!(!snapshot.contains("Skill descriptions were shortened"));
+        assert!(snapshot.contains(r#""id":"item_0""#));
+        assert!(!snapshot.contains(r#""id":"item_1""#));
+        Ok(())
     }
 
     #[test]
