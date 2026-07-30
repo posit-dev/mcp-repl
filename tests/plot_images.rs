@@ -802,7 +802,7 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
         "did not expect pager footer in response"
     );
     assert!(
-        !result_text(&result).contains("full output:"),
+        !result_text(&result).contains("Full output:"),
         "did not expect oversized-output path marker in mixed text+image reply: {}",
         result_text(&result)
     );
@@ -1871,7 +1871,7 @@ while (!file.exists({release_literal})) Sys.sleep(0.05)
         first_text
     );
     assert!(
-        first_text.contains("later content omitted"),
+        first_text.contains("later content past the output bundle quota"),
         "expected omission notice in image-only timeout reply, got: {first_text:?}"
     );
     assert!(
@@ -1934,7 +1934,7 @@ Sys.sleep(8)
             .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"))
             .join("images"),
         None => images_dir_path(&bundled_text).unwrap_or_else(|| {
-            panic!("expected output bundle images path in timeout poll, got: {bundled_text:?}")
+            panic!("expected output bundle image path in timeout poll, got: {bundled_text:?}")
         }),
     };
     let bundle_dir = images_dir
