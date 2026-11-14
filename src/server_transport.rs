@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -18,6 +18,9 @@ use crate::worker_client::ResponseDelivery;
 // A blocked stdout cannot carry a correlated overload response. Closing the
 // transport at this bound keeps rmcp's detached handler backlog finite.
 const MAX_RESPONSE_GATED_CALLS: usize = 64;
+
+/// The bound on `send` calls whose handlers have not finished.
+const MAX_OUTSTANDING_SENDS: usize = 64;
 
 #[derive(Clone, Default)]
 pub(crate) struct ResponseDeliveries {
@@ -825,13 +828,13 @@ impl Drop for ResponseDeliveryWrite {
 
 type SendObserver = dyn Fn(&mut CallToolRequest) + Send;
 
-/// One ordered capture operation, awaited by its handler rather than MCP receipt.
+/// One call queued for capture at MCP receipt, carried to its handler.
 #[derive(Clone)]
 pub(crate) struct RecordingCall {
     id: u64,
-    ready: tokio::sync::watch::Receiver<Option<crate::transcript::Call>>,
+    call: crate::transcript::Call,
     // Closing the last sender releases capture ownership, independently of
-    // cancelled delivery admission. Blocking result writers retain a clone.
+    // cancelled delivery admission.
     _completion: Arc<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -841,11 +844,8 @@ impl RecordingCall {
     // Cancellation can remove delivery ownership before a response is captured.
     const RESPONSE_ID: &'static str = "mcp-console/internal/recording-call";
 
-    pub(crate) async fn recorded(mut self) -> crate::transcript::Call {
-        match self.ready.wait_for(Option::is_some).await {
-            Ok(call) => call.clone().expect("recorded call ready"),
-            Err(_) => crate::transcript::Call::unrecorded(),
-        }
+    pub(crate) fn call(&self) -> crate::transcript::Call {
+        self.call.clone()
     }
 
     pub(crate) fn response(
@@ -897,30 +897,26 @@ impl RecordingCall {
     }
 }
 
-/// Receive-order capture and result writers survive delivery cancellation.
+/// Handlers that can still queue a result survive delivery cancellation.
 #[derive(Clone, Default)]
 pub(crate) struct RecordingQueue(Arc<Mutex<RecordingQueueState>>);
 
 #[derive(Default)]
 struct RecordingQueueState {
     closed: bool,
-    tail: Option<tokio::sync::watch::Receiver<Option<crate::transcript::Call>>>,
     pending: Vec<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl RecordingQueue {
     pub(crate) async fn close_and_settle(&self) {
-        let (tail, pending) = {
+        let pending = {
             let mut queue = self.0.lock().expect("recording queue lock");
             queue.closed = true;
-            (queue.tail.take(), std::mem::take(&mut queue.pending))
+            std::mem::take(&mut queue.pending)
         };
-        if let Some(mut tail) = tail {
-            let _ = tail.wait_for(Option::is_some).await;
-        }
         for completion in pending {
-            // Sender closure means all handler/writer owners have retired; it
-            // does not fabricate a successful tool result for an abandoned call.
+            // Sender closure means all handler owners have retired; it does
+            // not fabricate a successful tool result for an abandoned call.
             let _ = completion.await;
         }
     }
@@ -932,7 +928,6 @@ pub(crate) struct ServerTransport<R: AsyncRead, W: AsyncWrite> {
     send_observer: Option<Box<SendObserver>>,
     recording: Option<crate::transcript::Transcript>,
     recording_queue: RecordingQueue,
-    recording_tasks: VecDeque<tokio::task::JoinHandle<()>>,
 }
 
 impl<R, W> ServerTransport<R, W>
@@ -950,7 +945,6 @@ where
             send_observer: None,
             recording: None,
             recording_queue: RecordingQueue::default(),
-            recording_tasks: VecDeque::new(),
         }
     }
 
@@ -1064,48 +1058,49 @@ where
     }
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+        if let Some(recording) = &self.recording {
+            // Handlers queue their journal operations without waiting, so
+            // intake is where a burst is held to the recording writer's pace.
+            tokio::select! {
+                biased;
+                _ = self.deliveries.wait_for_close() => return None,
+                () = recording.paced() => {}
+            }
+        }
         let mut message = tokio::select! {
             biased;
             _ = self.deliveries.wait_for_close() => return None,
             message = self.inner.receive() => message,
         };
-        // Serialize receipt/capture enrollment with shutdown's final tail cut.
+        // Serialize receipt/capture enrollment with shutdown's final cut.
         // This lock protects only queueing, never recorder locks or journal I/O.
         let mut queue = self.recording_queue.0.lock().expect("recording queue lock");
         if queue.closed {
             return None;
         }
-        let mut received_call_id = None;
-        let mut capture = None;
+        let mut receipt = None;
         if let (Some(recording), Some(JsonRpcMessage::Request(request))) =
-            (&self.recording, &mut message)
-            && let ClientRequest::CallToolRequest(call) = &mut request.request
+            (&self.recording, &message)
+            && let ClientRequest::CallToolRequest(call) = &request.request
             && call.params.name.as_ref() == "send"
         {
-            while self
-                .recording_tasks
-                .front()
-                .is_some_and(|task| task.is_finished())
-            {
-                self.recording_tasks.pop_front();
-            }
-            // Apply the existing transport backlog bound to journal waits too.
-            // A stalled recorder must not grow an unbounded queue of handlers.
+            // A send can stay outstanding without a deadline, and its handler
+            // retains its request. Closing the transport at this bound keeps
+            // those handlers finite whatever the recording writer's pace.
             queue.pending.retain_mut(|completion| {
                 matches!(
                     completion.try_recv(),
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty)
                 )
             });
-            if queue.pending.len() >= MAX_RESPONSE_GATED_CALLS {
-                // No capture slot remains for a canonical call. Preserve this
-                // final received frame in the bounded protocol queue instead.
+            if queue.pending.len() >= MAX_OUTSTANDING_SENDS {
+                // The refused call gets no handler. Keep its received frame.
                 match serde_json::to_value(&message) {
                     Ok(message) => recording.protocol("received", message),
                     Err(error) => recording.disable(format!("protocol capture failed: {error}")),
                 }
                 eprintln!(
-                    "mcp-console: recording capture backlog exceeded ({MAX_RESPONSE_GATED_CALLS} calls); closing MCP input"
+                    "mcp-console: {MAX_OUTSTANDING_SENDS} send calls are outstanding; closing MCP input"
                 );
                 self.deliveries.close();
                 return None;
@@ -1118,61 +1113,40 @@ where
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("default");
             let recorder = recording.for_session(session);
-            let receipt = recorder.receive_call(&call.params);
-            let call_id = receipt.id;
-            let request_id = request.id.clone();
-            let params = call.params.clone();
-            let meta = call
-                .extensions
-                .get::<RequestMetaObject>()
-                .cloned()
-                .unwrap_or_default();
-            let (completed, ready) = tokio::sync::watch::channel(None);
-            let predecessor = queue.tail.replace(ready.clone());
-            let (completion, finished) = tokio::sync::oneshot::channel();
-            queue.pending.push(finished);
-            let pending = RecordingCall {
-                id: call_id,
-                ready,
-                _completion: Arc::new(completion),
-            };
-            call.extensions.insert(pending);
-            received_call_id = Some(call_id);
-            capture = Some(async move {
-                if let Some(mut predecessor) = predecessor {
-                    let _ = predecessor.wait_for(Option::is_some).await;
-                }
-                let diagnostics = recorder.clone();
-                let recorded = match tokio::task::spawn_blocking(move || {
-                    recorder.begin(receipt, &request_id, &meta, &params)
-                })
-                .await
-                {
-                    Ok(recorded) => recorded,
-                    Err(error) => {
-                        diagnostics.disable(format!("recording activation task failed: {error}"));
-                        crate::transcript::Call::unrecorded()
-                    }
-                };
-                let _ = completed.send(Some(recorded));
-            });
+            receipt = Some((recorder.receive_call(&call.params), recorder));
         }
-        if let (Some(recording), Some(message)) = (&self.recording, &mut message) {
-            let mut captured = serde_json::to_value(&*message);
-            if let Some(id) = received_call_id
+        if let (Some(recording), Some(message)) = (&self.recording, &message) {
+            let mut captured = serde_json::to_value(message);
+            if let Some((receipt, _)) = &receipt
                 && let Ok(message) = &mut captured
             {
-                message["params"] = serde_json::json!({"tool_call_id": id});
+                message["params"] = serde_json::json!({"tool_call_id": receipt.id});
             }
             match captured {
                 Ok(message) => recording.protocol("received", message),
                 Err(error) => recording.disable(format!("protocol capture failed: {error}")),
             }
         }
-        // Queue receipt before any capture task can activate or append the call,
-        // including when this transport runs on a multithreaded executor.
-        if let Some(capture) = capture {
-            self.recording_tasks.push_back(tokio::spawn(capture));
+        // Queue the call after its receipt and in receive order. Neither waits
+        // for the recording writer.
+        if let Some((receipt, recorder)) = receipt
+            && let Some(JsonRpcMessage::Request(request)) = &mut message
+            && let ClientRequest::CallToolRequest(call) = &mut request.request
+        {
+            let id = receipt.id;
+            let meta = call
+                .extensions
+                .get::<RequestMetaObject>()
+                .cloned()
+                .unwrap_or_default();
+            let recorded = recorder.begin(receipt, &request.id, &meta, &call.params);
+            let (completion, finished) = tokio::sync::oneshot::channel();
+            queue.pending.push(finished);
+            call.extensions.insert(RecordingCall {
+                id,
+                call: recorded,
+                _completion: Arc::new(completion),
+            });
         }
         drop(queue);
         if message.is_some() {
@@ -1214,16 +1188,7 @@ where
 
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
         self.deliveries.close();
-        let tasks = std::mem::take(&mut self.recording_tasks);
-        let close = self.inner.close();
-        async move {
-            // All ordered activation writers must settle before recording finalization,
-            // including calls cancelled before their handler could run.
-            for task in tasks {
-                let _ = task.await;
-            }
-            close.await
-        }
+        self.inner.close()
     }
 }
 

@@ -1,0 +1,5 @@
+---
+!same-as tests/snapshots/client_server/server/test_tools/initializes_and_lists_tools.custom.direct.yaml
+---
+phase-bearing reply: bounded wait; raw log path and stalled writer named
+raw log after release: complete

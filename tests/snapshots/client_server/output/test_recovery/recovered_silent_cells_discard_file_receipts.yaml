@@ -13,11 +13,17 @@ result:
 send:
   control: interrupt
   r: complete silently
+result:
+  content:
+    - type: text
+      text: "[done]"
+  isError: false
 transcript_normalization:
   target: repeated cancellation setup exchanges
   repeated_exchange_count: 4
   exchange_entry_count: 3
   request_ids: distinct in each exchange
+  result: each cancelled reply also replays the output recovered so far
 id: <cancelled request 1>
 ---
 input:

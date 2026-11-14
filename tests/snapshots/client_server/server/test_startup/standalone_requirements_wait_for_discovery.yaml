@@ -4,8 +4,8 @@ scenario: >-
   timeout_ms=0.
 fixture: >-
   The R discovery probe is held at a loopback socket and fails after
-  release. A native checkpoint observes the request recorder returning to
-  its pool before a ping acknowledges readiness-wait dispatch.
+  release. A ping sent after the request acknowledges readiness-wait
+  dispatch.
 ---
 !same-as tests/snapshots/client_server/server/test_tools/initializes_and_lists_tools.direct.yaml
 ---

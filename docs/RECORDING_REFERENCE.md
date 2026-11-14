@@ -137,9 +137,34 @@ A long-location notice may instead name a path relative to the selected Console 
 
 ### Recording failures {#recording-failures}
 
-Recording can fail while computation continues.
+Recording can fail or fall behind while computation continues.
 A notice identifies files or artifacts that are unavailable or only partially retained; do not assume all output was saved.
-If a stalled journal writer exhausts the bounded protocol backlog, Console disables recording and reports the failure on stderr while continuing to receive MCP traffic.
+
+A background writer performs all recording I/O, so recording files can trail the replies that describe them.
+Replies do not wait for the writer, except when an omission notice names retained files: the reply waits up to 5 seconds for the writer to reach them.
+If the writer is still behind, the notice gives the same path and adds `recording writer stalled; retained files may be missing or incomplete`.
+If the writer is still behind on the recording's first write, there is no directory yet, so the notice gives no path and adds `recording writer stalled; retained files are not yet published` instead; later notices give the path once the writer resumes.
+The files are completed if the writer resumes.
+While the backlog remains, later replies with such notices carry the same warning without waiting again.
+If recording has stopped, the notice gives the same path and adds `recording stopped; retained files may be missing or incomplete` because output still queued for the writer when it stopped was discarded.
+Integrator previews and preview subscriptions do not wait for the writer.
+Their omission notices include these warnings only if recording has stopped or a backlog that a reply's bounded wait gave up on remains.
+Before the writer publishes the recording, their notices omit the path and say `retained files are not yet published`; a preview subscription sends a new snapshot with the path when the recording is published.
+
+A failed write to an output file is reported by the first reply that waits for the writer and still holds output from that file.
+A reply that shows the file's output in full does not report the failure.
+In both cases, the file's `cell_output` or `session_output` event records the retained and discarded byte counts.
+
+Creating an output file is limited to 5 seconds.
+A creation that takes longer is reported as a file that was not created.
+Until the creation returns, later output files are not created either, and it can leave an empty file behind.
+
+When the backlog exceeds 16 MiB or 512 operations, output text and images wait for the writer, slowing a worker that produces them faster than they can be recorded to the writer's pace.
+Console also waits before reading the next MCP message or integrator request when 64 operations, or 16 MiB of operations, without output text or images are queued, slowing a burst of requests to the writer's pace.
+Queued output text and images do not count toward that bound, so a worker flooding output does not delay the request that interrupts it.
+If the writer completes no operation for 5 seconds while output, images, or the next request wait for it, or if its backlog reaches 1,024 operations or 64 MiB excluding queued output text and images, Console disables recording, reports the failure on stderr, and continues to receive MCP traffic.
+The writer prints the report after its current filesystem call returns.
+Shutdown still waits for the writer without a limit ([RT-6](TODO.md)).
 
 The recording journal and generated file formats are not independently versioned APIs.
 Implementation and failure-handling details belong in [Architecture](ARCHITECTURE.md#output-and-delivery).

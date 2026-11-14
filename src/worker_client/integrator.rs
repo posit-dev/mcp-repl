@@ -447,15 +447,21 @@ impl Client {
         serde_json::json!({"state": state, "idle": state == "idle", "evaluation": evaluation})
     }
 
-    pub(crate) fn integrator_preview(&self) -> Result<Vec<Content>, IntegratorError> {
+    pub(crate) fn integrator_preview(
+        &self,
+        writer: crate::transcript::WriterState,
+    ) -> Result<Vec<Content>, IntegratorError> {
         let active = self
             .0
             .evaluation
             .lock()
             .map_err(|_| IntegratorError::Busy)?;
         match active.as_ref() {
-            Some(active) => active.evaluation.preview().ok_or(IntegratorError::Busy),
-            None => Ok(self.0.output.preview()),
+            Some(active) => active
+                .evaluation
+                .preview(writer)
+                .ok_or(IntegratorError::Busy),
+            None => Ok(self.0.output.preview(writer)),
         }
     }
 

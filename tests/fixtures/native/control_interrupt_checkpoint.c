@@ -6,12 +6,13 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static _Thread_local pthread_mutex_t *locks[64];
 static _Thread_local size_t lock_count;
 static atomic_bool attaching;
-static atomic_bool interrupt_recorded;
+static atomic_bool interrupt_received;
 static atomic_bool paused;
 static atomic_uintptr_t operation;
 
@@ -27,20 +28,30 @@ static bool contains(const void *buffer, size_t length, const char *text) {
     return false;
 }
 
-static ssize_t observed_write(int descriptor, const void *buffer, size_t length) {
-    ssize_t result = write(descriptor, buffer, length);
-    if (result != (ssize_t)length) return result;
-    if (contains(buffer, length, "\"event\":\"tool_call\"") &&
-        contains(buffer, length, "selected interrupt target: "))
+// The recording writer journals on its own thread and cannot order these
+// gates. Observe each request as the server receives it, before its handler.
+static void received(const void *buffer, ssize_t length) {
+    if (length <= 0) return;
+    if (contains(buffer, (size_t)length, "selected interrupt target: "))
         atomic_store(&attaching, true);
-    if (contains(buffer, length, "\"direction\":\"integrator_to_server\"") &&
-        contains(buffer, length, "\"op\":\"interrupt\""))
-        atomic_store(&interrupt_recorded, true);
+    if (contains(buffer, (size_t)length, "\"interrupt\""))
+        atomic_store(&interrupt_received, true);
+}
+
+static ssize_t observed_read(int descriptor, void *buffer, size_t length) {
+    ssize_t result = read(descriptor, buffer, length);
+    if (descriptor == STDIN_FILENO) received(buffer, result);
+    return result;
+}
+
+static ssize_t observed_recv(int descriptor, void *buffer, size_t length, int flags) {
+    ssize_t result = recv(descriptor, buffer, length, flags);
+    received(buffer, result);
     return result;
 }
 
 static int observed_lock(pthread_mutex_t *mutex) {
-    if (lock_count == 0 && atomic_load(&interrupt_recorded) &&
+    if (lock_count == 0 && atomic_load(&interrupt_received) &&
         (uintptr_t)mutex == atomic_load(&operation) &&
         !atomic_exchange(&paused, true)) {
         // Selection takes this mutex under publication and lifecycle guards.
@@ -88,4 +99,5 @@ static int observed_unlock(pthread_mutex_t *mutex) {
     };
 INTERPOSE(observed_lock, pthread_mutex_lock)
 INTERPOSE(observed_unlock, pthread_mutex_unlock)
-INTERPOSE(observed_write, write)
+INTERPOSE(observed_read, read)
+INTERPOSE(observed_recv, recv)

@@ -20,7 +20,49 @@ from support.requirements import NATIVE_FIXTURES, PROCESS_EVENTS, requires
 from support.suites import run_this_suite
 
 
-def finish_after_eof(binary: Path, execution: Execution, *, cancel: bool) -> Transcript:
+@executions(DIRECT, SANDBOXED)
+@requires(PROCESS_EVENTS)
+def test_cancelled_result_is_not_written_after_eof(
+    binary: Path, execution: Execution
+) -> Transcript:
+    worker = Path(__file__).resolve().parents[3] / "fixtures/zod"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        with (
+            Events() as exits,
+            McpClient(
+                binary,
+                execution.serve("--worker", str(worker)),
+                {**os.environ, "TMPDIR": str(root), "ZOD_REPORT_PID": "1"},
+            ) as client,
+        ):
+            client.initialize_and_list_tools()
+            client.send(r="echo ready")
+            worker_pid = host_process_id(
+                int(wait_for_worker_file(root, "zod-worker-pid", client).read_text()),
+                client.process.pid,
+            )
+            exits.watch_process(worker_pid)
+            pending = client.start_send(r="complete after release")
+            wait_for_worker_file(root, "zod-evaluation-started", client)
+            client.notify("notifications/cancelled", requestId=pending["id"])
+            assert client.request("ping")["result"] == {}
+            client.stdin.close()
+            # The cancelled handler still owns the running cell. Worker
+            # retirement ends it only after the server observes MCP EOF, so its
+            # result reaches the SDK's EOF drain rather than the live loop.
+            assert exits.wait(5) == {worker_pid}
+            # Finishing fails on any output that follows the ping reply.
+            transcript = client.finish()
+            assert pending.keys() == {"id", "send"}, pending
+            return transcript
+
+
+@executions(DIRECT, SANDBOXED)
+@requires(NATIVE_FIXTURES, PROCESS_EVENTS)
+def test_accepted_result_is_written_after_eof(
+    binary: Path, execution: Execution
+) -> Transcript:
     worker = Path(__file__).resolve().parents[3] / "fixtures/zod"
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -52,39 +94,17 @@ def finish_after_eof(binary: Path, execution: Execution, *, cancel: bool) -> Tra
             profile.pause_results(True)
             try:
                 pending = client.start_send(r="echo held response")
-                reached.wait("result owns delivery before journaling")
-                if cancel:
-                    client.notify("notifications/cancelled", requestId=pending["id"])
-                    assert client.request("ping")["result"] == {}
+                reached.wait("reply write starts", client=client)
                 client.stdin.close()
                 # Worker retirement proves the server observed MCP EOF while
-                # this handler's result was still held outside the SDK queue.
+                # the write of this reply was still held.
                 assert exits.wait(5) == {worker_pid}
             finally:
                 profile.pause_results(False)
                 release.release()
-            if cancel:
-                assert pending.keys() == {"id", "send"}, pending
-            else:
-                client.receive(pending)
-                assert last_tool_text(client) == "zod: held response\n"
+            client.receive(pending)
+            assert last_tool_text(client) == "zod: held response\n"
             return client.finish()
-
-
-@executions(DIRECT, SANDBOXED)
-@requires(NATIVE_FIXTURES, PROCESS_EVENTS)
-def test_cancelled_result_is_not_written_after_eof(
-    binary: Path, execution: Execution
-) -> Transcript:
-    return finish_after_eof(binary, execution, cancel=True)
-
-
-@executions(DIRECT, SANDBOXED)
-@requires(NATIVE_FIXTURES, PROCESS_EVENTS)
-def test_accepted_result_is_written_after_eof(
-    binary: Path, execution: Execution
-) -> Transcript:
-    return finish_after_eof(binary, execution, cancel=False)
 
 
 if __name__ == "__main__":

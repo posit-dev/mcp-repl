@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from boundaries.client_server.integrations.test_control import ControlClient
+from boundaries.client_server.output.test_recovery import cancel_result
 from boundaries.client_server.python.test_without_r import selected_environment
 from support.allocations import AllocationProfile
 from support.checkpoints import FifoCheckpoint, wait_for_checkpoint
@@ -51,7 +52,7 @@ def test_restart_orders_cancelled_mcp_error_before_worker_notices(
             client.transcript.append(
                 {
                     "scenario": "Restart returns a cancelled MCP error before its worker notices while the integrator receives only its own stopped cell.",
-                    "fixture": "A Python cell ignores SIGINT and waits at a FIFO. A native result-journal checkpoint holds an MCP interrupt response until cancellation returns its delivery to MCP recovery.",
+                    "fixture": "A Python cell ignores SIGINT and waits at a FIFO. A native checkpoint holds the write of an MCP interrupt response until cancellation returns its delivery to MCP recovery.",
                 }
             )
             client.initialize_and_list_tools()
@@ -109,17 +110,10 @@ def test_restart_orders_cancelled_mcp_error_before_worker_notices(
                     interrupted = client.start_send(
                         control="interrupt", python="sentinel = 99"
                     )
-                    result_reached.wait(
-                        "MCP interrupt result owns delivery", client=client
-                    )
-                    client.notify(
-                        "notifications/cancelled", requestId=interrupted["id"]
-                    )
                     # Cancellation returns recovery synchronously before the
                     # following ping is read from the same MCP input stream.
-                    assert client.request("ping")["result"] == {}
+                    cancel_result(client, interrupted, result_reached, result_release)
                     profile.pause_results(False)
-                    result_release.release()
 
                     restarted = client.send(control="restart")
                     assert restarted == {
@@ -154,7 +148,6 @@ def test_restart_orders_cancelled_mcp_error_before_worker_notices(
                             "isError": True,
                         },
                     }, stopped
-                    assert "result" not in interrupted, interrupted
                     client.expect("\n[idle]")
                     client.expect(
                         "replacement ready\n", python="print('replacement ready')"

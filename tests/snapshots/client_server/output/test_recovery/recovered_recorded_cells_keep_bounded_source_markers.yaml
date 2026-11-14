@@ -13,11 +13,34 @@ result:
 send:
   control: restart
   r: preview recovery cell 0
+result:
+  content:
+    - type: text
+      text:
+        text_bytes: 8118
+        concat:
+          - |
+            [worker stopped: in-memory state lost]
+            [starting new worker]
+            cell 0 head
+          - repeat: x
+            count: 3956
+          - |
+
+            [output omitted: 24857 UTF-8 bytes; raw log: .agents/console/sessions/<run ID>/capture/sessions/002/cell-001.txt]
+          - repeat: x
+            count: 3955
+          - |-
+
+            cell 0 tail
+            [done]
+  isError: false
 transcript_normalization:
   target: repeated cancellation setup exchanges
   repeated_exchange_count: 32
   exchange_entry_count: 3
   request_ids: distinct in each exchange
+  result: each cancelled reply also replays the output recovered so far
   send.r:
     template: preview recovery cell {index}
     index_start: 0

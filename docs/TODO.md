@@ -33,6 +33,10 @@ Recurring release checks belong in [Release](../RELEASE.md).
   Exercise this through Console's SQL API and verify interruption and retained connection state before advancing the DuckDB fixture pin in [shared R support](../tests/support/r.py).
   Those tests pin DuckDB 1.5.6; production package selection is independent of that fixture.
 
+- [ ] **RT-6 — Bound the remaining waits on the recording writer.**
+  Shutdown finalization and the integrator's `recording` request wait for the [recording writer](../src/transcript.rs) without a limit, so a filesystem call that never returns keeps the process alive after MCP input closes.
+  Before adding a deadline, decide what abandoned finalization leaves behind (writable files, no `recording_ended` event, incomplete projections) and how Console reports it.
+
 ## Sandbox and platforms
 
 - [ ] **SP-1 — Verify the macOS policy exceptions against their callers.**

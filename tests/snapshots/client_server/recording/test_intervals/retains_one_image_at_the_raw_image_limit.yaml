@@ -1,0 +1,12 @@
+---
+!same-as custom MCP initialization for this execution mode
+---
+send:
+  r: emit largest retained image
+result:
+  content:
+    - type: text
+      text: |
+
+        [output omitted: 1 image (89478488 encoded bytes); retained image: .agents/console/sessions/<recording ID>/capture/sessions/001/cell-001-001.png]
+  isError: false

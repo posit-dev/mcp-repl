@@ -1,0 +1,29 @@
+---
+input:
+  method: initialize
+  params:
+    protocolVersion: 2025-11-25
+    capabilities: {}
+    clientInfo:
+      name: acceptance-test
+      version: 1.0.0
+result:
+  protocolVersion: 2025-11-25
+  capabilities:
+    tools: {}
+  serverInfo:
+    name: mcp-console
+    title: MCP Console
+    version: <Console version>
+    description: >-
+      An interactive workbench for agents working in R, Python, and SQL.
+    websiteUrl: https://github.com/posit-dev/mcp-console
+  instructions: >-
+    Persistent custom-worker R, Python, and SQL REPL. Reuse objects across
+    calls to inspect results, test hypotheses, and compare approaches.
+---
+input:
+  method: notifications/initialized
+---
+oversized reply: bounded wait; unpublished recording named
+raw log after release: complete

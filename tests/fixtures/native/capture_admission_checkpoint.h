@@ -39,12 +39,12 @@ static void unlocked(pthread_mutex_t *mutex) {
     if (lock_count != 0 && locks[lock_count - 1] == mutex) --lock_count;
 }
 
-static ssize_t observed_write(int descriptor, const void *buffer, size_t length) {
-    ssize_t result = write(descriptor, buffer, length);
-    if (result != (ssize_t)length) return result;
-    const char call[] = "{\"event\":\"tool_call\",";
-    if (length >= sizeof(call) - 1 && memcmp(buffer, call, sizeof(call) - 1) == 0 &&
-        contains(buffer, length, getenv("MCP_CONSOLE_TEST_ADMISSION_SOURCE")))
+static ssize_t observed_read(int descriptor, void *buffer, size_t length) {
+    ssize_t result = read(descriptor, buffer, length);
+    // The server reads a call from MCP input before it dispatches the handler.
+    // The recording writer runs on its own thread and cannot order this gate.
+    if (descriptor == STDIN_FILENO && result > 0 &&
+        contains(buffer, (size_t)result, getenv("MCP_CONSOLE_TEST_ADMISSION_SOURCE")))
         atomic_store(&armed, true);
     return result;
 }
@@ -58,4 +58,4 @@ static ssize_t observed_write(int descriptor, const void *buffer, size_t length)
         (const void *)(uintptr_t)&original,                                   \
     };
 INTERPOSE(observed_lock, pthread_mutex_lock)
-INTERPOSE(observed_write, write)
+INTERPOSE(observed_read, read)

@@ -1,0 +1,3 @@
+---
+cancelled_aggregate_reports_file_failure: true
+recovered_aggregate_reports_file_failure_once: true

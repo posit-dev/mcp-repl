@@ -1,0 +1,9 @@
+---
+!same-as tests/snapshots/client_server/server/test_tools/initializes_and_lists_tools.direct.yaml
+---
+send:
+  requirements:
+    r:
+      - DBI
+---
+sends outstanding when input closed: 64

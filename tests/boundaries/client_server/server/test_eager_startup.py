@@ -656,7 +656,11 @@ def test_startup_poll_deadline_preserves_unclaimed_output(
                 write_reached.wait(
                     "early cell's running response write is held", client=client
                 )
+                # The held write returns only on release, so the recording
+                # cannot yet hold this reply's delivery.
+                client.recording_receipts = False
                 client.receive(submitted)
+                client.recording_receipts = True
                 assert without_elapsed(last_result_text(client)) == RUNNING
                 assert phase_progress(last_result_text(client)) == "startup"
                 proceed.release()
@@ -833,7 +837,11 @@ def early_requirements_with_pending_poll(
                         else 10
                     ),
                 )
+                # The held write returns only on release, so the recording
+                # cannot yet hold this reply's delivery.
+                client.recording_receipts = False
                 client.receive(submitted)
+                client.recording_receipts = True
                 if completed_response:
                     assert last_result_text(client) == "[1] 42\n"
                     pending = client.start_send(

@@ -13,6 +13,25 @@ result:
 send:
   r: preview recovery cell 0
   session: alpha
+result:
+  content:
+    - type: text
+      text:
+        text_bytes: 8051
+        concat:
+          - |
+            cell 0 head
+          - repeat: x
+            count: 3956
+          - |
+
+            [output omitted: 24857 UTF-8 bytes; raw log: .agents/console/sessions/<run ID>/capture/sessions/002/cell-001.txt]
+          - repeat: x
+            count: 3955
+          - |
+
+            cell 0 tail
+  isError: false
 id: <cancelled request 1>
 ---
 input:
@@ -27,6 +46,25 @@ result: {}
 send:
   r: preview recovery cell 1
   session: beta
+result:
+  content:
+    - type: text
+      text:
+        text_bytes: 8051
+        concat:
+          - |
+            cell 1 head
+          - repeat: x
+            count: 3956
+          - |
+
+            [output omitted: 24857 UTF-8 bytes; raw log: .agents/console/sessions/<run ID>/capture/sessions/003/cell-001.txt]
+          - repeat: x
+            count: 3955
+          - |
+
+            cell 1 tail
+  isError: false
 id: <cancelled request 2>
 ---
 input:

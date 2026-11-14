@@ -13,6 +13,12 @@ result:
 send:
   r: echo alpha output
   session: alpha
+result:
+  content:
+    - type: text
+      text: |
+        zod: alpha output
+  isError: false
 id: <cancelled request 1>
 ---
 input:
@@ -27,6 +33,12 @@ result: {}
 send:
   r: echo beta output
   session: beta
+result:
+  content:
+    - type: text
+      text: |
+        zod: beta output
+  isError: false
 id: <cancelled request 2>
 ---
 input:
@@ -40,6 +52,18 @@ result: {}
 ---
 send:
   timeout_ms: 0
+result:
+  content:
+    - type: text
+      text: |-
+        [session: "alpha"; status: idle]
+        zod: alpha output
+        [session: "beta"; status: idle]
+        zod: beta output
+        [session: "default"; status: idle]
+
+        [idle]
+  isError: false
 id: <cancelled request 3>
 ---
 input:

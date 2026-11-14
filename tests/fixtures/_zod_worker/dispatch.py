@@ -12,6 +12,7 @@ EXACT_HANDLERS: dict[str, Callable[[WorkerContext, str], LoopAction | None]] = {
     "overflow console output": output.overflow_console_output,
     "preview image limit": output.preview_image_limit,
     "overflow image retention": output.overflow_image_retention,
+    "emit largest retained image": output.emit_largest_retained_image,
     "preview allocation image": output.preview_allocation_image,
     "preview allocation image then fail": output.preview_allocation_image,
     "preview allocation image and text": output.preview_allocation_image,
@@ -104,6 +105,10 @@ def dispatch(context: WorkerContext, source: str) -> LoopAction | None:
         return probes.checkpoint(context, source)
     if source.startswith("wait for interrupt: "):
         return lifecycle.wait_for_interrupt(context, source)
+    if source.startswith("exit after output: "):
+        return lifecycle.exit_unexpectedly(context, source)
+    if source.startswith("hold after output: "):
+        return lifecycle.hold_after_output(context, source)
     if source.startswith("stall: "):
         return lifecycle.stall_operation(context, source)
     if source.startswith("preview recovery cell "):

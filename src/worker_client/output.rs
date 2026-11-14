@@ -48,6 +48,9 @@ pub(crate) struct Response {
     delivery: Option<Box<ResponseDeliveryTarget>>,
     terminal: Option<TerminalState>,
     phase: Option<super::status::Source>,
+    /// The phase `settle_recording` read. The reply renders this one, so its
+    /// omission marker is the one that wait examined.
+    settled_phase: Option<Option<&'static str>>,
     execution_error: Option<Box<crate::worker_protocol::ExecutionError>>,
 }
 
@@ -171,22 +174,14 @@ impl Response {
 
     /// Combine session previews under the ordinary complete-result bounds while
     /// keeping each session's original response available for delivery recovery.
+    /// The caller holds the returned copy until `settle_recording` has seen it.
     pub(crate) fn append_session(
         &mut self,
         name: &str,
         status: &str,
         mut response: Self,
     ) -> Option<ResponseDelivery> {
-        let phase = response
-            .phase
-            .as_ref()
-            .filter(|_| {
-                matches!(
-                    response.terminal,
-                    Some(TerminalState::Running | TerminalState::WorkerStarting)
-                )
-            })
-            .and_then(|source| source.phase());
+        let phase = response.observed_phase();
         let delivery = response.delivery.take().map(|target| ResponseDelivery {
             target: Some(target),
             unclaimed: Some(Response {
@@ -194,6 +189,7 @@ impl Response {
                 is_error: response.is_error,
                 terminal: response.terminal,
                 phase: response.phase.take(),
+                settled_phase: None,
                 delivery: None,
                 execution_error: response.execution_error.clone(),
             }),
@@ -204,10 +200,9 @@ impl Response {
         ));
         if let Some(phase) = phase {
             response.preview.bound();
-            response.preview.phase_before_terminal(
-                phase,
-                matches!(response.terminal, Some(TerminalState::Running)),
-            );
+            response
+                .preview
+                .phase_before_terminal(phase, response.phase_joins_cell_clock());
         }
         self.extend(response);
         delivery
@@ -257,12 +252,13 @@ impl Response {
             delivery: None,
             terminal: None,
             phase: None,
+            settled_phase: None,
             execution_error: self.execution_error.clone(),
         }
     }
 
-    pub(super) fn preview(&self) -> Vec<Content> {
-        self.preview.inspection_copy().render_preview()
+    pub(super) fn preview(&self, writer: crate::transcript::WriterState) -> Vec<Content> {
+        self.preview.inspection_copy().render_preview(writer)
     }
 
     /// The integrator collector owns its result even if its socket disconnects.
@@ -279,6 +275,36 @@ impl Response {
         response
     }
 
+    /// Give the recording writer a bounded chance to catch up before a reply
+    /// names retained files. Other replies never wait for it; see
+    /// `Transcript::settle`. `sessions` are an aggregate reply's sessions, each
+    /// holding the copy that returns its output to the session if this reply
+    /// is not delivered.
+    pub(crate) async fn settle_recording(
+        &mut self,
+        transcript: &crate::transcript::Transcript,
+        sessions: &mut [ResponseDelivery],
+    ) {
+        let phase = self.observed_phase();
+        self.settled_phase = Some(phase);
+        // A phase notice can itself push the reply past its text budget.
+        let phase = phase.map(|phase| (phase, self.phase_joins_cell_clock()));
+        if !self.preview.cites_recording(phase) {
+            return;
+        }
+        let recorder = transcript.clone();
+        let writer = tokio::task::spawn_blocking(move || recorder.settle())
+            .await
+            .expect("recording settle task");
+        // A cancelled aggregate reply returns each session's copy, which must
+        // still report the file failures this wait collected.
+        let recoverable = sessions
+            .iter_mut()
+            .filter_map(|session| session.unclaimed.as_mut())
+            .map(|response| &mut *response.preview);
+        self.preview.recording_settled(writer, recoverable);
+    }
+
     /// Consumes the response for the MCP adapter.
     pub(crate) fn into_parts(
         mut self,
@@ -290,24 +316,15 @@ impl Response {
     ) {
         // Phase observations are rendered inside the ordinary complete-response
         // budget, but never enter retained output or delivery recovery history.
-        let (content, recorded_parts) = match self
-            .phase
-            .as_ref()
-            .filter(|_| {
-                matches!(
-                    self.terminal,
-                    Some(TerminalState::Running | TerminalState::WorkerStarting)
-                )
-            })
-            .and_then(|source| source.phase())
-        {
+        let phase = self
+            .settled_phase
+            .take()
+            .unwrap_or_else(|| self.observed_phase());
+        let (content, recorded_parts) = match phase {
             Some(phase) => {
                 self.preview.bound();
                 let mut preview = self.preview.clone();
-                preview.phase_before_terminal(
-                    phase,
-                    matches!(self.terminal, Some(TerminalState::Running)),
-                );
+                preview.phase_before_terminal(phase, self.phase_joins_cell_clock());
                 preview.render_recorded()
             }
             None => self.preview.render_recorded(),
@@ -321,10 +338,28 @@ impl Response {
                 delivery: None,
                 terminal: self.terminal,
                 phase: self.phase.take(),
+                settled_phase: None,
                 execution_error: self.execution_error.take(),
             }),
         });
         (content, is_error, delivery, recorded_parts)
+    }
+
+    /// The phase notice this response would carry if rendered now.
+    fn observed_phase(&self) -> Option<&'static str> {
+        self.phase
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    self.terminal,
+                    Some(TerminalState::Running | TerminalState::WorkerStarting)
+                )
+            })
+            .and_then(|source| source.phase())
+    }
+
+    fn phase_joins_cell_clock(&self) -> bool {
+        matches!(self.terminal, Some(TerminalState::Running))
     }
 
     pub(super) fn observe_phase(&mut self, source: Option<super::status::Source>) {
@@ -652,6 +687,7 @@ impl Drop for Response {
             delivery: None,
             terminal: self.terminal,
             phase: self.phase.take(),
+            settled_phase: None,
             execution_error: self.execution_error.take(),
         };
         target.unclaimed(response);

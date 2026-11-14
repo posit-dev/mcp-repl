@@ -35,17 +35,17 @@ def test_queued_calls_keep_their_response_identity(
     ):
         first = client.start_send(session="default")
         try:
-            reached.wait(
-                "first result retained before response assembly", client=client
-            )
-            # The later request is received while the earlier result waits for
-            # capture. MCP request IDs remain unique throughout the session.
+            reached.wait("first reply write starts", client=client)
+            # The later request is received while the write of the earlier
+            # reply is held. MCP request IDs remain unique throughout the session.
             second = client.start_send(r="echo queued")
-            assert client.request("ping")["result"] == {}
+            ping = client.start_request("ping")
+            client.await_received(ping)
         finally:
             profile.pause_results(False)
             release.release()
-        client.receive_many([first, second])
+        client.receive_many([first, ping, second])
+        assert ping["result"] == {}, ping
         assert first["result"] == {
             "content": [{"type": "text", "text": "\n[idle]"}],
             "isError": False,
@@ -147,7 +147,9 @@ def protocol_backlog(binary: Path, *, large_frames: bool) -> Transcript:
                 DIRECT.serve("--worker", str(worker)),
                 environment,
                 root,
-                response_timeout=5,
+                response_timeout=15,
+                # The stalled writer cannot record a delivery.
+                recording_receipts=False,
             ) as client:
                 try:
                     client.initialize_and_list_tools()
@@ -155,31 +157,39 @@ def protocol_backlog(binary: Path, *, large_frames: bool) -> Transcript:
                         client.start_send(r="echo ready") if large_frames else None
                     )
                     observed.wait("protocol journal writer stalled", client=client)
+                    if pending is not None:
+                        # The reply does not wait for its stalled journal write.
+                        client.receive(pending)
+                        assert pending["result"] == {
+                            "content": [{"type": "text", "text": "zod: ready\n"}],
+                            "isError": False,
+                        }, pending
                     baseline = profile.live
-                    for _ in range(24 if large_frames else 400):
+                    # Past 64 queued frames or 16 MiB, Console stops reading
+                    # requests until the writer catches up. This writer never
+                    # does: after 5 seconds without progress, recording stops
+                    # and the remaining requests are read without it.
+                    for _ in range(96 if large_frames else 400):
                         client.notify(
                             "notifications/cancelled",
                             requestId=1_000_000,
                             reason="x" * (1024 * 1024 if large_frames else 1),
                         )
                         assert client.request("ping")["result"] == {}
-                    assert client.request("ping")["result"] == {}
-                    assert profile.live - baseline < 16 * 1024 * 1024, (
-                        profile.live - baseline
-                    )
+                        # The paced byte bound, the frame that crosses it, and
+                        # the frame being read.
+                        assert profile.live - baseline < 24 * 1024 * 1024, (
+                            profile.live - baseline
+                        )
                 finally:
                     release.release()
-                if pending is not None:
-                    client.receive(pending)
-                    assert pending["result"] == {
-                        "content": [{"type": "text", "text": "zod: ready\n"}],
-                        "isError": False,
-                    }, pending
+                # The writer reports the failure once its held write returns.
+                client.await_recording_disabled()
                 client.expect("zod: after overflow\n", r="echo after overflow")
                 _, diagnostics = client.finish_with_standard_error()
                 assert diagnostics == (
                     "mcp-console: transcript recording disabled: "
-                    "protocol capture backlog exceeded (1024 events or 8388608 bytes)\n"
+                    "recording writer made no progress for 5 seconds\n"
                 ), diagnostics
                 if large_frames:
                     (recording,) = (root / ".agents/console/sessions").iterdir()
@@ -236,12 +246,16 @@ def test_protocol_writer_does_not_hold_frame_reception(binary: Path) -> Transcri
                 environment,
                 root,
                 response_timeout=5,
+                # The stalled writer cannot record a delivery.
+                recording_receipts=False,
             ) as client:
                 try:
                     client.initialize_and_list_tools()
                     observed.wait("protocol journal writer stalled", client=client)
-                    pending = client.start_send(session="default")
-                    client.notify("notifications/cancelled", requestId=pending["id"])
+                    # The stalled writer holds neither this reply nor the
+                    # reception of the frames that follow it.
+                    client.expect("\n[idle]", session="default")
+                    client.notify("notifications/cancelled", requestId=1_000_000)
                     assert client.request("ping")["result"] == {}
                     client.stdin.close()
                 finally:
@@ -249,9 +263,8 @@ def test_protocol_writer_does_not_hold_frame_reception(binary: Path) -> Transcri
                 transcript = client.finish()
             (recording,) = (root / ".agents/console/sessions").iterdir()
             events = recording_events(recording)
-            assert [e["request_id"] for e in events if e["event"] == "tool_call"] == [
-                pending["id"]
-            ]
+            assert [e["call_id"] for e in events if e["event"] == "tool_call"] == [1]
+            assert [e["call_id"] for e in events if e["event"] == "tool_result"] == [1]
             received = [
                 e["message"]
                 for e in events

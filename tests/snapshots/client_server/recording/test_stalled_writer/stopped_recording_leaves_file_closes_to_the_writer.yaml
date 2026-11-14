@@ -1,0 +1,22 @@
+---
+!same-as tests/snapshots/client_server/server/test_tools/initializes_and_lists_tools.custom.direct.yaml
+---
+send:
+  r: echo first
+result:
+  content:
+    - type: text
+      text: |
+        zod: first
+  isError: false
+---
+send:
+  r: echo second
+result:
+  content:
+    - type: text
+      text: |
+        zod: second
+  isError: false
+---
+requests after recording stops: answered while a file close is held

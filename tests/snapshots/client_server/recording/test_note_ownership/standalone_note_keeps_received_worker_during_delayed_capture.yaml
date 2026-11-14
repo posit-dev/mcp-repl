@@ -11,26 +11,12 @@ result:
   isError: false
 ---
 send:
-  control: interrupt
-result:
-  content:
-    - type: text
-      text: |-
-
-        [idle]
-  isError: false
----
-send:
   note: The first worker has completed its baseline measurement.
 result:
   content:
     - type: text
       text: "[done]"
   isError: false
----
-input:
-  method: ping
-result: {}
 ---
 send: {}
 result:

@@ -807,6 +807,10 @@ class WindowsConsole(unittest.TestCase):
                 ),
                 os.environ.copy(),
                 root,
+                # An installed command is a launcher, so the server's recording
+                # is not named after this process. The case reads the recording
+                # only after the server exits.
+                recording_receipts=False,
             ) as client:
                 client.initialize_and_list_tools()
                 client.expect("42\n", python="print(42)")

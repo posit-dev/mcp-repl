@@ -103,6 +103,7 @@ def test_waits_with_client(binary: Path) -> list[dict[str, str]]:
         Path(sys.executable),
         ("-u", str(root / "server.py"), "refuse-close", str(root)),
         current_directory=root,
+        recording_receipts=False,
     )
     (root / "server-pid").write_text(str(client.process.pid))
     try:
@@ -135,6 +136,7 @@ def test_waits_with_client(binary: Path) -> list[dict[str, str]]:
         current_directory=root,
         response_timeout=60,
         shutdown_timeout=0.1,
+        recording_receipts=False,
     )
     try:
         with client:
@@ -166,6 +168,7 @@ def test_waits_with_client(binary: Path) -> list[dict[str, str]]:
         ("-u", str(root / "server.py"), "refuse-close", str(root)),
         current_directory=root,
         shutdown_timeout=0.1,
+        recording_receipts=False,
     )
     try:
         with client:
@@ -282,6 +285,8 @@ class McpClientTests(unittest.TestCase):
                 Path(sys.executable),
                 ("-u", "-c", FAKE_SERVER, mode, str(root)),
                 current_directory=root,
+                # The fake server writes no recording.
+                recording_receipts=False,
                 **timeouts,
             )
             try:
@@ -499,13 +504,136 @@ class PortableMcpClientTests(unittest.TestCase):
             )
             assert sys.stdin.read() == ""
             """)
-        with McpClient(Path(sys.executable), ("-u", "-c", source)) as client:
+        with McpClient(
+            Path(sys.executable), ("-u", "-c", source), recording_receipts=False
+        ) as client:
             result = client.send(python="6 * 7")
             self.assertEqual(result["content"][0]["text"], "42")
             transcript, diagnostics = client.finish_with_standard_error()
             self.assertEqual(diagnostics, ("diagnostic" + os.linesep) * 10000)
             self.assertEqual(transcript[0]["send"], {"python": "6 * 7"})
             self.assertEqual(client.process.returncode, 0)
+
+    def test_recording_disabled_wait_requires_the_report(self) -> None:
+        # fmt: python
+        source = code("""
+            import sys
+
+            sys.stdin.readline()
+            sys.stderr.write("mcp-console: transcript recording disabled: no space\\n")
+            sys.stderr.flush()
+            assert sys.stdin.read() == ""
+            """)
+        with McpClient(
+            Path(sys.executable),
+            ("-u", "-c", source),
+            response_timeout=1,
+            recording_receipts=False,
+        ) as client:
+            # Opting out of receipts is not a report that recording stopped.
+            with self.assertRaises(TimeoutError):
+                client.await_recording_disabled()
+            client.notify("notifications/cancelled", requestId=1)
+            client.await_recording_disabled()
+            _, diagnostics = client.finish_with_standard_error()
+            self.assertEqual(
+                diagnostics,
+                "mcp-console: transcript recording disabled: no space" + os.linesep,
+            )
+
+    def test_reply_does_not_wait_for_a_disabled_recording(self) -> None:
+        # fmt: python
+        source = code("""
+            import json
+            import sys
+
+            request = json.loads(sys.stdin.readline())
+            print(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"content": [{"type": "text", "text": "42"}], "isError": False},
+                    }
+                ),
+                flush=True,
+            )
+            sys.stderr.write("mcp-console: transcript recording disabled: no space\\n")
+            sys.stderr.flush()
+            assert sys.stdin.read() == ""
+            """)
+        with McpClient(
+            Path(sys.executable), ("-u", "-c", source), response_timeout=5
+        ) as client:
+            # No journal ever records this delivery; the report ends the wait.
+            result = client.send(python="6 * 7")
+            self.assertEqual(result["content"][0]["text"], "42")
+            self.assertFalse(client.recording_receipts)
+            _, diagnostics = client.finish_with_standard_error()
+            self.assertEqual(
+                diagnostics,
+                "mcp-console: transcript recording disabled: no space" + os.linesep,
+            )
+
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "only Windows holds a file exclusively while copying it into place",
+    )
+    def test_reply_waits_for_a_journal_that_is_being_published(self) -> None:
+        # fmt: python
+        source = code("""
+            import ctypes
+            import json
+            import sys
+            import time
+            from ctypes import wintypes
+            from pathlib import Path
+
+            request = json.loads(sys.stdin.readline())
+            pid = int(request["params"]["arguments"]["python"])
+            journal = Path(f".agents/console/sessions/run-{pid:010}/capture/events.jsonl")
+            journal.parent.mkdir(parents=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            # GENERIC_WRITE, no sharing, CREATE_NEW: the destination of a copy.
+            handle = kernel32.CreateFileW(str(journal), 0x40000000, 0, None, 1, 0x80, None)
+            assert handle != wintypes.HANDLE(-1).value, ctypes.get_last_error()
+            print(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"content": [{"type": "text", "text": "42"}], "isError": False},
+                    }
+                ),
+                flush=True,
+            )
+            # The client cannot report a refused open. Keep the journal held
+            # long enough for the client's path discovery to meet it.
+            time.sleep(0.5)
+            assert kernel32.CloseHandle(handle)
+            with journal.open("a") as stream:
+                stream.write(json.dumps({"event": "delivery", "request_id": request["id"]}) + "\\n")
+            assert sys.stdin.read() == ""
+            """)
+        with McpClient(
+            Path(sys.executable), ("-u", "-c", source), response_timeout=5
+        ) as client:
+            # The server's process ID names its recording directory.
+            pending = client.start_send(python=str(client.process.pid))
+            client.receive(pending)
+            self.assertEqual(pending["result"]["content"][0]["text"], "42")
+            client.finish()
 
     def test_partial_pipe_response_has_a_bounded_diagnostic_timeout(self) -> None:
         # fmt: python
@@ -770,6 +898,42 @@ class MarkerTests(unittest.TestCase):
                             )
                     finally:
                         events.cancel()
+
+    def test_marker_wait_watches_a_directory_created_during_subscription(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, Events() as events:
+            marker = Path(directory) / "late" / "ready"
+            subscribe = events.watch_file
+            arrived = Event()
+
+            def create_then_subscribe(path: Path) -> None:
+                # The directory appears after its ancestor was chosen and
+                # before that ancestor can report the creation.
+                marker.parent.mkdir(exist_ok=True)
+                subscribe(path)
+
+            def discover() -> Path | None:
+                found = marker if marker.exists() else None
+                arrived.set()
+                return found
+
+            with (
+                patch.object(events, "watch_file", create_then_subscribe),
+                ThreadPoolExecutor(max_workers=1) as executor,
+            ):
+                pending = executor.submit(
+                    wait_for_checkpoint,
+                    discover,
+                    "late directory",
+                    root=marker.parent,
+                    events=events,
+                    timeout=2,
+                )
+                try:
+                    self.assertTrue(arrived.wait(1))
+                    marker.touch()
+                    self.assertEqual(pending.result(timeout=1), marker)
+                finally:
+                    events.cancel()
 
     def test_exact_generation_path_and_missing_marker_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

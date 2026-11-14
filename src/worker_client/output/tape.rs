@@ -141,7 +141,7 @@ impl OutputTape {
         state.seal(true);
         if let Some(output) = state.cell_output.take() {
             let record = output.record();
-            state.recording_notice(output.finish());
+            output.finish();
             record.publish();
         }
         state.cell_active = false;
@@ -181,7 +181,7 @@ impl OutputTape {
         state.seal(true);
         if let Some(output) = state.cell_output.take() {
             let record = output.record();
-            state.recording_notice(output.finish());
+            output.finish();
             record.publish();
         }
         state.cell_active = false;
@@ -329,8 +329,11 @@ impl OutputTape {
         state.drain(cut)
     }
 
-    pub(in crate::worker_client) fn preview(&self) -> Vec<Content> {
-        self.snapshot().preview()
+    pub(in crate::worker_client) fn preview(
+        &self,
+        writer: crate::transcript::WriterState,
+    ) -> Vec<Content> {
+        self.snapshot().preview(writer)
     }
 
     pub(in crate::worker_client) fn snapshot(&self) -> Response {
@@ -550,16 +553,14 @@ impl DirectOutput {
 impl OutputTapeState {
     fn finish_cell_output(&mut self, completion_confirmed: bool) -> OutputCut {
         let cut = self.seal(true);
-        let notice = self.cell_output.take().and_then(|output| output.finish());
+        if let Some(output) = self.cell_output.take() {
+            output.finish();
+        }
         self.cell_active = false;
         self.owner = self.session_recording.as_ref().and_then(|transcript| {
             transcript.end_cell(completion_confirmed);
             transcript.owner()
         });
-        if notice.is_some() {
-            self.recording_notice(notice);
-            return self.seal(false);
-        }
         cut
     }
 
@@ -567,7 +568,7 @@ impl OutputTapeState {
         self.idle_recording_attempted = false;
         if let Some(output) = self.session_output.take() {
             let record = output.record();
-            self.recording_notice(output.finish());
+            output.finish();
             record.publish();
         }
     }
@@ -597,7 +598,7 @@ impl OutputTapeState {
             }
         }
         self.current_output()
-            .and_then(|output| output.append(bytes).1)
+            .and_then(|output| output.append(bytes))
     }
 
     fn current_output(&mut self) -> Option<&mut crate::transcript::CellOutput> {
@@ -672,8 +673,6 @@ impl OutputTapeState {
             self.flush_decoders();
         }
         self.flush_terminal();
-        let notice = self.current_output().and_then(|output| output.flush());
-        self.recording_notice(notice);
         let raw_bytes = self.raw_bytes;
         let source = match self.current_output() {
             Some(output) => Source {

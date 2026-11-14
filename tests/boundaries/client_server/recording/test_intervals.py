@@ -191,6 +191,34 @@ def test_raw_image_limit_preserves_inline_output_and_resets_at_cell_boundary(
 
 @requires(POSIX)
 @executions(DIRECT, SANDBOXED)
+def test_retains_one_image_at_the_raw_image_limit(
+    binary: Path, execution: Execution
+) -> Transcript:
+    worker = Path(__file__).resolve().parents[3] / "fixtures/zod"
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory)
+        with McpClient(
+            binary,
+            execution.serve("--worker", str(worker)),
+            current_directory=workspace,
+        ) as client:
+            client.initialize_and_list_tools()
+            # One image may use the whole interval budget. Recording it must
+            # leave room for the events that complete its cell.
+            result = client.send(r="emit largest retained image")
+            assert not result["isError"], result
+            (recording,) = (workspace / ".agents/console/sessions").iterdir()
+            transcript = client.finish()
+        capture = events(recording)
+        (artifact,) = [e for e in capture if e["event"] == "image_retained"]
+        assert (recording / artifact["path"]).stat().st_size == 64 * 1024 * 1024
+        assert not [e for e in capture if e["event"] == "image_omitted"]
+        assert capture[-1]["event"] == "recording_ended"
+        return normalize_recording(transcript, workspace)
+
+
+@requires(POSIX)
+@executions(DIRECT, SANDBOXED)
 def test_cell_intervals_and_empty_cells(
     binary: Path, execution: Execution
 ) -> Transcript:

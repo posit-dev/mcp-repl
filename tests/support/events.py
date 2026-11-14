@@ -13,6 +13,7 @@ class Events:
     def __init__(self) -> None:
         self.files: dict[Path, int] = {}
         self.processes: dict[int, int] = {}
+        self.readable: list[int] = []
         self.native = sys.platform in {"darwin", "linux"}
         self.cancelled = False
         self.closed = False
@@ -82,18 +83,40 @@ class Events:
 
     def watch_tree(self, root: Path, *, recursive: bool) -> None:
         """Subscribe before discovery, including newly created directories."""
-        ancestor = root
-        while not ancestor.exists():
-            ancestor = ancestor.parent
-        self.watch_file(ancestor)
-        if recursive and root.exists():
-            for directory in root.rglob("*"):
-                if directory.is_dir():
-                    try:
-                        self.watch_file(directory)
-                    except FileNotFoundError:
-                        # A worker may retire a temporary directory during discovery.
-                        continue
+        # A path created while its parent was being subscribed reported no
+        # change, so repeat discovery until a pass finds nothing new to watch.
+        while True:
+            watched = len(self.files)
+            ancestor = root
+            while not ancestor.exists():
+                ancestor = ancestor.parent
+            self.watch_file(ancestor)
+            if recursive and root.exists():
+                for directory in root.rglob("*"):
+                    if directory.is_dir():
+                        try:
+                            self.watch_file(directory)
+                        except FileNotFoundError:
+                            # A worker may retire a temporary directory during discovery.
+                            continue
+            if len(self.files) == watched:
+                return
+
+    def watch_readable(self, descriptor: int) -> None:
+        """Report readable input as a change until the caller consumes it."""
+        if sys.platform == "darwin":
+            self.queue.control(
+                [
+                    select.kevent(
+                        descriptor,
+                        filter=select.KQ_FILTER_READ,
+                        flags=select.KQ_EV_ADD,
+                    )
+                ],
+                0,
+                0,
+            )
+        self.readable.append(descriptor)
 
     def watch_process(self, pid: int) -> None:
         assert self.native
@@ -127,16 +150,25 @@ class Events:
             return {-1}
         if sys.platform == "darwin":
             events = self.queue.control(
-                None, 1 + len(self.files) + len(self.processes), timeout
+                None,
+                1 + len(self.files) + len(self.processes) + len(self.readable),
+                timeout,
             )
-            if any(event.filter == select.KQ_FILTER_READ for event in events):
+            if any(
+                event.filter == select.KQ_FILTER_READ
+                and event.ident == self.cancel_reader.fileno()
+                for event in events
+            ):
                 raise CancelledError("checkpoint wait cancelled")
             return {
                 event.ident if event.filter == select.KQ_FILTER_PROC else -1
                 for event in events
             }
         ready, _, _ = select.select(
-            [self.cancel_reader, self.fd, *self.processes.values()], [], [], timeout
+            [self.cancel_reader, self.fd, *self.readable, *self.processes.values()],
+            [],
+            [],
+            timeout,
         )
         if self.cancel_reader in ready:
             raise CancelledError("checkpoint wait cancelled")
@@ -147,6 +179,8 @@ class Events:
             os.close(self.processes.pop(pid))
         if self.fd in ready:
             os.read(self.fd, 64 * 1024)
+            result.add(-1)
+        if not set(self.readable).isdisjoint(ready):
             result.add(-1)
         return result
 

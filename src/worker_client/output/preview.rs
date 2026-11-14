@@ -49,6 +49,8 @@ pub(super) struct Preview {
     omitted_artifacts: Location,
     omitted_controls: u64,
     omitted_control_bytes: u64,
+    /// The outcome of the reply's bounded wait for the recording writer.
+    writer: crate::transcript::WriterState,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +72,93 @@ impl Preview {
             }
         }
         preview
+    }
+
+    /// Whether the bounded rendering carries an omission marker that names
+    /// retained files a reader may open. Omitted output that no file retained
+    /// does not count: the recording writer cannot change what its marker
+    /// says. `phase` is the phase notice the reply will add, with whether it
+    /// joins the cell clock.
+    pub(super) fn cites_recording(&self, phase: Option<(&str, bool)>) -> bool {
+        let mut probe = self.inspection_copy();
+        probe.bound();
+        if let Some((phase, cell_clock)) = phase {
+            probe.phase_before_terminal(phase, cell_clock);
+            probe.bound();
+        }
+        probe.omission().cites(&probe.omitted_artifacts)
+    }
+
+    /// The combined accounting of every omitted text interval.
+    fn omission(&self) -> Summary {
+        let mut summary = Summary::default();
+        let mut gap = Gap::default();
+        for part in &self.parts {
+            match part {
+                Part::Gap(omitted) => {
+                    gap.bytes += omitted.bytes;
+                    gap.notices += omitted.notices;
+                }
+                Part::Source(source) => {
+                    if gap.bytes != 0 {
+                        summary.gap.bytes += gap.bytes;
+                        summary.gap.notices += gap.notices;
+                        summary.source(source);
+                    }
+                    gap = Gap::default();
+                }
+                Part::Summary(omitted) => summary.extend(omitted.clone()),
+                _ => {}
+            }
+        }
+        if gap.bytes != 0 {
+            summary.gap.bytes += gap.bytes;
+            summary.gap.notices += gap.notices;
+            summary.source(&Source::default());
+        }
+        summary
+    }
+
+    /// Apply the outcome of the reply's wait for the recording writer: place
+    /// each write failure the writer reported before the first interval of the
+    /// file it truncated, and let the omission marker qualify the files it
+    /// names when the writer is still behind or recording stopped.
+    ///
+    /// The writer hands over each report once. `recoverable` holds the copies
+    /// that return an aggregate reply's sessions when it is not delivered, so
+    /// they receive the same outcome as the reply.
+    pub(super) fn recording_settled<'a>(
+        &'a mut self,
+        writer: crate::transcript::WriterState,
+        recoverable: impl Iterator<Item = &'a mut Preview>,
+    ) {
+        let failures: Vec<_> = self
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Source(Source {
+                    file: Some(file), ..
+                }) => file.take_notice().map(|notice| (file.clone(), notice)),
+                _ => None,
+            })
+            .collect();
+        for preview in recoverable.chain(std::iter::once(self)) {
+            preview.writer = writer;
+            let mut failures: Vec<_> = failures.iter().collect();
+            for part in std::mem::take(&mut preview.parts) {
+                if let Part::Source(Source {
+                    file: Some(file), ..
+                }) = &part
+                    && let Some(index) = failures
+                        .iter()
+                        .position(|(failed, _)| failed.same_file(file))
+                {
+                    let (_, notice) = failures.swap_remove(index);
+                    preview.notice(format!("[{notice}]\n"));
+                }
+                preview.parts.push(part);
+            }
+        }
     }
 
     pub(super) fn phase_before_terminal(&mut self, phase: &str, cell_clock: bool) {
@@ -493,8 +582,13 @@ impl Preview {
     }
 
     /// Inspect the same bounded rendering without publishing receipts or
-    /// accounting omissions as if a client had received the output.
-    pub(super) fn render_preview(&mut self) -> Vec<Content> {
+    /// accounting omissions as if a client had received the output. `writer`
+    /// is what the recording already knows; see `Transcript::writer_state`.
+    pub(super) fn render_preview(
+        &mut self,
+        writer: crate::transcript::WriterState,
+    ) -> Vec<Content> {
+        self.writer = writer;
         self.bound();
         self.project(ProjectionMode::Inspect)
             .content
@@ -550,37 +644,14 @@ impl Preview {
         }
         // Recompute after each trim. Sizing and delivery use exactly the same
         // combined notice, without retaining a list of omitted source paths.
-        let mut summary = Summary::default();
-        let mut gap = Gap::default();
-        for part in &self.parts {
-            match part {
-                Part::Gap(omitted) => {
-                    gap.bytes += omitted.bytes;
-                    gap.notices += omitted.notices;
-                }
-                Part::Source(source) => {
-                    if gap.bytes != 0 {
-                        summary.gap.bytes += gap.bytes;
-                        summary.gap.notices += gap.notices;
-                        summary.source(source);
-                    }
-                    gap = Gap::default();
-                }
-                Part::Summary(omitted) => summary.extend(omitted.clone()),
-                _ => {}
-            }
-        }
-        if gap.bytes != 0 {
-            summary.gap.bytes += gap.bytes;
-            summary.gap.notices += gap.notices;
-            summary.source(&Source::default());
-        }
+        let mut summary = self.omission();
         let mut marker = (summary.gap.bytes != 0 || self.omitted_images != 0).then(|| {
             summary.notice(
                 self.omitted_images,
                 self.omitted_image_bytes,
                 self.recorded_omitted_images,
                 &self.omitted_artifacts,
+                self.writer,
             )
         });
         // A combined omission can span cells or workers. Preserve one owner only

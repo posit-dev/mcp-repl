@@ -127,8 +127,8 @@ def test_eof_preserves_first_send_response(
             profile.pause_results(True)
             try:
                 waiting = client.start_send(r="1", python="1")
-                # Hold the accepted result before it enters the response queue.
-                # Writing stdin alone does not establish acceptance before EOF.
+                # Hold the write of the accepted reply. Writing stdin alone
+                # does not establish acceptance before EOF.
                 reached.wait("first send owns response delivery", timeout=30)
                 client.stdin.close()
             finally:

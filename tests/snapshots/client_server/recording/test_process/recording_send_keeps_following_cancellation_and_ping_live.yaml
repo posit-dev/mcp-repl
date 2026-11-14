@@ -20,10 +20,6 @@ result:
         [idle]
   isError: false
 ---
-input:
-  method: ping
-result: {}
----
 send:
   r: echo cancelled cell must not run
 id: <cancelled request 1>

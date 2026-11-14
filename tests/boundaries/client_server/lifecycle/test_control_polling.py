@@ -10,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from support.progress import elapsed_progress, without_elapsed, without_elapsed_result
 from support.assertions import last_tool_text
-from support.allocations import AllocationProfile
 from support.checkpoints import FifoCheckpoint, wait_for_worker_file
 from support.client import McpClient
 from support.execution import DIRECT, SANDBOXED, Execution, executions
@@ -100,8 +99,6 @@ def test_interrupt_preserves_completed_response_delivery(
             grace_release,
             write_reached,
             write_release,
-            result_reached,
-            result_release,
         ) = [
             resources.enter_context(closing(FifoCheckpoint.create(root / name)))
             for name in (
@@ -109,24 +106,18 @@ def test_interrupt_preserves_completed_response_delivery(
                 "grace-release",
                 "write-reached",
                 "write-release",
-                "result-reached",
-                "result-release",
             )
         ]
-        profile = resources.enter_context(closing(AllocationProfile(root)))
         environment = {
             **os.environ,
-            **profile.environment,
             "MCP_CONSOLE_TEST_INTERRUPT_GRACE_REACHED": str(grace_reached.path),
             "MCP_CONSOLE_TEST_INTERRUPT_GRACE_RELEASE": str(grace_release.path),
             "MCP_CONSOLE_TEST_RESPONSE_WRITE_REACHED": str(write_reached.path),
             "MCP_CONSOLE_TEST_RESPONSE_WRITE_RELEASE": str(write_release.path),
             "MCP_CONSOLE_TEST_RESPONSE_WRITE_MATCH": "before shutdown",
             "MCP_CONSOLE_TEST_RESPONSE_WRITE_COMPLETE": "1",
-            "MCP_CONSOLE_TEST_RESULT_REACHED": str(result_reached.path),
-            "MCP_CONSOLE_TEST_RESULT_RELEASE": str(result_release.path),
         }
-        environment[LOADER_VARIABLE] += ":" + ":".join(
+        environment[LOADER_VARIABLE] = ":".join(
             str(build_interposer(root, name))
             for name in ("response_write_interposer", "interrupt_grace_checkpoint")
         )
@@ -157,23 +148,22 @@ def test_interrupt_preserves_completed_response_delivery(
                     write_reached.wait(
                         "original response visible with delivery unsettled"
                     )
+                    # The held write returns only on release, so the recording
+                    # cannot yet hold this reply's delivery.
+                    client.recording_receipts = False
                     client.receive(waiting)
+                    client.recording_receipts = True
                     content = waiting["result"]["content"]
                     assert content[0] == {"type": "text", "text": "before shutdown\n"}
                     assert content[1]["type"] == "image"
                     assert content[2] == {"type": "text", "text": "after image\n"}
                     assert not waiting["result"]["isError"], waiting
-                    profile.pause_results(True)
                     grace_release.release()
                     # Control must finish observing while the original response
                     # still owns delivery, without waiting for its acknowledgment.
-                    result_reached.wait(
-                        "interrupt assembled without claiming original delivery"
-                    )
+                    client.await_assembled(interrupt)
                 finally:
-                    profile.pause_results(False)
                     grace_release.release()
-                    result_release.release()
                     write_release.release()
                 client.receive(interrupt)
                 assert without_elapsed_result(interrupt["result"]) == {

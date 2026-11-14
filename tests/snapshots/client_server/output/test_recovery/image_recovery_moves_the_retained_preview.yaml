@@ -12,6 +12,12 @@ result:
 ---
 send:
   r: preview allocation image
+result:
+  content:
+    - type: image
+      data: <image byte-identical to 6 MiB of zero bytes>
+      mimeType: image/png
+  isError: false
 id: <cancelled request 1>
 ---
 input:

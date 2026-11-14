@@ -660,7 +660,7 @@ def test_cancelled_mcp_control_keeps_recovery_out_of_integrator_result(
             client.transcript.append(
                 {
                     "scenario": "Cancelled MCP control keeps its error separate from an integrator cell.",
-                    "fixture": "The Python cell ignores SIGINT and waits at a FIFO. A native checkpoint holds the MCP result before journaling so cancellation follows result assembly.",
+                    "fixture": "The Python cell ignores SIGINT and waits at a FIFO. A native checkpoint holds the write of the MCP result so cancellation follows result assembly.",
                 }
             )
             client.initialize_and_list_tools()
@@ -720,14 +720,7 @@ def test_cancelled_mcp_control_keeps_recovery_out_of_integrator_result(
                             control="interrupt", python="sentinel = 99"
                         )
                         interrupted.append(request)
-                        result_reached.wait(
-                            "MCP interrupt result owns delivery", client=client
-                        )
-                        client.notify(
-                            "notifications/cancelled", requestId=request["id"]
-                        )
-                        assert client.request("ping")["result"] == {}
-                        result_release.release()
+                        cancel_result(client, request, result_reached, result_release)
                     profile.pause_results(False)
                     preview = inspector.request(op="preview")
                     release.release()
@@ -752,9 +745,6 @@ def test_cancelled_mcp_control_keeps_recovery_out_of_integrator_result(
                         ],
                         "isError": True,
                     }, recovered
-                    assert all("result" not in request for request in interrupted), (
-                        interrupted
-                    )
                     client.expect("\n[idle]")
                     client.expect("0\n", python="print(sentinel)")
                     transcript = normalize_recording(client.finish(), root)

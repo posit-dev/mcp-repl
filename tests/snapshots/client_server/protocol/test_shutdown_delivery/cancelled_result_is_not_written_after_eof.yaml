@@ -11,7 +11,7 @@ result:
   isError: false
 ---
 send:
-  r: echo held response
+  r: complete after release
 id: <cancelled request 1>
 ---
 input:

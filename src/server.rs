@@ -307,7 +307,8 @@ impl ConsoleServer {
                     &request.transcript,
                     &self.deliveries,
                     &delivery,
-                ));
+                )
+                .await);
             }
         };
         let runtime = startup.runtime();
@@ -326,7 +327,8 @@ impl ConsoleServer {
                         &runtime.transcript,
                         &self.deliveries,
                         &delivery,
-                    ));
+                    )
+                    .await);
                 }
                 Err(_) => {
                     let response = runtime.worker.starting_response();
@@ -336,7 +338,8 @@ impl ConsoleServer {
                         &runtime.transcript,
                         &self.deliveries,
                         &delivery,
-                    ));
+                    )
+                    .await);
                 }
             }
             if let Some(response) = runtime.worker.take_prelaunch_failure()? {
@@ -346,7 +349,8 @@ impl ConsoleServer {
                     &runtime.transcript,
                     &self.deliveries,
                     &delivery,
-                ));
+                )
+                .await);
             }
             let snapshot = runtime.worker.inspect_requirements();
             let json = serde_json::to_string_pretty(&snapshot).expect("requirements JSON");
@@ -375,7 +379,8 @@ impl ConsoleServer {
             &runtime.transcript,
             &self.deliveries,
             &delivery,
-        ))
+        )
+        .await)
     }
 }
 
@@ -438,17 +443,36 @@ impl ConsoleServer {
             &self.startup.runtime().transcript,
             &self.deliveries,
             delivery,
-        ))
+        )
+        .await)
     }
 }
 
-fn response_to_tool_result(
+async fn response_to_tool_result(
     response: crate::worker_client::Response,
     call: &crate::transcript::Call,
     transcript: &crate::transcript::Transcript,
     deliveries: &crate::server_transport::ResponseDeliveries,
     delivery: &crate::server_transport::ResponseDeliveryCall,
 ) -> CallToolResult {
+    aggregate_to_tool_result(response, Vec::new(), call, transcript, deliveries, delivery).await
+}
+
+/// `sessions` are an aggregate reply's sessions. They stay here, unregistered,
+/// through the wait for the recording writer: a call cancelled during that
+/// wait drops them, which returns each session's copy to its session.
+async fn aggregate_to_tool_result(
+    mut response: crate::worker_client::Response,
+    mut sessions: Vec<crate::worker_client::ResponseDelivery>,
+    call: &crate::transcript::Call,
+    transcript: &crate::transcript::Transcript,
+    deliveries: &crate::server_transport::ResponseDeliveries,
+    delivery: &crate::server_transport::ResponseDeliveryCall,
+) -> CallToolResult {
+    response.settle_recording(transcript, &mut sessions).await;
+    for session in sessions {
+        deliveries.register(delivery, session);
+    }
     let (blocks, is_error, response_delivery, parts) = response.into_parts();
     if let Some(response_delivery) = response_delivery {
         deliveries.register(delivery, response_delivery);
@@ -479,7 +503,7 @@ fn response_to_tool_result(
     }
 }
 
-fn responses_to_tool_result(
+async fn responses_to_tool_result(
     mut responses: Vec<(String, &'static str, crate::worker_client::Response)>,
     call: &crate::transcript::Call,
     transcript: &crate::transcript::Transcript,
@@ -488,17 +512,16 @@ fn responses_to_tool_result(
 ) -> CallToolResult {
     if responses.len() == 1 {
         let (_, _, response) = responses.pop().expect("one visible session");
-        return response_to_tool_result(response, call, transcript, deliveries, delivery);
+        return response_to_tool_result(response, call, transcript, deliveries, delivery).await;
     }
     // Poll output belongs in content. Status-only structured content can hide
     // text, language errors, and images in hosts that prefer structured results.
     let mut combined = crate::worker_client::Response::default();
+    let mut sessions = Vec::new();
     for (name, status, response) in responses {
-        if let Some(acknowledgment) = combined.append_session(&name, status, response) {
-            deliveries.register(delivery, acknowledgment);
-        }
+        sessions.extend(combined.append_session(&name, status, response));
     }
-    response_to_tool_result(combined, call, transcript, deliveries, delivery)
+    aggregate_to_tool_result(combined, sessions, call, transcript, deliveries, delivery).await
 }
 
 /// Console's identity in legacy handshakes and modern result metadata.
@@ -580,7 +603,7 @@ impl ServerHandler for ConsoleServer {
             .extensions
             .remove::<crate::server_transport::RecordingCall>()
             .expect("send carries its recording call");
-        let call = recording.clone().recorded().await;
+        let call = recording.call();
         let session = request
             .arguments
             .as_ref()
@@ -622,18 +645,9 @@ impl ServerHandler for ConsoleServer {
         let (delivery, operation) = match admitted {
             Ok(admitted) => admitted,
             Err(error) => {
-                let recorder = transcript.clone();
-                let recorded_error = error.clone();
-                let completion = recording.clone();
-                if let Err(error) = tokio::task::spawn_blocking(move || {
-                    let _completion = completion;
-                    recorder.finish(call, &Err(recorded_error));
-                })
-                .await
-                {
-                    transcript.disable(format!("transcript task failed: {error}"));
-                }
-                return recording.response(Err(error));
+                let result = Err(error);
+                transcript.finish(call, &result);
+                return recording.response(result);
             }
         };
         let sandbox::CaptureResult(inherited) = context
@@ -700,6 +714,7 @@ impl ServerHandler for ConsoleServer {
                 &self.deliveries,
                 &delivery,
             )
+            .await
             .into()),
             result => result,
         };
@@ -722,20 +737,7 @@ impl ServerHandler for ConsoleServer {
         {
             result.meta.get_or_insert_default().extend(metadata);
         }
-        let result = Arc::new(result);
-        let recorder = transcript.clone();
-        let recording_result = Arc::clone(&result);
-        let completion = recording.clone();
-        if let Err(error) = tokio::task::spawn_blocking(move || {
-            let _completion = completion;
-            recorder.finish(call, recording_result.as_ref());
-        })
-        .await
-        {
-            transcript.disable(format!("transcript task failed: {error}"));
-        }
-        let result =
-            Arc::into_inner(result).expect("transcript task should release the tool result");
+        transcript.finish(call, &result);
         operation.complete();
         recording.response(result)
     }

@@ -135,6 +135,45 @@ def test_does_not_offer_logs_after_recording_failures(
 
 @requires(POSIX)
 @executions(DIRECT, SANDBOXED)
+def test_qualifies_retained_files_after_recording_stops(
+    binary: Path, execution: Execution
+) -> Transcript:
+    worker = Path(__file__).resolve().parents[3] / "fixtures/zod"
+    with McpClient(binary, execution.serve("--worker", str(worker))) as client:
+        client.initialize_and_list_tools()
+        client.expect("zod: ready\n", r="echo ready")
+        assert client.temporary_directory is not None
+        sessions = Path(client.temporary_directory.name) / ".agents/console/sessions"
+        session = next(sessions.iterdir())
+        # The recording writer cannot create the omitted image's file. Its
+        # failure stops recording after this cell's receipts were issued.
+        image = session / "capture/sessions/001/cell-002-001.png"
+        image.mkdir()
+        client.send(r="preview image limit")
+        text = "".join(
+            block["text"]
+            for block in client.transcript[-1]["result"]["content"]
+            if block["type"] == "text"
+        )
+        (marker,) = [
+            line for line in text.splitlines() if line.startswith("[output omitted: ")
+        ]
+        assert marker.endswith(
+            "; recording stopped; retained files may be missing or incomplete]"
+        ), marker
+        assert image.name in marker, marker
+        _, stderr = client.finish_with_standard_error()
+        assert stderr.count("transcript recording disabled:") == 1, stderr
+    return [
+        {
+            "omitted_image_path_named": True,
+            "stopped_recording_qualifies_retained_files": True,
+        }
+    ]
+
+
+@requires(POSIX)
+@executions(DIRECT, SANDBOXED)
 def test_starts_notice_on_new_line_after_polled_partial_line(
     binary: Path, execution: Execution
 ) -> Transcript:

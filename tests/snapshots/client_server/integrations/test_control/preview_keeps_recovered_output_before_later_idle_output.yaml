@@ -42,6 +42,15 @@ result:
 send:
   r: print(42)
   timeout_ms: 10
+result:
+  content:
+    - type: text
+      text: |-
+        early idle
+
+        [elapsed: <elapsed>s since admission; no new output]
+        [running; poll with an empty send]
+  isError: false
 id: <cancelled request 1>
 ---
 input:

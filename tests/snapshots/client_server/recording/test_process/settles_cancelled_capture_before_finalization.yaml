@@ -1,4 +1,0 @@
----
-!same-as custom MCP initialization for this execution mode
----
-capture: all received calls retained before finalization

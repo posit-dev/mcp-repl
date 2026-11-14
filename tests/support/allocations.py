@@ -8,7 +8,7 @@ from support.native import LOADER_VARIABLE, build_interposer
 
 
 class AllocationProfile:
-    def __init__(self, root: Path, *, thread_marker: str | None = None) -> None:
+    def __init__(self, root: Path, *, thread: str | None = None) -> None:
         path = root / "allocations"
         path.write_bytes(bytes(32))
         with path.open("r+b") as stream:
@@ -17,10 +17,9 @@ class AllocationProfile:
             LOADER_VARIABLE: str(build_interposer(root, "preview_allocations")),
             "MCP_CONSOLE_TEST_ALLOCATION_PROFILE": str(path),
         }
-        if thread_marker is not None:
-            self.environment["MCP_CONSOLE_TEST_ALLOCATION_THREAD_MARKER"] = (
-                thread_marker
-            )
+        if thread is not None:
+            # Count only the server thread of this name.
+            self.environment["MCP_CONSOLE_TEST_ALLOCATION_THREAD"] = thread
 
     def start(self) -> None:
         struct.pack_into("=QQ", self.mapping, 8, 0, 0)

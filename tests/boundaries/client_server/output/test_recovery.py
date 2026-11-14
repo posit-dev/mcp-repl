@@ -4,7 +4,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
@@ -14,7 +14,12 @@ from boundaries.client_server._harness import expose_idle_sideband_output
 from support.progress import elapsed_progress, phase_progress, without_elapsed
 from support.allocations import AllocationProfile
 from support.assertions import last_tool_text
-from support.checkpoints import FifoCheckpoint, wait_for_path
+from support.checkpoints import (
+    FifoCheckpoint,
+    release_fixture_checkpoint,
+    wait_for_path,
+    wait_for_worker_file,
+)
 from support.client import McpClient
 from support.execution import DIRECT
 from support.previews import (
@@ -29,6 +34,8 @@ from support.previews import (
 from support.records import Transcript
 from support.requirements import NATIVE_FIXTURES, requires
 from support.suites import run_this_suite
+
+PENDING_TEXT_BUDGET = 8 * 1024 * 1024
 
 
 @requires(NATIVE_FIXTURES)
@@ -72,16 +79,16 @@ def cancelled_control_recovery(
             try:
                 for _ in range(count):
                     pending = client.start_send(control="interrupt")
-                    reached.wait("controlled result owns delivery before journaling")
-                    client.notify("notifications/cancelled", requestId=pending["id"])
-                    # Receipt of ping follows cancellation on the same MCP input.
-                    assert client.request("ping")["result"] == {}
-                    release.release()
-                    assert "result" not in pending, pending
+                    cancel_result(client, pending, reached, release)
             finally:
                 profile.pause_results(False)
                 release.release()
-            compact_cancelled_exchanges(client, cancellation_start, count=count)
+            compact_cancelled_exchanges(
+                client,
+                cancellation_start,
+                count=count,
+                reply=lambda index: "\n[idle]" * (index + 1),
+            )
             result = client.send(control="interrupt")
             client.request("ping")
             _, largest = profile.stop()
@@ -109,8 +116,8 @@ def cancelled_control_recovery(
                 for event in live_recording_events(session_directory(client))
                 if event["event"] == "protocol" and event["direction"] == "received"
             ]
-            # Protocol capture must retain the cancellation and ping exchanges
-            # that completed while each result's journal writer was paused.
+            # Protocol capture must retain the cancellation and ping that the
+            # server received while each reply's write was held.
             assert (
                 received[4 : 4 + 3 * count]
                 == [
@@ -178,11 +185,15 @@ def recovered_recorded_cells(
                         if silent
                         else f"preview recovery cell {index}",
                     )
-                    reached.wait("cell result owns delivery before journaling")
-                    client.notify("notifications/cancelled", requestId=pending["id"])
-                    assert client.request("ping")["result"] == {}
-                    release.release()
-                    assert "result" not in pending, pending
+                    cancel_result(client, pending, reached, release)
+                    if not silent:
+                        # Each cancelled reply replays the bounded output that
+                        # earlier cancelled replies did not deliver.
+                        replayed = pending["result"]["content"][0]["text"]
+                        assert len(replayed.encode()) <= 8192
+                        assert "cell 0 head\n" in replayed, replayed[:200]
+                        assert replayed.endswith(f"cell {index} tail\n[done]")
+                        assert replayed.count("[output omitted:") == 1
             finally:
                 profile.pause_results(False)
                 release.release()
@@ -190,6 +201,9 @@ def recovered_recorded_cells(
                 client,
                 cancellation_start,
                 count=count,
+                reply=(lambda index: "\n".join(["[done]"] * (index + 1)))
+                if silent
+                else None,
                 source_template=None if silent else "preview recovery cell {index}",
             )
             result = client.send(control="interrupt")
@@ -261,10 +275,17 @@ def recovered_recorded_cells(
 
 
 def compact_cancelled_exchanges(
-    client: McpClient, start: int, *, count: int, source_template: str | None = None
+    client: McpClient,
+    start: int,
+    *,
+    count: int,
+    reply: Callable[[int], str] | None,
+    source_template: str | None = None,
 ) -> None:
     # Verify every repeated setup exchange before recording one representative.
     # The full response is checked before any lossless repetition notation.
+    # `reply` gives the text of each cancelled reply; a caller passing None has
+    # already checked that text.
     entries = client.transcript[start:]
     assert len(entries) == 3 * count
     for index, (pending, cancelled, ping) in enumerate(
@@ -273,7 +294,17 @@ def compact_cancelled_exchanges(
         expected = dict(entries[0]["send"])
         if source_template is not None:
             expected["r"] = source_template.format(index=index)
-        assert pending == {"id": pending["id"], "send": expected}
+        replayed = pending["result"]["content"][0]["text"]
+        assert pending == {
+            "id": pending["id"],
+            "send": expected,
+            "result": {
+                "content": [{"type": "text", "text": replayed}],
+                "isError": False,
+            },
+        }
+        if reply is not None:
+            assert replayed == reply(index), (index, replayed)
         assert cancelled == {
             "input": {
                 "method": "notifications/cancelled",
@@ -286,6 +317,7 @@ def compact_cancelled_exchanges(
         "repeated_exchange_count": count,
         "exchange_entry_count": 3,
         "request_ids": "distinct in each exchange",
+        "result": "each cancelled reply also replays the output recovered so far",
     }
     if source_template is not None:
         entries[0]["transcript_normalization"]["send.r"] = {
@@ -302,6 +334,7 @@ def recovery_client(
     *,
     recording_directory: Path | None = None,
     block_replacement: bool = False,
+    file_limit: int | None = None,
 ) -> Iterator[tuple[McpClient, AllocationProfile, FifoCheckpoint, FifoCheckpoint]]:
     worker = Path(__file__).resolve().parents[3] / "fixtures/zod"
     with tempfile.TemporaryDirectory() as temporary:
@@ -322,6 +355,11 @@ def recovery_client(
                     "MCP_CONSOLE_TEST_RESULT_RELEASE": str(release.path),
                     "MCP_CONSOLE_TEST_PREVIEW_DIRECTORY": str(root),
                     "TMPDIR": str(root),
+                    **(
+                        {"MCP_CONSOLE_TEST_FILE_LIMIT": str(file_limit)}
+                        if file_limit is not None
+                        else {}
+                    ),
                     **(
                         {
                             "ZOD_STARTUP_CONTROL": str(root / "startup-control"),
@@ -359,11 +397,27 @@ def cancel_result(
     reached: FifoCheckpoint,
     release: FifoCheckpoint,
 ) -> None:
-    reached.wait("result owns delivery before journaling")
+    """Cancel a call once the write of its assembled reply is held."""
+    reached.wait("reply write starts with its result assembled", client=client)
+    cancel_held_result(client, pending, release)
+
+
+def cancel_held_result(
+    client: McpClient, pending: dict, release: FifoCheckpoint
+) -> None:
+    """Cancel a call while the write of its assembled reply is held.
+
+    The held write blocks every later reply, so the recorded receipt of a
+    following ping proves that the server applied the cancellation first. The
+    client then receives the reply it no longer wants.
+    """
     client.notify("notifications/cancelled", requestId=pending["id"])
-    assert client.request("ping")["result"] == {}
+    ping = client.start_request("ping")
+    client.await_received(ping)
     release.release()
-    assert "result" not in pending, pending
+    client.receive(pending)
+    client.receive(ping)
+    assert ping["result"] == {}
 
 
 @requires(NATIVE_FIXTURES)
@@ -510,6 +564,65 @@ def test_cancelled_idle_polls_retain_output_until_delivery(binary: Path) -> Tran
 
 
 @requires(NATIVE_FIXTURES)
+def test_cancelled_aggregate_poll_keeps_a_file_failure_notice(
+    binary: Path,
+) -> Transcript:
+    file_limit = 3 * PENDING_TEXT_BUDGET + 3
+    with recovery_client(binary, file_limit=file_limit) as (
+        client,
+        profile,
+        reached,
+        release,
+    ):
+        pending = client.start_send(r="echo beta output", session="beta")
+        cancel_result(client, pending, reached, release)
+        profile.pause_results(False)
+        client.send(r="overflow cell output file", session="alpha", timeout_ms=0)
+        assert (
+            without_elapsed(last_tool_text(client))
+            == "\n[running; poll with an empty send]"
+        )
+        gate = wait_for_worker_file(
+            reached.path.parent, "zod-release-spooled-output", client
+        )
+        with closing(
+            FifoCheckpoint.attach(gate.with_name("zod-spooled-output-processed"))
+        ) as processed:
+            # The first batch outgrows the file limit before any reply waits
+            # for the writer, so the aggregate poll is the first to report it.
+            release_fixture_checkpoint(gate, client=client)
+            processed.wait(timeout=client.response_timeout)
+            profile.pause_results(True)
+            pending = client.start_send(timeout_ms=0)
+            cancel_result(client, pending, reached, release)
+            profile.pause_results(False)
+            failure = f"stopped after {file_limit} retained bytes"
+            (cancelled,) = pending["result"]["content"]
+            assert failure in cancelled["text"], cancelled["text"]
+            assert "zod: beta output\n" in cancelled["text"], cancelled["text"]
+
+            # Each session's recovered output still reports the failed file.
+            client.send(timeout_ms=0)
+            replayed = last_tool_text(client)
+            assert failure in replayed, replayed
+            assert "zod: beta output\n" in replayed, replayed
+            assert replayed.count("[cell output file ") == 1, replayed
+
+            release_fixture_checkpoint(gate, client=client)
+            processed.wait(timeout=client.response_timeout)
+        client.send(session="alpha")
+        assert "later raw text unavailable" in last_tool_text(client)
+        client.send(session="alpha")
+        assert last_tool_text(client) == "\n[idle]"
+    return [
+        {
+            "cancelled_aggregate_reports_file_failure": True,
+            "recovered_aggregate_reports_file_failure_once": True,
+        }
+    ]
+
+
+@requires(NATIVE_FIXTURES)
 def test_aggregate_poll_keeps_one_text_budget(binary: Path) -> Transcript:
     with recovery_client(binary) as (client, profile, reached, release):
         for number, session in enumerate(("alpha", "beta")):
@@ -630,11 +743,18 @@ def test_image_recovery_moves_the_retained_preview(binary: Path) -> Transcript:
     with recovery_client(binary) as (client, profile, reached, release):
         pending = client.start_send(r="preview allocation image")
         cancel_result(client, pending, reached, release)
-        # Stop at the next result journal write: image ingestion and persistence
-        # have finished, and MCP serialization has not started yet.
+        [cancelled] = pending["result"]["content"]
+        assert cancelled == {
+            "type": "image",
+            "data": "A" * (8 * 1024 * 1024),
+            "mimeType": "image/png",
+        }
+        cancelled["data"] = "<image byte-identical to 6 MiB of zero bytes>"
+        # Stop where the reply's write starts: image ingestion, persistence,
+        # and MCP serialization have finished.
         profile.start()
         recovered = client.start_send(session="default")
-        reached.wait("recovered image owns delivery before journaling")
+        reached.wait("recovered image reply starts its write")
         allocated, _ = profile.stop()
         release.release()
         client.receive(recovered)
@@ -676,9 +796,11 @@ def test_image_recovery_moves_the_retained_preview(binary: Path) -> Transcript:
             ]
             * 2
         ), recorded
-        # One encoded copy is required for MCP; retaining recovery must move the
-        # existing preview. Allow small response, journal, and transport overhead.
-        assert allocated < 9 * 1024 * 1024, allocated
+        # MCP requires one encoded copy and protocol capture takes a second;
+        # retaining recovery must move the existing preview. The frame reuses
+        # the buffer of the cancelled reply. Allow small response, journal, and
+        # transport overhead.
+        assert allocated < 17 * 1024 * 1024, allocated
         result["content"][0]["data"] = "<image byte-identical to 6 MiB of zero bytes>"
         profile.pause_results(False)
         client.send(session="default")
@@ -712,7 +834,7 @@ def test_phase_projection_copies_retained_image_once(binary: Path) -> Transcript
         profile.pause_results(True)
         profile.start()
         pending = client.start_send(session="default", timeout_ms=0)
-        reached.wait("phase-bearing image result owns delivery before journaling")
+        reached.wait("phase-bearing image reply starts its write")
         allocated, _ = profile.stop()
         profile.pause_results(False)
         release.release()
@@ -725,8 +847,10 @@ def test_phase_projection_copies_retained_image_once(binary: Path) -> Transcript
         }
         assert phase_progress(progress["text"]) == "replacement"
         assert progress["text"].endswith("\n[worker starting]")
-        # MCP requires one encoded copy; the phase overlay must not add another.
-        assert allocated < 9 * 1024 * 1024, allocated
+        # MCP requires one encoded copy and protocol capture takes a second.
+        # This first large reply also allocates its frame (8 MiB, then doubled)
+        # and a 2 MiB stdout chunk. The phase overlay must not add another copy.
+        assert allocated < 45 * 1024 * 1024, allocated
         image["data"] = "<image byte-identical to 6 MiB of zero bytes>"
         (root / "startup-release").touch()
         client.send(session="default")
@@ -943,7 +1067,17 @@ def recovered_image_omissions(
             pending = client.start_send(control="interrupt", r="preview rejected image")
             cancel_result(client, pending, reached, release)
         if count > 1:
-            compact_cancelled_exchanges(client, start, count=count - 1)
+            compact_cancelled_exchanges(
+                client,
+                start,
+                count=count - 1,
+                reply=lambda index: (
+                    f"\n[output omitted: {index + 2} images "
+                    f"({4 * (index + 2)} encoded bytes); "
+                    f"{index + 2} images not retained]\n\n"
+                    + "\n".join(["[done]"] * (index + 1))
+                ),
+            )
         profile.pause_results(False)
         # Measure recovery after image parsing and admission have completed.
         profile.start()

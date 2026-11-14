@@ -1,0 +1,6 @@
+---
+!same-as tests/snapshots/client_server/server/test_tools/initializes_and_lists_tools.custom.direct.yaml
+---
+subscription while the writer is stalled: raw log path and stalled writer named
+subscription after the writer catches up: >-
+  replaced without new output; raw log path only

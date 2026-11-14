@@ -174,14 +174,17 @@ Logical names, generation IDs, and recording worker numbers have different purpo
 Output, images, notes, source associations, and requirement metadata retain their original worker owner through replacement and delayed publication.
 A source admission is not evidence that the worker entered the cell.
 
-The bounded capture queue keeps journal I/O off worker dispatch and retirement.
-Raw file handles have separate ownership from journal state.
+The bounded capture queue carries every recording operation, including output-file bytes and images, to one writer thread.
+Worker dispatch, retirement, handlers, and replies queue operations and do not perform recording I/O.
+Four waits on the writer remain, each bounded at 5 seconds: creating an output file, pacing a producer of output text or images behind a large backlog, pacing request intake behind queued request operations, and assembling a reply whose omission notice names retained files.
+Output pacing blocks the producer's thread, which can hold the session's output state, and intake pacing delays every later request, including cancellation, so both continue only while the writer makes progress.
 Markdown and QMD are projections; neither is an interpreter checkpoint.
 Reported capture failures disable recording without stopping computation; projection failures can leave the journal and raw files usable.
-The [recording reference](RECORDING_REFERENCE.md) owns retention limits and file layout.
+The [recording reference](RECORDING_REFERENCE.md#recording-failures) owns retention limits, file layout, and the visible effects of a slow writer.
 
-Finalization waits for capture and result writers after worker retirement and transport settlement.
-An indefinitely blocked filesystem operation can therefore keep the process alive; fail-open error handling cannot cancel that OS operation.
+Finalization waits for the writer after worker retirement and transport settlement.
+The integrator's `recording` request also waits for the writer so that its reply covers the request.
+Neither wait is bounded: an indefinitely blocked filesystem operation can keep the process alive at shutdown because fail-open error handling cannot cancel that OS operation ([RT-6](TODO.md)).
 Local capture algorithms and identity rules belong in [transcript.rs](../src/transcript.rs) and its modules.
 
 ## Policy extensions and compatibility

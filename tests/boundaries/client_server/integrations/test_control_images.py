@@ -25,7 +25,7 @@ from support.execution import DIRECT, SANDBOXED, Execution, executions
 from support.normalization import code, normalize_recording
 from support.native import LOADER_VARIABLE, build_interposer
 from support.previews import OMISSION, assert_preview, recording_events
-from support.records import TranscriptWithCompanions
+from support.records import Transcript, TranscriptWithCompanions
 from support.requirements import NATIVE_FIXTURES, POSIX, R, requires
 from support.suites import run_this_suite
 
@@ -135,7 +135,11 @@ def test_previews_images_without_consuming_or_reaccounting(
                     public_image = base64.b64decode(content[0]["data"], validate=True)
                     public_encoded = content[0]["data"]
                     release.release()
+                    # The held write returns only on release, so the recording
+                    # cannot yet hold this reply's delivery.
+                    client.recording_receipts = False
                     client.receive(pending)
+                    client.recording_receipts = True
                     ack_reached.wait(
                         "complete MCP response written before acknowledgment"
                     )
@@ -229,6 +233,97 @@ def test_previews_images_without_consuming_or_reaccounting(
             finally:
                 release.release()
                 ack_release.release()
+
+
+@requires(POSIX, R)
+@executions(DIRECT, SANDBOXED)
+def test_preview_qualifies_retained_files_after_recording_stops(
+    binary: Path, execution: Execution
+) -> Transcript:
+    with tempfile.TemporaryDirectory(
+        dir="/tmp", prefix="console-control-stopped-"
+    ) as directory:
+        root = Path(directory)
+        endpoint = root / "control.sock"
+        arguments = ["--control-socket", str(endpoint)]
+        if execution == SANDBOXED:
+            arguments += ["--writable-root", str(root)]
+        with (
+            closing(FifoCheckpoint.create(root / "entered")) as entered,
+            closing(FifoCheckpoint.create(root / "release")) as release,
+            McpClient(
+                binary, execution.serve(*arguments), current_directory=root
+            ) as client,
+        ):
+            client.initialize_and_list_tools()
+            client.expect(r="invisible(NULL)")
+            (recording,) = (root / ".agents/console/sessions").iterdir()
+            # The recording writer cannot create the plot's file. Its failure
+            # stops recording after the cell's text file was named.
+            (recording / "capture/sessions/001/cell-002-001.png").mkdir()
+            # fmt: r
+            source = code(f"""
+                cat(strrep("x", 24000), "\\n", sep = "")
+                plot(1:3)
+                invisible(grDevices::dev.off())
+                gate <- fifo(
+                  {
+                    json.dumps(str(entered.path))
+                  },
+                  "wb",
+                  blocking = TRUE
+                )
+                writeBin(charToRaw("1"), gate)
+                close(gate)
+                gate <- fifo(
+                  {
+                    json.dumps(str(release.path))
+                  },
+                  "rb",
+                  blocking = TRUE
+                )
+                invisible(readBin(gate, "raw", n = 1))
+                close(gate)
+                """)
+            pending = client.start_send(r=source, timeout_ms=60000)
+            try:
+                entered.wait(client=client)
+                client.await_recording_disabled()
+                stopped = (
+                    "; recording stopped; retained files may be missing or incomplete]"
+                )
+
+                def marker(content: list[dict]) -> str:
+                    text = "".join(
+                        block["text"] for block in content if block["type"] == "text"
+                    )
+                    (line,) = [
+                        line
+                        for line in text.splitlines()
+                        if line.startswith("[output omitted: ")
+                    ]
+                    assert "cell-002.txt" in line, line
+                    return line
+
+                with ControlClient(endpoint) as control:
+                    preview = control.request(op="preview")
+                    assert marker(preview["result"]["content"]).endswith(stopped), (
+                        preview
+                    )
+                release.release()
+                client.receive(pending)
+                assert marker(pending["result"]["content"]).endswith(stopped), pending
+                _, stderr = client.finish_with_standard_error()
+                assert stderr.count("transcript recording disabled:") == 1, stderr
+            finally:
+                release.release()
+    return [
+        {
+            "preview_names_raw_log": True,
+            "preview_qualifies_retained_files_after_recording_stops": True,
+            "reply_carries_the_same_qualifier": True,
+        }
+    ]
 
 
 @requires(POSIX)

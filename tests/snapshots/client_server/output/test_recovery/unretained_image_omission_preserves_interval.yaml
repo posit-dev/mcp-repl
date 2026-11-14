@@ -12,6 +12,13 @@ result:
 ---
 send:
   r: preview rejected image
+result:
+  content:
+    - type: text
+      text: |
+
+        [output omitted: 1 image (4 encoded bytes); 1 image not retained]
+  isError: false
 id: <cancelled request 1>
 ---
 input:

@@ -2,12 +2,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -46,9 +48,7 @@ static struct profile *profile;
 static pid_t owner;
 static int reached = -1;
 static int release = -1;
-static const char *thread_marker;
-static pthread_t measured_thread;
-static atomic_bool thread_selected;
+static const char *thread_name;
 static const char *dispatcher_exited;
 static const char *dispatcher_armed;
 static pthread_key_t dispatcher;
@@ -77,12 +77,20 @@ __attribute__((constructor)) static void initialize(void) {
     close(descriptor);
     if (mapping == MAP_FAILED) _exit(122);
     profile = mapping;
-    thread_marker = getenv("MCP_CONSOLE_TEST_ALLOCATION_THREAD_MARKER");
+    thread_name = getenv("MCP_CONSOLE_TEST_ALLOCATION_THREAD");
     dispatcher_exited = getenv("MCP_CONSOLE_TEST_DISPATCHER_EXITED");
     dispatcher_armed = getenv("MCP_CONSOLE_TEST_DISPATCHER_ARMED");
     if (dispatcher_exited != NULL &&
         (dispatcher_armed == NULL ||
          pthread_key_create(&dispatcher, notify_dispatcher_exit) != 0)) _exit(127);
+    const char *file_limit = getenv("MCP_CONSOLE_TEST_FILE_LIMIT");
+    if (file_limit != NULL) {
+        // A write past this file size fails with EFBIG instead of raising SIGXFSZ.
+        rlim_t bytes = strtoull(file_limit, NULL, 10);
+        struct rlimit limit = {bytes, bytes};
+        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR ||
+            setrlimit(RLIMIT_FSIZE, &limit) != 0) _exit(129);
+    }
     const char *checkpoint = getenv("MCP_CONSOLE_TEST_RESULT_REACHED");
     if (checkpoint != NULL) {
         reached = open(checkpoint, O_WRONLY);
@@ -93,8 +101,14 @@ __attribute__((constructor)) static void initialize(void) {
 
 static void observe(size_t size) {
     if (profile == NULL || getpid() != owner || !atomic_load(&profile->enabled)) return;
-    if (thread_marker != NULL && (!atomic_load(&thread_selected) ||
-        !pthread_equal(pthread_self(), measured_thread))) return;
+    if (thread_name != NULL) {
+        // The server names the thread that ingests worker output. The recording
+        // writer drains different batches under different loads; its
+        // allocations do not measure the copies ingestion makes.
+        char name[64];
+        if (pthread_getname_np(pthread_self(), name, sizeof(name)) != 0 ||
+            strcmp(name, thread_name) != 0) return;
+    }
     atomic_fetch_add(&profile->bytes, size);
     uint64_t previous = atomic_load(&profile->largest);
     while (size > previous &&
@@ -111,7 +125,7 @@ static void profile_free(void *pointer) {
     RESOLVE(free);
     // The dispatcher constructs this final diagnostic after consuming the
     // worker outcome. Its thread exit proves WorkerEnded was queued, even while
-    // the journal mutex is held by the result-write checkpoint below.
+    // a case stalls the recording writer.
     const char marker[] = "worker stopped before interrupt completed";
     if (getpid() == owner && dispatcher_exited != NULL && pointer != NULL &&
         access(dispatcher_armed, F_OK) == 0 &&
@@ -135,21 +149,28 @@ static void *profile_realloc(void *pointer, size_t size) {
     return native_realloc(pointer, size);
 }
 
+// A reply to tools/call: a tool result or an MCP error, but not a ping reply.
+static bool tool_reply(const char *buffer, size_t size) {
+    const char prefix[] = "{\"jsonrpc\":\"2.0\",\"id\":";
+    size_t offset = sizeof(prefix) - 1;
+    if (size < offset || memcmp(buffer, prefix, offset) != 0) return false;
+    while (offset < size && buffer[offset] != ',') offset++;
+    const char *const bodies[] = {",\"result\":{\"content\":", ",\"error\":{"};
+    for (size_t index = 0; index < 2; index++) {
+        size_t length = strlen(bodies[index]);
+        if (size - offset >= length && memcmp(buffer + offset, bodies[index], length) == 0)
+            return true;
+    }
+    return false;
+}
+
 static ssize_t profile_write(int descriptor, const void *buffer, size_t size) {
     RESOLVE(write);
-    if (thread_marker != NULL && getpid() == owner && !atomic_load(&thread_selected) &&
-        size >= strlen(thread_marker) && memcmp(buffer, thread_marker, strlen(thread_marker)) == 0) {
-        // A raw-output write identifies its ingestion thread during warmup.
-        // Recorder threads may drain different batches under different loads;
-        // their allocations do not measure the direct UTF-8 decoder's copies.
-        measured_thread = pthread_self();
-        atomic_store(&thread_selected, true);
-    }
-    const char marker[] = "{\"event\":\"tool_result\",";
     if (profile != NULL && getpid() == owner && atomic_load(&profile->pause_results) &&
-        size >= sizeof(marker) - 1 && memcmp(buffer, marker, sizeof(marker) - 1) == 0) {
-        // The result is assembled and owns delivery before its journal append.
-        // Hold that public recording write until the client cancels the call.
+        descriptor == STDOUT_FILENO && tool_reply(buffer, size)) {
+        // The reply owns delivery once its write starts. Recording does not
+        // hold a reply, so this write is the public point at which a client
+        // can still cancel a call whose result is already assembled.
         if (native_write(reached, "1", 1) != 1) _exit(124);
         char token;
         ssize_t count;

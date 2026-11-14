@@ -352,9 +352,24 @@ def test_updates_quarto_without_rereading_journal(
             journal = session / "capture" / "events.jsonl"
             journal.chmod(0o200)
             journal_read_disabled = True
+            # The harness cannot read this journal for a delivery receipt, so
+            # wait for the projection itself.
+            client.recording_receipts = False
 
             client.send(python="echo second")
-            quarto = (session / "sessions/session-001.qmd").read_text(encoding="utf-8")
+            projection = session / "sessions/session-001.qmd"
+            wait_for_checkpoint(
+                lambda: (
+                    projection
+                    if "echo second" in projection.read_text(encoding="utf-8")
+                    else None
+                ),
+                "second cell projected",
+                root=projection.parent,
+                client=client,
+                timeout=client.response_timeout,
+            )
+            quarto = projection.read_text(encoding="utf-8")
 
             journal.chmod(0o600)
             journal_read_disabled = False

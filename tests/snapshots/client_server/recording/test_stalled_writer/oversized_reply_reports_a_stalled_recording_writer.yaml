@@ -1,0 +1,6 @@
+---
+!same-as tests/snapshots/client_server/server/test_tools/initializes_and_lists_tools.custom.direct.yaml
+---
+oversized reply: bounded wait; raw log path and stalled writer named
+ordinary reply: returned while the writer was stalled
+raw log after release: complete

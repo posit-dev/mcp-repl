@@ -264,7 +264,10 @@ impl Evaluation {
         (phase, state.cell_entered)
     }
 
-    pub(super) fn preview(&self) -> Option<Vec<super::Content>> {
+    pub(super) fn preview(
+        &self,
+        writer: crate::transcript::WriterState,
+    ) -> Option<Vec<super::Content>> {
         let mut state = self.state.lock().ok()?;
         // Delivery cancellation can restore output without another worker event.
         // Accept that receipt before copying; preview still neither drains nor
@@ -290,7 +293,7 @@ impl Evaluation {
         } else {
             self.output.snapshot()
         });
-        Some(response.preview())
+        Some(response.preview(writer))
     }
 
     fn claim_wait(self: &Arc<Self>) -> Result<WaitClaim, String> {

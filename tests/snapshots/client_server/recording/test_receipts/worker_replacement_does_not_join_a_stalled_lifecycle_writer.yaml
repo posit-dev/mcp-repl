@@ -2,5 +2,5 @@
 !same-as tests/snapshots/client_server/server/test_tools/initializes_and_lists_tools.custom.direct.yaml
 ---
 capture: >-
-  worker retirement and replacement do not wait for worker_ended journal
-  I/O
+  worker retirement, replacement, and the reply do not wait for
+  worker_ended journal I/O

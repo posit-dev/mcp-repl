@@ -17,7 +17,6 @@ from boundaries.client_server._harness import (
 )
 from boundaries.client_server.recording.test_process import recording_events
 from boundaries.client_server.recording.test_journal import local_discovery
-from support.allocations import AllocationProfile
 from support.checkpoints import FifoCheckpoint
 from support.client import McpClient, stop_client
 from support.execution import DIRECT
@@ -30,21 +29,13 @@ from support.suites import run_this_suite
 @contextmanager
 def blocked_response(
     binary: Path, *, ping: bool = False
-) -> Iterator[
-    tuple[SocketGateMcpClient, dict, AllocationProfile, dict[str, FifoCheckpoint], Path]
-]:
+) -> Iterator[tuple[SocketGateMcpClient, dict, Path]]:
     with tempfile.TemporaryDirectory() as directory, ExitStack() as resources:
         root = Path(directory)
         gates = {
             name: resources.enter_context(closing(FifoCheckpoint.create(root / name)))
-            for name in (
-                "write-reached",
-                "write-release",
-                "result-reached",
-                "result-release",
-            )
+            for name in ("write-reached", "write-release")
         }
-        profile = resources.enter_context(closing(AllocationProfile(root)))
         writer = compile_interposer(
             Path(__file__).parents[1] / "server/_response_admission.c",
             root / "response-admission",
@@ -56,10 +47,7 @@ def blocked_response(
             ),
             {
                 **os.environ,
-                **profile.environment,
-                LOADER_VARIABLE: os.pathsep.join(
-                    (str(writer), profile.environment[LOADER_VARIABLE])
-                ),
+                LOADER_VARIABLE: str(writer),
                 "MCP_CONSOLE_HOME": str(root / "console-home"),
                 "MCP_CONSOLE_TEST_INITIAL_WRITE_REACHED": str(
                     gates["write-reached"].path
@@ -67,8 +55,6 @@ def blocked_response(
                 "MCP_CONSOLE_TEST_INITIAL_WRITE_RELEASE": str(
                     gates["write-release"].path
                 ),
-                "MCP_CONSOLE_TEST_RESULT_REACHED": str(gates["result-reached"].path),
-                "MCP_CONSOLE_TEST_RESULT_RELEASE": str(gates["result-release"].path),
             },
             root,
         )
@@ -90,48 +76,12 @@ def blocked_response(
             expected_prefix = f'"id":{json.dumps(first["id"])}'.encode()[:64]
             prefix = client.stdout.stream.recv(256, socket.MSG_PEEK)
             assert expected_prefix in prefix and b"\n" not in prefix, prefix
-            yield client, first, profile, gates, root
+            yield client, first, root
         finally:
-            profile.pause_results(False)
-            gates["result-release"].release()
             gates["write-release"].release()
             if client.process.poll() is None:
                 stop_client(client)
             client.close_test_stdio()
-
-
-@requires(NATIVE_FIXTURES)
-def test_cancelled_call_journaling_keeps_ping_live(binary: Path) -> Transcript:
-    with blocked_response(binary) as (client, first, profile, gates, root):
-        profile.pause_results(True)
-        cancelled = client.start_send(r="echo must not execute")
-        client.notify("notifications/cancelled", requestId=cancelled["id"])
-        gates["result-reached"].wait(
-            "cancelled call result is being journaled", client=client
-        )
-        gates["write-release"].release()
-        client.receive(first)
-        client.response_timeout = 2
-        try:
-            assert client.request("ping")["result"] == {}
-        finally:
-            profile.pause_results(False)
-            gates["result-release"].release()
-        client.response_timeout = 600
-        client.expect("zod: still live\n", r="echo still live")
-        client.close_input_observer()
-        client.finish()
-        (recording,) = (root / "console-home/sessions").iterdir()
-        events = recording_events(recording)
-        (result,) = [
-            e for e in events if e["event"] == "tool_result" and e["call_id"] == 2
-        ]
-        assert result["error"]["message"] == "request cancelled before execution"
-        assert events[-1]["event"] == "recording_ended"
-        return [
-            *client.transcript[:3],
-            {"capture": "cancelled call journaling leaves ping live"},
-        ]
 
 
 @requires(NATIVE_FIXTURES)
@@ -147,7 +97,7 @@ def test_failed_ping_write_is_recorded_before_finalization(binary: Path) -> Tran
 
 
 def failed_write_before_finalization(binary: Path, *, ping: bool) -> Transcript:
-    with blocked_response(binary, ping=ping) as (client, first, profile, gates, root):
+    with blocked_response(binary, ping=ping) as (client, first, root):
         client.close_input_observer()
         client.stdin.close()
         # The native stdout writer remains blocked until after process exit.

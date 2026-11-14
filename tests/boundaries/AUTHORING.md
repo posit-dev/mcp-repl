@@ -75,8 +75,16 @@ Choose a receipt at the boundary being asserted.
 Before competing with a gated submission, observe its polling/admission claim.
 Before testing EOF delivery, gate an accepted result.
 Before checking shutdown output attribution, observe cell completion and its recorded output event.
-Settle preceding response writes with a ping before racing a long poll, and observe the cancelled call's recorded result before asserting that its claim was released.
+Settle preceding response writes with a ping before racing a long poll.
 Integrator callers requiring idle state must observe `status.idle` or use ordinary `busy: "wait"` admission.
+
+Replies do not wait for the recording writer.
+After each reply following the first `send`, `McpClient` waits until the live recording holds that reply's `delivery` event.
+The writer appends the event after everything the reply recorded, so a case can read recording files as soon as it has the reply.
+Clear `client.recording_receipts` around a reply whose stdout write or recording write the case holds, and pass `recording_receipts=False` when the case stalls or disables the writer.
+When a held reply write blocks every later reply, use `client.await_received()` to prove the server applied an earlier message and `client.await_assembled()` to prove a later handler finished.
+`pause_results` holds a `tools/call` reply at its stdout write, after its result is assembled.
+`cancel_result` cancels the call there, proves the cancellation with the recorded receipt of a following ping, and then receives the reply the client no longer wants.
 
 Raw streams and sideband are independent.
 Use `read_relay_ready()` for the ordered acquisition/readiness handshake and count every record up to the producer's gate.

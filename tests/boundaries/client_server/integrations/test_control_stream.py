@@ -12,6 +12,7 @@ from boundaries.client_server.integrations.test_control import (
     ControlClient,
     result_text,
 )
+from boundaries.client_server.output.test_recovery import cancel_held_result
 from boundaries.client_server.python.test_without_r import selected_environment
 from support.allocations import AllocationProfile
 from support.checkpoints import FifoCheckpoint
@@ -129,7 +130,7 @@ def test_pushes_cancelled_response_recovery_without_polling(
             client.transcript.append(
                 {
                     "scenario": "A subscription restores ghost output after an MCP response is cancelled, without another status or preview request.",
-                    "fixture": "A worker FIFO holds output pending; a native result-journal checkpoint then holds its assembled MCP response while the client cancels delivery.",
+                    "fixture": "A worker FIFO holds output pending; a native checkpoint then holds the write of its assembled MCP response while the client cancels delivery.",
                 }
             )
             client.initialize_and_list_tools()
@@ -163,10 +164,8 @@ def test_pushes_cancelled_response_recovery_without_polling(
                     claimed = preview()
                     while result_text(claimed):
                         claimed = preview()
-                    client.notify("notifications/cancelled", requestId=pending["id"])
-                    assert client.request("ping")["result"] == {}
+                    cancel_held_result(client, pending, result_release)
                     profile.pause_results(False)
-                    result_release.release()
                     recovered = preview()
                     assert result_text(recovered) == "recovered ghost\n", recovered
                     client.expect("recovered ghost\n")

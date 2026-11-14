@@ -13,6 +13,7 @@ from yaml12 import format_yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from boundaries.client_server.output.test_recovery import cancel_result
 from boundaries.client_server.python.test_startup import selected_python
 from support.python import isolated_python
 from boundaries.client_server.python.test_without_r import (
@@ -673,15 +674,16 @@ def test_cancelled_response_preserves_bootstrap_and_first_cell(
         profile.pause_results(True)
         try:
             pending = client.start_send(python="counter = 1; counter", timeout_ms=0)
-            result_reached.wait("first cell response owns delivery")
-            client.notify("notifications/cancelled", requestId=pending["id"])
-            client.request("ping")
+            cancel_result(client, pending, result_reached, result_release)
         finally:
             profile.pause_results(False)
             result_release.release()
         client.send(session="default", timeout_ms=0)
         assert without_elapsed(last_result_text(client)) == RUNNING
-        assert "result" not in pending
+        cancelled = pending["result"]
+        assert not cancelled["isError"], pending
+        [content] = cancelled["content"]
+        assert without_elapsed(content["text"]) == RUNNING, pending
         release.release()
         wait_for_evaluation_output(
             client,

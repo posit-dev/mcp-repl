@@ -28,6 +28,13 @@ result:
 ---
 send:
   timeout_ms: 0
+result:
+  content:
+    - type: text
+      text: |-
+        [input requested: "idle> "]
+        [waiting for stdin]
+  isError: false
 id: <cancelled request 1>
 ---
 input:

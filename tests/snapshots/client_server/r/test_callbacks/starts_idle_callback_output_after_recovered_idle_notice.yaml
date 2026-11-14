@@ -39,6 +39,13 @@ result:
   isError: false
 ---
 send: {}
+result:
+  content:
+    - type: text
+      text: |-
+
+        [idle]
+  isError: false
 id: <cancelled request 1>
 ---
 input:

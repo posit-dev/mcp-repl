@@ -54,6 +54,11 @@ result:
 send:
   control: interrupt
   r: print(1)
+result:
+  content:
+    - type: text
+      text: interrupted evaluation is still active; cell was not run
+  isError: true
 id: <cancelled request 1>
 ---
 input:

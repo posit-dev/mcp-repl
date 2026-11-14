@@ -201,6 +201,8 @@ Inspection can return `busy` if state cannot be read immediately.
 The response does not reserve the worker.
 
 `preview` reads bounded pending content, including partial terminal lines, without consuming output, acknowledging delivery, or changing omission accounting.
+A preview never waits for the recording writer.
+Its omission notice includes a warning described in [Recording failures](RECORDING_REFERENCE.md#recording-failures) only if recording has stopped or a backlog that a reply's bounded wait gave up on remains.
 Output already claimed by a response writer may no longer be visible there.
 
 ### Subscribe to pending output
@@ -221,6 +223,7 @@ After `{"id":"ghost","result":{"subscribed":true}}`, frames use this shape:
 ```
 
 Replace the displayed content with each snapshot, including an empty one after collection.
+A new snapshot is also sent when the recording writer changes an omission notice about retained files, even if the worker emits no output.
 Slow readers can miss coalesced changes or output already collected by MCP.
 Subscriptions retain only the latest change and never block output producers.
 Close the connection to unsubscribe; use other connections for requests.

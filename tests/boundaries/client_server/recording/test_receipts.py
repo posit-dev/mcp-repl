@@ -283,11 +283,14 @@ def replacement_with_stalled_journal(
                         root=pid,
                         client=client,
                     )
+                    # The stalled writer cannot record a delivery.
+                    client.recording_receipts = False
+                    client.receive(restart)
+                    assert restart["result"]["isError"] == ("r" in arguments), restart
                     assert client.request("ping")["result"] == {}
                 finally:
                     release.release()
-                client.receive(restart)
-                assert restart["result"]["isError"] == ("r" in arguments), restart
+                client.recording_receipts = True
                 transcript = client.finish()
             (recording,) = (root / ".agents/console/sessions").iterdir()
             events = recording_events(recording)
@@ -305,7 +308,7 @@ def replacement_with_stalled_journal(
             return [
                 *transcript[:3],
                 {
-                    "capture": f"worker retirement and replacement do not wait for {event} journal I/O"
+                    "capture": f"worker retirement, replacement, and the reply do not wait for {event} journal I/O"
                 },
             ]
 

@@ -15,6 +15,7 @@ from support.assertions import tool_text
 from support.checkpoints import FifoCheckpoint
 from support.client import McpClient
 from support.execution import DIRECT
+from support.native import LOADER_VARIABLE, build_interposer
 from support.normalization import normalize_recording
 from support.records import Transcript
 from support.requirements import NATIVE_FIXTURES, requires
@@ -29,8 +30,8 @@ def test_standalone_note_keeps_received_worker_during_delayed_capture(
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         with (
-            closing(FifoCheckpoint.create(root / "result-reached")) as reached,
-            closing(FifoCheckpoint.create(root / "result-release")) as release,
+            closing(FifoCheckpoint.create(root / "observed")) as observed,
+            closing(FifoCheckpoint.create(root / "release")) as release,
             closing(FifoCheckpoint.create(root / "dispatcher-exited")) as retired,
             closing(AllocationProfile(root)) as profile,
             McpClient(
@@ -39,39 +40,43 @@ def test_standalone_note_keeps_received_worker_during_delayed_capture(
                 {
                     **os.environ,
                     **profile.environment,
+                    LOADER_VARIABLE: os.pathsep.join(
+                        [
+                            profile.environment[LOADER_VARIABLE],
+                            str(build_interposer(root, "recording_observation")),
+                        ]
+                    ),
                     "TMPDIR": str(root),
                     "ZOD_REPORT_PID": "1",
-                    "MCP_CONSOLE_TEST_RESULT_REACHED": str(reached.path),
-                    "MCP_CONSOLE_TEST_RESULT_RELEASE": str(release.path),
+                    "MCP_CONSOLE_TEST_OBSERVED_EVENT": "tool_result",
+                    "MCP_CONSOLE_TEST_JOURNAL_OBSERVED": str(observed.path),
+                    "MCP_CONSOLE_TEST_JOURNAL_RELEASE": str(release.path),
                     "MCP_CONSOLE_TEST_DISPATCHER_EXITED": str(retired.path),
                     "MCP_CONSOLE_TEST_DISPATCHER_ARMED": str(root / "armed"),
                 },
                 root,
+                # The stalled writer cannot record a delivery.
+                recording_receipts=False,
             ) as client,
         ):
             try:
                 client.initialize_and_list_tools()
                 client.expect("zod: original\n", r="echo original")
+                observed.wait("first result journal write is stalled", client=client)
                 original_pid = int((root / "zod-worker-pid").read_text())
-                profile.pause_results(True)
-                pending = client.start_send(control="interrupt")
-                reached.wait("result writer holds the journal before note receipt")
+                # The note's reply follows its receipt and its queued capture.
+                # Retirement follows both, while the writer has written neither.
                 annotation = client.start_send(note=note)
-                # The ping follows the note on the same MCP transport. Receipt
-                # therefore precedes retirement even though capture is blocked.
-                assert client.request("ping")["result"] == {}
+                client.receive(annotation)
+                assert tool_text(annotation["result"]) == "[done]", annotation
                 (root / "armed").touch()
                 os.kill(original_pid, signal.SIGKILL)
                 retired.wait(
-                    "worker retirement queued while note capture is blocked",
+                    "worker retirement queued while the note is unwritten",
                     client=client,
                 )
-                profile.pause_results(False)
                 release.release()
-                client.receive(pending)
-                assert tool_text(pending["result"]) == "\n[idle]", pending
-                client.receive(annotation)
-                assert tool_text(annotation["result"]) == "[done]", annotation
+                client.recording_receipts = True
                 failure = client.send()
                 assert failure["isError"], failure
                 client.expect(
@@ -80,7 +85,6 @@ def test_standalone_note_keeps_received_worker_during_delayed_capture(
                 )
                 transcript = client.finish()
             finally:
-                profile.pause_results(False)
                 release.release()
 
         (recording,) = (root / ".agents/console/sessions").iterdir()
@@ -103,7 +107,7 @@ def test_standalone_note_keeps_received_worker_during_delayed_capture(
             if event["event"] == "tool_call"
             and event["request"]["arguments"].get("note") == note
         )
-        assert received["sequence"] < retired["sequence"] < captured["sequence"], (
+        assert received["sequence"] < captured["sequence"] < retired["sequence"], (
             capture
         )
         assert captured["note_target"] == {"kind": "worker", "session_id": 1}, captured

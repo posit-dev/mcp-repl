@@ -139,7 +139,11 @@ def test_cancelled_aggregate_poll_releases_named_startup_observation(
                     }, cancelled
                     if selection:
                         armed.touch()
+                        # The held write returns only on release, so the recording
+                        # cannot yet hold this reply's delivery.
+                        client.recording_receipts = False
                     observed = client.send(session="alpha", timeout_ms=0)
+                    client.recording_receipts = True
                     assert observed["isError"] is False, observed
                     assert observed["content"][0]["text"].endswith(
                         "[running; poll with an empty send]"

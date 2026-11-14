@@ -292,6 +292,13 @@ async fn connection(stream: UnixStream, server: ConsoleServer, mut closing: watc
         let mut read = BufReader::new(read);
         let mut activated = false;
         loop {
+            // As at MCP receipt, hold intake to the recording writer's pace.
+            tokio::select! {
+                biased;
+                _ = reader_closing.changed() => break,
+                _ = frames.closed() => break,
+                () = incoming.paced() => {}
+            }
             let mut frame = Vec::new();
             let mut bounded = (&mut read).take((MAX_FRAME + 1) as u64);
             let result = tokio::select! {
@@ -302,8 +309,7 @@ async fn connection(stream: UnixStream, server: ConsoleServer, mut closing: watc
             };
             if !frame.is_empty() {
                 if !activated {
-                    let activation = incoming.clone();
-                    let _ = tokio::task::spawn_blocking(move || activation.activate()).await;
+                    incoming.activate();
                     activated = true;
                 }
                 incoming.protocol(
@@ -353,6 +359,7 @@ async fn connection(stream: UnixStream, server: ConsoleServer, mut closing: watc
                     format: *format,
                     changes: worker.integrator_subscribe(),
                     worker,
+                    recording: transcript.clone(),
                 }
             }),
             _ => None,
@@ -408,6 +415,7 @@ struct Subscription {
     worker: crate::worker_client::Client,
     format: SubscriptionFormat,
     changes: watch::Receiver<()>,
+    recording: crate::transcript::Transcript,
 }
 
 async fn stream_snapshots(
@@ -423,13 +431,18 @@ async fn stream_snapshots(
         worker,
         format,
         mut changes,
+        recording,
     } = subscription;
     let mut previous = None;
+    // The recording writer changes what a preview says about retained files
+    // without a worker change.
+    let mut recorded = recording.subscribe_writer();
     loop {
         changes.borrow_and_update();
+        recorded.borrow_and_update();
         let mut event = match format {
             SubscriptionFormat::Preview => {
-                let Ok(content) = worker.integrator_preview() else {
+                let Ok(content) = worker.integrator_preview(recording.writer_state()) else {
                     break;
                 };
                 let result = CallToolResult::success(content_blocks(content));
@@ -467,6 +480,7 @@ async fn stream_snapshots(
             _ = disconnect.changed() => break,
             _ = received.recv() => break,
             result = changes.changed() => if result.is_err() { break; },
+            result = recorded.changed() => if result.is_err() { break; },
         }
     }
 }
@@ -560,11 +574,7 @@ async fn handle(
     let record = matches!(&request, Request::Evaluate { record: true, .. });
     let recording = runtime.transcript.clone();
     let request_id = RequestId::String(request.id().to_string().into());
-    let call = tokio::task::spawn_blocking(move || {
-        recording.begin_integrator(&request_id, &arguments, record)
-    })
-    .await
-    .expect("integrator recording task");
+    let call = recording.begin_integrator(&request_id, &arguments, record);
     let call_id = call.id();
     let operation_call = call.clone();
     let operation = async {
@@ -660,13 +670,19 @@ async fn handle(
                         .await,
                 ))
             }
-            Request::Recording { .. } => runtime
-                .transcript
-                .integrator_recording()
-                .map(CallToolResult::structured)
-                .map_err(|error| ("projection_unavailable", error)),
+            Request::Recording { .. } => {
+                // This reply describes the recording itself, so it alone
+                // waits for the recording writer.
+                let recording = runtime.transcript.clone();
+                tokio::task::spawn_blocking(move || recording.integrator_recording())
+                    .await
+                    .expect("integrator recording task")
+                    .map(CallToolResult::structured)
+                    .map_err(|error| ("projection_unavailable", error))
+            }
             Request::Preview { .. } => {
-                let content = runtime.worker.integrator_preview().map_err(|_| {
+                let writer = runtime.transcript.writer_state();
+                let content = runtime.worker.integrator_preview(writer).map_err(|_| {
                     (
                         "busy",
                         "runner state is changing; retry preview".to_string(),
@@ -747,11 +763,7 @@ async fn handle(
                 }
                 execution_error = serde_json::to_value(response.execution_error())
                     .expect("execution error serialization");
-                Ok(evaluation_result(
-                    response,
-                    &operation_call,
-                    &runtime.transcript,
-                ))
+                Ok(evaluation_result(response, &operation_call, &runtime.transcript).await)
             }
         }
     };
@@ -800,10 +812,7 @@ async fn handle(
             }
         })
         .map_err(|(_, message)| rmcp::ErrorData::internal_error(message, None));
-    let recording = runtime.transcript.clone();
-    tokio::task::spawn_blocking(move || recording.finish(call, &recorded))
-        .await
-        .expect("integrator result recording task");
+    runtime.transcript.finish(call, &recorded);
     (response, call_id)
 }
 
@@ -837,11 +846,12 @@ fn content_blocks(content: Vec<Content>) -> Vec<ContentBlock> {
         .collect()
 }
 
-fn evaluation_result(
-    response: Response,
+async fn evaluation_result(
+    mut response: Response,
     call: &crate::transcript::Call,
     transcript: &crate::transcript::Transcript,
 ) -> CallToolResult {
+    response.settle_recording(transcript, &mut []).await;
     let (content, is_error, delivery, parts) = response.into_parts();
     call.record_result_parts(parts);
     record_images(&content, call, transcript);

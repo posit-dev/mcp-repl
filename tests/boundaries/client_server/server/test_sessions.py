@@ -305,6 +305,9 @@ def test_cancelled_aggregate_poll_omits_empty_stopped_session(
             )
             try:
                 armed.touch()
+                # The held write returns only on release, so the recording
+                # cannot yet hold this reply's delivery.
+                client.recording_receipts = False
                 started = client.send(
                     timeout_ms=0,
                     # fmt: python
@@ -316,6 +319,7 @@ def test_cancelled_aggregate_poll_omits_empty_stopped_session(
                         print("default returned")
                         """),
                 )
+                client.recording_receipts = True
                 running = {
                     "content": [{"type": "text", "text": RUNNING}],
                     "isError": False,

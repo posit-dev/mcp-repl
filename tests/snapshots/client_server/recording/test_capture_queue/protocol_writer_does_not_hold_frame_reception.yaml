@@ -3,12 +3,18 @@
 ---
 send:
   session: default
-id: <cancelled request 1>
+result:
+  content:
+    - type: text
+      text: |-
+
+        [idle]
+  isError: false
 ---
 input:
   method: notifications/cancelled
   params:
-    requestId: <cancelled request 1>
+    requestId: 1000000
 ---
 input:
   method: ping

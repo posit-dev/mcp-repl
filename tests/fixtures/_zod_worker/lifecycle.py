@@ -92,6 +92,8 @@ def close_sideband_with_unread_shutdown(
 def exit_unexpectedly(context: WorkerContext, source: str) -> None:
     if source == "exit after output":
         send_output(context.writer, "zod output before exit\n")
+    elif source.startswith("exit after output: "):
+        send_output(context.writer, source.removeprefix("exit after output: "))
     os._exit(86)
 
 
@@ -177,6 +179,15 @@ def complete_after_release(context: WorkerContext, source: str) -> None:
     while not (context.root / "zod-release-evaluation").exists():
         time.sleep(0.01)
     echo(context, source)
+
+
+def hold_after_output(context: WorkerContext, source: str) -> None:
+    send_output(context.writer, source.removeprefix("hold after output: "))
+    wait_for_server_to_process_sideband(context.reader, context.writer)
+    publish_marker(context.root / "zod-output-held")
+    while not (context.root / "zod-release-evaluation").exists():
+        time.sleep(0.01)
+    send(context.writer, {"kind": "completed"})
 
 
 def output_then_complete_after_release(context: WorkerContext, source: str) -> None:

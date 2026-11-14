@@ -12,6 +12,13 @@ result:
 ---
 send:
   r: preview rejected image
+result:
+  content:
+    - type: text
+      text: |
+
+        [output omitted: 1 image (4 encoded bytes); 1 image not retained]
+  isError: false
 id: <cancelled request 1>
 ---
 input:
@@ -26,11 +33,21 @@ result: {}
 send:
   control: interrupt
   r: preview rejected image
+result:
+  content:
+    - type: text
+      text: |-
+
+        [output omitted: 2 images (8 encoded bytes); 2 images not retained]
+
+        [done]
+  isError: false
 transcript_normalization:
   target: repeated cancellation setup exchanges
   repeated_exchange_count: 1023
   exchange_entry_count: 3
   request_ids: distinct in each exchange
+  result: each cancelled reply also replays the output recovered so far
 id: <cancelled request 2>
 ---
 input:

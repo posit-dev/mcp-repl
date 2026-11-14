@@ -1,16 +1,22 @@
-//! Raw capture handles remain independent of the journal writer and its mutex.
+//! Capture files are created here and written only by the recording writer.
+//! A producer creates its output file through a bounded helper, so a storage
+//! call that does not return costs it one wait, not its thread.
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::queue::WRITER_WAIT;
 use super::{create_private_directory, create_private_file};
 
 #[derive(Default)]
 pub(super) struct CaptureStorage {
     files: Mutex<Option<CaptureFiles>>,
     pub(super) public_directory: Arc<Mutex<PathBuf>>,
+    /// Creations whose producer stopped waiting and which have not returned.
+    abandoned_creates: AtomicUsize,
 }
 
 struct CaptureFiles {
@@ -77,6 +83,59 @@ impl CaptureStorage {
                 .insert(relative.to_owned(), Arc::downgrade(&file));
             Ok(file)
         })
+    }
+
+    /// Create a producer's output file, waiting at most `WRITER_WAIT`.
+    ///
+    /// The creation runs on a helper thread. A helper that outlives the wait
+    /// is abandoned: it may still leave an empty file, and later creations
+    /// fail at once until it returns, so a stalled filesystem holds one thread.
+    pub(super) fn create_output_file(
+        self: &Arc<Self>,
+        relative: &str,
+    ) -> Result<Arc<Mutex<CaptureFile>>, String> {
+        if self.abandoned_creates.load(Ordering::Acquire) != 0 {
+            return Err("recording storage is not responding".to_string());
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // Decides, under one lock, whether the helper delivers or is abandoned.
+        let abandoned = Arc::new(Mutex::new(false));
+        let helper = (self.clone(), relative.to_owned(), abandoned.clone());
+        std::thread::spawn(move || {
+            let (storage, relative, abandoned) = helper;
+            let result = storage.create_file(&relative);
+            let abandoned = abandoned.lock().expect("output creation lock");
+            if *abandoned {
+                storage.abandoned_creates.fetch_sub(1, Ordering::Release);
+            } else {
+                let _ = sender.send(result);
+            }
+        });
+        if let Ok(result) = receiver.recv_timeout(WRITER_WAIT) {
+            return result;
+        }
+        let mut abandoned = abandoned.lock().expect("output creation lock");
+        if let Ok(result) = receiver.try_recv() {
+            return result;
+        }
+        *abandoned = true;
+        self.abandoned_creates.fetch_add(1, Ordering::Release);
+        Err(format!(
+            "recording storage did not respond within {} seconds",
+            WRITER_WAIT.as_secs()
+        ))
+    }
+
+    /// Writer only.
+    pub(super) fn write_image(&self, relative: &str, bytes: &[u8]) -> Result<(), String> {
+        let file = self.create_file(relative)?;
+        let mut file = file.lock().map_err(|_| "image lock poisoned")?;
+        file.writer
+            .as_mut()
+            .expect("image writer")
+            .write_all(bytes)
+            .map_err(|e| e.to_string())?;
+        file.finish()
     }
 
     pub(super) fn relocate(&self, destination: &Path) -> Result<(), String> {
@@ -296,27 +355,16 @@ impl super::Transcript {
             "bin"
         };
         let path = format!("{stem}.{extension}");
-        let retained = (|| {
-            let file = self.3.create_file(&path)?;
-            let mut file = file.lock().map_err(|_| "image lock poisoned")?;
-            file.writer
-                .as_mut()
-                .expect("image writer")
-                .write_all(bytes)
-                .map_err(|e| e.to_string())?;
-            file.finish()
-        })();
-        if let Err(error) = retained {
-            self.disable(error);
-            return None;
-        }
-        self.queue_event(super::queue::QueuedEvent::ImageRetained {
+        // The writer creates and writes the file before journaling it. A
+        // failure there disables recording; this receipt is already issued.
+        self.queue_data(super::queue::QueuedEvent::ImageRetained {
             owner,
             artifact_id: id,
             call_id,
             path: path.clone(),
             mime_type: mime_type.to_owned(),
             bytes: bytes.len(),
+            data: bytes.to_vec(),
         });
         Some(super::Artifact {
             id,

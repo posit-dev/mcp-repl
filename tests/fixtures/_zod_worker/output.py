@@ -107,6 +107,12 @@ def overflow_image_retention(context: WorkerContext, source: str) -> None:
     send(context.writer, {"kind": "completed"})
 
 
+def emit_largest_retained_image(context: WorkerContext, source: str) -> None:
+    data = base64.b64encode(b"\0" * (64 * 1024 * 1024)).decode("ascii")
+    send(context.writer, {"kind": "image", "data": data, "mime_type": "image/png"})
+    send(context.writer, {"kind": "completed"})
+
+
 def preview_rejected_image(context: WorkerContext, source: str) -> None:
     send(context.writer, {"kind": "image", "data": "AAAA", "mime_type": "m" * 65537})
     send(context.writer, {"kind": "completed"})

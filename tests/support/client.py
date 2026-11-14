@@ -152,6 +152,7 @@ class McpClient:
         record_in_project: bool = True,
         use_home_configuration: bool = False,
         use_r_startup_files: bool = False,
+        recording_receipts: bool = True,
     ) -> None:
         self.response_timeout = response_timeout
         self.shutdown_timeout = shutdown_timeout
@@ -213,6 +214,7 @@ class McpClient:
         assert process.stdout is not None
         assert process.stderr is not None
 
+        self._track_recording(environment, current_directory, recording_receipts)
         self.process = process
         self.stdin = process.stdin
         self.stdout = TextReader(process.stdout)
@@ -337,6 +339,167 @@ class McpClient:
         assert message.keys() == {"result"} or message.keys() == {"error"}, message
         assert entry.keys().isdisjoint(message), message
         entry.update(message)
+        self._await_recording(entry)
+
+    def _track_recording(
+        self,
+        environment: dict[str, str] | None,
+        current_directory: Path,
+        recording_receipts: bool,
+    ) -> None:
+        launch = os.environ if environment is None else environment
+        self._recording_roots = [
+            root / "sessions"
+            for root in (
+                current_directory / ".agents/console",
+                Path(launch["MCP_CONSOLE_HOME"])
+                if "MCP_CONSOLE_HOME" in launch
+                else Path(launch.get("HOME") or Path.home()) / ".agents/console",
+            )
+        ]
+        # A case clears this before it stalls, stops, or hides the recording.
+        # Receipts find the recording by this process's PID, so a case that
+        # starts the server through a launcher also clears it.
+        self.recording_receipts = recording_receipts
+        self._recording_failed = False
+        self._recording_published = False
+        self._journal_offset = 0
+        self._recorded_deliveries: set[int | str] = set()
+        self._recorded_receipts: set[int | str] = set()
+        self._recorded_assemblies: set[int | str] = set()
+
+    def _await_recording(self, entry: TranscriptEntry) -> None:
+        """Wait until the live recording holds this reply's delivery event.
+
+        Replies do not wait for the recording writer. The writer appends a
+        reply's delivery event after everything that reply recorded, so a case
+        can read the live recording once the event is present. The first send
+        publishes the recording; earlier replies have no journal to wait for.
+        A recording that the server reports as disabled receives nothing more.
+        """
+        if not self.recording_receipts:
+            return
+        request = entry.get("input", {})
+        self._recording_published = (
+            self._recording_published
+            or "send" in entry
+            or (
+                request.get("method") == "tools/call"
+                and isinstance(params := request.get("params"), dict)
+                and params.get("name") == "send"
+                and isinstance(params.get("arguments"), dict)
+            )
+        )
+        if not self._recording_published:
+            return
+        self._await_journal(
+            self._recorded_deliveries, entry["id"], "the delivery of request"
+        )
+
+    def await_received(self, entry: TranscriptEntry) -> None:
+        """Wait until the live recording holds the server's receipt of a request.
+
+        The server records the receipt of a message after it has applied every
+        earlier message from the same input. A case that holds a reply's write
+        cannot use a later reply as that proof, so it waits here instead.
+        """
+        assert self._await_journal(
+            self._recorded_receipts, entry["id"], "the receipt of request"
+        ), self._diagnostics()
+
+    def await_assembled(self, entry: TranscriptEntry) -> None:
+        """Wait until the live recording holds the server's assembled reply.
+
+        The server records a reply as assembled when its handler has finished
+        and before the reply's write starts. A case that holds an earlier
+        write waits here to prove that a later handler did not wait for it.
+        """
+        assert self._await_journal(
+            self._recorded_assemblies, entry["id"], "the assembled reply to request"
+        ), self._diagnostics()
+
+    def _await_journal(
+        self, recorded: set[int | str], request_id: int | str, awaited: str
+    ) -> bool:
+        """Wait for a journal event; report whether the recording still runs."""
+        from support.events import Events
+
+        deadline = self.response_deadline()
+        with Events() as events:
+            if events.native:
+                try:
+                    events.watch_process(self.process.pid)
+                except ProcessLookupError:
+                    return False
+            events.watch_readable(self.stderr.fileno())
+            # An exited server has finalized or abandoned its recording.
+            while self.process.poll() is None:
+                # Watch each path before reading it so no append is missed.
+                journal = self._watch_journal(events)
+                if journal is not None:
+                    self._read_journal(journal)
+                if request_id in recorded:
+                    return True
+                if self._recording_disabled():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"recording did not receive {awaited} {request_id!r}; "
+                        "a case that stalls or hides the recording clears "
+                        f"recording_receipts: {self._diagnostics()}"
+                    )
+                events.wait(remaining)
+        return False
+
+    def await_recording_disabled(self) -> None:
+        """Wait for the server to report that its recording stopped."""
+        deadline = self.response_deadline()
+        while not self._recording_disabled():
+            self._wait_for_output(deadline, "the recording to stop")
+
+    def _recording_disabled(self) -> bool:
+        # The server reports this once, after its last write to the recording.
+        while not self.stderr.eof and select.select([self.stderr], [], [], 0)[0]:
+            self.stderr.fill()
+        if b"transcript recording disabled:" in self.stderr.buffer:
+            # A case can opt out of receipts; only this line is the report.
+            self._recording_failed = True
+            self.recording_receipts = False
+        return self._recording_failed
+
+    def _watch_journal(self, events: Any) -> Path | None:
+        for root in self._recording_roots:
+            events.watch_tree(root, recursive=False)
+            for recording in root.glob(f"*-{self.process.pid:010}"):
+                journal = recording / "capture/events.jsonl"
+                events.watch_tree(journal, recursive=False)
+                if journal.exists():
+                    return journal
+        return None
+
+    def _read_journal(self, journal: Path) -> None:
+        try:
+            stream = journal.open("rb")
+        except PermissionError:
+            # Publication copies the journal into place, and a Windows copy
+            # holds its destination exclusively. The next pass reads it.
+            assert os.name == "nt"
+            return
+        with stream:
+            stream.seek(self._journal_offset)
+            appended = stream.read()
+        complete = appended.rfind(b"\n") + 1
+        self._journal_offset += complete
+        for line in appended[:complete].splitlines():
+            event = json.loads(line)
+            if event["event"] == "delivery":
+                self._recorded_deliveries.add(event["request_id"])
+            elif event["event"] == "protocol" and "id" in event["message"]:
+                if event["direction"] == "received":
+                    self._recorded_receipts.add(event["message"]["id"])
+                elif event["direction"] == "assembled":
+                    self._recorded_assemblies.add(event["message"]["id"])
 
     def receive_many(self, entries: list[TranscriptEntry]) -> None:
         pending = {entry["id"]: entry for entry in entries}
@@ -351,6 +514,8 @@ class McpClient:
             assert message.keys() == {"result"} or message.keys() == {"error"}, message
             assert entry.keys().isdisjoint(message), message
             entry.update(message)
+        for entry in entries:
+            self._await_recording(entry)
 
     def start_request(self, method: str, **params: Any) -> TranscriptEntry:
         message: dict[str, Any] = {

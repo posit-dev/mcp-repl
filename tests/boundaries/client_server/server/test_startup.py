@@ -13,14 +13,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from support.requirements import NATIVE_FIXTURES, POSIX, R, command, requires
+from support.requirements import POSIX, R, command, requires
 from support.checkpoints import FifoCheckpoint
 from support.assertions import last_result_text
 from support.progress import elapsed_progress, without_elapsed_result
 from support.client import McpClient
 from support.execution import DIRECT, Execution, executions
 from support.normalization import code, normalize_process_diagnostic
-from support.native import LOADER_VARIABLE, build_interposer
 from support.records import Transcript
 from support.r import r_test_environment
 from support.discovery import DiscoveryGate, discovery_environment
@@ -32,10 +31,8 @@ def gated_discovery(
     binary: Path,
     *,
     r_home: Path | None = None,
-    server_environment: dict[str, str] | None = None,
 ) -> Iterator[tuple[McpClient, DiscoveryGate]]:
     with discovery_environment(r_home=r_home) as (environment, discovery):
-        environment.update(server_environment or {})
         with McpClient(
             binary, ("serve", "--no-sandbox"), environment, response_timeout=5
         ) as client:
@@ -194,50 +191,29 @@ def test_reports_discovery_failure_without_losing_mcp(binary: Path) -> Transcrip
         )
 
 
-@requires(POSIX, NATIVE_FIXTURES, command("rustc"))
+@requires(POSIX, command("rustc"))
 def test_standalone_requirements_wait_for_discovery(binary: Path) -> Transcript:
-    with (
-        tempfile.TemporaryDirectory() as directory,
-        closing(FifoCheckpoint.create(Path(directory) / "recorded")) as recorded,
-    ):
-        root = Path(directory)
-        armed = root / "armed"
-        environment = {
-            LOADER_VARIABLE: str(build_interposer(root, "startup_request_recorded")),
-            "MCP_CONSOLE_TEST_REQUEST_ARMED": str(armed),
-            "MCP_CONSOLE_TEST_REQUEST_RECORDED": str(recorded.path),
-        }
-        with gated_discovery(binary, server_environment=environment) as (
-            client,
-            release,
-        ):
-            return standalone_requirements_during_discovery(
-                client, release, armed, recorded
-            )
+    with gated_discovery(binary) as (client, release):
+        return standalone_requirements_during_discovery(client, release)
 
 
 def standalone_requirements_during_discovery(
-    client: McpClient,
-    release: DiscoveryGate,
-    armed: Path,
-    recorded: FifoCheckpoint,
+    client: McpClient, release: DiscoveryGate
 ) -> Transcript:
     client.transcript.append(
         {
             "scenario": "Standalone preparation waits for initial discovery even with timeout_ms=0.",
-            "fixture": "The R discovery probe is held at a loopback socket and fails after release. A native checkpoint observes the request recorder returning to its pool before a ping acknowledges readiness-wait dispatch.",
+            "fixture": "The R discovery probe is held at a loopback socket and fails after release. A ping sent after the request acknowledges readiness-wait dispatch.",
         }
     )
     client.initialize_and_list_tools()
-    armed.touch()
     pending = client.start_send(
         requirements={"action": "set", "r": ["must-not-resolve"]},
         timeout_ms=0,
     )
-    # The recorder's completion wakes the send handler before the later ping
-    # enters the current-thread runtime's FIFO ready queue. The handler runs
-    # through validation to its readiness wait before that ping can reply.
-    recorded.wait("standalone request recorder returned to its blocking pool")
+    # The send handler enters the current-thread runtime's FIFO ready queue at
+    # receipt, before the later ping. It runs through validation to its
+    # readiness wait before that ping can reply.
     ping = client.start_request("ping")
     client.receive(ping)
     assert ping["result"] == {}, ping

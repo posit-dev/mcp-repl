@@ -70,19 +70,22 @@ impl WorkerEventDispatcher {
         interrupts: super::platform::InterruptRequests,
         shutdown_started: super::platform::LocalShutdownObservation,
     ) -> Self {
-        let thread = thread::spawn(move || {
-            dispatch_worker_events(
-                events,
-                operation,
-                commands,
-                output,
-                callbacks,
-                startup,
-                ready_commit,
-                interrupts,
-                shutdown_started,
-            )
-        });
+        let thread = thread::Builder::new()
+            .name("worker events".to_string())
+            .spawn(move || {
+                dispatch_worker_events(
+                    events,
+                    operation,
+                    commands,
+                    output,
+                    callbacks,
+                    startup,
+                    ready_commit,
+                    interrupts,
+                    shutdown_started,
+                )
+            })
+            .expect("spawn worker event dispatcher");
         Self { thread }
     }
 

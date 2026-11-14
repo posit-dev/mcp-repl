@@ -3,8 +3,8 @@ scenario: >-
   A subscription restores ghost output after an MCP response is cancelled,
   without another status or preview request.
 fixture: >-
-  A worker FIFO holds output pending; a native result-journal checkpoint
-  then holds its assembled MCP response while the client cancels delivery.
+  A worker FIFO holds output pending; a native checkpoint then holds the
+  write of its assembled MCP response while the client cancels delivery.
 ---
 !same-as python-only MCP initialization for this execution mode
 ---
@@ -22,6 +22,12 @@ send:
     with open('<workspace>/release', "rb", buffering=0) as gate:
         gate.read(1)
   timeout_ms: 60000
+result:
+  content:
+    - type: text
+      text: |
+        recovered ghost
+  isError: false
 id: <cancelled request 1>
 ---
 input:
